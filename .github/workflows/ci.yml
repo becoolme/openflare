@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # vrt-config/tests/workerd_schema.rs checks generated configs against
@@ -28,7 +28,7 @@ jobs:
       - name: Fetch workerd.capnp for the pinned workerd
         run: |
           set -euo pipefail
-          version=$(node -p "require('./deploy/docker/workerd.lock').version")
+          version=$(node -p "JSON.parse(require('fs').readFileSync('deploy/docker/workerd.lock', 'utf8')).version")
           mkdir -p "$RUNNER_TEMP/workerd"
           cd "$RUNNER_TEMP/workerd"
           npm pack --silent "workerd@${version}"
@@ -48,10 +48,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # gen-manifest.mjs uses node:module stripTypeScriptTypes; the
       # committed manifest bytes are produced with Node 24.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '24.22.1'
       - name: Facade manifest is up to date
