@@ -329,7 +329,7 @@ impl ServiceConfig {
                 )
                 .is_err()
                 {
-                    return Err("persistence.s3.endpoint must be https (http only loopback/allowDevBackend)");
+                    return Err("persistence.s3.endpoint must be https (http only loopback, <svc>.<ns>.svc:port, or allowDevBackend)");
                 }
                 // T36b：s3 快照上传为内存路径——超限 fail closed。
                 if self.persistence.snapshot_max_bytes > S3_SNAPSHOT_MAX_BYTES {

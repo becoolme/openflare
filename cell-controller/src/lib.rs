@@ -28,6 +28,7 @@ pub mod cron;
 pub mod d1ops;
 pub mod execset;
 pub mod kvops;
+pub mod r2ops;
 pub mod fence;
 pub mod file_channel;
 pub mod health;

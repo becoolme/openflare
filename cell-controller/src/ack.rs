@@ -120,6 +120,12 @@ pub struct AckCapabilities {
     /// older strict control plane keeps accepting acks (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub kv: bool,
+    /// R2 backend wired on this cell (`R2_LIST/HEAD/GET/PUT/DELETE`
+    /// object data ops). The control plane rejects R2 object data ops
+    /// (409 VRT_CAPABILITY_UNSUPPORTED) unless claimed. Omitted from the
+    /// wire while false (rolling-upgrade compatibility, like `kv`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub r2: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

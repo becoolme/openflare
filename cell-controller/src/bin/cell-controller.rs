@@ -106,6 +106,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage_purge: storage_purge_exec.is_some(),
         // KV bindings are admitted only when a KV backend was actually built.
         kv: storage_purge_exec.as_ref().is_some_and(|e| e.has_kv()),
+        // R2 object data ops: only when an R2 backend was actually built.
+        r2: storage_purge_exec.as_ref().is_some_and(|e| e.has_r2()),
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,
@@ -338,10 +340,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         b as std::sync::Arc<dyn vrt_provider::kv::KvDataBackend>,
                     )
                 });
+            let r2_exec = storage_purge_exec
+                .as_ref()
+                .and_then(|s| s.r2_backend())
+                .map(|b| {
+                    cell_controller::r2ops::R2OpsExecutor::new(
+                        b as std::sync::Arc<dyn vrt_provider::r2::R2DataBackend>,
+                    )
+                });
             if wf_exec.is_none()
                 && d1_exec.is_none()
                 && storage_purge_exec.is_none()
                 && kv_exec.is_none()
+                && r2_exec.is_none()
             {
                 tracing::error!("no executor wired — cell-ops channel disabled");
                 return;
@@ -380,6 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     d1_exec.as_ref(),
                     storage_purge_exec.as_deref(),
                     kv_exec.as_ref(),
+                    r2_exec.as_ref(),
                     &mut seen,
                     &mut executed,
                     desired.as_ref(),

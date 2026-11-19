@@ -84,6 +84,12 @@ fn s3_endpoint_requires_https_unless_loopback_or_dev_switch() {
         let e = err("", &s3(bad));
         assert!(e.contains("s3.endpoint"), "{bad}: {e}");
     }
+    // In-cluster Service FQDN with explicit port (in-cluster S3, e.g. silo).
+    parse("", &s3("http://vrt-r2-silo.vibeploy-data.svc:9000")).validate().unwrap();
+    for bad in ["http://vrt-r2-silo:9000", "http://vrt-r2-silo.vibeploy-data.svc", "http://10.43.0.10:9000"] {
+        let e = err("", &s3(bad));
+        assert!(e.contains("s3.endpoint"), "{bad}: {e}");
+    }
     // Explicit dev switch re-allows plain http.
     parse("allowDevBackend = true", &s3("http://s3.example.com"))
         .validate()

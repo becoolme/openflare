@@ -33,6 +33,7 @@ use serde::Deserialize;
 
 use crate::execset::{CellOp, CellOpAck};
 use vrt_provider::kv::kvrocks::KvrocksKvProvider;
+use vrt_provider::error::ProviderError;
 use vrt_provider::purge::PurgeOutcome;
 use vrt_provider::r2::s3::{S3Config, S3R2Provider, SecretString};
 
@@ -147,15 +148,92 @@ impl vrt_provider::kv::KvDataBackend for KvBackend {
         }
     }
 }
-enum R2Backend {
+#[derive(Debug)]
+pub enum R2Backend {
     S3(S3R2Provider),
     Fs(vrt_provider::r2::fs::FsR2Provider),
+}
+
+/// R2 data ops share this backend (one client, purge + data ops);
+/// every method delegates to the provider's validated `R2DataBackend`.
+#[async_trait::async_trait]
+impl vrt_provider::r2::R2DataBackend for R2Backend {
+    async fn data_head(
+        &self,
+        tenant_id: &str,
+        bucket_id: &str,
+        key: &str,
+        budget: Duration,
+    ) -> Result<Option<vrt_provider::r2::R2ObjectMetadata>, ProviderError> {
+        match self {
+            R2Backend::S3(p) => p.data_head(tenant_id, bucket_id, key, budget).await,
+            R2Backend::Fs(p) => p.data_head(tenant_id, bucket_id, key, budget).await,
+        }
+    }
+    async fn data_get(
+        &self,
+        tenant_id: &str,
+        bucket_id: &str,
+        key: &str,
+        max_bytes: u64,
+        budget: Duration,
+    ) -> Result<vrt_provider::r2::R2GetResult, ProviderError> {
+        match self {
+            R2Backend::S3(p) => p.data_get(tenant_id, bucket_id, key, max_bytes, budget).await,
+            R2Backend::Fs(p) => p.data_get(tenant_id, bucket_id, key, max_bytes, budget).await,
+        }
+    }
+    async fn data_put(
+        &self,
+        tenant_id: &str,
+        bucket_id: &str,
+        key: &str,
+        body: &[u8],
+        options: &vrt_provider::r2::R2PutOptions,
+        budget: Duration,
+    ) -> Result<Option<vrt_provider::r2::R2ObjectMetadata>, ProviderError> {
+        match self {
+            R2Backend::S3(p) => p.data_put(tenant_id, bucket_id, key, body, options, budget).await,
+            R2Backend::Fs(p) => p.data_put(tenant_id, bucket_id, key, body, options, budget).await,
+        }
+    }
+    async fn data_delete(
+        &self,
+        tenant_id: &str,
+        bucket_id: &str,
+        keys: &[String],
+        budget: Duration,
+    ) -> Result<(), ProviderError> {
+        match self {
+            R2Backend::S3(p) => p.data_delete(tenant_id, bucket_id, keys, budget).await,
+            R2Backend::Fs(p) => p.data_delete(tenant_id, bucket_id, keys, budget).await,
+        }
+    }
+    async fn data_list(
+        &self,
+        tenant_id: &str,
+        bucket_id: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        after: Option<&str>,
+        limit: u16,
+        budget: Duration,
+    ) -> Result<vrt_provider::r2::R2ListPage, ProviderError> {
+        match self {
+            R2Backend::S3(p) => {
+                p.data_list(tenant_id, bucket_id, prefix, delimiter, after, limit, budget).await
+            }
+            R2Backend::Fs(p) => {
+                p.data_list(tenant_id, bucket_id, prefix, delimiter, after, limit, budget).await
+            }
+        }
+    }
 }
 
 /// Wired backends; `None` fields mean that kind fails closed.
 pub struct StoragePurgeExecutor {
     kv: Option<std::sync::Arc<KvBackend>>,
-    r2: Option<R2Backend>,
+    r2: Option<std::sync::Arc<R2Backend>>,
     max_items: usize,
     timeout: Duration,
 }
@@ -187,7 +265,7 @@ impl StoragePurgeExecutor {
                 .map_err(|_| "storage_purge.kv dir is not a usable 0700 directory".to_string())?;
             kv = Some(std::sync::Arc::new(KvBackend::Fs(provider)));
         }
-        let mut r2: Option<R2Backend> = None;
+        let mut r2: Option<std::sync::Arc<R2Backend>> = None;
         if let Some(s3c) = &cfg.s3 {
             let access_key = std::env::var(&s3c.access_key_env)
                 .ok()
@@ -209,14 +287,14 @@ impl StoragePurgeExecutor {
                 multipart_ttl_ms: s3c.multipart_ttl_ms,
             })
             .map_err(|_| "storage_purge.s3 client build failed".to_string())?;
-            r2 = Some(R2Backend::S3(provider));
+            r2 = Some(std::sync::Arc::new(R2Backend::S3(provider)));
         } else if let Some(fsc) = &cfg.r2 {
             let provider =
                 vrt_provider::r2::fs::FsR2Provider::new(fsc.dir.clone(), fsc.max_object_bytes)
                     .map_err(|_| {
                         "storage_purge.r2 dir is not a usable 0700 directory".to_string()
                     })?;
-            r2 = Some(R2Backend::Fs(provider));
+            r2 = Some(std::sync::Arc::new(R2Backend::Fs(provider)));
         }
         if kv.is_none() && r2.is_none() {
             return Err("storage_purge configured with no usable backend".to_string());
@@ -234,6 +312,18 @@ impl StoragePurgeExecutor {
     /// presence alone).
     pub fn has_kv(&self) -> bool {
         self.kv.is_some()
+    }
+
+    /// True when an R2 backend (S3 or fs) was built — the `r2`
+    /// capability claim derives from this.
+    pub fn has_r2(&self) -> bool {
+        self.r2.is_some()
+    }
+
+    /// Shared R2 backend for the data cell-ops executor (`None` → kinds
+    /// stay unrouted and expire PENDING; fail closed).
+    pub fn r2_backend(&self) -> Option<std::sync::Arc<R2Backend>> {
+        self.r2.clone()
     }
 
     /// KV1: the shared KV backend for the data cell-ops executor —
@@ -273,7 +363,7 @@ impl StoragePurgeExecutor {
                 if !vrt_provider::purge::valid_r2_purge_id(&payload.storage_id) {
                     return failed(op, "invalid r2 storageId");
                 }
-                match &self.r2 {
+                match self.r2.as_deref() {
                     Some(R2Backend::S3(p)) => {
                         p.purge_prefix(
                             &payload.tenant_id,
@@ -342,9 +432,9 @@ mod tests {
             kv: Some(std::sync::Arc::new(KvBackend::Fs(
                 vrt_provider::kv::fs::FsKvProvider::new(root.join("kv")).unwrap(),
             ))),
-            r2: Some(R2Backend::Fs(
+            r2: Some(std::sync::Arc::new(R2Backend::Fs(
                 vrt_provider::r2::fs::FsR2Provider::new(root.join("r2"), 1024).unwrap(),
-            )),
+            ))),
             max_items: 3,
             timeout: Duration::from_secs(5),
         }

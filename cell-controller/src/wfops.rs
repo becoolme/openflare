@@ -626,6 +626,12 @@ impl HttpCellOpsAckSink {
 /// executor. A kind with no wired executor is SKIPPED (left PENDING
 /// for the control plane to expire — never acked, never half-executed). Outcomes are persisted BEFORE the ack
 /// POST, so a crash or failed ack never re-executes an op.
+/// Data-plane read kinds whose outcome is never journaled (see the
+/// record() call in `wfops_tick`).
+pub fn is_pure_read_kind(kind: &str) -> bool {
+    crate::kvops::KV_READ_KINDS.contains(&kind) || crate::r2ops::R2_READ_KINDS.contains(&kind)
+}
+
 pub async fn wfops_tick(
     source: &HttpCellOpsSource,
     sink: &HttpCellOpsAckSink,
@@ -633,6 +639,7 @@ pub async fn wfops_tick(
     d1_exec: Option<&crate::d1ops::D1OpsExecutor>,
     storage_exec: Option<&crate::storagepurge::StoragePurgeExecutor>,
     kv_exec: Option<&crate::kvops::KvOpsExecutor>,
+    r2_exec: Option<&crate::r2ops::R2OpsExecutor>,
     seen: &mut crate::execset::SeenSet,
     executed: &mut ExecutedSet,
     desired: Option<&snapshot_protocol::compute_desired::ComputeDesired>,
@@ -702,6 +709,12 @@ pub async fn wfops_tick(
                     Some(x) => x.execute(op).await,
                     None => continue,
                 },
+                // R2 data ops — shared R2 backend executor; never the
+                // wf fallback (which would FAIL the unknown kind).
+                k if crate::r2ops::is_r2_kind(k) => match r2_exec {
+                    Some(x) => x.execute(op).await,
+                    None => continue,
+                },
                 _ => match wf_exec {
                     Some(w) => w.execute(op, desired).await,
                     None => continue,
@@ -709,8 +722,13 @@ pub async fn wfops_tick(
             };
             // record() is per-op durable (journal append + sync_data) —
             // a crash anywhere after this line replays the stored
-            // outcome on redelivery, never re-executes.
-            executed.record(&op.id, &ack);
+            // outcome on redelivery, never re-executes. Pure reads are
+            // not recorded: re-running one is harmless, while keeping
+            // multi-MiB read results on disk and in memory (up to
+            // EXECUTED_CAP entries) is not.
+            if !is_pure_read_kind(&op.kind) {
+                executed.record(&op.id, &ack);
+            }
             ack
         };
         acks.push(ack);
@@ -1049,6 +1067,33 @@ mod tests {
             assert!(set.get(&format!("op-{i}")).is_some(), "op-{i} lost");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_data_plane_reads_skip_the_journal() {
+        for k in ["KV_GET", "KV_LIST", "R2_LIST", "R2_HEAD", "R2_GET"] {
+            assert!(is_pure_read_kind(k), "{k}");
+        }
+        for k in [
+            "KV_PUT",
+            "KV_DELETE",
+            "KV_BULK_PUT",
+            "KV_BULK_DELETE",
+            "R2_PUT",
+            "R2_DELETE",
+            "STORAGE_PURGE",
+            "WF_ACTION",
+            "",
+        ] {
+            assert!(!is_pure_read_kind(k), "{k}");
+        }
+        // Every read kind is a routed kind of its own executor.
+        for k in crate::kvops::KV_READ_KINDS {
+            assert!(crate::kvops::is_kv_kind(k));
+        }
+        for k in crate::r2ops::R2_READ_KINDS {
+            assert!(crate::r2ops::is_r2_kind(k));
+        }
     }
 
     #[tokio::test]

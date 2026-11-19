@@ -13,11 +13,13 @@
 //! same-partNumber re-upload replaces, terminal-state ops →
 //! `R2_MULTIPART_INVALID`), and ~7-day expiry on unfinished uploads.
 
+pub mod data;
 pub mod fs;
 pub mod memory;
 pub mod s3;
 pub mod wire;
 
+pub use data::R2DataBackend;
 pub use memory::MemoryR2Provider;
 pub use s3::S3R2Provider;
 pub use wire::{

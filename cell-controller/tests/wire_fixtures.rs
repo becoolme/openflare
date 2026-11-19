@@ -177,6 +177,7 @@ fn desired_ack_fixture() {
             workflows_cross_worker: true,
             storage_purge: true,
             kv: false,
+            r2: false,
         }),
     };
     check(
@@ -263,6 +264,15 @@ fn kv_capability_wire_shape() {
     })
     .unwrap();
     assert_eq!(on["kv"], serde_json::json!(true));
+    // R2 object data ops: same omit-while-false rolling-upgrade shape.
+    assert!(off.get("r2").is_none(), "r2 must be omitted while false");
+    let r2_on = serde_json::to_value(AckCapabilities {
+        r2: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(r2_on["r2"], serde_json::json!(true));
+    assert!(r2_on.get("kv").is_none());
     let back: AckCapabilities =
         serde_json::from_value(serde_json::json!({"cron": true, "assets": true})).unwrap();
     assert!(!back.kv);

@@ -470,7 +470,7 @@ impl ProviderConfig {
             .is_err()
             {
                 return Err(ConfigError::Invalid(
-                    "s3.endpoint must be https (http only loopback/allowDevBackend)",
+                    "s3.endpoint must be https (http only loopback, <svc>.<ns>.svc:port, or allowDevBackend)",
                 ));
             }
         }

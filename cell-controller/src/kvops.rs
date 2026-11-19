@@ -54,6 +54,11 @@ pub fn is_kv_kind(kind: &str) -> bool {
     KV_OP_KINDS.contains(&kind)
 }
 
+/// Kinds that never mutate the namespace: re-executing one on
+/// redelivery is safe, so its (possibly ~1.9 MiB) result is never
+/// written to the executed journal.
+pub const KV_READ_KINDS: &[&str] = &["KV_GET", "KV_LIST"];
+
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }

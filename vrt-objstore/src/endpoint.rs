@@ -11,7 +11,7 @@ use std::net::IpAddr;
 pub enum EndpointError {
     #[error("endpoint is not a valid absolute URL")]
     Invalid,
-    #[error("endpoint scheme must be https (http only for loopback or allowDevBackend)")]
+    #[error("endpoint scheme must be https (http only for loopback, a <svc>.<ns>.svc:port Service, or allowDevBackend)")]
     InsecureScheme,
     #[error("endpoint must not carry credentials, query or fragment")]
     Forbidden,
@@ -74,13 +74,46 @@ fn parse_common(raw: &str) -> Result<Url, EndpointError> {
     Ok(url)
 }
 
+/// Kubernetes Service FQDN with an explicit port: `<svc>.<ns>.svc[:port]`
+/// or `<svc>.<ns>.svc.cluster.local[:port]` — exactly two labels before
+/// the suffix, each a DNS-1123 label. Narrower than
+/// `host_is_cluster_internal`: no single-label names (search-domain
+/// expansion), no bare `*.cluster.local`, no IP literals — an in-cluster
+/// object store is addressed by its Service, and the egress NetworkPolicy
+/// pins the namespace/port it may reach.
+fn host_is_k8s_service_fqdn(url: &Url) -> bool {
+    if url.port().is_none() {
+        return false;
+    }
+    let Some(url::Host::Domain(d)) = url.host() else {
+        return false;
+    };
+    let d = d.to_ascii_lowercase();
+    let stem = if let Some(s) = d.strip_suffix(".svc.cluster.local") {
+        s
+    } else if let Some(s) = d.strip_suffix(".svc") {
+        s
+    } else {
+        return false;
+    };
+    let labels: Vec<&str> = stem.split('.').collect();
+    labels.len() == 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
+}
+
 /// External object-store endpoint: `https://` always; `http://` only for
 /// a loopback host or when `allow_dev` is set.
 pub fn validate_object_store_endpoint(raw: &str, allow_dev: bool) -> Result<(), EndpointError> {
     let url = parse_common(raw)?;
     match url.scheme() {
         "https" => Ok(()),
-        "http" if allow_dev || host_is_loopback(&url) => Ok(()),
+        "http" if allow_dev || host_is_loopback(&url) || host_is_k8s_service_fqdn(&url) => Ok(()),
         _ => Err(EndpointError::InsecureScheme),
     }
 }
@@ -120,6 +153,39 @@ mod tests {
             assert!(validate_object_store_endpoint(bad, false).is_err(), "{bad}");
         }
         assert!(validate_object_store_endpoint("http://s3.example.com", true).is_ok());
+    }
+
+    #[test]
+    fn object_store_allows_http_only_to_k8s_service_fqdn_with_port() {
+        for ok in [
+            "http://vrt-r2-silo.vibeploy-data.svc:9000",
+            "http://vrt-r2-silo.vibeploy-data.svc.cluster.local:9000",
+            "http://S3.NS.SVC:9000",
+        ] {
+            assert!(validate_object_store_endpoint(ok, false).is_ok(), "{ok}");
+        }
+        for bad in [
+            // no explicit port
+            "http://vrt-r2-silo.vibeploy-data.svc",
+            // single label / search-domain expansion
+            "http://silo:9000",
+            // wrong label count
+            "http://silo.svc:9000",
+            "http://a.b.c.svc:9000",
+            "http://a.b.c.svc.cluster.local:9000",
+            // bare cluster.local, private IP literal
+            "http://silo.cluster.local:9000",
+            "http://10.43.0.10:9000",
+            // suffix spoofing / bad labels
+            "http://silo.ns.svc.evil.com:9000",
+            "http://silo.ns.svcx:9000",
+            "http://-silo.ns.svc:9000",
+            "http://si_lo.ns.svc:9000",
+            "http://silo.ns.svc@evil.com:9000",
+            "http://silo.ns.svc:9000/path",
+        ] {
+            assert!(validate_object_store_endpoint(bad, false).is_err(), "{bad}");
+        }
     }
 
     #[test]
