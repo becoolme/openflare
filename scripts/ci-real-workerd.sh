@@ -120,11 +120,19 @@ TIER2=(
   waituntil_workerd
   workerd_entry_smoke
 )
+FAILED=()
 for t in "${TIER2[@]}"; do
   echo "-- $t"
-  env "VRT_HOST_UNIX_TESTS=${VRT_HOST_UNIX_TESTS:-1}" \
+  if ! env "VRT_HOST_UNIX_TESTS=${VRT_HOST_UNIX_TESTS:-1}" \
     cargo test --locked -p vrt-host --test "$t" \
-    -- --ignored --test-threads="$THREADS" --nocapture
+    -- --ignored --test-threads="$THREADS" --nocapture; then
+    FAILED+=("$t")
+  fi
 done
+
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  echo "== FAILED tier-2 targets: ${FAILED[*]} ==" >&2
+  exit 1
+fi
 
 echo "== all real-workerd tests finished =="

@@ -124,6 +124,13 @@ jobs:
           CARGO_INCREMENTAL: '0'
           CARGO_PROFILE_DEV_DEBUG: '0'
         run: cargo build --locked --workspace --bins
+      # workerd's tcmalloc reserves tens of GB of virtual address space
+      # per process; under the default heuristic overcommit mode the
+      # kernel refuses that mprotect once a second generation starts
+      # next to a live one ("Cannot allocate memory"). Reservations are
+      # not touched memory, so allow them on the throwaway runner.
+      - name: Allow virtual address reservations for workerd
+        run: sudo sysctl -w vm.overcommit_memory=1
       - name: Run VRT_WORKERD_BIN-gated tests
         env:
           CARGO_INCREMENTAL: '0'
