@@ -40,7 +40,7 @@ The standalone mode runs the whole stack with one `docker compose up`.
 | `vrt-provider` | binding provider: KV, R2, Queues, rate limiting (memory / filesystem / Kvrocks / S3 backends) |
 | `vrt-sql` | D1 and Durable Object SQL storage service |
 | `cell-controller` | consumes signed desired state and orchestrates hosts (cron, queues, leases, assignment) |
-| `vrt-local` | standalone management plane and `vrt` CLI (init, deploy, rollback, secrets, hostnames) |
+| `vrt-local` | standalone management plane and `vrt` CLI (init, dev, deploy, rollback, secrets, hostnames, logs, doctor) |
 | `vrt-securefs` | hardened shared-filesystem helpers (0700 dirs, atomic writes, safe path segments) |
 | `vrt-objstore`, `vrt-metrics` | shared object-store and metrics helpers |
 | `facade/` | TypeScript system workers that expose bindings to user code inside workerd |
@@ -64,8 +64,9 @@ WORKERD_SOURCE=file WORKERD_SHA256=$WORKERD_SHA256 \
 ```
 
 Deploy the hello example. The management API reads a path local to the
-server, so copy the project into the container first. The example declares
-a secret binding, so seed the secret before deploying:
+server, so copy the project into the container first (or deploy from the
+host — see "Local development and remote deploy" below). The example
+declares a secret binding, so seed the secret before deploying:
 
 ```sh
 dc="docker compose -f deploy/standalone/docker-compose.yml"
@@ -87,6 +88,47 @@ WORKERD_SOURCE=stub docker compose \
 [`deploy/standalone/README.md`](deploy/standalone/README.md) covers the rest:
 day-2 operations (rollback, secrets, versions), backup, host-directory storage
 and the end-to-end acceptance script `deploy/standalone/e2e.sh`.
+
+## Local development and remote deploy
+
+`vrt dev` runs the whole stack (vrt-local + vrt-host + vrt-provider +
+vrt-sql) directly on your machine — no compose — with state under
+`<worker_dir>/.vrt` (add it to your `.gitignore`). It deploys on
+start, redeploys on file changes, streams worker logs to the terminal,
+and binds a loopback ingress where any `Host` routes to your worker:
+
+```sh
+vrt dev examples/standalone-hello        # real workerd on PATH / VRT_WORKERD / --workerd
+vrt dev examples/standalone-hello --stub # vrt-stub-workerd, no binary needed
+curl http://127.0.0.1:8787/              # dev catch-all routes any Host
+```
+
+A real `workerd` is verified against `deploy/docker/workerd.lock`;
+platforms without a pinned digest need the explicit
+`--allow-unpinned-workerd` opt-out. `.dev.vars` in the project dir is
+picked up as secrets/vars. `--no-watch`, `--no-logs`, `--no-color`,
+`--listen <addr>` are supported; Ctrl+C shuts every child down.
+
+`vrt deploy --url <http://host:port> --token-file <path> <worker_dir>`
+deploys a local project to a remote management endpoint without
+copying it first. The listener is off by default — `vrt serve`
+enables it with `--mgmt-tcp-listen <addr>
+--mgmt-tcp-token-file <path>` (0600, 64-hex token, bearer auth,
+request-size cap, per-source-IP rate limit). Bind loopback and reach
+it over an SSH tunnel or a TLS-terminating proxy — the API is HTTP
+only. `--secrets-file <f|->` (dotenv), `--var KEY:VALUE`, `--name`,
+and `--dry-run` work in both modes:
+
+```sh
+vrt deploy --root /data --dry-run ./my-worker      # pack + validate only
+vrt deploy --url http://127.0.0.1:9090 --token-file ~/.vrt-mgmt-token ./my-worker
+```
+
+Other operator commands: `vrt logs --root <dir> <worker> [--follow]
+[--since 5m] [--level error] [--json]` (read-only tail, never consumes
+the drain cursor) and `vrt doctor [--root <dir>] [--json] [--strict]`
+(workerd pin, root/key permissions, disk, ports, facade manifest,
+service health, project config).
 
 ## Building and testing
 

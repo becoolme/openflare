@@ -56,7 +56,8 @@ To deploy the hello worker, copy `examples/standalone-hello/` into
 the container volume first (the management API takes a server-local
 path), or mount it: add `- ../examples:/examples:ro` under the
 `vrt` service volumes, then `vrt deploy --root /data
-/examples/standalone-hello`.
+/examples/standalone-hello`. You can also deploy straight from the
+host — see "Remote deploy over TCP" below.
 
 ## Real workerd
 
@@ -91,7 +92,15 @@ $compose vrt rollback --root /data <worker> <version_id>
 $compose vrt hostnames add --root /data <worker> <host>
 printf 's3cret' | $compose vrt secret put --root /data <ref>
 $compose vrt versions --root /data <worker>
+$compose vrt logs --root /data <worker> --follow --since 10m --level error
+$compose vrt doctor --root /data          # add --json or --strict
 ```
+
+`vrt logs` is a read-only tail of the host log hub (console.log,
+exceptions, platform codes; secrets are already redacted at ingest).
+It never consumes the cell-controller drain cursor — `--follow`
+polls the `controlListen` endpoint, `--since`/`--level` filter
+client-side, `--json` prints one record per line.
 
 `vrt-init` is idempotent: rerunning `up` with unchanged settings is
 a no-op. If settings drifted (e.g. you changed `VRT_CELL`), `vrt
@@ -99,6 +108,62 @@ init` exits non-zero and names the differing config fields — apply
 the change with `--reconfigure` (rewrites `config/` only; keys and
 state are never regenerated). `vrt-init` compose service: edit its
 `command:` to add `--reconfigure`, or exec it manually.
+
+## Remote deploy over TCP
+
+The management API normally lives on the container's unix socket.
+`vrt serve` can additionally bind a TCP listener so a host-side `vrt`
+CLI can deploy a local directory without copying it in:
+
+```sh
+printf '%s' "$(openssl rand -hex 32)" > /etc/vrt-mgmt-token && chmod 600 /etc/vrt-mgmt-token
+docker compose -f deploy/standalone/docker-compose.yml exec vrt   vrt serve --root /data --supervise     --mgmt-tcp-listen 127.0.0.1:9090 --mgmt-tcp-token-file /etc/vrt-mgmt-token
+
+vrt deploy --url http://127.0.0.1:9090 --token-file /etc/vrt-mgmt-token ./my-worker
+```
+
+The client packs the bundle locally (same validation, digests and
+size caps as `--root` deploys) and uploads it; the server re-verifies
+everything through the signed-envelope path, so a tampered bundle is
+rejected exactly like a bad local deploy.
+
+Security notes — the listener is **off by default** and only enabled
+by the flags above:
+
+- Bearer-token auth on every request. The token file must be `0600`
+  and contain the same 64-hex string on both sides; comparison is
+  constant-time. This token is independent of the unix-socket
+  `mgmt/token`.
+- Request bodies are capped (64 KiB default; uploads allow up to the
+  packed-bundle cap) and per-source-IP rate limited.
+- The transport is plain HTTP — bind `127.0.0.1` and reach it over an
+  SSH tunnel or a TLS-terminating proxy when the CLI runs elsewhere.
+- Secret values travel only inside the upload body
+  (`--secrets-file <f|->`, dotenv format) or stdin — never on argv,
+  in logs, or in error text. `--var KEY:VALUE` is for non-secret
+  vars.
+
+`vrt deploy --dry-run` (both modes) prints the pack summary — worker
+name, module count, bundle bytes/digest, binding list, rejected keys —
+without calling the API.
+
+## Bare-metal dev without compose: `vrt dev`
+
+On a machine with the `vrt-*` binaries on PATH (or `--vrt-*-bin`
+flags):
+
+```sh
+vrt dev ./my-worker                    # 127.0.0.1:8787, watch+redeploy, live logs
+vrt dev ./my-worker --stub --no-watch  # stub runtime, redeploy by hand
+```
+
+State lands in `./my-worker/.vrt` (add it to `.gitignore`), ingress
+is loopback-only, and any `Host` routes to the one deployed worker —
+`vrt dev` writes `ingress.devCatchAll` into the generated config for
+this. The flag exists only to make `vrt dev` work; production
+`vrt-host.toml` files must not set it (ingress keeps strict
+exact-Host routing). Ctrl+C SIGTERMs every child
+(vrt-host/provider/sql) before exiting.
 
 ## Backup
 

@@ -25,6 +25,11 @@ pub struct RouteTarget {
 #[derive(Clone, Debug, Default)]
 pub struct RouteTable {
     map: Arc<HashMap<String, RouteTarget>>,
+    /// Dev-only catch-all target — populated when the desired doc
+    /// contains exactly ONE worker (the `vrt dev` shape). The ingress
+    /// consults it only when its `devCatchAll` switch is on, so
+    /// production routing is byte-identical to before.
+    catch_all: Option<RouteTarget>,
 }
 
 /// Host header bounds: 253 chars total (DNS hostname limit).
@@ -81,8 +86,24 @@ impl RouteTable {
     /// Build from a verified snapshot.
     pub fn from_desired(desired: &ComputeDesired) -> Self {
         let mut map = HashMap::new();
+        // Single-worker desired docs get a catch-all candidate; the
+        // ingress decides (via devCatchAll) whether to honor it.
+        let mut only_target: Option<RouteTarget> = None;
+        let mut worker_count = 0usize;
         for tenant in &desired.tenants {
             for worker in &tenant.workers {
+                worker_count += 1;
+                let assets_first = worker.bindings.iter().any(|b| match b {
+                    snapshot_protocol::compute_desired::BindingDesired::Assets(a) => {
+                        a.assets_first_enabled()
+                    }
+                    _ => false,
+                });
+                only_target = Some(RouteTarget {
+                    tenant_id: tenant.tenant_id.clone(),
+                    worker_id: worker.worker_id.clone(),
+                    assets_first,
+                });
                 for route in &worker.routes {
                     // Snapshot validation guarantees global uniqueness;
                     // a duplicate still fails closed (first wins, never
@@ -91,22 +112,27 @@ impl RouteTable {
                         .or_insert(RouteTarget {
                             tenant_id: tenant.tenant_id.clone(),
                             worker_id: worker.worker_id.clone(),
-                            assets_first: worker.bindings.iter().any(|b| match b {
-                                snapshot_protocol::compute_desired::BindingDesired::Assets(a) => {
-                                    a.assets_first_enabled()
-                                }
-                                _ => false,
-                            }),
+                            assets_first,
                         });
                 }
             }
         }
-        Self { map: Arc::new(map) }
+        Self {
+            map: Arc::new(map),
+            catch_all: (worker_count == 1).then_some(only_target).flatten(),
+        }
     }
 
     /// Exact-match lookup on a normalized host.
     pub fn lookup(&self, normalized_host: &str) -> Option<&RouteTarget> {
         self.map.get(normalized_host)
+    }
+
+    /// Dev-mode fallback: the single worker this desired doc contains,
+    /// if and only if there is exactly one — never a guess between
+    /// multiple tenants/workers.
+    pub fn catch_all(&self) -> Option<&RouteTarget> {
+        self.catch_all.as_ref()
     }
 
     /// Route count (diagnostics).

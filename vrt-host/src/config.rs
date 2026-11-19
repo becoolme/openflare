@@ -1261,6 +1261,15 @@ pub struct IngressConfig {
     /// optional; an absent section keeps the built-in defaults.
     #[serde(default)]
     pub websocket: WebsocketConfig,
+    /// `vrt dev` only: route requests with an unmatched Host to the
+    /// desired doc's single worker (any Host). Absent/false keeps the
+    /// strict exact-host routing production requires. Not settable to
+    /// true by accident — validation rejects it when the desired doc
+    /// carries more than one worker is impossible to know at config
+    /// time, so the fallback only ever applies to a single-worker
+    /// route table (see `RouteTable::catch_all`).
+    #[serde(default)]
+    pub dev_catch_all: bool,
 }
 
 /// `[ingress.websocket]` — bounds for upgraded WebSocket sessions.
@@ -1624,6 +1633,7 @@ impl Default for IngressConfig {
             forwarded_proto_trusted: Vec::new(),
             client_ip: ClientIpConfig::default(),
             websocket: WebsocketConfig::default(),
+            dev_catch_all: false,
         }
     }
 }

@@ -47,7 +47,7 @@
 //! `node_modules/` are skipped; symlinks are rejected.
 
 use crate::LocalError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use snapshot_protocol::compute_desired::{
     AssetsBinding, BindingDesired, BindingPermissions, CronDesired, DoBindingDesired,
@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 /// vrt.toml document (deny_unknown_fields — a typo must fail closed).
 /// pub(crate) — `project_cfg` synthesizes this shape from wrangler
 /// sources through the identical deserialize path.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerToml {
     pub(crate) name: String,
@@ -103,7 +103,7 @@ pub struct WorkerToml {
     pub(crate) assets: Option<AssetsToml>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct BindingsToml {
     #[serde(default)]
@@ -128,7 +128,7 @@ pub(crate) struct BindingsToml {
 /// T37b `[[queueConsumers]]`: fields aligned with wrangler `queues.consumers[]`
 /// (snake->camel is normalized by project_cfg; numeric bounds are checked at pack time,
 /// consistent with [`QueueConsumerDesired`] validation).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QueueConsumerToml {
     /// Queue display name (id derived at pack time).
@@ -150,7 +150,7 @@ pub(crate) struct QueueConsumerToml {
 /// P3c-1 `durableObjectBindings[]` -- fields aligned with wrangler
 /// `durable_objects.bindings[]` (`script_name` -> `scriptName`
 /// normalization is done by project_cfg; the native vrt.toml uses camelCase directly).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoBindingToml {
     /// The namespace stub handle on `env.<name>`.
@@ -165,7 +165,7 @@ pub(crate) struct DoBindingToml {
 /// P3c-1 `durableObjectMigrations[]` -- the normalized shape of wrangler `[[migrations]]`.
 /// Evaluated in array order: `newClasses`/`newSqliteClasses` declare,
 /// `renamedClasses` inherit storage identity, `deletedClasses` remove.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoMigrationToml {
     /// Human-readable tag (CF semantics -- identification only, not part of evaluation).
@@ -185,7 +185,7 @@ pub(crate) struct DoMigrationToml {
 }
 
 /// The `{from,to}` shape of P3c-1 `renamedClasses[]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoRenameToml {
     /// Existing class name (declared by the current version or by an earlier migration step in this deploy).
@@ -198,7 +198,7 @@ pub(crate) struct DoRenameToml {
 /// `className`, `script_name` -> `scriptName` normalization is done by
 /// project_cfg). MVP: only classes of the same worker are allowed; when `script_name` points to another
 /// worker, pack fails closed.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkflowToml {
     /// Workflow name (`^[A-Za-z0-9_-]{1,64}$`), unique within the worker.
@@ -215,7 +215,7 @@ pub(crate) struct WorkflowToml {
 }
 
 /// T21: `[assets]` — static-assets directory packed at deploy.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AssetsToml {
     /// Directory relative to the worker dir (canonicalized inside).
@@ -243,7 +243,7 @@ pub(crate) struct AssetsToml {
 }
 
 /// T31c: `runWorkerFirst` value on `[assets]` — Wrangler wire shape.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum RunWorkerFirstToml {
     /// `runWorkerFirst = <bool>`.
@@ -256,7 +256,7 @@ fn default_assets_binding() -> String {
     "ASSETS".into()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QuotasToml {
     pub(crate) cpu_ms: u32,
@@ -287,6 +287,11 @@ pub struct DeployOverrides {
     pub bindings: Vec<BindingDesired>,
     /// Extra hostnames.
     pub hostnames: Vec<String>,
+    /// Non-secret var overrides merged into `[vars]` (`--var`,
+    /// `.dev.vars` undeclared keys) — same-name config entries lose.
+    /// Secret values must NEVER be passed here; they go through
+    /// `put_secret` + `[secrets]` refs.
+    pub vars: BTreeMap<String, String>,
 }
 
 /// Fully packed worker ready for state application.
@@ -379,10 +384,11 @@ pub fn mime_for_path(path: &str) -> &'static str {
     }
 }
 
-/// Scan `assets_dir` → canonical manifest + objects. Paths are
+/// Scan `assets_dir` → `(request path, bytes)` entries. Paths are
 /// forward-slash `/`-prefixed request paths; `..`/absolute/backslash/
 /// NUL names are impossible under `read_dir`, but symlinks and
-/// over-cap inputs are still rejected.
+/// over-cap inputs are still rejected. Manifest construction lives
+/// in [`assets_from_entries`] so the upload path shares it.
 fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAssets, LocalError> {
     let dir = worker_dir
         .join(&assets.dir)
@@ -406,8 +412,7 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
         &assets.not_found_handling,
         &["none", "404-page", "single-page-application"],
     )?;
-    let mut files: Vec<(String, String, u64, String, Vec<u8>)> = Vec::new();
-    let mut total: u64 = 0;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut stack = vec![dir.clone()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).map_err(|_| LocalError::Worker("assets read"))? {
@@ -438,21 +443,38 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
             let req_path = format!("/{rel_str}");
             let bytes =
                 std::fs::read(&entry_path).map_err(|_| LocalError::Worker("assets read"))?;
-            let size = bytes.len() as u64;
-            if size > MAX_ASSET_FILE_BYTES {
-                return Err(LocalError::Worker("asset file too large"));
-            }
-            total += size;
-            if total > MAX_ASSET_TOTAL_BYTES {
-                return Err(LocalError::Worker("assets total too large"));
-            }
-            if files.len() >= MAX_ASSET_FILES {
-                return Err(LocalError::Worker("too many asset files"));
-            }
-            let digest = hex::encode(sha2::Sha256::digest(&bytes));
-            let mime = mime_for_path(&rel_str).to_string();
-            files.push((req_path, digest, size, mime, bytes));
+            entries.push((req_path, bytes));
         }
+    }
+    assets_from_entries(entries, &html_handling, &not_found)
+}
+
+/// Build the canonical manifest + digest-keyed objects from
+/// `(request path, bytes)` entries — shared by the directory scan
+/// and any future in-memory source. All caps apply here.
+fn assets_from_entries(
+    entries: Vec<(String, Vec<u8>)>,
+    html_handling: &str,
+    not_found: &str,
+) -> Result<PendingAssets, LocalError> {
+    let mut files: Vec<(String, String, u64, String, Vec<u8>)> = Vec::new();
+    let mut total: u64 = 0;
+    for (req_path, bytes) in entries {
+        let size = bytes.len() as u64;
+        if size > MAX_ASSET_FILE_BYTES {
+            return Err(LocalError::Worker("asset file too large"));
+        }
+        total += size;
+        if total > MAX_ASSET_TOTAL_BYTES {
+            return Err(LocalError::Worker("assets total too large"));
+        }
+        if files.len() >= MAX_ASSET_FILES {
+            return Err(LocalError::Worker("too many asset files"));
+        }
+        let digest = hex::encode(sha2::Sha256::digest(&bytes));
+        let rel_str = req_path.trim_start_matches('/');
+        let mime = mime_for_path(rel_str).to_string();
+        files.push((req_path, digest, size, mime, bytes));
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let file_entries: Vec<serde_json::Value> = files
@@ -529,15 +551,46 @@ fn pack_inner(
     resolve_worker: &dyn Fn(&str) -> Option<String>,
     do_ctx: Option<&DoPackCtx<'_>>,
 ) -> Result<PackedWorker, LocalError> {
+    assemble(
+        gather_dir(worker_dir)?,
+        overrides,
+        tenant_id,
+        resolve_worker,
+        do_ctx,
+    )
+}
+
+/// The content a pack consumes — collected from a local worker
+/// directory or decoded from a remote-deploy upload. `assemble` runs
+/// the identical validation either way: a remote deploy cannot
+/// smuggle module bytes, asset digests, or meta fields that a local
+/// one could not produce.
+pub struct Gathered {
+    /// Worker meta (vrt.toml shape — `project_cfg` normalizes the
+    /// wrangler family into this same structure client-side).
+    pub meta: WorkerToml,
+    /// `/`-separated rel path → file bytes for module candidates.
+    /// `[assets] dir` contents and scan exclusions (dotfiles,
+    /// `node_modules`, config basenames) are never here.
+    pub files: BTreeMap<String, Vec<u8>>,
+    /// Paths the directory scan skipped — informational (the
+    /// `--dry-run` summary); always empty for uploads.
+    pub skipped: Vec<String>,
+    /// `[assets] dir` packed content (None when undeclared).
+    pub pending_assets: Option<PendingAssets>,
+}
+
+/// Collect `worker_dir` into a [`Gathered`]: meta normalization,
+/// self-contained-file scan (symlinks rejected), module-byte cap
+/// (pre-read), and the `[assets] dir` scan. Type assignment and
+/// everything downstream live in [`assemble`] — the single
+/// validation path shared by `vrt deploy --root` and remote uploads.
+pub fn gather_dir(worker_dir: &Path) -> Result<Gathered, LocalError> {
     // T31/C4: `vrt.toml` keeps precedence; otherwise the wrangler family
     // (json > jsonc > toml) normalizes into the same meta shape.
-    let (meta, meta_source) = crate::project_cfg::load_worker_meta(worker_dir)?;
-    let _ = meta_source;
-    let name = overrides.name.clone().unwrap_or_else(|| meta.name.clone());
-
-    // --- module scan ---
-    let mut modules: BTreeMap<String, String> = BTreeMap::new();
-    let mut declared = meta.modules;
+    let (meta, _meta_source) = crate::project_cfg::load_worker_meta(worker_dir)?;
+    let mut files = BTreeMap::new();
+    let mut skipped = Vec::new();
     let mut total: u64 = 0;
     // `[assets] dir` is content-addressed asset data, not worker
     // modules — exclude it from the module scan (an .html file there
@@ -559,75 +612,66 @@ fn pack_inner(
                 .filter(|p| p.starts_with(&worker_canonical))
         })
         .flatten();
-    scan_dir(worker_dir, worker_dir, &mut |rel, path| {
-        if let Some(root) = &assets_rel {
-            let canon = path
-                .canonicalize()
-                .unwrap_or_else(|_| worker_canonical.join(rel));
-            if canon.starts_with(root) {
-                return Ok(());
+    scan_dir(
+        worker_dir,
+        worker_dir,
+        &mut |rel, path| {
+            if let Some(root) = &assets_rel {
+                let canon = path
+                    .canonicalize()
+                    .unwrap_or_else(|_| worker_canonical.join(rel));
+                if canon.starts_with(root) {
+                    return Ok(());
+                }
             }
-        }
-        total += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        if total > MAX_WORKER_DIR_BYTES {
-            return Err(LocalError::Worker("dir size"));
-        }
-        if let Some(ty) = declared.remove(rel) {
-            modules.insert(rel.to_string(), ty);
-        } else if let Some(ty) = type_for_extension(path) {
-            modules.insert(rel.to_string(), ty.to_string());
-        } else {
-            return Err(LocalError::Worker("module type"));
-        }
-        Ok(())
-    })?;
-    // Declared modules that are NOT files on disk fail closed.
-    if !declared.is_empty() {
-        return Err(LocalError::Worker("modules missing"));
-    }
+            total += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if total > MAX_WORKER_DIR_BYTES {
+                return Err(LocalError::Worker("dir size"));
+            }
+            let bytes = std::fs::read(path).map_err(|_| LocalError::Worker("read"))?;
+            files.insert(rel.to_string(), bytes);
+            Ok(())
+        },
+        &mut |rel| skipped.push(rel.to_string()),
+    )?;
+    let pending_assets = match &meta.assets {
+        Some(decl) => Some(scan_assets_dir(worker_dir, decl)?),
+        None => None,
+    };
+    Ok(Gathered {
+        meta,
+        files,
+        skipped,
+        pending_assets,
+    })
+}
 
-    // --- pack-format JSON (same wire forms the TS builder emits) ---
-    let mut pack_modules = serde_json::Map::new();
-    // W7: esModule sources for the workflow class scan below.
-    let mut esm_sources: Vec<String> = Vec::new();
-    for (rel, ty) in &modules {
-        let path = worker_dir.join(rel);
-        let wire = match ty.as_str() {
-            "esModule" | "commonJs" | "text" | "json" => {
-                let text =
-                    std::fs::read_to_string(&path).map_err(|_| LocalError::Worker("utf8"))?;
-                if ty == "esModule" {
-                    esm_sources.push(text.clone());
-                }
-                match ty.as_str() {
-                    "esModule" => serde_json::Value::String(text),
-                    "commonJs" => serde_json::json!({"cjs": text}),
-                    "text" => serde_json::json!({"text": text}),
-                    _ => {
-                        serde_json::json!({"json": serde_json::from_str::<serde_json::Value>(&text).map_err(|_| LocalError::Worker("json module"))?})
-                    }
-                }
-            }
-            "wasm" | "data" => {
-                use base64::Engine;
-                let bytes = std::fs::read(&path).map_err(|_| LocalError::Worker("read"))?;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                if ty == "wasm" {
-                    serde_json::json!({"wasm_b64": b64})
-                } else {
-                    serde_json::json!({"data_b64": b64})
-                }
-            }
-            _ => return Err(LocalError::Worker("module type")),
-        };
-        pack_modules.insert(rel.clone(), wire);
+/// Validate a [`Gathered`] into a [`PackedWorker`]. Everything the
+/// signed desired doc depends on is computed HERE — tenant id,
+/// worker-name resolution, and DO/workflow unique-key derivation are
+/// server-side inputs the upload body never carries.
+pub fn assemble(
+    g: Gathered,
+    overrides: &DeployOverrides,
+    tenant_id: &str,
+    resolve_worker: &dyn Fn(&str) -> Option<String>,
+    do_ctx: Option<&DoPackCtx<'_>>,
+) -> Result<PackedWorker, LocalError> {
+    let Gathered {
+        mut meta,
+        files,
+        pending_assets: gathered_assets,
+        ..
+    } = g;
+    // Caller-side non-secret var overrides (`--var`, `.dev.vars`).
+    for (k, v) in &overrides.vars {
+        meta.vars.insert(k.clone(), v.clone());
     }
-    let pack = serde_json::json!({
-        "mainModule": meta.main_module,
-        "modules": pack_modules,
-        "compatibilityDate": meta.compatibility_date,
-        "compatibilityFlags": meta.compatibility_flags,
-    });
+    let name = overrides.name.clone().unwrap_or_else(|| meta.name.clone());
+
+    // --- modules → pack JSON: typing, caps, and the wire forms the
+    // TS builder emits — one shared path for local and remote. ---
+    let (pack, esm_sources) = build_pack_json(&meta, &files)?;
     // The shared validator/digester — identical code to the platform.
     let bundle = vrt_config::VersionBundle::from_pack(&pack)?;
 
@@ -994,7 +1038,10 @@ fn pack_inner(
     // binding references the manifest digest it produced).
     let pending_assets = match &meta.assets {
         Some(decl) => {
-            let pending = scan_assets_dir(worker_dir, decl)?;
+            // `[assets]` declared but no content gathered — on the
+            // upload path the client simply did not ship it (a local
+            // gather fails earlier at `scan_assets_dir`). Fail closed.
+            let pending = gathered_assets.ok_or(LocalError::Worker("assets missing"))?;
             bindings.push(BindingDesired::Assets(AssetsBinding {
                 name: decl.binding.clone(),
                 manifest_digest: pending.manifest_digest.clone(),
@@ -1059,13 +1106,21 @@ fn type_for_extension(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`.
+/// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`
+/// (reported via `skipped` so `--dry-run` can list them).
 /// Symlinks are rejected — a worker dir must be self-contained.
 fn scan_dir(
     root: &Path,
     dir: &Path,
     emit: &mut dyn FnMut(&str, &Path) -> Result<(), LocalError>,
+    skipped: &mut dyn FnMut(&str),
 ) -> Result<(), LocalError> {
+    let rel_of = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|_| LocalError::Worker("dir read"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1077,6 +1132,7 @@ fn scan_dir(
             || file_name == "node_modules"
             || crate::project_cfg::is_config_basename(file_name)
         {
+            skipped(&rel_of(&path));
             continue;
         }
         let meta = std::fs::symlink_metadata(&path).map_err(|_| LocalError::Worker("stat"))?;
@@ -1084,14 +1140,9 @@ fn scan_dir(
             return Err(LocalError::Worker("symlink"));
         }
         if meta.is_dir() {
-            scan_dir(root, &path, emit)?;
+            scan_dir(root, &path, emit, skipped)?;
         } else if meta.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .map_err(|_| LocalError::Worker("path"))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            emit(&rel, &path)?;
+            emit(&rel_of(&path), &path)?;
         }
     }
     Ok(())
@@ -1187,4 +1238,355 @@ pub fn derive_queue_id(tenant_id: &str, queue_name: &str) -> Result<String, Loca
         format!("vrt-q:{tenant_id}:{queue_name}").as_bytes(),
     ));
     Ok(digest[..26].to_string())
+}
+
+/// Modules → pack-format JSON: explicit `[modules]` type override
+/// wins, else the extension rule; unknown extensions, absent
+/// declared files, over-cap totals, non-UTF8 text, and bad JSON all
+/// fail closed. Returns the pack doc + the esModule sources (the
+/// workflow class scan needs them).
+fn build_pack_json(
+    meta: &WorkerToml,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<(serde_json::Value, Vec<String>), LocalError> {
+    let mut declared = meta.modules.clone();
+    let mut typed: BTreeMap<String, String> = BTreeMap::new();
+    let mut total: u64 = 0;
+    for (rel, bytes) in files {
+        total += bytes.len() as u64;
+        if total > MAX_WORKER_DIR_BYTES {
+            return Err(LocalError::Worker("dir size"));
+        }
+        let ty = declared
+            .remove(rel)
+            .or_else(|| type_for_extension(Path::new(rel)).map(str::to_string))
+            .ok_or(LocalError::Worker("module type"))?;
+        typed.insert(rel.clone(), ty);
+    }
+    // Declared modules that are NOT in the gathered files fail closed.
+    if !declared.is_empty() {
+        return Err(LocalError::Worker("modules missing"));
+    }
+    let mut pack_modules = serde_json::Map::new();
+    let mut esm_sources: Vec<String> = Vec::new();
+    for (rel, ty) in &typed {
+        let bytes = &files[rel];
+        let wire = match ty.as_str() {
+            "esModule" | "commonJs" | "text" | "json" => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| LocalError::Worker("utf8"))?
+                    .to_string();
+                if ty == "esModule" {
+                    esm_sources.push(text.clone());
+                }
+                match ty.as_str() {
+                    "esModule" => serde_json::Value::String(text),
+                    "commonJs" => serde_json::json!({"cjs": text}),
+                    "text" => serde_json::json!({"text": text}),
+                    _ => {
+                        serde_json::json!({"json": serde_json::from_str::<serde_json::Value>(&text).map_err(|_| LocalError::Worker("json module"))?})
+                    }
+                }
+            }
+            "wasm" | "data" => {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                if ty == "wasm" {
+                    serde_json::json!({"wasm_b64": b64})
+                } else {
+                    serde_json::json!({"data_b64": b64})
+                }
+            }
+            _ => return Err(LocalError::Worker("module type")),
+        };
+        pack_modules.insert(rel.clone(), wire);
+    }
+    Ok((
+        serde_json::json!({
+            "mainModule": meta.main_module,
+            "modules": pack_modules,
+            "compatibilityDate": meta.compatibility_date,
+            "compatibilityFlags": meta.compatibility_flags,
+        }),
+        esm_sources,
+    ))
+}
+
+/// `vrt deploy --dry-run` output — pack-side facts only: worker name,
+/// module count, bundle bytes, declared bindings, scan-skipped paths.
+/// Server-side derivations (service target ids, DO/workflow unique
+/// keys) are listed as declared, never resolved — the dry run proves
+/// the pack is valid and shows what WOULD deploy.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploySummary {
+    /// Worker name (after overrides).
+    pub name: String,
+    /// Module count in the bundle.
+    pub module_count: usize,
+    /// Stored bundle document bytes.
+    pub bundle_bytes: usize,
+    /// Bundle digest (the version's content identity).
+    pub bundle_digest: String,
+    /// `kind:bindingName` per declared binding.
+    pub bindings: Vec<String>,
+    /// Secret binding names (names only — refs/values never print).
+    pub secret_bindings: Vec<String>,
+    /// Paths the scan ignored (dotfiles, `node_modules`, configs).
+    pub ignored: Vec<String>,
+}
+
+/// Build the [`DeploySummary`] — runs the full module validation so
+/// a dry run fails on exactly what a real deploy would.
+pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySummary, LocalError> {
+    let mut meta = g.meta.clone();
+    for (k, v) in &overrides.vars {
+        meta.vars.insert(k.clone(), v.clone());
+    }
+    let (pack, _esm) = build_pack_json(&meta, &g.files)?;
+    let bundle = vrt_config::VersionBundle::from_pack(&pack)?;
+    let mut bindings: Vec<String> = Vec::new();
+    for name in meta.vars.keys() {
+        bindings.push(format!("var:{name}"));
+    }
+    let mut secret_bindings: Vec<String> = meta.secrets.keys().cloned().collect();
+    for name in &secret_bindings {
+        bindings.push(format!("secret:{name}"));
+    }
+    if let Some(b) = &meta.bindings {
+        for name in b.kv.keys() {
+            bindings.push(format!("kv:{name}"));
+        }
+        for name in b.r2.keys() {
+            bindings.push(format!("r2:{name}"));
+        }
+        for name in b.d1.keys() {
+            bindings.push(format!("d1:{name}"));
+        }
+        for name in b.queue.keys() {
+            bindings.push(format!("queue:{name}"));
+        }
+        for name in b.pg.keys() {
+            bindings.push(format!("pg:{name}"));
+        }
+        for name in b.service.keys() {
+            bindings.push(format!("service:{name}"));
+        }
+        for name in b.assets.keys() {
+            bindings.push(format!("assets:{name}"));
+        }
+    }
+    if let Some(a) = &meta.assets {
+        bindings.push(format!("assets:{}", a.binding));
+    }
+    for b in &meta.durable_object_bindings {
+        bindings.push(format!("durableObject:{}", b.name));
+    }
+    for w in &meta.workflows {
+        bindings.push(format!("workflow:{}({})", w.name, w.binding));
+    }
+    for c in &meta.queue_consumers {
+        bindings.push(format!("queueConsumer:{}", c.queue));
+    }
+    bindings.sort();
+    secret_bindings.sort();
+    Ok(DeploySummary {
+        name: overrides.name.clone().unwrap_or_else(|| meta.name.clone()),
+        module_count: g.files.len(),
+        bundle_bytes: bundle.stored_document().len(),
+        bundle_digest: bundle.digest().to_string(),
+        bindings,
+        secret_bindings,
+        ignored: g.skipped.clone(),
+    })
+}
+
+/// Remote-upload wire body (`vrt deploy --url`): the client
+/// materializes meta + module bytes + `[assets]` content locally and
+/// the server re-validates everything through [`assemble`]. Secret
+/// values travel only inside this body — never in argv, logs, or
+/// error text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeployUpload {
+    /// Worker meta as normalized by `project_cfg` client-side.
+    pub meta: WorkerToml,
+    /// `/`-separated rel path → base64 file bytes (module candidates
+    /// only; `[assets] dir` content belongs in `assets`).
+    #[serde(default)]
+    pub modules: BTreeMap<String, String>,
+    /// `[assets] dir` content (manifest + digest-keyed objects).
+    #[serde(default)]
+    pub assets: Option<UploadAssets>,
+    /// Non-secret var overrides (`--var KEY:VALUE`) — merged into
+    /// `[vars]` by `assemble`, identical to a local deploy.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    /// secretRef → value (`--secrets-file`, `.dev.vars` format) —
+    /// written to the tenant secret store before the deploy commits.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
+    /// Worker name override (`vrt.toml` name otherwise).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Uploaded `[assets]` payload — canonical manifest + objects keyed
+/// by their sha256 (each re-hashed server-side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UploadAssets {
+    /// Canonical manifest JSON, base64.
+    pub manifest: String,
+    /// sha256 hex → base64 file bytes.
+    #[serde(default)]
+    pub objects: BTreeMap<String, String>,
+}
+
+/// Decode + sanity-check a [`DeployUpload`] into a [`Gathered`].
+/// A malformed path, an over-cap body, a digest that does not match
+/// its bytes, or a manifest that does not enumerate exactly the
+/// shipped objects fails closed here, before `assemble` runs.
+pub fn gathered_from_upload(body: &DeployUpload) -> Result<Gathered, LocalError> {
+    use base64::Engine;
+    let mut files = BTreeMap::new();
+    let mut total: u64 = 0;
+    for (rel, b64) in &body.modules {
+        if !valid_module_rel(rel) {
+            return Err(LocalError::Worker("module path"));
+        }
+        // Reject absurd payloads before decode — b64 inflates ~4/3,
+        // so anything beyond 2x the cap can never fit.
+        if b64.len() as u64 > MAX_WORKER_DIR_BYTES * 2 {
+            return Err(LocalError::Worker("dir size"));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| LocalError::Worker("module encoding"))?;
+        total += bytes.len() as u64;
+        if total > MAX_WORKER_DIR_BYTES {
+            return Err(LocalError::Worker("dir size"));
+        }
+        files.insert(rel.clone(), bytes);
+    }
+    let pending_assets = match &body.assets {
+        Some(a) => Some(upload_assets_verified(a)?),
+        None => None,
+    };
+    Ok(Gathered {
+        meta: body.meta.clone(),
+        files,
+        skipped: Vec::new(),
+        pending_assets,
+    })
+}
+
+/// Upload-path shape check — mirrors `scan_dir`'s exclusions so a
+/// remote body cannot place bytes where a local scan never would:
+/// no `.`-prefixed components, no `node_modules`, no config
+/// basenames at the leaf, no traversal or separators.
+fn valid_module_rel(rel: &str) -> bool {
+    if rel.is_empty() || rel.len() > 1024 || rel.contains('\\') || rel.contains('\0') {
+        return false;
+    }
+    let comps: Vec<&str> = rel.split('/').collect();
+    if comps
+        .iter()
+        .any(|c| c.is_empty() || *c == "." || *c == "..")
+    {
+        return false;
+    }
+    if comps
+        .iter()
+        .any(|c| c.starts_with('.') || *c == "node_modules")
+    {
+        return false;
+    }
+    if crate::project_cfg::is_config_basename(comps[comps.len() - 1]) {
+        return false;
+    }
+    true
+}
+
+/// `/`-prefixed request path in an assets manifest — same rules the
+/// scan produces: clean components, no traversal, no separators.
+fn valid_asset_req_path(path: &str) -> bool {
+    let Some(rel) = path.strip_prefix('/') else {
+        return false;
+    };
+    !rel.is_empty()
+        && rel.len() <= 1024
+        && !rel.contains('\\')
+        && !rel.contains('\0')
+        && rel
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Verify an uploaded `[assets]` payload into [`PendingAssets`] —
+/// every object digest must match its bytes, the manifest file
+/// table must enumerate EXACTLY the shipped objects, and the same
+/// file/total caps apply as the directory scan.
+fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError> {
+    use base64::Engine;
+    let manifest_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&a.manifest)
+        .map_err(|_| LocalError::Worker("assets encoding"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| LocalError::Worker("assets manifest"))?;
+    let files = manifest["files"]
+        .as_array()
+        .ok_or(LocalError::Worker("assets manifest"))?;
+    if files.len() > MAX_ASSET_FILES {
+        return Err(LocalError::Worker("too many asset files"));
+    }
+    let mut declared = std::collections::BTreeSet::new();
+    let mut objects = Vec::with_capacity(files.len());
+    let mut total: u64 = 0;
+    for f in files {
+        let path = f["path"]
+            .as_str()
+            .ok_or(LocalError::Worker("assets manifest"))?;
+        let sha = f["sha256"]
+            .as_str()
+            .ok_or(LocalError::Worker("assets manifest"))?;
+        let size = f["size"]
+            .as_u64()
+            .ok_or(LocalError::Worker("assets manifest"))?;
+        if !valid_asset_req_path(path) {
+            return Err(LocalError::Worker("assets path"));
+        }
+        let Some(b64) = a.objects.get(sha) else {
+            return Err(LocalError::Worker("assets object missing"));
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| LocalError::Worker("assets encoding"))?;
+        if bytes.len() as u64 != size {
+            return Err(LocalError::Worker("assets size"));
+        }
+        if hex::encode(sha2::Sha256::digest(&bytes)) != sha {
+            return Err(LocalError::Worker("assets digest"));
+        }
+        if size > MAX_ASSET_FILE_BYTES {
+            return Err(LocalError::Worker("asset file too large"));
+        }
+        total += size;
+        if total > MAX_ASSET_TOTAL_BYTES {
+            return Err(LocalError::Worker("assets total too large"));
+        }
+        declared.insert(sha.to_string());
+        objects.push((sha.to_string(), bytes));
+    }
+    // Exact match both directions — a hand-crafted upload that ships
+    // objects the manifest never names is rejected, not ignored.
+    if a.objects.keys().any(|k| !declared.contains(k)) {
+        return Err(LocalError::Worker("assets object extra"));
+    }
+    let manifest_digest = hex::encode(sha2::Sha256::digest(&manifest_bytes));
+    Ok(PendingAssets {
+        manifest_bytes,
+        manifest_digest,
+        objects,
+    })
 }
