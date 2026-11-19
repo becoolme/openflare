@@ -160,7 +160,11 @@ OpenFlare accepts standard wrangler configuration. Cloudflare-specific
 resource IDs, such as a KV namespace `id`, are accepted and ignored: bindings
 resolve to the namespace local to the deployment. A field that cannot be
 honoured is reported as a typed warning or a deploy-time error. It is never
-silently dropped. Platform error codes returned by the ingress are listed in
+silently dropped. Per-binding support tiers and known differences are listed in
+[`docs/bindings/`](docs/bindings/README.md), every wrangler key's behavior in
+[`docs/wrangler-config.md`](docs/wrangler-config.md), and the platform-level
+summary in [`docs/compatibility.md`](docs/compatibility.md). Platform error
+codes returned by the ingress are listed in
 [`docs/log-codes.md`](docs/log-codes.md). WebSocket upgrade passthrough is
 described in [`docs/ingress-websocket.md`](docs/ingress-websocket.md).
 

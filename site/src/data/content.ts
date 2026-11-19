@@ -12,19 +12,20 @@ export const content = {
     { n: '7', t: 'Egress checked', d: 'Outbound fetch() and connect() are denied for private, link-local and metadata addresses.' }
   ],
   binds: [
-    B('KV', 'ok', 'Memory, filesystem or Kvrocks, through vrt-provider.'),
-    B('R2', 'ok', 'Filesystem or any S3-compatible object store.'),
-    B('D1', 'ok', 'Served by vrt-sql; the server mints database IDs.'),
-    B('Durable Objects', 'ok', 'SQL storage plus new, new_sqlite, renamed and deleted migrations.'),
-    B('Queues', 'ok', 'Producers, consumers, retry delay, concurrency and dead-letter queues.'),
-    B('Workflows', 'ok', '[[workflows]] entries are validated and listed by vrt workflows.'),
+    B('KV', 'ok', 'Filesystem or Kvrocks, through vrt-provider.'),
+    B('R2', 'lim', 'Filesystem or any S3-compatible store; conditional writes depend on the backend.'),
+    B('D1', 'lim', 'vrt-sql data plane under workerd’s d1-api; the server mints database IDs.'),
+    B('Durable Objects', 'lim', 'SQL storage and migrations; transferred_classes is rejected.'),
+    B('Queues', 'lim', 'Producers, consumers, retries, concurrency and dead-letter queues on vrt-sql.'),
+    B('Workflows', 'lim', 'Vendored engine as a Durable Object; class must extend WorkflowEntrypoint.'),
     B('Cron Triggers', 'ok', 'Delivered to your scheduled() handler.'),
-    B('Hyperdrive', 'ok', 'Postgres wire proxy; credentials stay outside the isolate.'),
-    B('Rate limiting', 'ok', 'wrangler ratelimits with limit and period.'),
-    B('Static assets', 'ok', 'Assets directory and binding, with not_found_handling.'),
-    B('Cache API', 'ok', 'caches.default inside your Worker.'),
-    B('Service bindings', 'ok', 'wrangler services, including named entrypoints.'),
-    B('WebSockets', 'lim', 'Passthrough to Workers and Durable Objects, with session caps.')
+    B('Hyperdrive', 'lim', 'Postgres wire proxy; credentials stay outside the isolate.'),
+    B('Rate limiting', 'lim', 'wrangler ratelimits with limit and period; per-process fixed window.'),
+    B('Static assets', 'lim', 'Assets directory and binding, with not_found_handling and deploy caps.'),
+    B('Cache API', 'lim', 'caches.default and caches.open; per-host and in-memory.'),
+    B('Service bindings', 'lim', 'wrangler services; default entrypoint only.'),
+    B('WebSockets', 'lim', 'Passthrough to Workers and Durable Objects, with session caps.'),
+    B('Vars and secrets', 'lim', 'vars arrive as strings; secrets via vrt secret put.')
   ],
   limits: [
     { k: 'WebSocket upgrades', v: 'HTTP/1.1 only' },
@@ -45,7 +46,7 @@ export const content = {
     { q: 'Is it affiliated with Cloudflare?', a: 'No. It is an independent open-source project. “Workers” is used only to describe API compatibility, which comes from running workerd.' },
     { q: 'Does it download workerd for me?', a: 'No. You supply the binary, and the build checks it against the pinned SHA-256. For smoke tests without workerd, use WORKERD_SOURCE=stub.' },
     { q: 'What happens to wrangler keys it doesn’t support?', a: 'account_id, placement and hosted resource IDs are accepted and ignored. Keys it can’t honour, such as ai or vectorize, fail the deploy with a typed error that names them.' },
-    { q: 'Where does my data live?', a: 'In services you run: vrt-provider for KV, R2 and Queues with memory, filesystem, Kvrocks or S3 backends, and vrt-sql for D1 and Durable Object SQL.' },
+    { q: 'Where does my data live?', a: 'In services you run: vrt-provider serves KV (filesystem or Kvrocks) and R2 (filesystem or S3-compatible); vrt-sql holds D1 and queue state; Durable Object storage is workerd localDisk under the host doStorageDir.' },
     { q: 'How are tenants isolated?', a: 'Each tenant gets its own workerd process with its own config, sockets and limits, supervised by vrt-host. Outbound traffic passes an egress filter.' },
     { q: 'Is it production-ready?', a: 'It is early and actively developed. Wire formats and the CLI may change between releases, so pin a commit and read the history before upgrading.' }
   ]
