@@ -5,8 +5,11 @@ snapshot corresponds to upstream `main` pulled 2026-11-09 (workerd
 binary 2026-07-22); refresh both together when bumping workerd.
 
 Outputs:
-  - ../src/compat_flags.rs                  (vrt-config)
-  - ../../../../../server/src/services/workerProjectConfig/compatFlags.ts
+  - ../src/compat_flags.rs                  (vrt-config, always)
+  - a TypeScript copy for a control plane, only with `--ts-out PATH`
+
+Flags: `--check` compares in memory and writes nothing (exit 1 on drift);
+`--ts-only` limits the run to the `--ts-out` file.
 
 Rule: a tenant `compatibilityFlags[]` entry must be a KNOWN STABLE flag.
 Anything else — experimental (`$experimental`), or simply unknown to the
@@ -39,10 +42,17 @@ PINNED_WORKERD_VERSION = _lock_version
 MAX_COMPAT_DATE = f"{_m.group(1)}-{_m.group(2)}-{_m.group(3)}"
 CAPNP_SHA256 = hashlib.sha256(SRC.read_bytes()).hexdigest()
 RUST_OUT = pathlib.Path(__file__).parent.parent / "src" / "compat_flags.rs"
-TS_OUT = (
-    pathlib.Path(__file__).parent.parent.parent.parent.parent
-    / "src/services/workerProjectConfig/compatFlags.ts"
-)
+
+def _ts_out():
+    if "--ts-out" not in sys.argv:
+        return None
+    i = sys.argv.index("--ts-out")
+    if i + 1 >= len(sys.argv) or sys.argv[i + 1].startswith("--"):
+        sys.exit("--ts-out needs a path")
+    return pathlib.Path(sys.argv[i + 1])
+
+
+TS_OUT = _ts_out()
 
 lines = SRC.read_text().splitlines()
 stable, experimental = [], []
@@ -87,6 +97,8 @@ assert ('nodejs_compat', 'no_nodejs_compat') in pairs, 'parse drift: pairs'
 assert enable_dates.get('nodejs_compat') == '2026-08-04', 'parse drift: enable dates'
 enable_date_rows = sorted(enable_dates.items())
 TS_ONLY = '--ts-only' in sys.argv  # Rust regen is queued separately
+if TS_ONLY and TS_OUT is None:
+    sys.exit("--ts-only needs --ts-out PATH")
 
 def rs_list(name, items):
     rows = ",\n".join(f'    "{x}"' for x in items)
@@ -236,7 +248,9 @@ export function isExperimentalCompatFlag(name: string): boolean {
 """)
 
 CHECK = "--check" in sys.argv
-outputs = [(TS_OUT, ts_text)] if TS_ONLY else [(RUST_OUT, rust_text), (TS_OUT, ts_text)]
+outputs = [] if TS_ONLY else [(RUST_OUT, rust_text)]
+if TS_OUT is not None:
+    outputs.append((TS_OUT, ts_text))
 if CHECK:
     # RV-R83: drift gate for CI — regenerate in memory, byte-compare, write
     # nothing. Exit 1 names every stale output.

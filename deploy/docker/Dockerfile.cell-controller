@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+# cell-controller — desired pull/verify/fence/deliver + cron leader.
+# No workerd needed — pure Rust + TLS; distroless-free debian-slim for
+# the same support reasons as vrt-host (see that Dockerfile).
+ARG RUST_IMAGE=rust:1.93.0-bookworm
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /build
+COPY . .
+RUN set -eux; \
+    cargo build --release --locked -p cell-controller --bin cell-controller; \
+    install -D -m 0755 target/release/cell-controller /out/cell-controller
+
+FROM ${DEBIAN_IMAGE} AS runtime
+ARG VRT_UID=10001
+ARG VRT_GID=10001
+RUN set -eux; \
+    groupadd --system --gid "${VRT_GID}" vrt; \
+    useradd --system --uid "${VRT_UID}" --gid vrt --home-dir /data vrt; \
+    install -d -o vrt -g vrt -m 0700 /data /tmp
+COPY --from=builder /out/cell-controller /usr/local/bin/cell-controller
+USER vrt
+WORKDIR /data
+# /data holds the revision fence + cron-claims.json — MUST be a
+# durable volume: a container restart that loses the fence file
+# rewinds fencing (fail-open regression); emptyDir is acceptable only
+# because the fence is also checked against control-plane revisions.
+VOLUME ["/data"]
+CMD ["/usr/local/bin/cell-controller", "/etc/vrt/cell-controller.toml"]

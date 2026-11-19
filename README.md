@@ -1,5 +1,7 @@
 # OpenFlare
 
+[![CI](https://github.com/becoolme/openflare/actions/workflows/ci.yml/badge.svg)](https://github.com/becoolme/openflare/actions/workflows/ci.yml)
+
 OpenFlare is a self-hostable runtime for Cloudflare Workers–style applications.
 It runs unmodified [`workerd`](https://github.com/cloudflare/workerd) (the
 official open-source Workers runtime) and adds what workerd alone does not

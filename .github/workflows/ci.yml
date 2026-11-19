@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # vrt-config/tests/workerd_schema.rs checks generated configs against
+      # the workerd.capnp of the pinned workerd version. Take it from the
+      # npm package of exactly that version (the schema only, no binary).
+      - name: Fetch workerd.capnp for the pinned workerd
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./deploy/docker/workerd.lock').version")
+          mkdir -p "$RUNNER_TEMP/workerd"
+          cd "$RUNNER_TEMP/workerd"
+          npm pack --silent "workerd@${version}"
+          tar -xzf "workerd-${version}.tgz" package/workerd.capnp
+          echo "WORKERD_CAPNP=$RUNNER_TEMP/workerd/package/workerd.capnp" >> "$GITHUB_ENV"
+      # Tests that need a real workerd binary (VRT_WORKERD_BIN) skip here.
+      # No debuginfo: tests do not need it and it keeps the linker small.
+      - name: cargo test
+        env:
+          CARGO_INCREMENTAL: '0'
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+        run: cargo test --locked --workspace --no-fail-fast
+
+  node:
+    name: Facade and contract checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # gen-manifest.mjs uses node:module stripTypeScriptTypes; the
+      # committed manifest bytes are produced with Node 24.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.22.1'
+      - name: Facade manifest is up to date
+        run: npm run facade:check
+      - name: Facade tests
+        run: npm run test:facade
+      - name: Contract checks
+        run: npm run test:contract
+      - name: Compat flag list is up to date
+        run: python3 vrt-config/compat/gen_compat_flags.py --check

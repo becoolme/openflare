@@ -78,7 +78,14 @@ fn deploy_provider_tomls_parse_and_validate() {
             std::fs::set_permissions(&pg, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        let text = provider_text(&std::fs::read_to_string(&toml).unwrap(), &root.0);
+        let raw = std::fs::read_to_string(&toml).unwrap();
+        // Deployment configs never enable the in-memory dev backend.
+        assert!(
+            !raw.contains("allowDevBackend"),
+            "{} must not enable the dev switch",
+            toml.display()
+        );
+        let text = provider_text(&raw, &root.0);
         // The binary's own parse path (vrt-provider.rs: `toml::from_str`
         // into the deny_unknown_fields struct), then validate().
         let config: vrt_provider::config::ProviderConfig = toml::from_str(&text)
