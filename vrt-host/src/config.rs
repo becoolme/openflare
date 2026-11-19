@@ -1257,6 +1257,106 @@ pub struct IngressConfig {
     /// Default `mode = "none"` — fail closed, never injected.
     #[serde(default)]
     pub client_ip: ClientIpConfig,
+    /// WebSocket tunnel bounds (`[ingress.websocket]`). Every field is
+    /// optional; an absent section keeps the built-in defaults.
+    #[serde(default)]
+    pub websocket: WebsocketConfig,
+}
+
+/// `[ingress.websocket]` — bounds for upgraded WebSocket sessions.
+/// Out-of-range values fail startup validation; nothing is silently
+/// clamped.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WebsocketConfig {
+    /// Close a session after this many seconds without bytes in either
+    /// direction. Range 1..=3600, default 300.
+    #[serde(default)]
+    pub idle_timeout_secs: Option<u64>,
+    /// Hard ceiling on one session's lifetime in seconds. Range
+    /// 1..=86400, default 14400 (4 h).
+    #[serde(default)]
+    pub max_duration_secs: Option<u64>,
+    /// Ingress-wide cap on concurrent sessions. Range 1..=65536,
+    /// default 4096.
+    #[serde(default)]
+    pub max_sessions: Option<usize>,
+    /// Per-tenant cap on concurrent sessions. Range 1..=maxSessions,
+    /// default 256 (or maxSessions when that is smaller).
+    #[serde(default)]
+    pub max_sessions_per_tenant: Option<usize>,
+}
+
+/// Resolved WebSocket limits (defaults applied, already validated).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WebsocketLimits {
+    /// Idle timeout.
+    pub idle_timeout: Duration,
+    /// Maximum session lifetime.
+    pub max_duration: Duration,
+    /// Ingress-wide session cap.
+    pub max_sessions: usize,
+    /// Per-tenant session cap.
+    pub max_sessions_per_tenant: usize,
+}
+
+impl WebsocketConfig {
+    /// Range checks (fail closed — never clamps).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(v) = self.idle_timeout_secs {
+            if !(1..=3600).contains(&v) {
+                return Err(ConfigError::Invalid(
+                    "ingress.websocket.idleTimeoutSecs must be 1..=3600",
+                ));
+            }
+        }
+        if let Some(v) = self.max_duration_secs {
+            if !(1..=86_400).contains(&v) {
+                return Err(ConfigError::Invalid(
+                    "ingress.websocket.maxDurationSecs must be 1..=86400",
+                ));
+            }
+        }
+        if let Some(v) = self.max_sessions {
+            if !(1..=65_536).contains(&v) {
+                return Err(ConfigError::Invalid(
+                    "ingress.websocket.maxSessions must be 1..=65536",
+                ));
+            }
+        }
+        if let Some(v) = self.max_sessions_per_tenant {
+            let cap = self
+                .max_sessions
+                .unwrap_or(crate::ingress::WS_DEFAULT_MAX_SESSIONS);
+            if v < 1 || v > cap {
+                return Err(ConfigError::Invalid(
+                    "ingress.websocket.maxSessionsPerTenant must be 1..=maxSessions",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The effective limits. Call after [`Self::validate`].
+    pub fn limits(&self) -> WebsocketLimits {
+        let max_sessions = self
+            .max_sessions
+            .unwrap_or(crate::ingress::WS_DEFAULT_MAX_SESSIONS);
+        WebsocketLimits {
+            idle_timeout: self
+                .idle_timeout_secs
+                .map(Duration::from_secs)
+                .unwrap_or(crate::ingress::WS_DEFAULT_IDLE_TIMEOUT),
+            max_duration: self
+                .max_duration_secs
+                .map(Duration::from_secs)
+                .unwrap_or(crate::ingress::WS_DEFAULT_MAX_DURATION),
+            max_sessions,
+            max_sessions_per_tenant: self
+                .max_sessions_per_tenant
+                .unwrap_or_else(|| crate::ingress::WS_DEFAULT_MAX_PER_TENANT.min(max_sessions)),
+        }
+    }
 }
 
 /// MIG-9: typed upstream client-IP trust layer — see
@@ -1483,7 +1583,13 @@ impl IngressConfig {
             }
         }
         self.client_ip.validate()?;
+        self.websocket.validate()?;
         Ok(())
+    }
+
+    /// The validated WebSocket limits.
+    pub fn websocket_limits(&self) -> WebsocketLimits {
+        self.websocket.limits()
     }
 
     /// MIG-9: the validated client-IP policy.
@@ -1517,6 +1623,7 @@ impl Default for IngressConfig {
             forwarded_proto: ForwardedProtoMode::default(),
             forwarded_proto_trusted: Vec::new(),
             client_ip: ClientIpConfig::default(),
+            websocket: WebsocketConfig::default(),
         }
     }
 }
@@ -2467,6 +2574,63 @@ mod tests {
         }
         // switchHoldMs = 0 is the documented "disable holding" value.
         IngressConfig { switch_hold_ms: 0, ..Default::default() }.validate().unwrap();
+    }
+
+    /// `[ingress.websocket]`: optional section, range checks fail
+    /// closed, old configs without it still parse.
+    #[test]
+    fn ingress_websocket_section() {
+        let d: IngressConfig = toml::from_str("requestTimeoutMs = 5000\n").unwrap();
+        d.validate().unwrap();
+        let l = d.websocket_limits();
+        assert_eq!(l.idle_timeout, Duration::from_secs(300));
+        assert_eq!(l.max_duration, Duration::from_secs(4 * 3600));
+        assert_eq!(l.max_sessions, 4096);
+        assert_eq!(l.max_sessions_per_tenant, 256);
+
+        let p: IngressConfig = toml::from_str(
+            "[websocket]\nidleTimeoutSecs = 30\nmaxDurationSecs = 600\nmaxSessions = 100\nmaxSessionsPerTenant = 10\n",
+        )
+        .unwrap();
+        p.validate().unwrap();
+        let l = p.websocket_limits();
+        assert_eq!(l.idle_timeout, Duration::from_secs(30));
+        assert_eq!(l.max_duration, Duration::from_secs(600));
+        assert_eq!((l.max_sessions, l.max_sessions_per_tenant), (100, 10));
+
+        // Per-tenant default never exceeds a smaller global cap.
+        let small: IngressConfig = toml::from_str("[websocket]\nmaxSessions = 8\n").unwrap();
+        small.validate().unwrap();
+        assert_eq!(small.websocket_limits().max_sessions_per_tenant, 8);
+
+        // Unknown keys rejected.
+        assert!(toml::from_str::<IngressConfig>("[websocket]\nbogus = 1\n").is_err());
+
+        // Out-of-range values are errors, not clamps.
+        for (field, body) in [
+            ("idleTimeoutSecs", "idleTimeoutSecs = 0"),
+            ("idleTimeoutSecs", "idleTimeoutSecs = 3601"),
+            ("maxDurationSecs", "maxDurationSecs = 0"),
+            ("maxDurationSecs", "maxDurationSecs = 86401"),
+            ("maxSessions", "maxSessions = 0"),
+            ("maxSessions", "maxSessions = 65537"),
+            ("maxSessionsPerTenant", "maxSessionsPerTenant = 0"),
+            ("maxSessionsPerTenant", "maxSessionsPerTenant = 4097"),
+            (
+                "maxSessionsPerTenant",
+                "maxSessions = 10\nmaxSessionsPerTenant = 11",
+            ),
+        ] {
+            let cfg: IngressConfig = toml::from_str(&format!("[websocket]\n{body}\n")).unwrap();
+            let e = cfg.validate().unwrap_err().to_string();
+            assert!(e.contains(field), "{body}: {e}");
+        }
+        // Boundaries are accepted.
+        let edge: IngressConfig = toml::from_str(
+            "[websocket]\nidleTimeoutSecs = 3600\nmaxDurationSecs = 86400\nmaxSessions = 65536\nmaxSessionsPerTenant = 65536\n",
+        )
+        .unwrap();
+        edge.validate().unwrap();
     }
 
     /// MIG-7: forwarded-proto strategy validation — the trusted-peer

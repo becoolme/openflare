@@ -12,6 +12,10 @@
 //! - Request bodies stream with a hard size cap; response bodies stream
 //!   while holding the generation's in-flight guard, so a draining
 //!   process is never killed mid-response.
+//! - WebSocket upgrades (HTTP/1.1 `GET` + `Upgrade: websocket` only) are
+//!   tunnelled byte-for-byte after the worker answers `101`; the tunnel
+//!   holds the in-flight guard, is bounded by idle / max-duration /
+//!   concurrency limits, and every other `Upgrade` is stripped.
 //! - Every failure is a typed status (`502 upstream_connect`,
 //!   `503 tenant_unavailable|tenant_circuit_open`, …) — never a bare 500.
 //!
@@ -23,7 +27,7 @@ use crate::supervisor::{InFlightGuard, TenantRegistry};
 use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
@@ -32,9 +36,12 @@ use http_body_util::{BodyExt, Limited};
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 
 /// Hop-by-hop + forged headers removed before forwarding.
@@ -72,6 +79,14 @@ const STRIP_REQUEST: &[&str] = &[
 /// Internal prefixes stripped from inbound requests — a client can never
 /// forge identity/ownership headers into the worker plane.
 const STRIP_PREFIXES: &[&str] = &["x-vrt-", "x-open-compute-"];
+
+/// WebSocket tunnel defaults: idle 300 s, lifetime 4 h, 4096 sessions
+/// per ingress.
+pub const WS_DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const WS_DEFAULT_MAX_DURATION: Duration = Duration::from_secs(4 * 60 * 60);
+pub const WS_DEFAULT_MAX_SESSIONS: usize = 4096;
+/// Default per-tenant cap on concurrent WebSocket sessions.
+pub const WS_DEFAULT_MAX_PER_TENANT: usize = 256;
 
 /// T31f: bounded route-failure reasons the in-workerd router emits on
 /// `x-vrt-route-error` — must match facade `router-wire.ts`
@@ -409,6 +424,21 @@ pub struct IngressState {
     forwarded_proto: ForwardedProto,
     /// MIG-9: typed upstream client-IP trust (`cf-connecting-ip`).
     client_ip: ClientIpPolicy,
+    /// WebSocket tunnel: close after this long with no bytes in either
+    /// direction.
+    ws_idle_timeout: Duration,
+    /// WebSocket tunnel: hard ceiling on one session's lifetime.
+    ws_max_duration: Duration,
+    /// WebSocket tunnel: per-ingress cap on concurrent sessions.
+    ws_max_sessions: usize,
+    /// Live + reserved WebSocket sessions (see [`WsPermit`]).
+    ws_active: Arc<AtomicUsize>,
+    /// WebSocket tunnel: per-tenant cap on concurrent sessions, so one
+    /// tenant cannot exhaust the ingress-wide cap.
+    ws_max_per_tenant: usize,
+    /// Live + reserved sessions per tenant. A key is removed when its
+    /// count reaches zero, so the map is bounded by live tenants.
+    ws_tenant_active: Arc<Mutex<HashMap<String, usize>>>,
     /// Worker-log hub: host-observed routing failures are recorded as
     /// `level=platform` records. Set once after construction; unset =
     /// log collection disabled (zero overhead).
@@ -440,6 +470,12 @@ impl IngressState {
             // MIG-9 fail closed: `none` until config proves a trusted
             // source — `cf-connecting-ip` is never forged for clients.
             client_ip: ClientIpPolicy::None,
+            ws_idle_timeout: WS_DEFAULT_IDLE_TIMEOUT,
+            ws_max_duration: WS_DEFAULT_MAX_DURATION,
+            ws_max_sessions: WS_DEFAULT_MAX_SESSIONS,
+            ws_active: Arc::new(AtomicUsize::new(0)),
+            ws_tenant_active: Arc::new(Mutex::new(HashMap::new())),
+            ws_max_per_tenant: WS_DEFAULT_MAX_PER_TENANT,
             logs: std::sync::OnceLock::new(),
         })
     }
@@ -479,6 +515,12 @@ impl IngressState {
             switch_hold_max_bytes: max_bytes,
             forwarded_proto: self.forwarded_proto.clone(),
             client_ip: self.client_ip.clone(),
+            ws_idle_timeout: self.ws_idle_timeout,
+            ws_max_duration: self.ws_max_duration,
+            ws_max_sessions: self.ws_max_sessions,
+            ws_active: self.ws_active.clone(),
+            ws_tenant_active: self.ws_tenant_active.clone(),
+            ws_max_per_tenant: self.ws_max_per_tenant,
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -506,6 +548,12 @@ impl IngressState {
             switch_hold_max_bytes: self.switch_hold_max_bytes,
             forwarded_proto: policy,
             client_ip: self.client_ip.clone(),
+            ws_idle_timeout: self.ws_idle_timeout,
+            ws_max_duration: self.ws_max_duration,
+            ws_max_sessions: self.ws_max_sessions,
+            ws_active: self.ws_active.clone(),
+            ws_tenant_active: self.ws_tenant_active.clone(),
+            ws_max_per_tenant: self.ws_max_per_tenant,
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -533,6 +581,52 @@ impl IngressState {
             switch_hold_max_bytes: self.switch_hold_max_bytes,
             forwarded_proto: self.forwarded_proto.clone(),
             client_ip: policy,
+            ws_idle_timeout: self.ws_idle_timeout,
+            ws_max_duration: self.ws_max_duration,
+            ws_max_sessions: self.ws_max_sessions,
+            ws_active: self.ws_active.clone(),
+            ws_tenant_active: self.ws_tenant_active.clone(),
+            ws_max_per_tenant: self.ws_max_per_tenant,
+            panic_once: std::sync::atomic::AtomicBool::new(false),
+            logs: match self.logs.get() {
+                Some(h) => {
+                    let c = std::sync::OnceLock::new();
+                    let _ = c.set(h.clone());
+                    c
+                }
+                None => std::sync::OnceLock::new(),
+            },
+        })
+    }
+
+    /// WebSocket tunnel bounds (rebuild pattern, same as
+    /// [`Self::with_client_ip`]). Zero values are clamped so a
+    /// misconfiguration can never mean "unbounded".
+    pub fn with_ws_limits(
+        self: &Arc<Self>,
+        idle_timeout: Duration,
+        max_duration: Duration,
+        max_sessions: usize,
+        max_per_tenant: usize,
+    ) -> Arc<Self> {
+        let at_least = |d: Duration| d.max(Duration::from_millis(1));
+        Arc::new(IngressState {
+            routes: ArcSwap::new(self.routes.load_full()),
+            registry: self.registry.clone(),
+            request_timeout: self.request_timeout,
+            connect_timeout: self.connect_timeout,
+            max_body_bytes: self.max_body_bytes,
+            switch_hold_budget: self.switch_hold_budget,
+            switch_hold_max_reqs: self.switch_hold_max_reqs,
+            switch_hold_max_bytes: self.switch_hold_max_bytes,
+            forwarded_proto: self.forwarded_proto.clone(),
+            client_ip: self.client_ip.clone(),
+            ws_idle_timeout: at_least(idle_timeout),
+            ws_max_duration: at_least(max_duration),
+            ws_max_sessions: max_sessions.max(1),
+            ws_active: self.ws_active.clone(),
+            ws_tenant_active: self.ws_tenant_active.clone(),
+            ws_max_per_tenant: max_per_tenant.max(1),
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -590,6 +684,9 @@ pub enum IngressError {
     /// Upstream I/O / protocol failure mid-request.
     #[error("upstream_error")]
     UpstreamError,
+    /// WebSocket session limit reached on this ingress.
+    #[error("ws_capacity")]
+    WsCapacity,
     /// Handler panic or other internal fault (boundary-caught).
     #[error("internal")]
     Internal,
@@ -618,6 +715,10 @@ impl IngressError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "worker unavailable on this generation",
             ),
+            Self::WsCapacity => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "websocket session capacity exhausted",
+            ),
             Self::PayloadTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
             Self::UpstreamConnect => (StatusCode::BAD_GATEWAY, "cannot reach worker"),
             Self::UpstreamTimeout => (StatusCode::GATEWAY_TIMEOUT, "worker response timeout"),
@@ -637,6 +738,7 @@ impl IngressError {
             Self::WakeTimeout => Some(C::WakeTimeout),
             Self::WakeFailed => Some(C::WakeFailed),
             Self::WakeCapacity => Some(C::WakeCapacity),
+            Self::WsCapacity => Some(C::WsCapacity),
             Self::WorkerUnavailable => Some(C::WorkerUnavailable),
             Self::UpstreamConnect => Some(C::UpstreamConnect),
             Self::UpstreamTimeout => Some(C::UpstreamTimeout),
@@ -656,6 +758,7 @@ impl IngressError {
             Self::WakeTimeout => Some("wake_timeout"),
             Self::WakeFailed => Some("wake_failed"),
             Self::WakeCapacity => Some("wake_capacity"),
+            Self::WsCapacity => Some("ws_capacity"),
             Self::PayloadTooLarge => Some("payload_too_large"),
             _ => Some("error"),
         }
@@ -842,6 +945,20 @@ async fn handle_routed(
     // when the feature is off), and a sleeping tenant is woken through
     // the single-flight wake path before the normal resolve.
     runtime.touch();
+    // WebSocket: decide once, up front. The permit is reserved BEFORE any
+    // wake / upstream work so an over-limit client cannot wake a sleeping
+    // tenant or open an upstream connection.
+    let is_ws = is_websocket_upgrade(req.method(), req.version(), req.headers());
+    let mut ws_permit = None;
+    if is_ws {
+        match WsPermit::try_acquire(&state, &target.tenant_id, &target.worker_id) {
+            Ok(p) => ws_permit = Some(p),
+            Err(denied) => {
+                ws_outcome(&target.worker_id, denied.outcome());
+                return Err(IngressError::WsCapacity);
+            }
+        }
+    }
     let hold_bytes = req
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -954,6 +1071,21 @@ async fn handle_routed(
         }
     }
 
+    let mut req = req;
+    let client_upgrade = if is_ws {
+        match req.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() {
+            Some(u) => Some(u),
+            None => {
+                // The serving stack always attaches it for h1; absence
+                // means we cannot complete the handshake - fail closed
+                // before the worker is told to accept a session.
+                ws_outcome(&target.worker_id, "client_upgrade_failed");
+                return Err(IngressError::Internal);
+            }
+        }
+    } else {
+        None
+    };
     let (parts, body) = req.into_parts();
     let limited = Limited::new(body, state.max_body_bytes);
     let counted = crate::metrics::CountedBody::new(
@@ -976,12 +1108,16 @@ async fn handle_routed(
         &state.forwarded_proto,
         &state.client_ip,
         parts.version,
+        is_ws,
     );
 
     let endpoint = slot.endpoint().clone();
     let log_hub = state.logs.get().cloned();
+    // `request_timeout` bounds connect + response headers only; a
+    // WebSocket tunnel that follows a 101 is governed by the ws limits.
+    let connect_timeout = state.connect_timeout;
     let response = tokio::time::timeout(state.request_timeout, async move {
-        let io = tokio::time::timeout(state.connect_timeout, endpoint.connect())
+        let io = tokio::time::timeout(connect_timeout, endpoint.connect())
             .await
             .map_err(|_| IngressError::UpstreamConnect)?
             .map_err(|_| IngressError::UpstreamConnect)?;
@@ -989,6 +1125,28 @@ async fn handle_routed(
     })
     .await
     .map_err(|_| IngressError::UpstreamTimeout)??;
+
+    if is_ws {
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            return finish_ws_upgrade(
+                &state,
+                response,
+                client_upgrade,
+                guard,
+                ws_permit,
+                &target.worker_id,
+                metric,
+            );
+        }
+        // Worker declined the upgrade: ordinary response below. Release
+        // the session reservation now; the body keeps the guard.
+        ws_outcome(&target.worker_id, "rejected_upstream");
+        drop(ws_permit.take());
+    } else if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        // 101 to a request that never asked for a tunnel: protocol
+        // violation (and we hold no OnUpgrade) - fail closed.
+        return Err(IngressError::UpstreamError);
+    }
 
     let (mut resp_parts, resp_body) = response.into_parts();
     // T31c: the in-workerd router marks asset-served responses before
@@ -1077,6 +1235,359 @@ async fn handle_routed(
     Ok(response)
 }
 
+/// Cloudflare-compatible upgrade detection: HTTP/1.1 `GET`, a single
+/// `Upgrade: websocket` token (case-insensitive), a `Connection` header
+/// listing `upgrade`, and no request-body framing. Everything else,
+/// including other protocols (`h2c`) and mixed lists, is NOT an
+/// upgrade and keeps being stripped (fail closed).
+fn is_websocket_upgrade(method: &Method, version: axum::http::Version, h: &HeaderMap) -> bool {
+    if method != Method::GET || version != axum::http::Version::HTTP_11 {
+        return false;
+    }
+    let has_body = h
+        .get(header::CONTENT_LENGTH)
+        .map(|v| v.as_bytes() != b"0")
+        .unwrap_or(false)
+        || h.contains_key(header::TRANSFER_ENCODING);
+    if has_body {
+        return false;
+    }
+    let tokens = |name: header::HeaderName| -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        for v in h.get_all(name) {
+            for t in v.to_str().ok()?.split(',') {
+                let t = t.trim();
+                if !t.is_empty() {
+                    out.push(t.to_ascii_lowercase());
+                }
+            }
+        }
+        Some(out)
+    };
+    let upgrade_ok = matches!(tokens(header::UPGRADE).as_deref(), Some([t]) if t == "websocket");
+    let connection_ok = tokens(header::CONNECTION)
+        .map(|ts| ts.iter().any(|t| t == "upgrade"))
+        .unwrap_or(false);
+    upgrade_ok && connection_ok
+}
+
+fn ws_outcome(worker_id: &str, outcome: &'static str) {
+    crate::metrics::registry().inc(
+        "vrt_host_ws_sessions_total",
+        &[("worker_id", worker_id), ("outcome", outcome)],
+        1.0,
+    );
+}
+
+/// RAII reservation against the per-ingress WebSocket session cap.
+/// Taken before any upstream work, released on every exit path (and
+/// held by the tunnel task for the whole session).
+struct WsPermit {
+    active: Arc<AtomicUsize>,
+    tenants: Arc<Mutex<HashMap<String, usize>>>,
+    tenant_id: String,
+    worker_id: String,
+    counted: bool,
+}
+
+/// Which cap refused a [`WsPermit`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsDenied {
+    /// Ingress-wide cap.
+    Global,
+    /// Per-tenant cap.
+    Tenant,
+}
+
+impl WsDenied {
+    fn outcome(self) -> &'static str {
+        match self {
+            WsDenied::Global => "rejected_capacity",
+            WsDenied::Tenant => "rejected_tenant_capacity",
+        }
+    }
+}
+
+impl WsPermit {
+    /// Reserves one slot against BOTH the global and the per-tenant cap.
+    /// Either refusal rolls back whatever was already reserved.
+    fn try_acquire(
+        state: &IngressState,
+        tenant_id: &str,
+        worker_id: &str,
+    ) -> Result<Self, WsDenied> {
+        // Reserve-then-check: never exceeds the cap under races.
+        let prev = state.ws_active.fetch_add(1, Ordering::SeqCst);
+        if prev >= state.ws_max_sessions {
+            state.ws_active.fetch_sub(1, Ordering::SeqCst);
+            return Err(WsDenied::Global);
+        }
+        {
+            // A poisoned lock only means another thread panicked while
+            // holding plain counters; the counts themselves stay valid.
+            let mut map = state
+                .ws_tenant_active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let n = map.entry(tenant_id.to_string()).or_insert(0);
+            if *n >= state.ws_max_per_tenant {
+                // ws_max_per_tenant >= 1, so an existing entry here is
+                // always > 0 and a fresh zero entry is never refused.
+                drop(map);
+                state.ws_active.fetch_sub(1, Ordering::SeqCst);
+                return Err(WsDenied::Tenant);
+            }
+            *n += 1;
+        }
+        Ok(Self {
+            active: state.ws_active.clone(),
+            tenants: state.ws_tenant_active.clone(),
+            tenant_id: tenant_id.to_string(),
+            worker_id: worker_id.to_string(),
+            counted: false,
+        })
+    }
+
+    /// The session is live: surface it on the active-sessions gauge.
+    fn activate(&mut self) {
+        if !self.counted {
+            self.counted = true;
+            crate::metrics::registry().add(
+                "vrt_host_ws_active_sessions",
+                &[("worker_id", &self.worker_id)],
+                1.0,
+            );
+        }
+    }
+}
+
+impl Drop for WsPermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        let mut map = self.tenants.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = map.get_mut(&self.tenant_id) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                map.remove(&self.tenant_id);
+            }
+        }
+        drop(map);
+        if self.counted {
+            crate::metrics::registry().add(
+                "vrt_host_ws_active_sessions",
+                &[("worker_id", &self.worker_id)],
+                -1.0,
+            );
+        }
+    }
+}
+
+/// Upstream answered 101: answer the client with a normalized 101 and
+/// hand both upgraded halves to the tunnel task.
+fn finish_ws_upgrade(
+    state: &IngressState,
+    mut response: hyper::Response<hyper::body::Incoming>,
+    client_upgrade: Option<hyper::upgrade::OnUpgrade>,
+    guard: InFlightGuard,
+    permit: Option<WsPermit>,
+    worker_id: &str,
+    metric: &mut crate::metrics::RequestMetric,
+) -> Result<Response, IngressError> {
+    let (Some(client_upgrade), Some(mut permit)) = (client_upgrade, permit) else {
+        return Err(IngressError::Internal);
+    };
+    // The worker must confirm the protocol we asked for.
+    let confirmed = response
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    if !confirmed {
+        return Err(IngressError::UpstreamError);
+    }
+    let upstream_upgrade = hyper::upgrade::on(&mut response);
+    let mut headers = std::mem::take(response.headers_mut());
+    scrub_upgrade_response_headers(&mut headers);
+
+    permit.activate();
+    ws_outcome(worker_id, "upgraded");
+    metric.finish(Some(StatusCode::SWITCHING_PROTOCOLS), None);
+    let tunnel = WsTunnel {
+        worker_id: worker_id.to_string(),
+        idle_timeout: state.ws_idle_timeout,
+        max_duration: state.ws_max_duration,
+        upgrade_wait: state.request_timeout,
+    };
+    tokio::spawn(tunnel.run(client_upgrade, upstream_upgrade, guard, permit));
+
+    let mut out = Response::new(Body::empty());
+    *out.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    *out.headers_mut() = headers;
+    Ok(out)
+}
+
+/// 101 headers: same scrub as any response, then re-add the two
+/// hop-by-hop headers the handshake requires, with canonical values.
+fn scrub_upgrade_response_headers(headers: &mut HeaderMap) {
+    scrub_response_headers(headers);
+    headers.remove(header::CONTENT_LENGTH);
+    headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+}
+
+/// Wraps the client half of the tunnel: records last-activity time and
+/// byte counts for BOTH directions (every byte either way crosses it).
+struct ActivityIo<T> {
+    inner: T,
+    started: Instant,
+    last_ms: Arc<AtomicU64>,
+    from_client: Arc<AtomicU64>,
+    to_client: Arc<AtomicU64>,
+}
+
+impl<T> ActivityIo<T> {
+    fn touch(&self) {
+        self.last_ms
+            .store(self.started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &poll {
+            let n = (buf.filled().len() - before) as u64;
+            if n > 0 {
+                self.from_client.fetch_add(n, Ordering::Relaxed);
+                self.touch();
+            }
+        }
+        poll
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            if *n > 0 {
+                self.to_client.fetch_add(*n as u64, Ordering::Relaxed);
+                self.touch();
+            }
+        }
+        poll
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Bounded byte tunnel between the two upgraded halves.
+struct WsTunnel {
+    worker_id: String,
+    idle_timeout: Duration,
+    max_duration: Duration,
+    /// Bound on awaiting each side's upgrade (the client side completes
+    /// only after our 101 is flushed).
+    upgrade_wait: Duration,
+}
+
+impl WsTunnel {
+    /// Owns `guard` and `permit` for the whole session, so tenant
+    /// hibernation / drain observe it and the session cap is exact.
+    /// Every exit, including a panic unwind, drops both.
+    async fn run(
+        self,
+        client: hyper::upgrade::OnUpgrade,
+        upstream: hyper::upgrade::OnUpgrade,
+        _guard: InFlightGuard,
+        _permit: WsPermit,
+    ) {
+        use hyper_util::rt::TokioIo;
+        let reg = crate::metrics::registry();
+        let w = self.worker_id.as_str();
+        let client = match tokio::time::timeout(self.upgrade_wait, client).await {
+            Ok(Ok(u)) => TokioIo::new(u),
+            _ => {
+                ws_outcome(w, "client_upgrade_failed");
+                return;
+            }
+        };
+        let mut upstream = match tokio::time::timeout(self.upgrade_wait, upstream).await {
+            Ok(Ok(u)) => TokioIo::new(u),
+            _ => {
+                ws_outcome(w, "upstream_upgrade_failed");
+                return;
+            }
+        };
+        let started = Instant::now();
+        let last_ms = Arc::new(AtomicU64::new(0));
+        let from_client = Arc::new(AtomicU64::new(0));
+        let to_client = Arc::new(AtomicU64::new(0));
+        let mut client = ActivityIo {
+            inner: client,
+            started,
+            last_ms: last_ms.clone(),
+            from_client: from_client.clone(),
+            to_client: to_client.clone(),
+        };
+
+        let idle_ms = self.idle_timeout.as_millis() as u64;
+        let idle_watch = async {
+            loop {
+                let last = last_ms.load(Ordering::Relaxed);
+                let now = started.elapsed().as_millis() as u64;
+                let idle_for = now.saturating_sub(last);
+                if idle_for >= idle_ms {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(idle_ms - idle_for)).await;
+            }
+        };
+        let reason = tokio::select! {
+            r = tokio::io::copy_bidirectional(&mut client, &mut upstream) => match r {
+                Ok(_) => "closed",
+                Err(_) => "error",
+            },
+            _ = idle_watch => "idle_timeout",
+            _ = tokio::time::sleep(self.max_duration) => "max_duration",
+        };
+        // Dropping both halves closes the sockets.
+        drop(client);
+        drop(upstream);
+        reg.inc(
+            "vrt_host_ws_session_end_total",
+            &[("worker_id", w), ("reason", reason)],
+            1.0,
+        );
+        for (dir, n) in [
+            ("client_to_worker", from_client.load(Ordering::Relaxed)),
+            ("worker_to_client", to_client.load(Ordering::Relaxed)),
+        ] {
+            if n > 0 {
+                reg.inc(
+                    "vrt_host_ws_bytes_total",
+                    &[("worker_id", w), ("dir", dir)],
+                    n as f64,
+                );
+            }
+        }
+    }
+}
+
 fn path_and_query(uri: &axum::http::Uri) -> String {
     uri.path_and_query()
         .map(|pq| pq.as_str())
@@ -1084,6 +1595,7 @@ fn path_and_query(uri: &axum::http::Uri) -> String {
         .to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scrubbed_headers(
     inbound: &HeaderMap,
     host: &str,
@@ -1092,6 +1604,7 @@ fn scrubbed_headers(
     proto_policy: &ForwardedProto,
     client_ip_policy: &ClientIpPolicy,
     version: axum::http::Version,
+    ws_upgrade: bool,
 ) -> HeaderMap {
     let mut out = HeaderMap::with_capacity(inbound.len() + 8);
     for (name, value) in inbound {
@@ -1202,6 +1715,13 @@ fn scrubbed_headers(
     if let Ok(v) = HeaderValue::from_str(&cf_blob_json(&cf, http_protocol(version))) {
         out.insert(CF_BLOB_HEADER, v);
     }
+    // WebSocket: the two hop-by-hop headers were stripped above like any
+    // other; for a verified upgrade request (see `is_websocket_upgrade`)
+    // we write canonical values; the client's originals never pass.
+    if ws_upgrade {
+        out.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+        out.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    }
     out
 }
 
@@ -1229,8 +1749,10 @@ async fn upstream_call(
         hyper::client::conn::http1::handshake::<_, UpstreamBody>(hyper_util::rt::TokioIo::new(io))
             .await
             .map_err(|_| IngressError::UpstreamConnect)?;
+    // `with_upgrades` is inert for ordinary exchanges; it lets a 101
+    // hand the raw socket over via `hyper::upgrade::on`.
     tokio::spawn(async move {
-        let _ = conn.await;
+        let _ = conn.with_upgrades().await;
     });
     sender
         .ready()
@@ -1446,5 +1968,283 @@ mod cf_blob_tests {
         assert!(STRIP_PREFIXES
             .iter()
             .any(|p| CF_BLOB_HEADER.starts_with(p)));
+    }
+}
+
+#[cfg(test)]
+mod ws_tests {
+    //! WebSocket upgrade detection + header normalization + typed
+    //! capacity error. End-to-end tunnel behaviour lives in
+    //! `tests/ingress.rs`.
+    use super::*;
+    use axum::http::Version;
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    fn up(method: Method, version: Version, pairs: &[(&str, &str)]) -> bool {
+        is_websocket_upgrade(&method, version, &hm(pairs))
+    }
+
+    #[test]
+    fn upgrade_truth_table() {
+        let ok = [("upgrade", "websocket"), ("connection", "Upgrade")];
+        assert!(up(Method::GET, Version::HTTP_11, &ok));
+        // Case-insensitive tokens.
+        assert!(up(
+            Method::GET,
+            Version::HTTP_11,
+            &[("upgrade", "WebSocket"), ("connection", "UPGRADE")]
+        ));
+        // Connection with several tokens, any order / spacing.
+        assert!(up(
+            Method::GET,
+            Version::HTTP_11,
+            &[("upgrade", "websocket"), ("connection", "keep-alive, Upgrade")]
+        ));
+        // Connection split across header lines.
+        assert!(up(
+            Method::GET,
+            Version::HTTP_11,
+            &[
+                ("upgrade", "websocket"),
+                ("connection", "keep-alive"),
+                ("connection", "upgrade")
+            ]
+        ));
+        // Non-GET, wrong version.
+        assert!(!up(Method::POST, Version::HTTP_11, &ok));
+        assert!(!up(Method::GET, Version::HTTP_10, &ok));
+        assert!(!up(Method::GET, Version::HTTP_2, &ok));
+        // Other protocols are never tunnelled.
+        assert!(!up(
+            Method::GET,
+            Version::HTTP_11,
+            &[("upgrade", "h2c"), ("connection", "Upgrade, HTTP2-Settings")]
+        ));
+        // A mixed list is not "exactly websocket": fail closed.
+        assert!(!up(
+            Method::GET,
+            Version::HTTP_11,
+            &[("upgrade", "websocket, h2c"), ("connection", "upgrade")]
+        ));
+        // Missing / non-matching Connection.
+        assert!(!up(Method::GET, Version::HTTP_11, &[("upgrade", "websocket")]));
+        assert!(!up(
+            Method::GET,
+            Version::HTTP_11,
+            &[("upgrade", "websocket"), ("connection", "keep-alive")]
+        ));
+        // Missing Upgrade.
+        assert!(!up(Method::GET, Version::HTTP_11, &[("connection", "upgrade")]));
+        // Request-body framing disqualifies.
+        assert!(!up(
+            Method::GET,
+            Version::HTTP_11,
+            &[
+                ("upgrade", "websocket"),
+                ("connection", "upgrade"),
+                ("content-length", "5")
+            ]
+        ));
+        assert!(!up(
+            Method::GET,
+            Version::HTTP_11,
+            &[
+                ("upgrade", "websocket"),
+                ("connection", "upgrade"),
+                ("transfer-encoding", "chunked")
+            ]
+        ));
+        // Explicit zero length is fine.
+        assert!(up(
+            Method::GET,
+            Version::HTTP_11,
+            &[
+                ("upgrade", "websocket"),
+                ("connection", "upgrade"),
+                ("content-length", "0")
+            ]
+        ));
+    }
+
+    fn scrub(inbound: &HeaderMap, ws: bool) -> HeaderMap {
+        let target = crate::route::RouteTarget {
+            tenant_id: "t".into(),
+            worker_id: "w".into(),
+            assets_first: false,
+        };
+        scrubbed_headers(
+            inbound,
+            "app.example.com",
+            &target,
+            "203.0.113.9:4000".parse().unwrap(),
+            &ForwardedProto::FixedHttp,
+            &ClientIpPolicy::None,
+            Version::HTTP_11,
+            ws,
+        )
+    }
+
+    #[test]
+    fn scrubbed_headers_normalize_upgrade_only_for_ws() {
+        let inbound = hm(&[
+            ("upgrade", "WebSocket"),
+            ("connection", "keep-alive, upgrade"),
+            ("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("sec-websocket-version", "13"),
+            ("sec-websocket-protocol", "chat"),
+            ("sec-websocket-extensions", "permessage-deflate"),
+            ("x-vrt-tenant-id", "evil"),
+            ("x-forwarded-for", "6.6.6.6"),
+            ("cf-ray", "forged"),
+        ]);
+        let out = scrub(&inbound, true);
+        assert_eq!(out.get(header::UPGRADE).unwrap(), "websocket");
+        assert_eq!(out.get(header::CONNECTION).unwrap(), "Upgrade");
+        assert_eq!(out.get_all(header::CONNECTION).iter().count(), 1);
+        for h in [
+            "sec-websocket-key",
+            "sec-websocket-version",
+            "sec-websocket-protocol",
+            "sec-websocket-extensions",
+        ] {
+            assert!(out.contains_key(h), "{h} must pass through");
+        }
+        // Trust-boundary rewrites are unchanged.
+        assert_eq!(out.get("x-vrt-tenant-id").unwrap(), "t");
+        assert_eq!(out.get("x-forwarded-for").unwrap(), "203.0.113.9");
+        assert!(!out.contains_key("cf-ray"));
+
+        // Non-upgrade (e.g. h2c attempt): both stay stripped.
+        let h2c = hm(&[("upgrade", "h2c"), ("connection", "upgrade")]);
+        let out = scrub(&h2c, false);
+        assert!(!out.contains_key(header::UPGRADE));
+        assert!(!out.contains_key(header::CONNECTION));
+    }
+
+    #[test]
+    fn upgrade_response_headers_keep_handshake_headers_only_for_101() {
+        let mut h = hm(&[
+            ("upgrade", "WebSocket"),
+            ("connection", "Upgrade"),
+            ("sec-websocket-accept", "abc"),
+            ("sec-websocket-protocol", "chat"),
+            ("x-vrt-error", "forged"),
+            ("content-length", "0"),
+        ]);
+        scrub_upgrade_response_headers(&mut h);
+        assert_eq!(h.get(header::UPGRADE).unwrap(), "websocket");
+        assert_eq!(h.get(header::CONNECTION).unwrap(), "Upgrade");
+        assert_eq!(h.get("sec-websocket-accept").unwrap(), "abc");
+        assert_eq!(h.get("sec-websocket-protocol").unwrap(), "chat");
+        assert!(!h.contains_key("x-vrt-error"));
+        assert!(!h.contains_key(header::CONTENT_LENGTH));
+        // Ordinary responses still lose both.
+        let mut h = hm(&[("upgrade", "websocket"), ("connection", "Upgrade")]);
+        scrub_response_headers(&mut h);
+        assert!(h.is_empty());
+    }
+
+    #[test]
+    fn ws_capacity_is_a_typed_503_with_platform_code() {
+        let e = IngressError::WsCapacity;
+        assert_eq!(e.status_and_detail().0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.to_string(), "ws_capacity");
+        assert_eq!(e.metric_reason(), Some("ws_capacity"));
+        let c = e.platform_code().expect("has code");
+        assert_eq!(c.as_str(), e.to_string());
+        assert!(crate::logs::PlatformCode::ALL.contains(&c));
+    }
+
+    fn st(max: usize, per_tenant: usize) -> Arc<IngressState> {
+        let reg = crate::supervisor::TenantRegistry::new();
+        IngressState::new(reg, Duration::from_secs(1), Duration::from_secs(1), 1024)
+            .with_ws_limits(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                max,
+                per_tenant,
+            )
+    }
+
+    #[test]
+    fn permit_cap_is_exact_and_released_on_drop() {
+        let st = st(2, 2);
+        let a = WsPermit::try_acquire(&st, "t", "w-permit").unwrap();
+        let b = WsPermit::try_acquire(&st, "t", "w-permit").unwrap();
+        assert_eq!(
+            WsPermit::try_acquire(&st, "t", "w-permit").err(),
+            Some(WsDenied::Global)
+        );
+        assert_eq!(st.ws_active.load(Ordering::SeqCst), 2);
+        drop(a);
+        let c = WsPermit::try_acquire(&st, "t", "w-permit").unwrap();
+        drop((b, c));
+        assert_eq!(st.ws_active.load(Ordering::SeqCst), 0);
+        assert!(st.ws_tenant_active.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn tenant_cap_isolates_tenants_and_rolls_back() {
+        let st = st(10, 2);
+        let a1 = WsPermit::try_acquire(&st, "a", "w").unwrap();
+        let a2 = WsPermit::try_acquire(&st, "a", "w").unwrap();
+        // N+1 for tenant a is refused by the tenant cap, and the global
+        // reservation made for it is rolled back (no leak).
+        assert_eq!(
+            WsPermit::try_acquire(&st, "a", "w").err(),
+            Some(WsDenied::Tenant)
+        );
+        assert_eq!(st.ws_active.load(Ordering::SeqCst), 2);
+        assert_eq!(WsDenied::Tenant.outcome(), "rejected_tenant_capacity");
+        assert_eq!(WsDenied::Global.outcome(), "rejected_capacity");
+        // Another tenant is unaffected.
+        let b1 = WsPermit::try_acquire(&st, "b", "w").unwrap();
+        assert_eq!(st.ws_active.load(Ordering::SeqCst), 3);
+        // Release makes room again.
+        drop(a1);
+        let a3 = WsPermit::try_acquire(&st, "a", "w").unwrap();
+        // Global cap wins when both would refuse and is reported as such.
+        drop((a2, a3, b1));
+        assert_eq!(st.ws_active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn tenant_map_keys_are_removed_at_zero() {
+        let st = st(10, 3);
+        let p1 = WsPermit::try_acquire(&st, "x", "w").unwrap();
+        let p2 = WsPermit::try_acquire(&st, "y", "w").unwrap();
+        assert_eq!(st.ws_tenant_active.lock().unwrap().len(), 2);
+        drop(p1);
+        {
+            let m = st.ws_tenant_active.lock().unwrap();
+            assert!(!m.contains_key("x"));
+            assert_eq!(m.get("y"), Some(&1));
+        }
+        // A refused attempt must not leave a key behind either.
+        let st2 = st_full();
+        assert_eq!(
+            WsPermit::try_acquire(&st2, "z", "w").err(),
+            Some(WsDenied::Global)
+        );
+        assert!(!st2.ws_tenant_active.lock().unwrap().contains_key("z"));
+        drop(p2);
+        assert!(st.ws_tenant_active.lock().unwrap().is_empty());
+    }
+
+    /// An ingress whose global cap (1) is already consumed.
+    fn st_full() -> Arc<IngressState> {
+        let s = st(1, 1);
+        std::mem::forget(WsPermit::try_acquire(&s, "other", "w").unwrap());
+        s
     }
 }

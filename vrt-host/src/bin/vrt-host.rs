@@ -510,6 +510,14 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     .with_forwarded_proto(config.ingress.forwarded_policy())
     // MIG-9: typed upstream client-IP trust — same rebuild chain.
     .with_client_ip(config.ingress.client_ip_policy());
+    // WebSocket tunnel bounds (`[ingress.websocket]`, validated at load).
+    let ws = config.ingress.websocket_limits();
+    let ingress_state = ingress_state.with_ws_limits(
+        ws.idle_timeout,
+        ws.max_duration,
+        ws.max_sessions,
+        ws.max_sessions_per_tenant,
+    );
     if let Some(hub) = &log_hub {
         ingress_state.set_log_hub(hub.clone());
     }

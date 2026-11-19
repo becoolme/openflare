@@ -119,7 +119,8 @@ resource IDs, such as a KV namespace `id`, are accepted and ignored: bindings
 resolve to the namespace local to the deployment. A field that cannot be
 honoured is reported as a typed warning or a deploy-time error. It is never
 silently dropped. Platform error codes returned by the ingress are listed in
-[`docs/log-codes.md`](docs/log-codes.md).
+[`docs/log-codes.md`](docs/log-codes.md). WebSocket upgrade passthrough is
+described in [`docs/ingress-websocket.md`](docs/ingress-websocket.md).
 
 ## License
 

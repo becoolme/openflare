@@ -1387,3 +1387,317 @@ async fn switch_hold_end_between_check_and_await_wakes_immediately() {
     wait_state(&rt, TenantState::Stopped, Duration::from_secs(8)).await;
     handle.join().await;
 }
+
+// ---------------------------------------------------------------------
+// WebSocket upgrade passthrough. The fake upstream is a bare TCP
+// listener speaking just enough HTTP/1.1 to 101 and echo.
+// ---------------------------------------------------------------------
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Clone, Copy)]
+enum FakeMode {
+    /// 101 + echo every byte.
+    Echo,
+    /// 403, no upgrade.
+    Reject,
+}
+
+/// Spawns the fake upstream; returns its address and a channel that
+/// receives each request head it saw.
+async fn fake_ws_upstream(
+    mode: FakeMode,
+) -> (
+    std::net::SocketAddr,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                loop {
+                    let mut c = [0u8; 4096];
+                    let n = s.read(&mut c).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&c[..n]);
+                    if find_sub(&buf, b"\r\n\r\n").is_some() {
+                        break;
+                    }
+                }
+                let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+                match mode {
+                    FakeMode::Reject => {
+                        let _ = s
+                            .write_all(
+                                b"HTTP/1.1 403 Forbidden\r\ncontent-length: 4\r\nconnection: close\r\n\r\nnope",
+                            )
+                            .await;
+                    }
+                    FakeMode::Echo => {
+                        let _ = s
+                            .write_all(
+                                b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: abc=\r\nsec-websocket-protocol: chat\r\n\r\n",
+                            )
+                            .await;
+                        let mut c = [0u8; 4096];
+                        loop {
+                            let n = s.read(&mut c).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            if s.write_all(&c[..n]).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, rx)
+}
+
+fn find_sub(h: &[u8], n: &[u8]) -> Option<usize> {
+    h.windows(n.len()).position(|w| w == n)
+}
+
+async fn ws_state(
+    worker_id: &str,
+    upstream: std::net::SocketAddr,
+    idle: Duration,
+    max_sessions: usize,
+) -> (Arc<TenantRuntime>, Arc<IngressState>, IngressGuard) {
+    ws_state_pt(worker_id, upstream, idle, max_sessions, 256).await
+}
+
+async fn ws_state_pt(
+    worker_id: &str,
+    upstream: std::net::SocketAddr,
+    idle: Duration,
+    max_sessions: usize,
+    per_tenant: usize,
+) -> (Arc<TenantRuntime>, Arc<IngressState>, IngressGuard) {
+    let registry = TenantRegistry::new();
+    let rt = TenantRuntime::new("t1");
+    registry.insert("t1".to_string(), rt.clone());
+    rt.test_install(BTreeMap::from([(
+        worker_id.to_string(),
+        vrt_host::endpoint::WorkerEndpoint::Tcp(upstream),
+    )]));
+    let desired = snapshot_protocol::compute_desired::ComputeDesired {
+        schema_version: 1,
+        cell_id: "cell".into(),
+        revision: 1,
+        tenants: vec![tenant(
+            "t1",
+            vec![worker(worker_id, "app.example.com", "d1")],
+        )],
+        deletions: vec![],
+    };
+    let state = IngressState::new(
+        registry,
+        Duration::from_millis(800),
+        Duration::from_millis(500),
+        1024,
+    )
+    .with_ws_limits(idle, Duration::from_secs(60), max_sessions, per_tenant);
+    state.set_routes(RouteTable::from_desired(&desired));
+    let ig = start_ingress(&state).await;
+    (rt, state, ig)
+}
+
+/// Sends a ws handshake, returns (stream, response head).
+async fn ws_handshake(addr: std::net::SocketAddr) -> (tokio::net::TcpStream, String) {
+    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+    s.write_all(
+        b"GET /chat HTTP/1.1\r\nhost: app.example.com\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\nsec-websocket-protocol: chat\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut buf = Vec::new();
+    loop {
+        let mut c = [0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut c))
+            .await
+            .expect("handshake response timed out")
+            .unwrap();
+        assert!(n > 0, "closed before response head");
+        buf.extend_from_slice(&c[..n]);
+        if let Some(i) = find_sub(&buf, b"\r\n\r\n") {
+            buf.truncate(i + 4);
+            break;
+        }
+    }
+    (s, String::from_utf8_lossy(&buf).to_string())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_upgrade_echo_and_in_flight_lifecycle() {
+    let (up, mut seen) = fake_ws_upstream(FakeMode::Echo).await;
+    let (rt, _state, ig) = ws_state("wws1", up, Duration::from_secs(30), 16).await;
+
+    let (mut s, head) = ws_handshake(ig.addr).await;
+    let lower = head.to_ascii_lowercase();
+    assert!(head.starts_with("HTTP/1.1 101"), "head: {head}");
+    assert!(lower.contains("upgrade: websocket"), "head: {head}");
+    assert!(lower.contains("connection: upgrade"), "head: {head}");
+    assert!(lower.contains("sec-websocket-accept: abc="), "head: {head}");
+    assert!(lower.contains("sec-websocket-protocol: chat"), "head: {head}");
+
+    // Upstream saw normalized upgrade headers + passthrough sec-* and
+    // our rewritten identity.
+    let req = seen.recv().await.unwrap().to_ascii_lowercase();
+    assert!(req.contains("upgrade: websocket"), "req: {req}");
+    assert!(req.contains("connection: upgrade"), "req: {req}");
+    assert!(req.contains("sec-websocket-key: "), "req: {req}");
+    assert!(req.contains("x-vrt-tenant-id: t1"), "req: {req}");
+
+    // Bidirectional bytes.
+    s.write_all(b"hello-ws").await.unwrap();
+    let mut got = [0u8; 8];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut got))
+        .await
+        .expect("echo timed out")
+        .unwrap();
+    assert_eq!(&got, b"hello-ws");
+
+    // The session holds the in-flight guard (drain/hibernate accounting)
+    // well past the 800 ms request_timeout.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(rt.in_flight(), 1, "session must hold the slot");
+    s.write_all(b"again").await.unwrap();
+    let mut got = [0u8; 5];
+    s.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"again");
+
+    drop(s);
+    wait_for(
+        || rt.in_flight() == 0,
+        Duration::from_secs(5),
+        "in_flight to return to 0 after client close",
+    )
+    .await;
+    ig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_idle_timeout_closes_session() {
+    let (up, _seen) = fake_ws_upstream(FakeMode::Echo).await;
+    let (rt, _state, ig) = ws_state("wws2", up, Duration::from_millis(400), 16).await;
+
+    let (mut s, head) = ws_handshake(ig.addr).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "head: {head}");
+    assert_eq!(rt.in_flight(), 1);
+
+    // No traffic: the ingress must close the client side.
+    let mut c = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut c))
+        .await
+        .expect("idle session was not closed")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF after idle timeout");
+    wait_for(
+        || rt.in_flight() == 0,
+        Duration::from_secs(5),
+        "in_flight to return to 0 after idle close",
+    )
+    .await;
+    ig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_concurrency_cap_returns_typed_503() {
+    let (up, _seen) = fake_ws_upstream(FakeMode::Echo).await;
+    let (rt, _state, ig) = ws_state("wws3", up, Duration::from_secs(30), 1).await;
+
+    let (s1, head) = ws_handshake(ig.addr).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "head: {head}");
+
+    let (_s2, head2) = ws_handshake(ig.addr).await;
+    assert!(head2.starts_with("HTTP/1.1 503"), "head2: {head2}");
+    assert_eq!(rt.in_flight(), 1, "rejected attempt must not leak a guard");
+
+    // Releasing the first frees the slot for a new session.
+    drop(s1);
+    wait_for(
+        || rt.in_flight() == 0,
+        Duration::from_secs(5),
+        "first session to release",
+    )
+    .await;
+    let (_s3, head3) = ws_handshake(ig.addr).await;
+    assert!(head3.starts_with("HTTP/1.1 101"), "head3: {head3}");
+    ig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_upstream_non_101_passes_through_and_releases() {
+    let (up, _seen) = fake_ws_upstream(FakeMode::Reject).await;
+    let (rt, _state, ig) = ws_state("wws4", up, Duration::from_secs(30), 1).await;
+
+    let (_s, head) = ws_handshake(ig.addr).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "head: {head}");
+    wait_for(
+        || rt.in_flight() == 0,
+        Duration::from_secs(5),
+        "in_flight to return to 0 after rejected upgrade",
+    )
+    .await;
+    // The cap permit was returned: with cap=1 a second attempt is still
+    // answered by the upstream (403), not by the capacity gate.
+    let (_s2, head2) = ws_handshake(ig.addr).await;
+    assert!(head2.starts_with("HTTP/1.1 403"), "head2: {head2}");
+    ig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_websocket_upgrade_is_stripped_not_tunnelled() {
+    let (up, mut seen) = fake_ws_upstream(FakeMode::Reject).await;
+    let (_rt, _state, ig) = ws_state("wws5", up, Duration::from_secs(30), 4).await;
+
+    let (status, _, _) = http_get(
+        ig.addr,
+        "app.example.com",
+        "/",
+        &[("upgrade", "h2c"), ("connection", "Upgrade, HTTP2-Settings")],
+    )
+    .await;
+    assert_eq!(status, 403);
+    let req = seen.recv().await.unwrap().to_ascii_lowercase();
+    assert!(!req.contains("upgrade:"), "req: {req}");
+    assert!(!req.contains("h2c"), "req: {req}");
+    ig.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_per_tenant_cap_rejects_with_503_and_frees_on_close() {
+    let (up, _seen) = fake_ws_upstream(FakeMode::Echo).await;
+    // Global cap is generous; the tenant cap (1) is what must bite.
+    let (rt, _state, ig) = ws_state_pt("wws6", up, Duration::from_secs(30), 100, 1).await;
+
+    let (s1, head) = ws_handshake(ig.addr).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "head: {head}");
+    let (_s2, head2) = ws_handshake(ig.addr).await;
+    assert!(head2.starts_with("HTTP/1.1 503"), "head2: {head2}");
+    assert_eq!(rt.in_flight(), 1, "refused attempt must not leak a guard");
+
+    drop(s1);
+    wait_for(
+        || rt.in_flight() == 0,
+        Duration::from_secs(5),
+        "first session to release",
+    )
+    .await;
+    let (_s3, head3) = ws_handshake(ig.addr).await;
+    assert!(head3.starts_with("HTTP/1.1 101"), "head3: {head3}");
+    ig.stop().await;
+}

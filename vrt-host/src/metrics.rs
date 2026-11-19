@@ -85,6 +85,23 @@ fn declare_all(r: &Registry) {
         "vrt_worker_inflight_requests",
         "In-flight proxied requests.",
     );
+    // ---- WebSocket passthrough (ingress) ----
+    r.declare_counter(
+        "vrt_host_ws_sessions_total",
+        "WebSocket upgrade attempts by outcome (upgraded, rejected_capacity, rejected_upstream, client_upgrade_failed, upstream_upgrade_failed).",
+    );
+    r.declare_counter(
+        "vrt_host_ws_session_end_total",
+        "Ended WebSocket sessions by reason (closed, idle_timeout, max_duration, error).",
+    );
+    r.declare_gauge(
+        "vrt_host_ws_active_sessions",
+        "WebSocket sessions currently tunnelled through the ingress.",
+    );
+    r.declare_counter(
+        "vrt_host_ws_bytes_total",
+        "WebSocket tunnel bytes by direction (client_to_worker, worker_to_client).",
+    );
     r.declare_counter(
         "vrt_worker_exceptions_total",
         "Worker-surfaced errors by reason.",

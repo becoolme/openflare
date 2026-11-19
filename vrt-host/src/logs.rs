@@ -107,6 +107,8 @@ pub enum PlatformCode {
     WakeCapacity,
     /// Ingress internal fault (500).
     Internal,
+    /// Host WebSocket session capacity exhausted (503).
+    WsCapacity,
     /// Static-asset router failed closed (503); see `x-vrt-route-error`.
     RouteIndexRpcFailed,
     RouteIndexInvalid,
@@ -130,6 +132,7 @@ impl PlatformCode {
         Self::WakeFailed,
         Self::WakeCapacity,
         Self::Internal,
+        Self::WsCapacity,
         Self::RouteIndexRpcFailed,
         Self::RouteIndexInvalid,
         Self::RouteIndexDigestMismatch,
@@ -151,6 +154,7 @@ impl PlatformCode {
             Self::WakeFailed => "tenant_wake_failed",
             Self::WakeCapacity => "wake_capacity",
             Self::Internal => "internal",
+            Self::WsCapacity => "ws_capacity",
             Self::RouteIndexRpcFailed => "route_index_rpc_failed",
             Self::RouteIndexInvalid => "route_index_invalid",
             Self::RouteIndexDigestMismatch => "route_index_digest_mismatch",

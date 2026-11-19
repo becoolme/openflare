@@ -16,6 +16,7 @@ listed here.
 | `tenant_wake_timeout` | 503 | scale-to-zero: wake exceeded its deadline (sends `Retry-After`) |
 | `tenant_wake_failed` | 503 | scale-to-zero: wake start / readiness probe failed (sends `Retry-After`) |
 | `wake_capacity` | 503 | scale-to-zero: host wake concurrency / queue / held-request capacity exhausted (sends `Retry-After`) |
+| `ws_capacity` | 503 | the ingress WebSocket session limit is reached; the upgrade is refused (sends `Retry-After`) |
 | `internal` | 500 | internal ingress failure (caught at the panic boundary) |
 | `route_index_rpc_failed` | 503 | static-asset router fails closed: route index RPC failed |
 | `route_index_invalid` | 503 | same: route index is invalid |
