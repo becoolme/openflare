@@ -100,6 +100,16 @@ Some integration tests need a real `workerd` binary, or `workerd.capnp` for
 the schema checks (`WORKERD_CAPNP=/path/to/workerd.capnp`). They skip
 when it is missing.
 
+If you keep your own deployment manifests, point `VRT_DEPLOY_TOML_DIRS` at
+them (one or more directories, separated like `PATH`). The `deploy_toml`
+tests then load every `vrt-host.toml`, `vrt-provider.toml`, `vrt-sql.toml`
+and `cell-controller.toml` below those directories through the real config
+loaders:
+
+```sh
+VRT_DEPLOY_TOML_DIRS=/path/to/your/k8s cargo test --workspace --offline --test deploy_toml
+```
+
 ## Compatibility notes
 
 OpenFlare accepts standard wrangler configuration. Cloudflare-specific
