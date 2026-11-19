@@ -100,7 +100,26 @@ npm test                  # facade + contract checks + cargo test --workspace
 
 Some integration tests need a real `workerd` binary, or `workerd.capnp` for
 the schema checks (`WORKERD_CAPNP=/path/to/workerd.capnp`). They skip
-when it is missing.
+when it is missing. To run the whole `VRT_WORKERD_BIN` batch locally
+against a binary you already verified against `deploy/docker/workerd.lock`:
+
+```sh
+scripts/ci-real-workerd.sh /path/to/workerd [/path/to/workerd.capnp]
+```
+
+CI runs the same script in the `real-workerd` job: it fetches the
+`@cloudflare/workerd-linux-64` npm package at the version pinned in
+`deploy/docker/workerd.lock` and verifies both the tarball integrity
+and the binary SHA-256 against the lock before testing. Fetching
+workerd in that job is a test-only exception to the "workerd is never
+downloaded by this repo" rule — Docker build and runtime paths still
+require an operator-supplied binary.
+
+`conformance/` holds the binding-layer conformance suite: declarative
+golden-behavior cases (worker + HTTP steps + expectations citing
+Cloudflare docs) executed against a running stack — see
+[`conformance/README.md`](conformance/README.md). Its manifest/report
+unit tests run as part of `npm test` and need no workerd.
 
 If you keep your own deployment manifests, point `VRT_DEPLOY_TOML_DIRS` at
 them (one or more directories, separated like `PATH`). The `deploy_toml`

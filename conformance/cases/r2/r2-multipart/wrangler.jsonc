@@ -1,0 +1,9 @@
+// Conformance case: R2 multipart uploads — create, parts, complete,
+// abort; signed-uploadId scope is enforced provider-side (W5 e2e).
+{
+  "name": "conf-r2-multipart",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-r2-multipart.vrt.local/*"],
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "conf-r2-multipart" }],
+}

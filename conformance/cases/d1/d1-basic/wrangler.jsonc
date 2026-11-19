@@ -1,0 +1,11 @@
+// Conformance case: D1 prepared-statement surface — bind/run/all/
+// first/raw/batch/exec, atomic batch rollback, D1_ERROR shape.
+{
+  "name": "conf-d1-basic",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-d1-basic.vrt.local/*"],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "conf-d1-basic-db", "database_id": "conf-d1-basic" },
+  ],
+}

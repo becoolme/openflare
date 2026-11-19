@@ -1,0 +1,288 @@
+{
+  "schemaVersion": 1,
+  "id": "d1-basic",
+  "binding": "d1",
+  "title": "D1 prepare/bind/run/all/first/raw/batch/exec + atomic rollback + D1_ERROR shape",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/d1/worker-api/prepared-statements/ (run/all/first/raw shapes)",
+    "https://developers.cloudflare.com/d1/worker-api/d1-database/ (exec {count,duration}; batch atomicity)",
+    "https://developers.cloudflare.com/d1/worker-api/return-object/ (meta: changes, last_row_id, duration; success flag)",
+    "vrt-host/tests/d1_smoke.rs (same surface proven in-repo: batchErr wraps D1_ERROR, batchRolledBack)"
+  ],
+  "steps": [
+    {
+      "name": "exec CREATE TABLE",
+      "request": {
+        "path": "/setup"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "count": 1
+        }
+      }
+    },
+    {
+      "name": "prepare+bind+run insert",
+      "request": {
+        "path": "/run"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "success": true,
+          "changes": 1,
+          "lastRowIdIsInt": true,
+          "durationIsNumber": true
+        }
+      }
+    },
+    {
+      "name": "all() rows",
+      "request": {
+        "path": "/all"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "success": true,
+          "values": [
+            "alpha"
+          ]
+        }
+      }
+    },
+    {
+      "name": "first() object/scalar/null",
+      "request": {
+        "path": "/first"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "row": {
+            "v": "alpha"
+          },
+          "scalar": "alpha",
+          "none": null
+        }
+      }
+    },
+    {
+      "name": "raw() rows + columnNames",
+      "request": {
+        "path": "/raw"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "rows": [
+            [
+              1,
+              "alpha"
+            ]
+          ],
+          "withNames": [
+            [
+              "id",
+              "v"
+            ],
+            [
+              1,
+              "alpha"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "batch() insert+select",
+      "request": {
+        "path": "/batch"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "insOk": true,
+          "insChanges": 1,
+          "selValues": [
+            "alpha",
+            "beta"
+          ]
+        }
+      }
+    },
+    {
+      "name": "bad batch rolls back atomically",
+      "request": {
+        "path": "/batch-rollback"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "rolledBack": true
+        },
+        "bodyContains": [
+          "D1_ERROR"
+        ]
+      }
+    },
+    {
+      "name": "bad SQL \u2192 D1_ERROR",
+      "request": {
+        "method": "POST",
+        "path": "/err",
+        "json": {
+          "sql": "SELEC oops"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true,
+          "message": "D1_ERROR"
+        }
+      }
+    },
+    {
+      "name": "object bind param \u2192 D1 error",
+      "request": {
+        "method": "POST",
+        "path": "/err",
+        "json": {
+          "sql": "SELECT ?",
+          "bind": [
+            {}
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true
+        },
+        "bodyMatches": "D1_|not supported|invalid"
+      }
+    },
+    {
+      "name": "over 100 params \u2192 D1 error",
+      "request": {
+        "method": "POST",
+        "path": "/err",
+        "json": {
+          "sql": "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59, ?60, ?61, ?62, ?63, ?64, ?65, ?66, ?67, ?68, ?69, ?70, ?71, ?72, ?73, ?74, ?75, ?76, ?77, ?78, ?79, ?80, ?81, ?82, ?83, ?84, ?85, ?86, ?87, ?88, ?89, ?90, ?91, ?92, ?93, ?94, ?95, ?96, ?97, ?98, ?99, ?100, ?101",
+          "bind": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41,
+            42,
+            43,
+            44,
+            45,
+            46,
+            47,
+            48,
+            49,
+            50,
+            51,
+            52,
+            53,
+            54,
+            55,
+            56,
+            57,
+            58,
+            59,
+            60,
+            61,
+            62,
+            63,
+            64,
+            65,
+            66,
+            67,
+            68,
+            69,
+            70,
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78,
+            79,
+            80,
+            81,
+            82,
+            83,
+            84,
+            85,
+            86,
+            87,
+            88,
+            89,
+            90,
+            91,
+            92,
+            93,
+            94,
+            95,
+            96,
+            97,
+            98,
+            99,
+            100
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true
+        }
+      }
+    }
+  ]
+}

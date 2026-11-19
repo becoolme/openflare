@@ -1,0 +1,244 @@
+{
+  "schemaVersion": 1,
+  "id": "r2-basic",
+  "binding": "r2",
+  "title": "R2 put/get/head/delete/list, range reads, conditional ops, list delimiter",
+  "requiresWorkerd": true,
+  "evidence": [
+    "third_party/open-compute/facade/r2/protocol.d.ts (binding contract: miss \u2192 null, precondition-fail \u2192 null, {objects,truncated,cursor,delimitedPrefixes})",
+    "vrt-provider/tests/r2_memory.rs (wildcard/strong etag precondition semantics, 32-char md5 etag + quoted httpEtag)",
+    "https://developers.cloudflare.com/r2/api/workers/workers-api-reference/ (upstream semantics the transport mirrors: onlyIf, range, list shape)"
+  ],
+  "steps": [
+    {
+      "name": "put o1",
+      "request": {
+        "method": "PUT",
+        "path": "/put?key=o1",
+        "headers": {
+          "content-type": "application/octet-stream"
+        },
+        "body": "hello-r2"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "meta": {
+            "key": "o1",
+            "size": 8,
+            "etagLen": 32,
+            "customMetadata": {
+              "m": "v"
+            },
+            "contentType": "text/plain",
+            "versionNonEmpty": true,
+            "httpEtagOk": true
+          }
+        }
+      }
+    },
+    {
+      "name": "get o1",
+      "request": {
+        "path": "/get?key=o1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "hit": true,
+          "text": "hello-r2",
+          "meta": {
+            "key": "o1",
+            "size": 8
+          }
+        }
+      }
+    },
+    {
+      "name": "head o1",
+      "request": {
+        "path": "/head?key=o1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "meta": {
+            "key": "o1",
+            "size": 8,
+            "etagLen": 32
+          }
+        }
+      }
+    },
+    {
+      "name": "get missing \u2192 null",
+      "request": {
+        "path": "/get?key=nope"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "hit": false
+        }
+      }
+    },
+    {
+      "name": "head missing \u2192 null",
+      "request": {
+        "path": "/head?key=nope"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "meta": null
+        }
+      }
+    },
+    {
+      "name": "range read offset=6 length=2",
+      "request": {
+        "path": "/range?key=o1&offset=6&length=2"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "hit": true,
+          "text": "r2",
+          "range": {
+            "offset": 6,
+            "length": 2
+          }
+        }
+      }
+    },
+    {
+      "name": "conditional put (if-not-exists) on missing \u2192 written",
+      "request": {
+        "path": "/put-cond?key=cond&mode=if-not-exists"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "written": true
+        }
+      }
+    },
+    {
+      "name": "conditional put (if-not-exists) on existing \u2192 rejected",
+      "request": {
+        "path": "/put-cond?key=cond&mode=if-not-exists"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "written": false
+        }
+      }
+    },
+    {
+      "name": "conditional put (if-exists) on existing \u2192 written",
+      "request": {
+        "path": "/put-cond?key=cond&mode=if-exists"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "written": true
+        }
+      }
+    },
+    {
+      "name": "conditional put (if-exists) on missing \u2192 rejected",
+      "request": {
+        "path": "/put-cond?key=missing&mode=if-exists"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "written": false
+        }
+      }
+    },
+    {
+      "name": "delete cond",
+      "request": {
+        "method": "POST",
+        "path": "/delete",
+        "json": {
+          "keys": [
+            "cond"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "seed dir/b1 + dir/sub/c1",
+      "request": {
+        "method": "PUT",
+        "path": "/put?key=dir/b1",
+        "body": "x"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "meta": {
+            "key": "dir/b1"
+          }
+        }
+      }
+    },
+    {
+      "name": "seed dir/sub/c1",
+      "request": {
+        "method": "PUT",
+        "path": "/put?key=dir/sub/c1",
+        "body": "y"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "meta": {
+            "key": "dir/sub/c1"
+          }
+        }
+      }
+    },
+    {
+      "name": "list prefix=dir/",
+      "request": {
+        "path": "/list?prefix=dir/"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "names": [
+            "dir/b1",
+            "dir/sub/c1"
+          ],
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "list delimiter folds subdir",
+      "request": {
+        "path": "/list?prefix=&delimiter=/"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "delimitedPrefixes": [
+            "dir/"
+          ],
+          "truncated": false
+        }
+      }
+    }
+  ]
+}

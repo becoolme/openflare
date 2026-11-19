@@ -12,6 +12,7 @@
     "test:facade": "node --test facade/test/*.test.mjs",
     "test:contract": "node contract/check-egress-deny-ranges.mjs && node contract/gen-facade-requests.mjs --check",
     "test:rust": "cargo test --workspace --offline",
-    "test": "npm run facade:check && npm run test:facade && npm run test:contract && npm run test:rust"
+    "test": "npm run facade:check && npm run test:facade && npm run test:contract && npm run test:conformance && npm run test:rust",
+    "test:conformance": "node --test conformance/test/*.test.mjs"
   }
 }

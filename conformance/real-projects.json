@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "projects": [
+    {
+      "name": "cloudflare-templates-todo-kv",
+      "repo": "https://github.com/cloudflare/templates",
+      "commit": "dfdf14099a81a08cfe1ffc78f8463605670ae513",
+      "path": "to-do-list-kv-template",
+      "bindings": [
+        "kv",
+        "assets"
+      ],
+      "expect": "unknown",
+      "notes": "Official KV todo template; assets + KV only \u2014 should be fully compatible."
+    },
+    {
+      "name": "cloudflare-templates-d1",
+      "repo": "https://github.com/cloudflare/templates",
+      "commit": "dfdf14099a81a08cfe1ffc78f8463605670ae513",
+      "path": "d1-template",
+      "bindings": [
+        "d1"
+      ],
+      "expect": "unknown",
+      "notes": "Official D1 comments template."
+    },
+    {
+      "name": "cloudflare-templates-do",
+      "repo": "https://github.com/cloudflare/templates",
+      "commit": "dfdf14099a81a08cfe1ffc78f8463605670ae513",
+      "path": "hello-world-do-template",
+      "bindings": [
+        "durable-objects"
+      ],
+      "expect": "unknown",
+      "notes": null
+    },
+    {
+      "name": "cloudflare-templates-workflows",
+      "repo": "https://github.com/cloudflare/templates",
+      "commit": "dfdf14099a81a08cfe1ffc78f8463605670ae513",
+      "path": "workflows-starter-template",
+      "bindings": [
+        "workflows"
+      ],
+      "expect": "unknown",
+      "notes": null
+    },
+    {
+      "name": "cloudflare-templates-durable-chat",
+      "repo": "https://github.com/cloudflare/templates",
+      "commit": "dfdf14099a81a08cfe1ffc78f8463605670ae513",
+      "path": "durable-chat-template",
+      "bindings": [
+        "durable-objects",
+        "websockets"
+      ],
+      "expect": "unknown",
+      "notes": "DO + WebSocket hibernation-style chat; ingress upgrade is HTTP/1.1 only (docs/ingress-websocket.md)."
+    },
+    {
+      "name": "cloudflare-workers-chat-demo",
+      "repo": "https://github.com/cloudflare/workers-chat-demo",
+      "commit": "dd32ce87617a9df6c614004d2fc2fb0628698121",
+      "path": null,
+      "bindings": [
+        "durable-objects",
+        "websockets"
+      ],
+      "expect": "unknown",
+      "notes": "Classic DO chat; rate limiting inside the DO."
+    },
+    {
+      "name": "tldraw-sync-cloudflare",
+      "repo": "https://github.com/tldraw/tldraw-sync-cloudflare",
+      "commit": "18ccd8717a1e98a80692e9317a1f9be428e7cc4c",
+      "path": null,
+      "bindings": [
+        "durable-objects",
+        "r2",
+        "websockets"
+      ],
+      "expect": "unknown",
+      "notes": "DO sync server + R2 snapshot persistence."
+    },
+    {
+      "name": "outerbase-starbasedb",
+      "repo": "https://github.com/outerbase/starbasedb",
+      "commit": "bb227352135051a0dd50190d67c3e82b03f8e485",
+      "path": null,
+      "bindings": [
+        "durable-objects"
+      ],
+      "expect": "unknown",
+      "notes": "DO-hosted sqlite database; may use nodejs_compat surface not yet verified."
+    },
+    {
+      "name": "napolab-y-durableobjects",
+      "repo": "https://github.com/napolab/y-durableobjects",
+      "commit": "e6d6d0615c7051ddc43222c16d8078070ee64d32",
+      "path": null,
+      "bindings": [
+        "durable-objects",
+        "websockets"
+      ],
+      "expect": "unknown",
+      "notes": "yjs collaborative docs on DOs."
+    },
+    {
+      "name": "spl0itable-nosflare",
+      "repo": "https://github.com/Spl0itable/nosflare",
+      "commit": "1f92b1a7ec55f36db4d74a3e03f5fc77bd1169cd",
+      "path": null,
+      "bindings": [
+        "durable-objects",
+        "websockets",
+        "kv",
+        "r2"
+      ],
+      "expect": "unknown",
+      "notes": "Nostr relay; mix of DO + KV + R2."
+    },
+    {
+      "name": "cloudflare-agents-mcp",
+      "repo": "https://github.com/cloudflare/agents",
+      "commit": "7dd51c518c517b0f9f92ec7e2c3ad1004222955e",
+      "path": "examples/mcp",
+      "bindings": [
+        "durable-objects",
+        "ai",
+        "websockets"
+      ],
+      "expect": "fails",
+      "notes": "Agents SDK MCP example \u2014 openflare has no Workers AI binding (deploy-time typed error); recorded as expected-failure until ai support lands."
+    },
+    {
+      "name": "threepointone-durable-chat",
+      "repo": "https://github.com/threepointone/durable-chat",
+      "commit": "40de8e937bf4dbf7286b2cac9f9a9f4c8c4a90bb",
+      "path": null,
+      "bindings": [
+        "durable-objects",
+        "websockets"
+      ],
+      "expect": "unknown",
+      "notes": null
+    }
+  ]
+}

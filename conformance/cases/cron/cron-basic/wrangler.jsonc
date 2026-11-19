@@ -1,0 +1,13 @@
+// Conformance case: cron trigger — the standalone CronRunner ticks
+// every minute; scheduled(controller) records the event fields into
+// D1 so the runner can poll a durable side effect.
+{
+  "name": "conf-cron-basic",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-cron-basic.vrt.local/*"],
+  "triggers": { "crons": ["* * * * *"] },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "conf-cron-basic-db", "database_id": "conf-cron-basic" },
+  ],
+}

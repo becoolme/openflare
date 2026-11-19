@@ -1,0 +1,9 @@
+// Conformance case: KVNamespace surface — put/get/delete/getWithMetadata,
+// bulk get, read types, client-side validation error codes.
+{
+  "name": "conf-kv-basic",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-kv-basic.vrt.local/*"],
+  "kv_namespaces": [{ "binding": "KV", "id": "conf-kv-basic" }],
+}

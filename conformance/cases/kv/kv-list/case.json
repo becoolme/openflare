@@ -1,0 +1,210 @@
+{
+  "schemaVersion": 1,
+  "id": "kv-list",
+  "binding": "kv",
+  "title": "KV list() prefix/limit/cursor pagination, expiration + metadata surface",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/kv/api/list-keys/ (lexicographic key order, prefix filter, cursor pagination, list_complete)",
+    "https://developers.cloudflare.com/kv/api/write-key-value-pairs/ (metadata listed with the key; expiration shows as epoch seconds)"
+  ],
+  "steps": [
+    {
+      "name": "seed pa/a1",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "pa/a1",
+          "value": "1"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "seed pa/a2",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "pa/a2",
+          "value": "2"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "seed pb/b1",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "pb/b1",
+          "value": "3"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "list prefix=pa/",
+      "request": {
+        "path": "/list?prefix=pa/"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "names": [
+            "pa/a1",
+            "pa/a2"
+          ],
+          "list_complete": true,
+          "cursorPresent": false
+        }
+      }
+    },
+    {
+      "name": "paginate all (limit=1)",
+      "request": {
+        "path": "/list-all?limit=1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "names": [
+            "pa/a1",
+            "pa/a2",
+            "pb/b1"
+          ],
+          "pages": 3
+        }
+      }
+    },
+    {
+      "name": "truncated page carries cursor",
+      "request": {
+        "path": "/list?limit=1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "names": [
+            "pa/a1"
+          ],
+          "list_complete": false,
+          "cursorNonEmpty": true
+        }
+      }
+    },
+    {
+      "name": "seed metadata + expiring keys",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "pm/m1",
+          "value": "4",
+          "options": {
+            "metadata": {
+              "m": 2
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "seed expiring key",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "pe/e1",
+          "value": "5",
+          "options": {
+            "expirationTtl": 120
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "list surfaces metadata + expiration",
+      "request": {
+        "path": "/list?prefix=p"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "keys": [
+            {
+              "name": "pa/a1",
+              "metadata": null,
+              "hasValidExpiration": false
+            },
+            {
+              "name": "pa/a2",
+              "metadata": null,
+              "hasValidExpiration": false
+            },
+            {
+              "name": "pb/b1",
+              "metadata": null,
+              "hasValidExpiration": false
+            },
+            {
+              "name": "pe/e1",
+              "metadata": null,
+              "hasValidExpiration": true
+            },
+            {
+              "name": "pm/m1",
+              "metadata": {
+                "m": 2
+              },
+              "hasValidExpiration": false
+            }
+          ],
+          "list_complete": true
+        }
+      }
+    },
+    {
+      "name": "prefix miss \u2192 empty complete page",
+      "request": {
+        "path": "/list?prefix=zz/"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "names": [],
+          "list_complete": true
+        }
+      }
+    }
+  ]
+}
