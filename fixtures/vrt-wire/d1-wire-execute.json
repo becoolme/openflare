@@ -1,0 +1,16 @@
+[
+  {
+    "meta": {
+      "changed_db": true,
+      "changes": 0,
+      "duration": 0,
+      "last_row_id": 0,
+      "rows_read": 0,
+      "rows_written": 0,
+      "served_by": "vrt-sql",
+      "size_after": 16384
+    },
+    "results": [],
+    "success": true
+  }
+]

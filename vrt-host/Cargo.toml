@@ -1,0 +1,73 @@
+[package]
+name = "vrt-host"
+version = "0.1.0"
+edition = "2021"
+description = "Per-tenant workerd supervisor, assembly, and local HTTP ingress for the Vibeploy runtime (Phase 1 T5)"
+license = "MIT"
+default-run = "vrt-host"
+
+[features]
+default = []
+# Dev/test only: enables `WorkerEndpoint::Tcp`, `EmitMode::StubJson` and
+# the `vrt-stub-workerd` binary. NEVER enable in production builds —
+# loopback TCP worker endpoints are reachable by any process in the Pod.
+dev-stub = []
+
+[dependencies]
+arc-swap = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+chrono = "0.4"
+futures-util = "0.3"
+hex = "0.4"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+snapshot-protocol = { path = "../snapshot-protocol" }
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+vrt-config = { path = "../vrt-config" }
+vrt-provider = { path = "../vrt-provider" }
+vrt-metrics = { path = "../vrt-metrics" }
+vrt-securefs = { path = "../vrt-securefs" }
+vrt-objstore = { path = "../vrt-objstore" }
+vrt-sql = { path = "../vrt-sql" }
+# W6-r2: reclaim-time empty-DB check (`_cf_KV.INSTANCE_METADATA`)
+# in wf_delete — same pinned version as vrt-sql, no new dependency.
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[[bin]]
+name = "vrt-host"
+path = "src/bin/vrt-host.rs"
+
+[[bin]]
+name = "vrt-stub-workerd"
+path = "src/bin/vrt-stub-workerd.rs"
+required-features = ["dev-stub"]
+
+[dev-dependencies]
+
+vrt-local = { path = "../vrt-local" }
+tower = { version = "0.5", features = ["util"] }
+tempfile = "3"
+# Self dev-dependency: integration tests always build the library with
+# `dev-stub` (stub bin + TCP endpoints). `cargo build`/`cargo check`
+# never pull dev-dependencies, so production artifacts stay clean.
+vrt-host = { path = ".", features = ["dev-stub"] }
+cell-controller = { path = "../cell-controller" }
+snapshot-protocol = { path = "../snapshot-protocol" }
+serde_json = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }

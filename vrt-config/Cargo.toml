@@ -1,0 +1,17 @@
+[package]
+name = "vrt-config"
+version = "0.1.0"
+edition = "2021"
+description = "Deployment manifest to workerd static capnp config generator with content-addressed version bundles"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22"
+chrono = "0.4"
+hex = "0.4"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+snapshot-protocol = { path = "../snapshot-protocol" }
+thiserror = "2"

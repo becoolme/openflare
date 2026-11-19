@@ -1,0 +1,16 @@
+// CR1 — cron trigger e2e: the standalone CronRunner ticks every 30 s,
+// claims the current minute via FileTriggerLog, and vrt-host
+// /v1/cron/trigger dispatches through `sock-cron-<id>` →
+// `facade-cron-<id>` → Fetcher.scheduled() — the only real scheduled
+// channel in workerd. `scheduled()` writes D1 so the assertion is a
+// durable side effect, not an HTTP-200 inference.
+{
+  "name": "cron-demo",
+  "main": "main.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["cron.vrt.local/*"],
+  "triggers": { "crons": ["* * * * *"] },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "cron-demo-db", "database_id": "standalone-cron-demo" },
+  ],
+}

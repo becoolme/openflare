@@ -1,0 +1,10 @@
+{
+  "result": {
+    "code": "VRT_FENCED",
+    "error": "writer is fenced (epoch 7 expired)",
+    "retryable": true,
+    "success": false
+  },
+  "seq": 3,
+  "status": "DONE"
+}

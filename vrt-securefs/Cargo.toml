@@ -1,0 +1,9 @@
+[package]
+name = "vrt-securefs"
+version = "0.1.0"
+edition = "2021"
+description = "Shared filesystem hardening for workers-runtime components: segment encoding, 0700 directory checks, atomic writes"
+license = "MIT"
+
+[dependencies]
+libc = "0.2"

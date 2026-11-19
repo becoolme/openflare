@@ -1,0 +1,6 @@
+# C1: Cache API demo — exercises `caches.default` and `caches.open`
+# against the per-tenant unix-socket cache service.
+name = "cache-demo"
+mainModule = "main.js"
+compatibilityDate = "2024-09-25"
+hostnames = ["cache.vrt.local"]

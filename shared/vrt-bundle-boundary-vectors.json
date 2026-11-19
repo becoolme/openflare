@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "description": "Shared boundary vectors for bundle manifest validation — TS vrtBundle.ts and Rust vrt-config/src/manifest.rs must agree on every verdict. modulePrefix cases carry `value` + `other` (two module names); moduleName carries a single name.",
+  "cases": [
+    {
+      "name": "unicode-200-chars-600-bytes",
+      "field": "moduleName",
+      "value": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "expect": "reject"
+    },
+    {
+      "name": "unicode-170-chars-510-bytes",
+      "field": "moduleName",
+      "value": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+      "expect": "accept"
+    },
+    {
+      "name": "prefix-file-vs-dir",
+      "field": "modulePrefix",
+      "value": "lib",
+      "other": "lib/x.js",
+      "expect": "reject"
+    },
+    {
+      "name": "prefix-case-folded",
+      "field": "modulePrefix",
+      "value": "Lib",
+      "other": "lib/x.js",
+      "expect": "reject"
+    },
+    {
+      "name": "sibling-not-prefix",
+      "field": "modulePrefix",
+      "value": "libx",
+      "other": "lib/x.js",
+      "expect": "accept"
+    },
+    {
+      "name": "exact-same-name",
+      "field": "modulePrefix",
+      "value": "lib/a.js",
+      "other": "lib/b.js",
+      "expect": "accept"
+    },
+    {
+      "name": "nested-prefix",
+      "field": "modulePrefix",
+      "value": "a/b",
+      "other": "a/b/c.js",
+      "expect": "reject"
+    },
+    {
+      "name": "self-prefix-no",
+      "field": "modulePrefix",
+      "value": "lib/x.js",
+      "other": "lib/x.js",
+      "expect": "reject"
+    },
+    {
+      "name": "empty-segment",
+      "field": "moduleName",
+      "value": "a//b.js",
+      "expect": "reject"
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+//! T36b：FsStore::list 最长目录前缀遍历 + 前缀合法性。
+
+use vrt_objstore::{FsStore, ObjectStore};
+
+fn store_with(keys: &[&str]) -> (tempfile::TempDir, FsStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let s = FsStore::new(dir.path().to_path_buf()).unwrap();
+    for k in keys {
+        let p = dir.path().join(k);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"x").unwrap();
+    }
+    (dir, s)
+}
+
+fn block<T: Send>(f: impl std::future::Future<Output = T> + Send) -> T {
+    vrt_objstore::block_on_store(async move { Ok::<T, ()>(f.await) }).unwrap()
+}
+
+#[test]
+fn list_scopes_to_deepest_dir_prefix() {
+    let (_d, s) = store_with(&[
+        "db/a/seg1",
+        "db/a/seg2",
+        "db/ab/x", // `db/a` 前缀的中间边界——不得命中
+        "db/b/seg1",
+        "other/z",
+    ]);
+    let out = block(s.list("db/a/")).unwrap().entries;
+    let keys: Vec<_> = out.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys, ["db/a/seg1", "db/a/seg2"]);
+}
+
+#[test]
+fn list_mid_boundary_prefix_matches_siblings() {
+    let (_d, s) = store_with(&["db/abc-1/k", "db/abc-2/k", "db/abd/k", "db/b/k"]);
+    // 前缀落在目录名中间：`db/abc` 命中 abc-1/abc-2，不命中 abd/b。
+    let out = block(s.list("db/abc")).unwrap().entries;
+    let keys: Vec<_> = out.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys, ["db/abc-1/k", "db/abc-2/k"]);
+}
+
+#[test]
+fn list_nonexistent_prefix_is_empty_not_error() {
+    let (_d, s) = store_with(&["db/a/x"]);
+    let out = block(s.list("db/zzz/")).unwrap().entries;
+    assert!(out.is_empty());
+    // 前缀穿过不存在的子目录也是空。
+    let out = block(s.list("nope/deep/")).unwrap().entries;
+    assert!(out.is_empty());
+}
+
+#[test]
+fn list_rejects_traversal_and_absolute_prefix() {
+    let (_d, s) = store_with(&["db/a/x"]);
+    for bad in ["../etc", "a/../../x", "/abs/path", "a//b"] {
+        let r = block(s.list(bad));
+        match bad {
+            // "a//b" 段含空——fs 路径 join 不产生穿越，但 key 形态非法；
+            // 该前缀下永远无合法 key → 空结果即可接受，关键是不得读树外。
+            "a//b" => assert!(r.unwrap().entries.is_empty()),
+            _ => assert!(r.is_err(), "prefix {bad} must be rejected"),
+        }
+    }
+}
+
+#[test]
+fn list_ignores_lock_and_tmp_artifacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = FsStore::new(dir.path().to_path_buf()).unwrap();
+    std::fs::create_dir_all(dir.path().join("db/a")).unwrap();
+    std::fs::write(dir.path().join("db/a/k"), b"x").unwrap();
+    std::fs::write(dir.path().join("db/a/k.lock"), b"").unwrap();
+    std::fs::write(dir.path().join("db/a/.k.tmp-1-1"), b"").unwrap();
+    let out = block(s.list("db/a/")).unwrap().entries;
+    let keys: Vec<_> = out.iter().map(|e| e.key.as_str()).collect();
+    assert_eq!(keys, ["db/a/k"]);
+}

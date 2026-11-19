@@ -1,0 +1,22 @@
+// T37b — queue producer + consumer in ONE worker (CF parity: a worker
+// may produce to and consume the same queue). `queues.consumers[]`
+// lands on `queueConsumers` in the signed snapshot; the standalone
+// dispatcher (vrt serve) claims batches from vrt-sql and invokes this
+// worker's `queue(batch, env, ctx)` handler via the qconsumer socket.
+// `queue`/`dead_letter_queue` are DISPLAY names — runtime queueIds are
+// server-derived at pack time, never client-set.
+{
+  "name": "queue-demo",
+  "main": "main.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["queue.vrt.local/*"],
+  "queues": {
+    "producers": [{ "binding": "Q", "queue": "e2e-queue" }],
+    "consumers": [
+      { "queue": "e2e-queue", "max_batch_size": 5, "max_batch_timeout": 1 },
+    ],
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "queue-demo-db", "database_id": "standalone-queue-demo" },
+  ],
+}

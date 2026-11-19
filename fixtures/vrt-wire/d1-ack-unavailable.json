@@ -1,0 +1,10 @@
+{
+  "result": {
+    "code": "VRT_UNAVAILABLE",
+    "error": "unavailable: service shutting down",
+    "retryable": true,
+    "success": false
+  },
+  "seq": 4,
+  "status": "DONE"
+}

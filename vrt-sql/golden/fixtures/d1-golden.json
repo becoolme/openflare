@@ -1,0 +1,660 @@
+{
+  "miniflareVersion": "5.20260916.0-alpha",
+  "capturedAt": "2026-11-09",
+  "setup": [
+    {
+      "path": "/query",
+      "body": {
+        "sql": "CREATE TABLE t(a INTEGER, b TEXT, c BLOB)",
+        "params": []
+      }
+    },
+    {
+      "path": "/query",
+      "body": [
+        {
+          "sql": "INSERT INTO t VALUES(?,?,?)",
+          "params": [
+            1,
+            "x",
+            [
+              0,
+              1,
+              255
+            ]
+          ]
+        },
+        {
+          "sql": "INSERT INTO t VALUES(?,?,?)",
+          "params": [
+            2,
+            "y",
+            null
+          ]
+        }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "format-ARRAY_OF_OBJECTS",
+      "path": "/query?resultsFormat=ARRAY_OF_OBJECTS",
+      "requestBody": {
+        "sql": "SELECT a,b,c FROM t ORDER BY a",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "a": 1,
+              "b": "x",
+              "c": [
+                0,
+                1,
+                255
+              ]
+            },
+            {
+              "a": 2,
+              "b": "y",
+              "c": null
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 1,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 4,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "format-ROWS_AND_COLUMNS",
+      "path": "/query?resultsFormat=ROWS_AND_COLUMNS",
+      "requestBody": {
+        "sql": "SELECT a,b,c FROM t ORDER BY a",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": {
+            "columns": [
+              "a",
+              "b",
+              "c"
+            ],
+            "rows": [
+              [
+                1,
+                "x",
+                [
+                  0,
+                  1,
+                  255
+                ]
+              ],
+              [
+                2,
+                "y",
+                null
+              ]
+            ]
+          },
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 4,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "format-NONE",
+      "path": "/query?resultsFormat=NONE",
+      "requestBody": {
+        "sql": "SELECT a,b,c FROM t ORDER BY a",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "a": 1,
+              "b": "x",
+              "c": [
+                0,
+                1,
+                255
+              ]
+            },
+            {
+              "a": 2,
+              "b": "y",
+              "c": null
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 4,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "format-BOGUS",
+      "path": "/query?resultsFormat=BOGUS",
+      "requestBody": {
+        "sql": "SELECT a,b,c FROM t ORDER BY a",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "a": 1,
+              "b": "x",
+              "c": [
+                0,
+                1,
+                255
+              ]
+            },
+            {
+              "a": 2,
+              "b": "y",
+              "c": null
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 4,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "format-default",
+      "path": "/query",
+      "requestBody": {
+        "sql": "SELECT a FROM t ORDER BY a",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "a": 1
+            },
+            {
+              "a": 2
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 4,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "single-object",
+      "path": "/query",
+      "requestBody": {
+        "sql": "SELECT a FROM t WHERE a=?",
+        "params": [
+          1
+        ]
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "a": 1
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 2,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "batch-array",
+      "path": "/query",
+      "requestBody": [
+        {
+          "sql": "SELECT a FROM t WHERE a=?",
+          "params": [
+            1
+          ]
+        },
+        {
+          "sql": "SELECT b FROM t WHERE a=?",
+          "params": [
+            2
+          ]
+        }
+      ],
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "a": 1
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 2,
+            "rows_written": 0
+          }
+        },
+        {
+          "success": true,
+          "results": [
+            {
+              "b": "y"
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 2,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "params-types",
+      "path": "/query",
+      "requestBody": {
+        "sql": "SELECT ? AS n, ? AS s, ? AS z, ? AS bb",
+        "params": [
+          42,
+          "hi",
+          null,
+          [
+            222,
+            173
+          ]
+        ]
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "n": 42,
+              "s": "hi",
+              "z": null,
+              "bb": [
+                222,
+                173
+              ]
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 0,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "empty-sql",
+      "path": "/query",
+      "requestBody": {
+        "sql": "",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": false,
+      "bodyJson": {
+        "success": false,
+        "error": "No SQL statements detected."
+      }
+    },
+    {
+      "name": "comment-only",
+      "path": "/query",
+      "requestBody": {
+        "sql": "-- just a comment",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": false,
+      "bodyJson": {
+        "success": false,
+        "error": "SQL code did not contain a statement."
+      }
+    },
+    {
+      "name": "comment-then-select",
+      "path": "/query",
+      "requestBody": {
+        "sql": "-- head\nSELECT 1 AS one",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [
+            {
+              "one": 1
+            }
+          ],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": false,
+            "size_after": 12288,
+            "rows_read": 0,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "syntax-error",
+      "path": "/query",
+      "requestBody": {
+        "sql": "SELEC bad",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": false,
+      "bodyJson": {
+        "success": false,
+        "error": "near \"SELEC\": syntax error at offset 0: SQLITE_ERROR"
+      }
+    },
+    {
+      "name": "missing-table",
+      "path": "/query",
+      "requestBody": {
+        "sql": "SELECT * FROM nope",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": false,
+      "bodyJson": {
+        "success": false,
+        "error": "no such table: nope: SQLITE_ERROR"
+      }
+    },
+    {
+      "name": "constraint-error",
+      "path": "/query",
+      "requestBody": [
+        {
+          "sql": "CREATE TABLE uq(x UNIQUE)",
+          "params": []
+        },
+        {
+          "sql": "INSERT INTO uq VALUES(1)",
+          "params": []
+        }
+      ],
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 2,
+            "changed_db": true,
+            "size_after": 20480,
+            "rows_read": 1,
+            "rows_written": 3
+          }
+        },
+        {
+          "success": true,
+          "results": [],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 1,
+            "last_row_id": 1,
+            "changed_db": true,
+            "size_after": 20480,
+            "rows_read": 0,
+            "rows_written": 2
+          }
+        }
+      ]
+    },
+    {
+      "name": "constraint-violation",
+      "path": "/query",
+      "requestBody": {
+        "sql": "INSERT INTO uq VALUES(1)",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": false,
+      "bodyJson": {
+        "success": false,
+        "error": "UNIQUE constraint failed: uq.x: SQLITE_CONSTRAINT (extended: SQLITE_CONSTRAINT_UNIQUE)"
+      }
+    },
+    {
+      "name": "batch-mid-fail",
+      "path": "/query",
+      "requestBody": [
+        {
+          "sql": "INSERT INTO t VALUES(99,'z',null)",
+          "params": []
+        },
+        {
+          "sql": "SELECT * FROM missing_table",
+          "params": []
+        }
+      ],
+      "status": 200,
+      "bookmarkHeader": false,
+      "bodyJson": {
+        "success": false,
+        "error": "no such table: missing_table: SQLITE_ERROR"
+      }
+    },
+    {
+      "name": "batch-rollback-check",
+      "path": "/query",
+      "requestBody": {
+        "sql": "SELECT a FROM t WHERE a=99",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 0,
+            "last_row_id": 3,
+            "changed_db": false,
+            "size_after": 20480,
+            "rows_read": 2,
+            "rows_written": 0
+          }
+        }
+      ]
+    },
+    {
+      "name": "execute-single",
+      "path": "/execute",
+      "requestBody": {
+        "sql": "UPDATE t SET b='w' WHERE a=1",
+        "params": []
+      },
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 1,
+            "last_row_id": 3,
+            "changed_db": true,
+            "size_after": 20480,
+            "rows_read": 2,
+            "rows_written": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "execute-line-split",
+      "path": "/execute",
+      "requestBody": [
+        {
+          "sql": "UPDATE t SET b='v' WHERE a=1;",
+          "params": null
+        },
+        {
+          "sql": "UPDATE t SET b='u' WHERE a=2;",
+          "params": null
+        }
+      ],
+      "status": 200,
+      "bookmarkHeader": true,
+      "bodyJson": [
+        {
+          "success": true,
+          "results": [],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 1,
+            "last_row_id": 3,
+            "changed_db": true,
+            "size_after": 20480,
+            "rows_read": 2,
+            "rows_written": 1
+          }
+        },
+        {
+          "success": true,
+          "results": [],
+          "meta": {
+            "served_by": "miniflare.db",
+            "duration": 0,
+            "changes": 1,
+            "last_row_id": 3,
+            "changed_db": true,
+            "size_after": 20480,
+            "rows_read": 2,
+            "rows_written": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "malformed-sql-type",
+      "path": "/query",
+      "requestBody": {
+        "sql": 123
+      },
+      "status": 500,
+      "bookmarkHeader": false,
+      "bodyJson": "ZodError\n    at D1DatabaseObject.queryExecute (file:///repo/node_modules/.pnpm/miniflare@5.20260916.0-alpha_@types+node@22.20.1/node_modules/miniflare/dist/src/workers/d1/database.worker.js:190:35)\n    at async D1DatabaseObject.fetch (file:///repo/node_modules/.pnpm/miniflare@5.20260916.0-alpha_@types+node@22.20.1/node_modules/miniflare/dist/src/workers/shared/index.worker.js:388:18)\n    at async D1DatabaseObject.fetch (file:///repo/node_modules/.pnpm/miniflare@5.20260916.0-alpha_@types+node@22.20.1/node_modules/miniflare/dist/src/workers/shared/index.worker.js:555:14)"
+    },
+    {
+      "name": "malformed-scalar",
+      "path": "/query",
+      "requestBody": 42,
+      "status": 500,
+      "bookmarkHeader": false,
+      "bodyJson": "ZodError\n    at D1DatabaseObject.queryExecute (file:///repo/node_modules/.pnpm/miniflare@5.20260916.0-alpha_@types+node@22.20.1/node_modules/miniflare/dist/src/workers/d1/database.worker.js:190:35)\n    at async D1DatabaseObject.fetch (file:///repo/node_modules/.pnpm/miniflare@5.20260916.0-alpha_@types+node@22.20.1/node_modules/miniflare/dist/src/workers/shared/index.worker.js:388:18)\n    at async D1DatabaseObject.fetch (file:///repo/node_modules/.pnpm/miniflare@5.20260916.0-alpha_@types+node@22.20.1/node_modules/miniflare/dist/src/workers/shared/index.worker.js:555:14)"
+    }
+  ]
+}

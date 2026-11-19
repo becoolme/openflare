@@ -1,0 +1,41 @@
+# Stub-runtime overlay — the "no workerd" smoke profile:
+#   WORKERD_SOURCE=stub docker compose -f docker-compose.yml \
+#     -f docker-compose.stub.yml up --build
+#
+# T25/L10: compose interpolation resolves per-file BEFORE merge, so
+# WORKERD_SOURCE must come from the environment even here — the base
+# file deliberately has NO stub default (a bare `up` fails closed
+# instead of silently rebuilding a stub image).
+# This overlay builds target `runtime-stub` — the prod image plus a
+# vrt-host compiled WITH dev-stub (the prod host refuses mode=stub).
+# A distinct image tag keeps stub/prod images apart — `up` without
+# the overlay can never reuse a stub build.
+x-stub-image: &stub-image
+  image: vrt-standalone-stub:${VRT_IMAGE_TAG:-local}
+
+services:
+  # vrt-init owns the single build — one args override covers the image.
+  vrt-init:
+    <<: *stub-image
+    build:
+      target: runtime-stub
+      args:
+        WORKERD_SOURCE: ${WORKERD_SOURCE:-stub}
+    command:
+      - init
+      - --root
+      - /data
+      - --cell
+      - ${VRT_CELL:-local}
+      - --tenant
+      - ${VRT_TENANT:-local}
+      - --mode
+      - stub
+      - --workerd
+      - /usr/local/bin/workerd
+      - --ingress-listen
+      - 0.0.0.0:8080
+  vrt: {<<: *stub-image}
+  vrt-host: {<<: *stub-image}
+  vrt-provider: {<<: *stub-image}
+  vrt-sql: {<<: *stub-image}

@@ -1,0 +1,8 @@
+[package]
+name = "vrt-metrics"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Minimal typed Prometheus text-format registry shared by vrt-host, vrt-provider, cell-controller and vrt-local (no external deps)."
+
+[dependencies]

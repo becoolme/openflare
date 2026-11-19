@@ -1,0 +1,13 @@
+# W7 e2e — `class_name` is exported but the class does NOT extend
+# WorkflowEntrypoint: workerd loads it happily (the entrypoint map
+# only requires a class/function/ExportedHandler) and the failure
+# surfaces at engine init instead — so the deploy gate must reject it.
+name = "wf-bad-class"
+main = "main.js"
+compatibility_date = "2024-09-25"
+routes = ["wfbad.vrt.local/*"]
+
+[[workflows]]
+name = "order-flow"
+binding = "WF"
+class_name = "OrderFlow"

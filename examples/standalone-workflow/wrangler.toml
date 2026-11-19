@@ -1,0 +1,13 @@
+# W1 — Workflows e2e: wrangler `[[workflows]]` on VRT. The Engine is a
+# Durable Object inside the tenant workerd (localDisk SQLite under the
+# tenant DO dir); `env.WF` is a workerd `wrapped` binding → the
+# internal `wf-engine-*` service's WorkflowBinding entrypoint.
+name = "wf-demo"
+main = "main.js"
+compatibility_date = "2024-09-25"
+routes = ["wf.vrt.local/*"]
+
+[[workflows]]
+name = "order-flow"
+binding = "WF"
+class_name = "OrderFlow"

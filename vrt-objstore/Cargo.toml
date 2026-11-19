@@ -1,0 +1,29 @@
+[package]
+name = "vrt-objstore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Typed object-store abstraction (memory/fs/s3) with conditional-write CAS; shared SigV4 signing used by vrt-provider and vrt-sql persistence (T36)."
+
+[dependencies]
+async-trait = "0.1"
+chrono = "0.4"
+hex = "0.4"
+hmac = "0.12"
+libc = "0.2"
+quick-xml = { version = "0.38", features = ["serialize"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "charset",
+    "stream",
+] }
+futures-util = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

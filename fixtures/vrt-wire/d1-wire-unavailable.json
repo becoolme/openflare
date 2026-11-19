@@ -1,0 +1,9 @@
+{
+  "body": {
+    "code": "VRT_UNAVAILABLE",
+    "error": "unavailable: service shutting down",
+    "retryable": true,
+    "success": false
+  },
+  "status": 503
+}

@@ -1,0 +1,431 @@
+// Pure routing internals for facade-router (T31d/E0): cfg compile +
+// memoization, bounded index cache, path normalization, fetchable
+// resolution, index parsing. Kept OUT of the entry module — real
+// workerd requires entry modules to export a WorkerEntrypoint
+// subclass or a {fetch} object; helper/test exports on the entry
+// module mis-register it (T25/L12). Tests import this module's dist
+// bytes directly.
+
+// ── bounded in-isolate index cache (per manifestDigest) ─────────────
+export const MAX_INDEX_ENTRIES = 8;
+export const MAX_INDEX_BYTES = 4 * 1024 * 1024;
+// Wire pairing with vrt-provider `MAX_ROUTE_INDEX_PATHS`
+// (assets.rs): both sides apply the same 4096-path bound — the
+// provider short-circuits with `tooLarge` instead of streaming a
+// multi-MB path list, and this side treats any index exceeding the
+// bound the same way (degrade to `canFetchAsset`, never 503).
+export const MAX_INDEX_PATHS = 4096;
+
+export interface RouteIndex {
+  htmlHandling: string;
+  notFoundHandling: string;
+  paths: Set<string>;
+  approxBytes: number;
+  digest: string;
+  /// E3: manifest digest the provider asserts this index describes —
+  /// cross-checked against cfg before caching.
+  manifestDigest: string;
+}
+
+/// Cacheable entry per digest: a parsed index OR a tooLarge marker
+/// (T31d/E2 — the marker stops the per-request index+probe double RPC).
+export type CacheEntry =
+  | { kind: "index"; index: RouteIndex }
+  | { kind: "tooLarge"; digest: string; approxBytes: number };
+
+interface CacheSlot {
+  entry: CacheEntry;
+  lastUsed: number;
+}
+
+const indexCache = new Map<string, CacheSlot>();
+let indexCacheBytes = 0;
+let clock = 0;
+
+export function cacheGet(digest: string): CacheEntry | undefined {
+  const slot = indexCache.get(digest);
+  if (!slot) return undefined;
+  slot.lastUsed = ++clock;
+  return slot.entry;
+}
+
+function entryBytes(entry: CacheEntry): number {
+  return entry.kind === "index" ? entry.index.approxBytes : entry.approxBytes;
+}
+
+export function cachePut(entry: CacheEntry): void {
+  const key = entry.kind === "index" ? entry.index.digest : entry.digest;
+  const bytes = entryBytes(entry);
+  // T31f/F2: a single entry over the whole cache bound is never
+  // stored — and must NOT evict healthy entries (the previous shape
+  // inserted first, then evicted until it had emptied the cache).
+  if (bytes > MAX_INDEX_BYTES) return;
+  // Overwrite accounting: subtract the evicted entry's bytes before
+  // adding the new one's, or `indexCacheBytes` only ever grows.
+  const old = indexCache.get(key);
+  if (old) indexCacheBytes -= entryBytes(old.entry);
+  indexCacheBytes += bytes;
+  indexCache.set(key, { entry, lastUsed: ++clock });
+  while (indexCache.size > MAX_INDEX_ENTRIES || indexCacheBytes > MAX_INDEX_BYTES) {
+    let oldestKey: string | undefined;
+    let oldest = Infinity;
+    for (const [k, slot] of indexCache) {
+      if (slot.lastUsed < oldest) {
+        oldest = slot.lastUsed;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey === undefined) break;
+    const slot = indexCache.get(oldestKey);
+    if (!slot) break;
+    indexCacheBytes -= entryBytes(slot.entry);
+    indexCache.delete(oldestKey);
+  }
+}
+
+// T31g/G1.3: every RPC the router awaits is bounded — a hung
+// provider must surface as a typed 503, never as an indefinite stall.
+// `scheduler.wait` is the stable Workers sleep API (verified on
+// workerd 2026-09-16); `setTimeout` is the fallback for Node tests.
+// The timer runs in the CALLER's own request context, so a timeout
+// never shares I/O across requests — each awaiter races the shared
+// promise against its own clock.
+export class RpcTimeoutError extends Error {
+  constructor(what: string) {
+    super(`${what} RPC timed out`);
+    this.name = "RpcTimeoutError";
+  }
+}
+
+/// Mutable so tests can shrink the budget; production values are
+/// constants. Per-call-site budgets keep probe timeouts distinct from
+/// index timeouts in the reason enum.
+export const RPC_BUDGET = { indexMs: 5_000, probeMs: 5_000 };
+
+// T31h/H1: timers armed for a race must be cancelled when the race
+// settles — otherwise every routed request leaves an armed 5s timer
+// in its IoContext. Both paths honour AbortSignal: `scheduler.wait`
+// takes `{ signal }` (rejects AbortError on abort — verified on
+// workerd 2026-09-16); the `setTimeout` fallback is cleared and
+// rejects with the abort reason.
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  const sched = (
+    globalThis as {
+      scheduler?: {
+        wait?: (
+          n: number,
+          o?: { signal?: AbortSignal },
+        ) => Promise<void>;
+      };
+    }
+  ).scheduler;
+  if (sched && typeof sched.wait === "function") {
+    __timersPendingForTest.n++;
+    return sched.wait(ms, signal ? { signal } : undefined).then(
+      () => {
+        __timersPendingForTest.n--;
+      },
+      (e) => {
+        __timersPendingForTest.n--;
+        throw e;
+      },
+    );
+  }
+  __timersPendingForTest.n++;
+  return new Promise<void>((resolve, reject) => {
+    // Once-only settle: the abort listener outlives a fired timer
+    // (withTimeout aborts on every settle) — without this guard the
+    // pending counter would double-decrement on the timeout path.
+    let settled = false;
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      __timersPendingForTest.n--;
+      fn();
+    };
+    const t = setTimeout(() => done(resolve), ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(t);
+        done(() => reject(signal.reason ?? new Error("aborted")));
+      },
+      { once: true },
+    );
+  });
+}
+
+export function withTimeout<T>(
+  p: Promise<T>,
+  ms: number,
+  what: string,
+): Promise<T> {
+  const ac = new AbortController();
+  const timer = sleep(ms, ac.signal).then(() => {
+    throw new RpcTimeoutError(what);
+  });
+  // Abort on settle — the loser branch's timer is released whether
+  // the RPC won, timed out, or failed. `timer` already has handlers
+  // via race, so the abort's AbortError is never unhandled.
+  return Promise.race([p, timer]).finally(() => ac.abort());
+}
+
+/// Test-only: armed minus settled/cancelled timers created via
+/// `sleep`. A `withTimeout` race must return this to 0 on settle —
+/// a leftover armed timer is what H1 guards against.
+export const __timersPendingForTest = { n: 0 };
+
+// F2: in-flight dedup for route-index fetches — N concurrent requests
+// on the same digest share ONE fetch+parse. The promise is removed
+// once settled (failures are never cached: a rejected promise frees
+// the slot so the next request retries). Dedup never crosses digests.
+const indexInflight = new Map<string, Promise<IndexParse>>();
+
+export function fetchRouteIndexDedup(
+  digest: string,
+  fetcher: () => Promise<unknown>,
+): Promise<IndexParse> {
+  const existing = indexInflight.get(digest);
+  if (existing) return existing;
+  const p = (async (): Promise<IndexParse> => parseIndex(await fetcher()))();
+  indexInflight.set(digest, p);
+  const cleanup = () => {
+    if (indexInflight.get(digest) === p) indexInflight.delete(digest);
+  };
+  p.then(cleanup, cleanup);
+  return p;
+}
+
+/// Test-only probe: cache accounting invariant —
+/// `indexCacheBytes` must equal the sum of stored entry bytes.
+export function __cacheInvariantForTest(): {
+  entries: number;
+  bytes: number;
+  consistent: boolean;
+} {
+  let sum = 0;
+  for (const slot of indexCache.values()) sum += entryBytes(slot.entry);
+  return {
+    entries: indexCache.size,
+    bytes: indexCacheBytes,
+    consistent: sum === indexCacheBytes,
+  };
+}
+
+// ── rule matching (glob-only, path-only — router.worker.js:168–177) ──
+export const ESCAPE = /[-/\\^$+?.()|[\]{}]/g;
+export function globMatch(rules: RegExp[], path: string): boolean {
+  for (const re of rules) {
+    if (re.test(path)) return true;
+  }
+  return false;
+}
+
+// Percent-decode one path segment — mirror of Miniflare `decodePath`
+// (assets.worker.js:1057–1062) and vrt-provider `decode_segment`:
+// malformed escapes or non-UTF-8 decodes keep the raw segment.
+export function decodeSegment(seg: string): string {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
+  }
+}
+
+// Mirror of vrt-provider normalize_asset_path — identical byte rules:
+// decode each segment FIRST (manifest stores decoded file paths), then
+// structural checks.
+export function normalizePath(raw: string): string | null {
+  if (!raw || raw.length > 2048 || raw.includes("\\") || raw.includes("\0")) return null;
+  let out = raw.startsWith("/") ? "" : "/";
+  const trailing = raw.endsWith("/") && raw.length > 1;
+  const parts = raw.split("/").filter((p) => p !== "");
+  for (let i = 0; i < parts.length; i++) {
+    const part = decodeSegment(parts[i]);
+    if (part === "." || part === ".." || part.includes("\\") || part.includes("\0")) {
+      return null;
+    }
+    if (i > 0 || !out.endsWith("/")) out += "/";
+    out += part;
+  }
+  if (trailing && !out.endsWith("/")) out += "/";
+  return out === "" ? "/" : out;
+}
+
+// Mirror of vrt-provider resolve/resolve_with_nfh — existence only.
+// `fetchable` means resolve() would produce Serve | Redirect |
+// SpaFallback (anything except NotFound).
+export function intentFetchable(
+  index: RouteIndex,
+  path: string,
+  navigate: boolean,
+  hasStaticRouting: boolean,
+): boolean {
+  const has = (p: string) => index.paths.has(p);
+  if (has(path)) return true;
+  const nfh =
+    hasStaticRouting || navigate ? index.notFoundHandling : "none";
+  if (index.htmlHandling === "auto-trailing-slash") {
+    if (path.endsWith("/")) {
+      if (has(`${path}index.html`)) return true;
+    } else {
+      if (has(`${path}.html`)) return true;
+      if (has(`${path}/index.html`)) return true; // 308 → fetchable
+    }
+  }
+  if (nfh === "single-page-application") return has("/index.html");
+  if (nfh === "404-page") {
+    // assets.worker.js:1011–1037 — the nearest ANCESTOR 404.html
+    // serves: /a/b/c → /a/b/404.html, /a/404.html, /404.html.
+    let dir = path;
+    while (dir.length > 0) {
+      const idx = dir.lastIndexOf("/");
+      dir = idx <= 0 ? "" : dir.slice(0, idx);
+      if (has(`${dir === "" ? "" : dir}/404.html`)) return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+interface RouterCfg {
+  invokeUserWorkerAhead?: boolean;
+  userWorker?: string[];
+  assetWorker?: string[];
+  manifestDigest?: string;
+}
+
+export interface CompiledCfg {
+  invokeAhead: boolean;
+  userWorker: RegExp[];
+  assetWorker: RegExp[];
+  manifestDigest: string;
+}
+
+// Compiled cfgs memoized by raw string — the JSON.parse and the
+// ≤200 RegExp constructions run once per cfg value, not per request.
+// Bounded: workerd keeps module state per isolate; cfg changes
+// (redeploy) create a new key, so stale entries self-evict at the cap.
+const MAX_CFG_ENTRIES = 16;
+const cfgCache = new Map<string, CompiledCfg | undefined>();
+let cfgCompiles = 0; // test probe — never reset
+
+function compileRule(rule: string): RegExp | undefined {
+  try {
+    return new RegExp(
+      "^" + rule.split("*").map((s) => s.replace(ESCAPE, "\$&")).join(".*") + "$",
+    );
+  } catch {
+    return undefined; // malformed rule never matches (validated upstream)
+  }
+}
+
+/// Compile `VRT_ROUTER_CFG` once per value. Returns undefined for ANY
+/// malformed cfg — unreadable JSON, bad rule shapes, or a missing/
+/// non-sha256 `manifestDigest` (config corruption — the router is only
+/// emitted for manifests carrying the digest, so absence is never
+/// legitimate). Callers treat undefined as route-unavailable.
+export function compileCfg(raw: string): CompiledCfg | undefined {
+  if (cfgCache.has(raw)) return cfgCache.get(raw);
+  cfgCompiles++;
+  const compiled = ((): CompiledCfg | undefined => {
+    let cfg: RouterCfg;
+    try {
+      cfg = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+    if (typeof cfg !== "object" || cfg === null) return undefined;
+    const digest = cfg.manifestDigest;
+    if (typeof digest !== "string" || !/^[0-9a-f]{64}$/.test(digest)) {
+      return undefined;
+    }
+    const userWorker = Array.isArray(cfg.userWorker) ? cfg.userWorker : [];
+    const assetWorker = Array.isArray(cfg.assetWorker) ? cfg.assetWorker : [];
+    if (userWorker.length + assetWorker.length > 200) return undefined;
+    if (
+      userWorker.some((r) => typeof r !== "string" || r.length > 512) ||
+      assetWorker.some((r) => typeof r !== "string" || r.length > 512)
+    ) {
+      return undefined;
+    }
+    return {
+      invokeAhead: cfg.invokeUserWorkerAhead === true,
+      userWorker: userWorker.map(compileRule).filter((r): r is RegExp => !!r),
+      assetWorker: assetWorker.map(compileRule).filter((r): r is RegExp => !!r),
+      manifestDigest: digest,
+    };
+  })();
+  cfgCache.set(raw, compiled);
+  if (cfgCache.size > MAX_CFG_ENTRIES) {
+    // FIFO evict — insertion-ordered Map; cfg churn is bounded.
+    const oldest = cfgCache.keys().next();
+    if (!oldest.done) cfgCache.delete(oldest.value);
+  }
+  return compiled;
+}
+
+// E4: whitelist — mirrors provider html_wire/nfh_wire output.
+const HTML_HANDLINGS = new Set(["auto-trailing-slash", "none"]);
+const NOT_FOUND_HANDLINGS = new Set(["none", "404-page", "single-page-application"]);
+const DIGEST_HEX = /^[0-9a-f]{64}$/;
+
+export type IndexParse =
+  | { kind: "index"; index: RouteIndex }
+  | { kind: "tooLarge" } // exceeds the cacheable bound → degrade, not 503
+  | { kind: "invalid" }; // malformed payload → fail closed 503
+
+export function parseIndex(raw: unknown): IndexParse {
+  if (typeof raw !== "object" || raw === null) return { kind: "invalid" };
+  const doc = raw as {
+    htmlHandling?: unknown;
+    notFoundHandling?: unknown;
+    paths?: unknown;
+    tooLarge?: unknown;
+    manifestDigest?: unknown;
+  };
+  if (
+    typeof doc.htmlHandling !== "string" ||
+    !HTML_HANDLINGS.has(doc.htmlHandling) ||
+    typeof doc.notFoundHandling !== "string" ||
+    !NOT_FOUND_HANDLINGS.has(doc.notFoundHandling)
+  ) {
+    return { kind: "invalid" };
+  }
+  // E3: every route-index response must name the manifest it
+  // describes; absence is malformed.
+  if (typeof doc.manifestDigest !== "string" || !DIGEST_HEX.test(doc.manifestDigest)) {
+    return { kind: "invalid" };
+  }
+  const md = doc.manifestDigest;
+  // Provider-side cap: same bound as MAX_INDEX_PATHS — an oversized
+  // manifest gets `tooLarge` without streaming its path list.
+  if (doc.tooLarge === true) return { kind: "tooLarge" };
+  if (!Array.isArray(doc.paths)) return { kind: "invalid" };
+  if (doc.paths.length > MAX_INDEX_PATHS) return { kind: "tooLarge" };
+  const paths = new Set<string>();
+  let approxBytes = 64;
+  for (const p of doc.paths) {
+    if (typeof p !== "string" || p.length > 2048) return { kind: "invalid" };
+    paths.add(p);
+    approxBytes += p.length + 8;
+  }
+  if (approxBytes > MAX_INDEX_BYTES) return { kind: "tooLarge" };
+  return {
+    kind: "index",
+    index: {
+      htmlHandling: doc.htmlHandling,
+      notFoundHandling: doc.notFoundHandling,
+      paths,
+      approxBytes,
+      digest: "", // set by the caller (cfg.manifestDigest)
+      manifestDigest: md,
+    },
+  };
+}
+
+/// Test-only probe: how many cfg strings have been compiled in this
+/// isolate (proves memoization without monkey-patching).
+export function __cfgCompileCountForTest(): number {
+  return cfgCompiles;
+}

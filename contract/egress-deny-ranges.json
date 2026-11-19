@@ -1,0 +1,109 @@
+{
+  "embeddedPrefixes": [
+    "::ffff:0.0.0.0/96",
+    "64:ff9b::/96",
+    "::/96"
+  ],
+  "generatedBy": "vrt-config egress.rs deny-range tables (single source of truth)",
+  "ipv4": [
+    {
+      "cidr": "0.0.0.0/8",
+      "code": "ip_this_net"
+    },
+    {
+      "cidr": "10.0.0.0/8",
+      "code": "ip_private"
+    },
+    {
+      "cidr": "100.64.0.0/10",
+      "code": "ip_cgnat"
+    },
+    {
+      "cidr": "127.0.0.0/8",
+      "code": "ip_loopback"
+    },
+    {
+      "cidr": "169.254.0.0/16",
+      "code": "ip_link_local"
+    },
+    {
+      "cidr": "172.16.0.0/12",
+      "code": "ip_private"
+    },
+    {
+      "cidr": "192.0.0.0/24",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "192.0.2.0/24",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "192.168.0.0/16",
+      "code": "ip_private"
+    },
+    {
+      "cidr": "198.18.0.0/15",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "198.51.100.0/24",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "203.0.113.0/24",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "224.0.0.0/4",
+      "code": "ip_multicast"
+    },
+    {
+      "cidr": "240.0.0.0/4",
+      "code": "ip_reserved"
+    }
+  ],
+  "ipv6": [
+    {
+      "cidr": "::/128",
+      "code": "ip_unspecified"
+    },
+    {
+      "cidr": "::1/128",
+      "code": "ip_loopback"
+    },
+    {
+      "cidr": "100::/64",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "2001::/32",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "2001:db8::/32",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "2002::/16",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "64:ff9b:1::/48",
+      "code": "ip_reserved"
+    },
+    {
+      "cidr": "fc00::/7",
+      "code": "ip_ula"
+    },
+    {
+      "cidr": "fe80::/10",
+      "code": "ip_link_local"
+    },
+    {
+      "cidr": "ff00::/8",
+      "code": "ip_multicast"
+    }
+  ],
+  "schemaVersion": 1
+}

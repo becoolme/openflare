@@ -1,0 +1,103 @@
+# syntax=docker/dockerfile:1
+# vrt-host — runtime supervisor + ingress, multi-stage.
+#
+# workerd is NEVER downloaded/built by this repo. The image expects an
+# external workerd binary delivered via one of:
+#   WORKERD_SOURCE=file   deploy/docker/workerd  + build-arg WORKERD_SHA256
+#                         (reproducible: bytes fixed by digest)
+#   WORKERD_SOURCE=image  WORKERD_IMAGE pinned-by-digest image exposing
+#                         /usr/local/bin/workerd
+#   WORKERD_SOURCE=none   no workerd baked in — mount/verify at runtime
+#                         (stub-mode or operator-provided)
+# Unknown WORKERD_SOURCE values fail the build (no such stage).
+ARG RUST_IMAGE=rust:1.93.0-bookworm
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+ARG WORKERD_IMAGE=debian:bookworm-slim
+ARG WORKERD_SOURCE=none
+
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /build
+COPY . .
+RUN set -eux; \
+    cargo build --release --locked -p vrt-host --bin vrt-host; \
+    install -D -m 0755 target/release/vrt-host /out/vrt-host
+
+FROM ${DEBIAN_IMAGE} AS workerd-file
+ARG WORKERD_SHA256
+# RV-R83: buildx sets TARGETARCH from --platform; the ELF machine of the
+# supplied binary must match it (a linux-x64 workerd in an arm64 image
+# would pass the sha256 check and then fail at exec). Unknown arch or
+# non-ELF input fails the build.
+ARG TARGETARCH
+COPY deploy/docker/workerd /workerd
+RUN set -eux; \
+    test -n "${WORKERD_SHA256:-}" || { echo "FATAL: WORKERD_SHA256 required"; exit 1; }; \
+    echo "${WORKERD_SHA256}  /workerd" | sha256sum -c -; \
+    test "$(od -An -tx1 -N4 /workerd | tr -d ' \n')" = "7f454c46" || { echo "FATAL: workerd is not an ELF binary"; exit 1; }; \
+    machine="$(od -An -tx1 -j18 -N2 /workerd | tr -d ' \n')"; \
+    case "${TARGETARCH:-}:${machine}" in \
+      amd64:3e00|arm64:b700) ;; \
+      *) echo "FATAL: workerd ELF machine ${machine} does not match TARGETARCH=${TARGETARCH:-unset}"; exit 1 ;; \
+    esac; \
+    install -D -m 0755 /workerd /opt/vrt/workerd
+
+FROM ${WORKERD_IMAGE} AS workerd-image
+ARG TARGETARCH
+RUN set -eux; \
+    test -x /usr/local/bin/workerd || { echo "FATAL: WORKERD_IMAGE lacks /usr/local/bin/workerd"; exit 1; }; \
+    machine="$(od -An -tx1 -j18 -N2 /usr/local/bin/workerd | tr -d ' \n')"; \
+    case "${TARGETARCH:-}:${machine}" in \
+      amd64:3e00|arm64:b700) ;; \
+      *) echo "FATAL: workerd ELF machine ${machine} does not match TARGETARCH=${TARGETARCH:-unset}"; exit 1 ;; \
+    esac; \
+    install -D -m 0755 /usr/local/bin/workerd /opt/vrt/workerd
+
+FROM ${DEBIAN_IMAGE} AS workerd-none
+RUN install -d /opt/vrt
+
+FROM workerd-${WORKERD_SOURCE} AS workerd-pick
+
+# debian-slim over distroless: vrt-host shells workerd via execve —
+# it needs only the binary, but operator debugging (capnp dump, ls of
+# state dirs) is part of the support contract for a supervisor; slim
+# gives /bin/sh + coreutils at ~30MB. Root filesystem stays read-only
+# in the manifests — writable state lives on the mounted volume.
+FROM ${DEBIAN_IMAGE} AS runtime
+ARG VRT_UID=10001
+ARG VRT_GID=10001
+# MIG-10: ca-certificates is LOAD-BEARING — workerd's outbound-network
+# TLS (trustBrowserCas=true) reads /etc/ssl/certs from THIS stage, so a
+# bookworm-slim image without the CA bundle fails every tenant HTTPS
+# egress with "unable to get local issuer certificate" (observed as
+# 502 EGRESS_UPSTREAM on 2026-11-17). The build-time `test -s` is the
+# regression gate; vrt-host additionally probes the trust store at
+# startup and surfaces `vrt_host_egress_trust_store_ok`.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid "${VRT_GID}" vrt; \
+    useradd --system --uid "${VRT_UID}" --gid vrt --home-dir /data vrt; \
+    install -d -o vrt -g vrt -m 0700 /data /tmp; \
+    test -s /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/vrt-host /usr/local/bin/vrt-host
+COPY --from=workerd-pick /opt/vrt/ /opt/vrt/
+RUN test ! -e /opt/vrt/workerd || test -x /opt/vrt/workerd
+# RV-R83: facade dir layout = {manifest.json, dist/...} at
+# /opt/vrt/facade — the path every vrt-host.toml `[render].facadeManifest`
+# references (base + all overlays). A module's bytes live at
+# <dir>/dist/<module.name>; vrt-host verifies each against the manifest
+# sha256 before seeding its object cache. Read-only, owned by root: the
+# runtime user (uid 10001) can neither edit nor replace them.
+COPY --chown=0:0 facade/manifest.json /opt/vrt/facade/manifest.json
+COPY --chown=0:0 facade/dist /opt/vrt/facade/dist
+RUN set -eux; \
+    test -s /opt/vrt/facade/manifest.json; \
+    test -d /opt/vrt/facade/dist; \
+    chown -R 0:0 /opt/vrt/facade; \
+    chmod -R u=rwX,go=rX,a-w /opt/vrt/facade
+USER vrt
+WORKDIR /data
+# /data is the state volume mount point (desired/, bundles/, tenants/).
+VOLUME ["/data"]
+CMD ["/usr/local/bin/vrt-host"]

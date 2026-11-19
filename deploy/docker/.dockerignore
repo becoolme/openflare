@@ -1,0 +1,8 @@
+# Build context must stay small — target/ alone is multi-GB.
+target/
+**/node_modules/
+**/.git/
+deploy/standalone/vrt-data/
+*.log
+**/*.sock
+.DS_Store

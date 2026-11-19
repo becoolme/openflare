@@ -1,0 +1,704 @@
+{
+ "version": 1,
+ "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here — that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
+ "vectors": [
+  {
+   "name": "toml full mapping",
+   "files": {
+    "wrangler.toml": "name = \"edge-api\"\nmain = \"src/worker.ts\"\ncompatibility_date = \"2025-01-15\"\ncompatibility_flags = [\"nodejs_compat\"]\naccount_id = \"cf-account-1\"\nworkers_dev = true\nroutes = [\"api.example.com/*\", \"www.example.com\"]\n\n[vars]\nLOG_LEVEL = \"info\"\nLIMIT = 42\nFLAG = true\n\n[[kv_namespaces]]\nbinding = \"CACHE\"\nid = \"ns-1\"\n\n[[r2_buckets]]\nbinding = \"BUCKET\"\nbucket_name = \"my-bucket\"\n\n[[services]]\nbinding = \"SVC\"\nservice = \"other-worker\"\nentrypoint = \"ApiEntrypoint\"\n\n[triggers]\ncrons = [\"*/15 * * * *\", \"0 9 * * mon-fri\"]\n\n[assets]\ndirectory = \"public\"\nbinding = \"ASSETS\"\nhtml_handling = \"auto-trailing-slash\"\nnot_found_handling = \"single-page-application\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "edge-api",
+     "main": "src/worker.ts",
+     "compatibilityDate": "2025-01-15",
+     "compatibilityFlags": [
+      "nodejs_compat"
+     ],
+     "vars": {
+      "LOG_LEVEL": "info",
+      "LIMIT": 42,
+      "FLAG": true
+     },
+     "bindings": [
+      {
+       "type": "kv",
+       "name": "CACHE",
+       "id": "ns-1"
+      },
+      {
+       "type": "r2",
+       "name": "BUCKET",
+       "bucketName": "my-bucket"
+      },
+      {
+       "type": "service",
+       "name": "SVC",
+       "service": "other-worker",
+       "entrypoint": "ApiEntrypoint"
+      }
+     ],
+     "crons": [
+      "*/15 * * * *",
+      "0 9 * * mon-fri"
+     ],
+     "routeHostnames": [
+      "api.example.com",
+      "www.example.com"
+     ],
+     "assets": {
+      "directory": "public",
+      "binding": "ASSETS",
+      "htmlHandling": "auto-trailing-slash",
+      "notFoundHandling": "single-page-application"
+     }
+    }
+   }
+  },
+  {
+   "name": "jsonc with comments and trailing commas",
+   "files": {
+    "wrangler.jsonc": "// project config\n{\n  \"name\": \"json-api\",\n  \"main\": \"dist/index.js\",\n  \"compatibility_date\": \"2025-03-01\",\n  \"vars\": {\n    \"MODE\": \"prod\", // trailing\n  },\n  \"kv_namespaces\": [\n    { \"binding\": \"KV\" },\n  ],\n}\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.jsonc",
+    "config": {
+     "schemaVersion": 1,
+     "name": "json-api",
+     "main": "dist/index.js",
+     "compatibilityDate": "2025-03-01",
+     "vars": {
+      "MODE": "prod"
+     },
+     "bindings": [
+      {
+       "type": "kv",
+       "name": "KV"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "env merge replaces non-inheritable keys",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[vars]\nA = \"base\"\nB = \"base\"\n\n[env.production]\ncompatibility_date = \"2025-06-01\"\n\n[env.production.vars]\nB = \"prod\"\nC = \"prod\"\n"
+   },
+   "envName": "production",
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-06-01",
+     "vars": {
+      "B": "prod",
+      "C": "prod"
+     }
+    }
+   }
+  },
+  {
+   "name": "env name without matching env block",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n"
+   },
+   "envName": "staging",
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "env"
+   }
+  },
+  {
+   "name": "d1 without database_name rejected with field path",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[d1_databases]]\nbinding = \"DB\"\ndatabase_id = \"abc\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "d1_databases[0].database_name"
+   },
+   "rustExpect": {
+    "ok": true,
+    "config": {
+     "bindings": [
+      {
+       "databaseId": "abc",
+       "name": "DB",
+       "type": "d1"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "d1 binds by database_name (database_id and dev keys ignored)",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[d1_databases]]\nbinding = \"DB\"\ndatabase_name = \"main-db\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "databaseName": "main-db",
+       "name": "DB",
+       "type": "d1"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "queues producers map to queue bindings",
+   "files": {
+    "wrangler.json": "{ \"name\": \"svc\", \"main\": \"src/index.ts\", \"compatibility_date\": \"2025-01-01\", \"queues\": { \"producers\": [{ \"binding\": \"Q\", \"queue\": \"q1\" }] } }\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.json",
+    "config": {
+     "bindings": [
+      {
+       "name": "Q",
+       "queue": "q1",
+       "type": "queue"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "nested unsupported trigger key keeps full path",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[triggers]\ncrons = [\"0 0 * * *\"]\nqueue = \"nope\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "triggers.queue"
+   }
+  },
+  {
+   "name": "documented ignore-list entries are dropped",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\naccount_id = \"cf-acct\"\nworkers_dev = true\nkeep_vars = true\nsend_metrics = false\n\n[build]\ncommand = \"npm run build\"\n\n[dev]\nport = 8787\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   }
+  },
+  {
+   "name": "route with path component is not a hostname",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [\"api.example.com/v1/*\"]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "routes[0]"
+   }
+  },
+  {
+   "name": "wrangler.json beats wrangler.toml",
+   "files": {
+    "wrangler.json": "{ \"name\": \"json-wins\", \"main\": \"a.ts\", \"compatibility_date\": \"2025-01-01\" }\n",
+    "wrangler.toml": "name = \"toml-loses\"\nmain = \"b.ts\"\ncompatibility_date = \"2025-01-02\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.json",
+    "config": {
+     "schemaVersion": 1,
+     "name": "json-wins",
+     "main": "a.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   }
+  },
+  {
+   "name": "explicit configFile selects toml over json",
+   "files": {
+    "wrangler.json": "{ \"name\": \"json\", \"main\": \"a.ts\", \"compatibility_date\": \"2025-01-01\" }\n",
+    "wrangler.toml": "name = \"toml-picked\"\nmain = \"b.ts\"\ncompatibility_date = \"2025-01-02\"\n"
+   },
+   "configFile": "wrangler.toml",
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "toml-picked",
+     "main": "b.ts",
+     "compatibilityDate": "2025-01-02"
+    }
+   }
+  },
+  {
+   "name": "service binding keeps entrypoint",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[services]]\nbinding = \"AUTH\"\nservice = \"auth-worker\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "bindings": [
+      {
+       "type": "service",
+       "name": "AUTH",
+       "service": "auth-worker"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "malformed toml fails with file label",
+   "files": {
+    "wrangler.toml": "name = \"unclosed\nmain = \n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "wrangler.toml"
+   }
+  },
+  {
+   "name": "vars reject non-JSON shapes",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\nvars = \"not-a-table\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "vars"
+   }
+  },
+  {
+   "name": "assets run_worker_first glob rules",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[assets]\ndirectory = \"public\"\nbinding = \"ASSETS\"\nrun_worker_first = [\"/api/*\", \"!/api/static/*\"]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "assets": {
+      "directory": "public",
+      "binding": "ASSETS",
+      "runWorkerFirst": [
+       "/api/*",
+       "!/api/static/*"
+      ]
+     }
+    }
+   }
+  },
+  {
+   "name": "assets run_worker_first boolean",
+   "files": {
+    "wrangler.json": "{\n  \"name\": \"svc\",\n  \"main\": \"src/index.ts\",\n  \"compatibility_date\": \"2025-01-01\",\n  \"assets\": {\n    \"directory\": \"public\",\n    \"binding\": \"ASSETS\",\n    \"run_worker_first\": true\n  }\n}\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.json",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "assets": {
+      "directory": "public",
+      "binding": "ASSETS",
+      "runWorkerFirst": true
+     }
+    }
+   }
+  },
+  {
+   "name": "run_worker_first all-negated rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[assets]\ndirectory = \"public\"\nrun_worker_first = [\"!/a/*\", \"!/b/*\"]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "assets.run_worker_first"
+   }
+  },
+  {
+   "name": "queues consumers normalized (all fields + defaults)",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[queues.consumers]]\nqueue = \"q1\"\nmax_batch_size = 10\nmax_batch_timeout = 2\nmax_retries = 3\nretry_delay = 5\ndead_letter_queue = \"dlq\"\nmax_concurrency = 4\n\n[[queues.consumers]]\nqueue = \"q2\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "queueConsumers": [
+      {
+       "queue": "q1",
+       "maxBatchSize": 10,
+       "maxBatchTimeoutMs": 2000,
+       "maxRetries": 3,
+       "retryDelaySeconds": 5,
+       "deadLetterQueue": "dlq",
+       "maxConcurrency": 4
+      },
+      {
+       "queue": "q2"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "queues consumer unknown key rejected with field path",
+   "files": {
+    "wrangler.json": "{ \"name\": \"svc\", \"main\": \"src/index.ts\", \"compatibility_date\": \"2025-01-01\", \"queues\": { \"consumers\": [{ \"queue\": \"q1\", \"max_ack\": 3 }] } }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "queues.consumers[0].max_ack"
+   }
+  },
+  {
+   "name": "queues producer extra key rejected with field path",
+   "files": {
+    "wrangler.json": "{ \"name\": \"svc\", \"main\": \"src/index.ts\", \"compatibility_date\": \"2025-01-01\", \"queues\": { \"producers\": [{ \"binding\": \"Q\", \"queue\": \"q1\", \"delivery_delay\": 5 }] } }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "queues.producers[0].delivery_delay"
+   }
+  },
+  {
+   "name": "durable objects bindings normalized",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[durable_objects]\nbindings = [\n  { name = \"COUNTER\", class_name = \"Counter\" },\n  { name = \"SHARED\", class_name = \"Shared\", script_name = \"peer\" },\n]\n"
+   },
+   "expect": {
+    "ok": true,
+    "config": {
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "schemaVersion": 1,
+     "durableObjectBindings": [
+      {
+       "name": "COUNTER",
+       "className": "Counter"
+      },
+      {
+       "name": "SHARED",
+       "className": "Shared",
+       "scriptName": "peer"
+      }
+     ]
+    },
+    "source": "wrangler.toml"
+   }
+  },
+  {
+   "name": "durable objects migrations normalized",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[migrations]]\ntag = \"v1\"\nnew_sqlite_classes = [\"Counter\"]\n\n[[migrations]]\ntag = \"v2\"\nrenamed_classes = [{ from = \"Counter\", to = \"CounterV2\" }]\ndeleted_classes = [\"Old\"]\nnew_classes = [\"KvObj\"]\n"
+   },
+   "expect": {
+    "ok": true,
+    "config": {
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "schemaVersion": 1,
+     "durableObjectMigrations": [
+      {
+       "tag": "v1",
+       "newSqliteClasses": [
+        "Counter"
+       ]
+      },
+      {
+       "tag": "v2",
+       "renamedClasses": [
+        {
+         "from": "Counter",
+         "to": "CounterV2"
+        }
+       ],
+       "deletedClasses": [
+        "Old"
+       ],
+       "newClasses": [
+        "KvObj"
+       ]
+      }
+     ]
+    },
+    "source": "wrangler.toml"
+   }
+  },
+  {
+   "name": "durable objects unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[durable_objects]\nsomething = 1\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "durable_objects.something"
+   }
+  },
+  {
+   "name": "migrations transferred_classes missing fields rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[migrations]]\ntag = \"v1\"\ntransferred_classes = [{ from = \"A\" }]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "migrations[0].transferred_classes[0].from_script"
+   },
+   "rustExpect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "migrations[0].transferred_classes"
+   }
+  },
+  {
+   "name": "durable objects binding missing class_name rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[durable_objects]\nbindings = [{ name = \"C\" }]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "durable_objects.bindings[0].class_name"
+   }
+  },
+  {
+   "name": "hyperdrive binds by database_tenant",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[hyperdrive]]\nbinding = \"DB\"\ndatabase_tenant = \"whois\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "bindings": [
+      {
+       "type": "hyperdrive",
+       "name": "DB",
+       "databaseTenant": "whois"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "hyperdrive external id is never identity",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[hyperdrive]]\nbinding = \"DB\"\nid = \"2f5d28b1-a0f4-4a3f-9d1c-cloudflare-uuid\"\ndatabase_tenant = \"whois\"\nlocalConnectionString = \"postgres://local:local@127.0.0.1:5432/x\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "bindings": [
+      {
+       "type": "hyperdrive",
+       "name": "DB",
+       "databaseTenant": "whois"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "hyperdrive missing database_tenant rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[hyperdrive]]\nbinding = \"DB\"\nid = \"cf-id\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "hyperdrive[0].database_tenant"
+   }
+  },
+  {
+   "name": "hyperdrive unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[hyperdrive]]\nbinding = \"DB\"\ndatabase_tenant = \"whois\"\nhyperdrive_id = \"h1\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "hyperdrive[0].hyperdrive_id"
+   }
+  },
+  {
+   "name": "ratelimits binds with simple limit/period",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RATE_LIMITER\"\nnamespace_id = \"1001\"\nsimple = { limit = 40, period = 60 }\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "bindings": [
+      {
+       "type": "ratelimit",
+       "name": "RATE_LIMITER",
+       "namespaceId": "1001",
+       "limit": 40,
+       "period": 60
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "ratelimits period 30 rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = \"1\"\nsimple = { limit = 5, period = 30 }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "ratelimits[0].simple.period"
+   }
+  },
+  {
+   "name": "ratelimits limit 0 rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = \"1\"\nsimple = { limit = 0, period = 60 }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "ratelimits[0].simple.limit"
+   }
+  },
+  {
+   "name": "ratelimits limit above cap rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = \"1\"\nsimple = { limit = 1000001, period = 60 }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "ratelimits[0].simple.limit"
+   }
+  },
+  {
+   "name": "ratelimits non-digit namespace rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = \"ab1\"\nsimple = { limit = 5, period = 10 }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "ratelimits[0].namespace_id"
+   }
+  },
+  {
+   "name": "ratelimits numeric namespace rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = 1001\nsimple = { limit = 5, period = 10 }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "ratelimits[0].namespace_id"
+   }
+  },
+  {
+   "name": "ratelimits unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = \"1\"\nsimple = { limit = 5, period = 10 }\nextra = true\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "ratelimits[0].extra"
+   }
+  },
+  {
+   "name": "ratelimits unknown simple key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = \"1\"\nsimple = { limit = 5, period = 10, burst = 2 }\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "ratelimits[0].simple.burst"
+   }
+  },
+  {
+   "name": "ratelimits missing simple rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[ratelimits]]\nname = \"RL\"\nnamespace_id = \"1\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "ratelimits[0].simple"
+   }
+  }
+ ]
+}

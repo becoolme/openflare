@@ -1,0 +1,47 @@
+# VRT 平台模式 —— cell-controller 示例配置。
+# 部署时把所有 __VRT_*__ 占位符替换为真实路径/地址；本文件不含真实密钥。
+cell_id = "cell-mvp-1"
+control_plane_url = "https://cp.internal"
+token_file = "__VRT_ROOT__/secrets/cell-token"       # 0600，scoped ingest token（vrt.cell-controller）
+health_listen = "0.0.0.0:9090"
+poll_interval_secs = 10
+fence_file = "__VRT_ROOT__/state/fence.json"          # 持久化 revision fence（必需）
+# egress_required = true 是默认且生产必须保持 true：NetworkPolicy apply+读回
+# 确认前不会投递租户。仅在本地开发时允许显式置 false（会打结构化 warn 且
+# healthz 恒报 egressPolicyDisabled，见 workers-runtime-cell-controller.md）。
+
+# 运行时 NetworkPolicy（T13/M1；pod/service CIDR 按集群实际填写）
+[netpolicy]
+policy_name = "vrt-tenant-egress"
+namespace = "vrt"
+pod_selector = { app = "vrt-host" }
+ingress_port = { protocol = "tcp", port = 8080 }
+node_excepts = ["10.0.0.0/8"]
+pod_cidrs = ["10.42.0.0/16"]
+service_cidrs = ["10.43.0.0/16"]
+# 公网可达端口白名单（T13/M1：空 = 不可达，非放开）
+public_ports = [{ protocol = "tcp", port = 80 }, { protocol = "tcp", port = 443 }]
+# 共享入口（Traefik）可达 workerd ingress 端口
+[[netpolicy.ingress_peers]]
+namespace_labels = { "kubernetes.io/metadata.name" = "traefik" }
+pod_labels = { app = "traefik" }
+# 集群 DNS（kube-dns）：UDP/TCP 53
+[netpolicy.dns_peer]
+namespace_labels = { "kubernetes.io/metadata.name" = "kube-system" }
+pod_labels = { "k8s-app" = "kube-dns" }
+# 平台数据面后端（kvrocks/s3 网关），selector 或 cidr + 单端口
+[[netpolicy.backends]]
+selector = { peer = { namespace_labels = { "kubernetes.io/metadata.name" = "vrt-data" }, pod_labels = { app = "kvrocks" } }, port = { protocol = "tcp", port = 6666 } }
+[[netpolicy.backends]]
+cidr = { cidr = "203.0.113.10/32", port = { protocol = "tcp", port = 443 } }
+
+# 控制面 Ed25519 验签公钥（示例值来自共享 golden fixture，非真实密钥）
+[[trusted_keys]]
+keyId = "bf29c9743adb0a97f43ae4bc"
+publicKey = "MCowBQYDK2VwAyEAO4cbNjsO7FQzisOvZshKKMa67lIim3ikig7RdntOAZM="
+
+# 每个 pod 一个投递目录 + readyz 探针（T14/B1 FileEnvelopePodChannel）
+[[pods]]
+id = "pod-0"
+dir = "__VRT_ROOT__/pods/pod-0"                        # 0700
+readyz = "http://127.0.0.1:9091"

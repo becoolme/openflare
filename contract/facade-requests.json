@@ -1,0 +1,251 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "contract/gen-facade-requests.mjs",
+  "note": "x-open-compute-request-id is per-call; the replay injects a fixed canonical UUID.",
+  "props": {
+    "kv": {
+      "bindingId": "w-contract-1~KV",
+      "versionId": "v-contract-1",
+      "workerId": "w-contract-1",
+      "instanceId": "tenant-contract",
+      "descriptorSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "namespaceResourceId": "kv-contract-ns",
+      "resourceSpecGeneration": 11,
+      "permissions": {
+        "read": true,
+        "write": true
+      }
+    },
+    "r2": {
+      "bindingId": "w-contract-1~MEDIA",
+      "versionId": "v-contract-1",
+      "workerId": "w-contract-1",
+      "instanceId": "tenant-contract",
+      "descriptorSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "namespaceResourceId": "bucket-contract-1",
+      "resourceSpecGeneration": 11,
+      "permissions": {
+        "read": true,
+        "write": true
+      }
+    }
+  },
+  "requests": [
+    {
+      "label": "kv-put",
+      "worker": "facade-kv",
+      "method": "POST",
+      "path": "/internal/bindings/v1/kv/w-contract-1~KV/put",
+      "headers": {
+        "content-type": "application/vnd.open-compute.kv.v1+frame",
+        "x-open-compute-binding-id": "w-contract-1~KV",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "kv-contract-ns",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "AAAALnsia2V5IjoiY29udHJhY3Qta2V5IiwibWV0YWRhdGFQcmVzZW50IjpmYWxzZX1jb250cmFjdC1rdi12YWx1ZQ==",
+      "expect": {
+        "status": 200,
+        "decoded": null
+      }
+    },
+    {
+      "label": "kv-get",
+      "worker": "facade-kv",
+      "method": "POST",
+      "path": "/internal/bindings/v1/kv/w-contract-1~KV/get",
+      "headers": {
+        "content-type": "application/vnd.open-compute.kv.v1+frame",
+        "x-open-compute-binding-id": "w-contract-1~KV",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "kv-contract-ns",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "eyJrZXlzIjpbImNvbnRyYWN0LWtleSJdfQ==",
+      "expect": {
+        "status": 200,
+        "decoded": "contract-kv-value"
+      }
+    },
+    {
+      "label": "kv-list",
+      "worker": "facade-kv",
+      "method": "POST",
+      "path": "/internal/bindings/v1/kv/w-contract-1~KV/list",
+      "headers": {
+        "content-type": "application/vnd.open-compute.kv.v1+frame",
+        "x-open-compute-binding-id": "w-contract-1~KV",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "kv-contract-ns",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "eyJwcmVmaXgiOiJjb250cmFjdCIsImxpbWl0IjoxMCwiY3Vyc29yIjpudWxsfQ==",
+      "expect": {
+        "status": 200,
+        "decoded": {
+          "keys": [
+            {
+              "name": "contract-key"
+            }
+          ],
+          "list_complete": true,
+          "cacheStatus": null
+        }
+      }
+    },
+    {
+      "label": "kv-delete",
+      "worker": "facade-kv",
+      "method": "POST",
+      "path": "/internal/bindings/v1/kv/w-contract-1~KV/delete",
+      "headers": {
+        "content-type": "application/vnd.open-compute.kv.v1+frame",
+        "x-open-compute-binding-id": "w-contract-1~KV",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "kv-contract-ns",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "eyJrZXkiOiJjb250cmFjdC1rZXkifQ==",
+      "expect": {
+        "status": 200,
+        "decoded": null
+      }
+    },
+    {
+      "label": "r2-put",
+      "worker": "facade-r2",
+      "method": "POST",
+      "path": "/internal/bindings/v1/r2/w-contract-1~MEDIA/put",
+      "headers": {
+        "content-type": "application/vnd.open-compute.r2.v1+frame",
+        "x-open-compute-binding-id": "w-contract-1~MEDIA",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "bucket-contract-1",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "AAAAJnsia2V5IjoiY29udHJhY3Qtb2JqZWN0Iiwib3B0aW9ucyI6e319Y29udHJhY3QtcjItYm9keQ==",
+      "expect": {
+        "status": 200,
+        "decoded": {
+          "key": "contract-object",
+          "version": "v-9",
+          "size": 16,
+          "etag": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "httpEtag": "\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"",
+          "uploaded": 1700000000000,
+          "checksums": {},
+          "storageClass": "Standard"
+        }
+      }
+    },
+    {
+      "label": "r2-head",
+      "worker": "facade-r2",
+      "method": "POST",
+      "path": "/internal/bindings/v1/r2/w-contract-1~MEDIA/head",
+      "headers": {
+        "content-type": "application/vnd.open-compute.r2.v1+json",
+        "x-open-compute-binding-id": "w-contract-1~MEDIA",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "bucket-contract-1",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "eyJrZXkiOiJjb250cmFjdC1vYmplY3QifQ==",
+      "expect": {
+        "status": 200,
+        "decoded": {
+          "key": "contract-object",
+          "version": "v-9",
+          "size": 16,
+          "etag": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "httpEtag": "\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"",
+          "uploaded": 1700000000000,
+          "checksums": {},
+          "storageClass": "Standard"
+        }
+      }
+    },
+    {
+      "label": "r2-get",
+      "worker": "facade-r2",
+      "method": "POST",
+      "path": "/internal/bindings/v1/r2/w-contract-1~MEDIA/get",
+      "headers": {
+        "content-type": "application/vnd.open-compute.r2.v1+frame",
+        "x-open-compute-binding-id": "w-contract-1~MEDIA",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "bucket-contract-1",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "eyJrZXkiOiJjb250cmFjdC1vYmplY3QiLCJvcHRpb25zIjp7fX0=",
+      "expect": {
+        "status": 200,
+        "decoded": {
+          "key": "contract-object",
+          "size": 16,
+          "text": "contract-r2-body"
+        }
+      }
+    },
+    {
+      "label": "r2-list",
+      "worker": "facade-r2",
+      "method": "POST",
+      "path": "/internal/bindings/v1/r2/w-contract-1~MEDIA/list",
+      "headers": {
+        "content-type": "application/vnd.open-compute.r2.v1+json",
+        "x-open-compute-binding-id": "w-contract-1~MEDIA",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "bucket-contract-1",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "eyJwcmVmaXgiOiJjb250cmFjdCJ9",
+      "expect": {
+        "status": 200,
+        "decoded": {
+          "truncated": false,
+          "keys": [
+            "contract-object"
+          ],
+          "delimitedPrefixes": []
+        }
+      }
+    },
+    {
+      "label": "r2-delete",
+      "worker": "facade-r2",
+      "method": "POST",
+      "path": "/internal/bindings/v1/r2/w-contract-1~MEDIA/delete",
+      "headers": {
+        "content-type": "application/vnd.open-compute.r2.v1+json",
+        "x-open-compute-binding-id": "w-contract-1~MEDIA",
+        "x-open-compute-descriptor-sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "x-open-compute-namespace-resource-id": "bucket-contract-1",
+        "x-open-compute-resource-spec-generation": "11",
+        "x-open-compute-version-id": "v-contract-1",
+        "x-open-compute-worker-id": "w-contract-1"
+      },
+      "bodyBase64": "eyJrZXlzIjpbImNvbnRyYWN0LW9iamVjdCJdfQ==",
+      "expect": {
+        "status": 204,
+        "decoded": null
+      }
+    }
+  ]
+}

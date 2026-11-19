@@ -1,0 +1,236 @@
+import type { PublicTransport } from "cloudflare-internal:wrapped-binding";
+import type { LoaderEnv } from "../loader/protocol.js";
+import type { SocketAuthorityWire } from "../sockets/tunnel.js";
+import type { DoHost } from "./host.js";
+import type * as RouterModule from "./router.js";
+
+/** Operator policy text embedded by the checked-in Cap'n Proto configuration. */
+export interface DoPolicyEnv {
+  DO_MAX_OBJECT_NAME_BYTES: string;
+  DO_MAX_FETCH_BODY_BYTES: string;
+  DO_DISPATCH_TIMEOUT_MS: string;
+  DO_MAX_IN_FLIGHT_DISPATCHES: string;
+}
+export interface DoPolicy {
+  maxObjectNameBytes: number;
+  maxFetchBodyBytes: number;
+  dispatchTimeoutMs: number;
+  maxInFlightDispatches: number;
+}
+export interface DoHostEnv extends LoaderEnv {
+  NATIVE_DO_ID: { create: DoNativeIdFactory };
+  DO_HOST: DurableObjectNamespace<DoHost>;
+  DO_DISK_STOP_WRITES_PERCENT: string;
+}
+
+/** Native transport with explicit per-stub ordering coordinates. */
+export interface DoRawTransport {
+  holdWebSocketHandoff(
+    handles: readonly string[],
+  ): Promise<ReadableStream<Uint8Array>>;
+  startRpc(
+    objectId: string,
+    channelId: string,
+    sequence: number,
+    kind: "call" | "get",
+    method: string,
+    args: unknown[],
+    identity: DoObjectIdentity,
+  ): DoRpcResultProvider;
+  cancelOrder(
+    objectId: string,
+    channelId: string,
+    sequence: number,
+  ): Promise<void>;
+  prepareConnect(
+    objectId: string,
+    channelId: string,
+    sequence: number,
+    operationId: string,
+    authority: SocketAuthorityWire,
+    identity: DoObjectIdentity,
+  ): Promise<void>;
+  cancelConnect(operationId: string): Promise<void>;
+}
+export interface DoRpcResultStub extends Disposable {}
+export interface DoRpcResultProvider extends Promise<DoRpcResultStub> {
+  take(): unknown;
+}
+export interface DoPreparedConnect {
+  tokenAddress: string;
+}
+export interface DoOrder {
+  channelId: string;
+  sequence: number;
+}
+/** Service binding RPC surface used by tenant DoTransport. */
+export interface DoRouterRpc extends Fetcher {
+  dispatchFetch(
+    identity: Record<string, string>,
+    request: Request,
+  ): Promise<Response>;
+  dispatchRpc(
+    identity: Record<string, string>,
+    method: string,
+    args: unknown[],
+  ): Promise<unknown>;
+  getRpcProperty(
+    identity: Record<string, string>,
+    property: string,
+  ): Promise<unknown>;
+  prepareConnect(
+    identity: Record<string, string>,
+    authority: SocketAuthorityWire,
+  ): Promise<DoPreparedConnect>;
+  cancelOrder(identity: Record<string, string>): Promise<void>;
+}
+export interface DoNamespaceCapability {
+  schemaVersion: 1;
+  namespacePrefix: string;
+  namespaceNameKey: string;
+  maxObjectNameBytes: number;
+  transport: object;
+}
+export interface AlarmProjection {
+  scheduledTimeMs: number;
+  retryCount: number;
+  rowToken: string;
+}
+export interface AlarmIdentity {
+  namespaceResourceId: string;
+  objectId: string;
+  objectGeneration: number;
+}
+export interface AlarmIndexCapability {
+  upsert(row: AlarmProjection): Promise<void>;
+  delete(rowToken: string): Promise<void>;
+  clear(): Promise<void>;
+}
+export interface LoadedDurableObject extends Rpc.DurableObjectBranded {
+  __openComputeInitialize(): Promise<void>;
+  fetch(request: Request): Promise<Response>;
+  __openComputePrepareFetch(
+    token: string,
+    started: Rpc.Stub<() => Promise<void>>,
+    timeoutMs: number,
+  ): Promise<void>;
+  __openComputeCancelFetch(token: string): Promise<void>;
+  __openComputeInvokeRpc(
+    kind: "call" | "get",
+    method: string,
+    args: unknown[],
+    started: () => Promise<void>,
+  ): Promise<unknown>;
+  __openComputeAlarm(payload: unknown): Promise<unknown>;
+  __openComputeAlarmRepair(): Promise<unknown>;
+}
+export type FacetClassDescriptor =
+  | {
+      entrypoint: string;
+      id: string;
+      props: unknown;
+    }
+  | { native: true; id: string };
+export interface FacetManagerCapability extends Fetcher {
+  __openComputePrepareNativeFacet(
+    authority: TenantDoAuthority,
+    path: readonly string[],
+  ): Promise<string>;
+  __openComputeFacetCall(
+    authority: TenantDoAuthority,
+    path: readonly string[],
+    descriptor: FacetClassDescriptor,
+    method: string,
+    args: unknown[],
+  ): Promise<unknown>;
+  __openComputeFacetGet(
+    authority: TenantDoAuthority,
+    path: readonly string[],
+    descriptor: FacetClassDescriptor,
+    property: string,
+  ): Promise<unknown>;
+  __openComputeFacetFetch(
+    authority: TenantDoAuthority,
+    path: readonly string[],
+    descriptor: FacetClassDescriptor,
+    request: Request,
+  ): Promise<Response>;
+  __openComputeFacetAbort(
+    authority: TenantDoAuthority,
+    parentPath: readonly string[],
+    name: string,
+    reason: unknown,
+  ): Promise<void>;
+  __openComputeFacetDelete(
+    authority: TenantDoAuthority,
+    parentPath: readonly string[],
+    name: string,
+  ): Promise<void>;
+  __openComputeFacetClone(
+    authority: TenantDoAuthority,
+    parentPath: readonly string[],
+    source: string,
+    destination: string,
+  ): Promise<void>;
+  __openComputePrepareFacetConnect(
+    authority: TenantDoAuthority,
+    path: readonly string[],
+    descriptor: FacetClassDescriptor,
+    token: string,
+    socket: SocketAuthorityWire,
+  ): Promise<void>;
+  __openComputeCancelFacetConnect(token: string): Promise<void>;
+}
+export interface TenantDoAuthority extends AlarmIdentity {
+  objectName?: string | undefined;
+  jurisdiction?: string | undefined;
+  instanceId: string;
+  workerId: string;
+  versionId: string;
+  workerCodeSha256: string;
+  routeGeneration: number;
+  className: string;
+}
+export interface ResolvedDoAuthority extends TenantDoAuthority {
+  hostKey: string;
+}
+
+declare global {
+  namespace Cloudflare {
+    interface GlobalProps {
+      mainModule: typeof RouterModule;
+      durableNamespaces: "DoHost";
+    }
+  }
+}
+
+/** Validated current object identity, without namespace secrets. */
+export interface DoObjectIdentity {
+  value: string;
+  name: string | undefined;
+  jurisdiction: string | undefined;
+}
+
+export type DoNativeIdFactory = (
+  value: string,
+  name?: string,
+  jurisdiction?: string,
+) => DurableObjectId;
+
+/** Native factories captured only by the INTERNAL host bootstrap. */
+export interface DoNativeFactories {
+  createId: DoNativeIdFactory;
+  createNamespace(policy: object): DurableObjectNamespace;
+  createStub(
+    id: DurableObjectId,
+    transport: object,
+    policy: object,
+  ): DurableObjectStub;
+  createRpcStub(policy: object): object;
+  isRpcStub(value: unknown): boolean;
+  createPrivateTransport(transport: object): object;
+  createPublicTransport(transport: object): PublicTransport;
+  createRpcTransport(transport: object): object;
+  createUserRpcTransport(transport: object): object;
+  disposeRpcResult(value: object): void;
+}

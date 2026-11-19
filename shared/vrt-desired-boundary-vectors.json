@@ -1,0 +1,834 @@
+{
+  "version": 1,
+  "description": "Shared boundary vectors for VRT compute.desired field validation. TS (vrtValidation.ts) and Rust (compute_desired.rs) MUST agree on every accept/reject verdict (T11/F6). Fields map to the like-named validator; lengths are byte lengths (all values are ASCII except deliberate unicode-reject cases).",
+  "cases": [
+    {
+      "name": "len-128",
+      "field": "identifier",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "accept"
+    },
+    {
+      "name": "len-129",
+      "field": "identifier",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "identifier",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "all-charset",
+      "field": "identifier",
+      "value": "A_Z-a.z:9",
+      "expect": "accept"
+    },
+    {
+      "name": "unicode",
+      "field": "identifier",
+      "value": "ref-é",
+      "expect": "reject"
+    },
+    {
+      "name": "space",
+      "field": "identifier",
+      "value": "a b",
+      "expect": "reject"
+    },
+    {
+      "name": "slash",
+      "field": "identifier",
+      "value": "a/b",
+      "expect": "reject"
+    },
+    {
+      "name": "len-63",
+      "field": "workerName",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "accept"
+    },
+    {
+      "name": "len-64",
+      "field": "workerName",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "workerName",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "uppercase",
+      "field": "workerName",
+      "value": "Worker",
+      "expect": "reject"
+    },
+    {
+      "name": "leading-dash",
+      "field": "workerName",
+      "value": "-abc",
+      "expect": "reject"
+    },
+    {
+      "name": "trailing-dash",
+      "field": "workerName",
+      "value": "abc-",
+      "expect": "reject"
+    },
+    {
+      "name": "double-dash",
+      "field": "workerName",
+      "value": "a--b",
+      "expect": "reject"
+    },
+    {
+      "name": "digits-dash",
+      "field": "workerName",
+      "value": "w-9",
+      "expect": "accept"
+    },
+    {
+      "name": "underscore",
+      "field": "workerName",
+      "value": "a_b",
+      "expect": "reject"
+    },
+    {
+      "name": "len-64",
+      "field": "bindingName",
+      "value": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "expect": "accept"
+    },
+    {
+      "name": "len-65",
+      "field": "bindingName",
+      "value": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "bindingName",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "underscore-first",
+      "field": "bindingName",
+      "value": "_x",
+      "expect": "accept"
+    },
+    {
+      "name": "dollar-first",
+      "field": "bindingName",
+      "value": "$x",
+      "expect": "accept"
+    },
+    {
+      "name": "digit-first",
+      "field": "bindingName",
+      "value": "9x",
+      "expect": "reject"
+    },
+    {
+      "name": "dash",
+      "field": "bindingName",
+      "value": "a-b",
+      "expect": "reject"
+    },
+    {
+      "name": "unicode",
+      "field": "bindingName",
+      "value": "café",
+      "expect": "reject"
+    },
+    {
+      "name": "len-3",
+      "field": "bucket",
+      "value": "abc",
+      "expect": "accept"
+    },
+    {
+      "name": "len-2",
+      "field": "bucket",
+      "value": "ab",
+      "expect": "reject"
+    },
+    {
+      "name": "len-63",
+      "field": "bucket",
+      "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "expect": "accept"
+    },
+    {
+      "name": "len-64",
+      "field": "bucket",
+      "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "expect": "reject"
+    },
+    {
+      "name": "uppercase",
+      "field": "bucket",
+      "value": "My-Bucket",
+      "expect": "reject"
+    },
+    {
+      "name": "leading-dash",
+      "field": "bucket",
+      "value": "-bucket",
+      "expect": "reject"
+    },
+    {
+      "name": "min",
+      "field": "hostname",
+      "value": "a.b",
+      "expect": "accept"
+    },
+    {
+      "name": "single-label",
+      "field": "hostname",
+      "value": "localhost",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "hostname",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "label-63",
+      "field": "hostname",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.x",
+      "expect": "accept"
+    },
+    {
+      "name": "label-64",
+      "field": "hostname",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.x",
+      "expect": "reject"
+    },
+    {
+      "name": "len-253",
+      "field": "hostname",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "expect": "accept"
+    },
+    {
+      "name": "len-254",
+      "field": "hostname",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "expect": "reject"
+    },
+    {
+      "name": "uppercase",
+      "field": "hostname",
+      "value": "Example.COM",
+      "expect": "reject"
+    },
+    {
+      "name": "wildcard",
+      "field": "hostname",
+      "value": "*.example.com",
+      "expect": "reject"
+    },
+    {
+      "name": "trailing-dot",
+      "field": "hostname",
+      "value": "example.com.",
+      "expect": "reject"
+    },
+    {
+      "name": "leading-dot",
+      "field": "hostname",
+      "value": ".example.com",
+      "expect": "reject"
+    },
+    {
+      "name": "double-dot",
+      "field": "hostname",
+      "value": "example..com",
+      "expect": "reject"
+    },
+    {
+      "name": "idn-unicode",
+      "field": "hostname",
+      "value": "bücher.example",
+      "expect": "reject"
+    },
+    {
+      "name": "label-leading-dash",
+      "field": "hostname",
+      "value": "-a.example.com",
+      "expect": "reject"
+    },
+    {
+      "name": "label-trailing-dash",
+      "field": "hostname",
+      "value": "a-.example.com",
+      "expect": "reject"
+    },
+    {
+      "name": "all-star",
+      "field": "cron",
+      "value": "* * * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "minute-max",
+      "field": "cron",
+      "value": "59 * * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "minute-60",
+      "field": "cron",
+      "value": "60 * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "hour-23",
+      "field": "cron",
+      "value": "0 23 * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "hour-24",
+      "field": "cron",
+      "value": "0 24 * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "dom-0",
+      "field": "cron",
+      "value": "0 0 0 * *",
+      "expect": "reject"
+    },
+    {
+      "name": "dom-31",
+      "field": "cron",
+      "value": "0 0 31 * *",
+      "expect": "accept"
+    },
+    {
+      "name": "dom-32",
+      "field": "cron",
+      "value": "0 0 32 * *",
+      "expect": "reject"
+    },
+    {
+      "name": "month-12",
+      "field": "cron",
+      "value": "0 0 * 12 *",
+      "expect": "accept"
+    },
+    {
+      "name": "month-13",
+      "field": "cron",
+      "value": "0 0 * 13 *",
+      "expect": "reject"
+    },
+    {
+      "name": "dow-7",
+      "field": "cron",
+      "value": "0 0 * * 7",
+      "expect": "accept"
+    },
+    {
+      "name": "dow-8",
+      "field": "cron",
+      "value": "0 0 * * 8",
+      "expect": "reject"
+    },
+    {
+      "name": "named-month",
+      "field": "cron",
+      "value": "0 0 * JAN *",
+      "expect": "accept"
+    },
+    {
+      "name": "named-month-lower",
+      "field": "cron",
+      "value": "0 0 * jan *",
+      "expect": "accept"
+    },
+    {
+      "name": "named-dow",
+      "field": "cron",
+      "value": "0 0 * * MON",
+      "expect": "accept"
+    },
+    {
+      "name": "named-range",
+      "field": "cron",
+      "value": "0 0 * * MON-FRI",
+      "expect": "accept"
+    },
+    {
+      "name": "named-range-reversed",
+      "field": "cron",
+      "value": "0 0 * * FRI-MON",
+      "expect": "reject"
+    },
+    {
+      "name": "range",
+      "field": "cron",
+      "value": "0 9-17 * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "range-reversed",
+      "field": "cron",
+      "value": "0 17-9 * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "step",
+      "field": "cron",
+      "value": "*/15 * * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "step-zero",
+      "field": "cron",
+      "value": "*/0 * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "step-over-max",
+      "field": "cron",
+      "value": "*/60 * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "list",
+      "field": "cron",
+      "value": "0,30 * * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "list-bad",
+      "field": "cron",
+      "value": "0,60 * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "list-with-range",
+      "field": "cron",
+      "value": "0 9-11,15 * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "four-fields",
+      "field": "cron",
+      "value": "* * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "six-fields",
+      "field": "cron",
+      "value": "* * * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "cron",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "range-step",
+      "field": "cron",
+      "value": "0 9-17/2 * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "double-step",
+      "field": "cron",
+      "value": "0 */5/2 * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "len-128",
+      "field": "cron",
+      "value": "* * 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,31 * *",
+      "expect": "accept"
+    },
+    {
+      "name": "len-129",
+      "field": "cron",
+      "value": "* * 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2 * *",
+      "expect": "reject"
+    },
+    {
+      "name": "valid",
+      "field": "compatDate",
+      "value": "2024-02-29",
+      "expect": "accept"
+    },
+    {
+      "name": "non-leap-feb29",
+      "field": "compatDate",
+      "value": "2023-02-29",
+      "expect": "reject"
+    },
+    {
+      "name": "leap-century",
+      "field": "compatDate",
+      "value": "2000-02-29",
+      "expect": "accept"
+    },
+    {
+      "name": "non-leap-century",
+      "field": "compatDate",
+      "value": "1900-02-29",
+      "expect": "reject"
+    },
+    {
+      "name": "month-00",
+      "field": "compatDate",
+      "value": "2024-00-15",
+      "expect": "reject"
+    },
+    {
+      "name": "month-13",
+      "field": "compatDate",
+      "value": "2024-13-01",
+      "expect": "reject"
+    },
+    {
+      "name": "day-00",
+      "field": "compatDate",
+      "value": "2024-01-00",
+      "expect": "reject"
+    },
+    {
+      "name": "day-32",
+      "field": "compatDate",
+      "value": "2024-01-32",
+      "expect": "reject"
+    },
+    {
+      "name": "april-31",
+      "field": "compatDate",
+      "value": "2024-04-31",
+      "expect": "reject"
+    },
+    {
+      "name": "april-30",
+      "field": "compatDate",
+      "value": "2024-04-30",
+      "expect": "accept"
+    },
+    {
+      "name": "slashes",
+      "field": "compatDate",
+      "value": "2024/01/15",
+      "expect": "reject"
+    },
+    {
+      "name": "not-padded",
+      "field": "compatDate",
+      "value": "2024-1-5",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "compatDate",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "len-64",
+      "field": "compatFlag",
+      "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expect": "accept"
+    },
+    {
+      "name": "len-65",
+      "field": "compatFlag",
+      "value": "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "expect": "reject"
+    },
+    {
+      "name": "all-charset",
+      "field": "compatFlag",
+      "value": "a_b+c.d-1",
+      "expect": "accept"
+    },
+    {
+      "name": "colon",
+      "field": "compatFlag",
+      "value": "a:b",
+      "expect": "reject"
+    },
+    {
+      "name": "unicode",
+      "field": "compatFlag",
+      "value": "fé",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "compatFlag",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "valid",
+      "field": "lowerHex64",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "accept"
+    },
+    {
+      "name": "mixed-hex",
+      "field": "lowerHex64",
+      "value": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "expect": "accept"
+    },
+    {
+      "name": "uppercase",
+      "field": "lowerHex64",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expect": "reject"
+    },
+    {
+      "name": "len-63",
+      "field": "lowerHex64",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "reject"
+    },
+    {
+      "name": "len-65",
+      "field": "lowerHex64",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "reject"
+    },
+    {
+      "name": "non-hex",
+      "field": "lowerHex64",
+      "value": "gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+      "expect": "reject"
+    },
+    {
+      "name": "empty",
+      "field": "lowerHex64",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "workflow-name-simple",
+      "field": "workflowName",
+      "value": "order-pipeline",
+      "expect": "accept"
+    },
+    {
+      "name": "workflow-name-underscore-dash-digit",
+      "field": "workflowName",
+      "value": "_w1-f2_3",
+      "expect": "accept"
+    },
+    {
+      "name": "workflow-name-leading-dash",
+      "field": "workflowName",
+      "value": "-lead",
+      "expect": "accept"
+    },
+    {
+      "name": "workflow-name-max64",
+      "field": "workflowName",
+      "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+      "expect": "accept"
+    },
+    {
+      "name": "workflow-name-empty",
+      "field": "workflowName",
+      "value": "",
+      "expect": "reject"
+    },
+    {
+      "name": "workflow-name-over64",
+      "field": "workflowName",
+      "value": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+      "expect": "reject"
+    },
+    {
+      "name": "workflow-name-space",
+      "field": "workflowName",
+      "value": "my flow",
+      "expect": "reject"
+    },
+    {
+      "name": "workflow-name-dot",
+      "field": "workflowName",
+      "value": "my.flow",
+      "expect": "reject"
+    },
+    {
+      "name": "workflow-name-dollar",
+      "field": "workflowName",
+      "value": "wf$1",
+      "expect": "reject"
+    },
+    {
+      "name": "workflow-name-unicode",
+      "field": "workflowName",
+      "value": "流程",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-dollar",
+      "field": "identifier",
+      "value": "$x",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-queue-env-name-dollar",
+      "field": "identifier",
+      "value": "Q$1",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-do-len-64",
+      "field": "doClassName",
+      "value": "Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-do-len-65",
+      "field": "doClassName",
+      "value": "Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-do-len-128",
+      "field": "doClassName",
+      "value": "Daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-do-dollar",
+      "field": "doClassName",
+      "value": "$Cls",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-do-digit-first",
+      "field": "doClassName",
+      "value": "9Cls",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-nbsp",
+      "field": "cron",
+      "value": "0 0 * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-u3000",
+      "field": "cron",
+      "value": "0　 0 * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-nbsp-leading",
+      "field": "cron",
+      "value": " 0 0 * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-ascii-tab",
+      "field": "cron",
+      "value": "0\t0 * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-formfeed",
+      "field": "cron",
+      "value": "0\f0 * * *",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-vtab",
+      "field": "cron",
+      "value": "0\u000b0 * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-leading-trailing-ws",
+      "field": "cron",
+      "value": " 0 0 * * * ",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-plus-5",
+      "field": "cron",
+      "value": "+5 * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-plus-step",
+      "field": "cron",
+      "value": "*/+5 * * * *",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-dow-5-7",
+      "field": "cron",
+      "value": "0 0 * * 5-7",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-dow-fri-sun",
+      "field": "cron",
+      "value": "0 0 * * FRI-SUN",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-dow-1-7-step",
+      "field": "cron",
+      "value": "0 0 * * 1-7/2",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-dow-0-7",
+      "field": "cron",
+      "value": "0 0 * * 0-7",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-dow-7-5",
+      "field": "cron",
+      "value": "0 0 * * 7-5",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-dow-sun-sun",
+      "field": "cron",
+      "value": "0 0 * * SUN-SUN",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-dow-8",
+      "field": "cron",
+      "value": "0 0 * * 6-8",
+      "expect": "reject"
+    },
+    {
+      "name": "r69-cron-month-name-range",
+      "field": "cron",
+      "value": "0 0 * JAN-MAR *",
+      "expect": "accept"
+    },
+    {
+      "name": "r69-cron-bytes-over-128-utf16-under",
+      "field": "cron",
+      "value": "* * * * * éééééééééééééééééééééééééééééééééééééééé",
+      "expect": "reject"
+    }
+  ]
+}

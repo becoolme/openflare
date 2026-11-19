@@ -1,0 +1,15 @@
+# KV + static-assets example (T25 e2e) — exercises the fs KV backend,
+# the assets materialization path, ETag/304, and SPA fallback.
+name = "kv-assets"
+mainModule = "main.js"
+compatibilityDate = "2024-09-25"
+hostnames = ["kv-assets.vrt.local"]
+
+[bindings]
+kv = { CACHE = "demo-ns" }
+
+[assets]
+dir = "public"
+binding = "ASSETS"
+# SPA fallback: unknown paths serve /index.html (200), not 404.
+notFoundHandling = "single-page-application"

@@ -1,0 +1,8 @@
+{
+  "result": {
+    "output": "hello",
+    "status": "running"
+  },
+  "seq": 5,
+  "status": "DONE"
+}

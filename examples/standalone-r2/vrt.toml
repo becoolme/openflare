@@ -1,0 +1,10 @@
+# R2 example (W5 e2e) — exercises put/get plus the multipart chain
+# against the standalone fs backend: create → parts → complete → get,
+# abort, and signed-uploadId scope enforcement.
+name = "r2-demo"
+mainModule = "main.js"
+compatibilityDate = "2024-09-25"
+hostnames = ["r2-demo.vrt.local"]
+
+[bindings]
+r2 = { BUCKET = "demo-bucket" }

@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "description": "Bundle digest vectors — TS vrtBundle.ts and Rust vrt-config VersionBundle::from_pack must agree byte-for-byte on digest and storedDocument for identical pack inputs.",
+  "cases": [
+    {
+      "name": "minimal-esmodule",
+      "pack": {
+        "mainModule": "index.js",
+        "modules": {
+          "index.js": "export default { async fetch() { return new Response(\"ok\") } }"
+        },
+        "compatibilityDate": "2024-09-25",
+        "compatibilityFlags": []
+      },
+      "digest": "8d3b7dd3bc92d1096e9399d17fe8fb702a1e5dfbfc1ea72e470c6e64a0e96a5c",
+      "storedDocumentBase64": "eyJjb21wYXRpYmlsaXR5RGF0ZSI6IjIwMjQtMDktMjUiLCJjb21wYXRpYmlsaXR5RmxhZ3MiOltdLCJkaWdlc3QiOiI4ZDNiN2RkM2JjOTJkMTA5NmU5Mzk5ZDE3ZmU4ZmI3MDJhMWU1ZGZiZmMxZWE3MmU0NzBjNmU2NGEwZTk2YTVjIiwibWFpbk1vZHVsZSI6ImluZGV4LmpzIiwibW9kdWxlcyI6W3sibmFtZSI6ImluZGV4LmpzIiwidGV4dCI6ImV4cG9ydCBkZWZhdWx0IHsgYXN5bmMgZmV0Y2goKSB7IHJldHVybiBuZXcgUmVzcG9uc2UoXCJva1wiKSB9IH0iLCJ0eXBlIjoiZXNNb2R1bGUifV0sInNjaGVtYVZlcnNpb24iOjF9"
+    },
+    {
+      "name": "all-module-forms",
+      "pack": {
+        "mainModule": "index.js",
+        "modules": {
+          "index.js": "export default { async fetch() { return new Response(\"ok\") } }",
+          "lib/util.js": {
+            "cjs": "module.exports = {}"
+          },
+          "data/hello.txt": {
+            "text": "hello vrt"
+          },
+          "data/table.json": {
+            "json": {
+              "answer": 42,
+              "list": [
+                1,
+                2,
+                3
+              ]
+            }
+          },
+          "bin/blob.bin": {
+            "data_b64": "AAECAw=="
+          },
+          "bin/mod.wasm": {
+            "wasm_b64": "AGFzbQ=="
+          }
+        },
+        "compatibilityDate": "2024-09-25",
+        "compatibilityFlags": [
+          "nodejs_compat"
+        ]
+      },
+      "digest": "9649f1009d0c379273ed5990eaea1359f1ad643dde42a47e1afdf4f88874f238",
+      "storedDocumentBase64": "eyJjb21wYXRpYmlsaXR5RGF0ZSI6IjIwMjQtMDktMjUiLCJjb21wYXRpYmlsaXR5RmxhZ3MiOlsibm9kZWpzX2NvbXBhdCJdLCJkaWdlc3QiOiI5NjQ5ZjEwMDlkMGMzNzkyNzNlZDU5OTBlYWVhMTM1OWYxYWQ2NDNkZGU0MmE0N2UxYWZkZjRmODg4NzRmMjM4IiwibWFpbk1vZHVsZSI6ImluZGV4LmpzIiwibW9kdWxlcyI6W3siZGF0YUJhc2U2NCI6IkFBRUNBdz09IiwibmFtZSI6ImJpbi9ibG9iLmJpbiIsInR5cGUiOiJkYXRhIn0seyJkYXRhQmFzZTY0IjoiQUdGemJRPT0iLCJuYW1lIjoiYmluL21vZC53YXNtIiwidHlwZSI6Indhc20ifSx7Im5hbWUiOiJkYXRhL2hlbGxvLnR4dCIsInRleHQiOiJoZWxsbyB2cnQiLCJ0eXBlIjoidGV4dCJ9LHsibmFtZSI6ImRhdGEvdGFibGUuanNvbiIsInRleHQiOiJ7XCJhbnN3ZXJcIjo0MixcImxpc3RcIjpbMSwyLDNdfSIsInR5cGUiOiJqc29uIn0seyJuYW1lIjoiaW5kZXguanMiLCJ0ZXh0IjoiZXhwb3J0IGRlZmF1bHQgeyBhc3luYyBmZXRjaCgpIHsgcmV0dXJuIG5ldyBSZXNwb25zZShcIm9rXCIpIH0gfSIsInR5cGUiOiJlc01vZHVsZSJ9LHsibmFtZSI6ImxpYi91dGlsLmpzIiwidGV4dCI6Im1vZHVsZS5leHBvcnRzID0ge30iLCJ0eXBlIjoiY29tbW9uSnMifV0sInNjaGVtYVZlcnNpb24iOjF9"
+    },
+    {
+      "name": "unicode-module-name-json",
+      "pack": {
+        "mainModule": "中/main.js",
+        "modules": {
+          "中/main.js": "export default {}",
+          "data/表.json": {
+            "json": {
+              "深": {
+                "nested": [
+                  -1,
+                  0,
+                  1
+                ]
+              },
+              "s": "值"
+            }
+          }
+        },
+        "compatibilityDate": "2024-01-01",
+        "compatibilityFlags": []
+      },
+      "digest": "141e805babc1b87102f5c8fcbf4d8d6bc2704f6a037300330d987c4261a840c8",
+      "storedDocumentBase64": "eyJjb21wYXRpYmlsaXR5RGF0ZSI6IjIwMjQtMDEtMDEiLCJjb21wYXRpYmlsaXR5RmxhZ3MiOltdLCJkaWdlc3QiOiIxNDFlODA1YmFiYzFiODcxMDJmNWM4ZmNiZjRkOGQ2YmMyNzA0ZjZhMDM3MzAwMzMwZDk4N2M0MjYxYTg0MGM4IiwibWFpbk1vZHVsZSI6IuS4rS9tYWluLmpzIiwibW9kdWxlcyI6W3sibmFtZSI6ImRhdGEv6KGoLmpzb24iLCJ0ZXh0Ijoie1wic1wiOlwi5YC8XCIsXCLmt7FcIjp7XCJuZXN0ZWRcIjpbLTEsMCwxXX19IiwidHlwZSI6Impzb24ifSx7Im5hbWUiOiLkuK0vbWFpbi5qcyIsInRleHQiOiJleHBvcnQgZGVmYXVsdCB7fSIsInR5cGUiOiJlc01vZHVsZSJ9XSwic2NoZW1hVmVyc2lvbiI6MX0="
+    },
+    {
+      "name": "empty-flags-data-only",
+      "pack": {
+        "mainModule": "bin/payload.bin",
+        "modules": {
+          "bin/payload.bin": {
+            "data_b64": "dnJ0"
+          }
+        },
+        "compatibilityDate": "2023-11-08",
+        "compatibilityFlags": []
+      },
+      "digest": "7bae0fdd6381bb08b86da60117ef5ce6386bee0216a9bce7c747c36c61fa3af4",
+      "storedDocumentBase64": "eyJjb21wYXRpYmlsaXR5RGF0ZSI6IjIwMjMtMTEtMDgiLCJjb21wYXRpYmlsaXR5RmxhZ3MiOltdLCJkaWdlc3QiOiI3YmFlMGZkZDYzODFiYjA4Yjg2ZGE2MDExN2VmNWNlNjM4NmJlZTAyMTZhOWJjZTdjNzQ3YzM2YzYxZmEzYWY0IiwibWFpbk1vZHVsZSI6ImJpbi9wYXlsb2FkLmJpbiIsIm1vZHVsZXMiOlt7ImRhdGFCYXNlNjQiOiJkbkowIiwibmFtZSI6ImJpbi9wYXlsb2FkLmJpbiIsInR5cGUiOiJkYXRhIn1dLCJzY2hlbWFWZXJzaW9uIjoxfQ=="
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+# VRT 独立模式 —— vrt-provider 示例配置。
+# KV 可用本地 kvrocks；R2 指向用户自备的 S3（minio/对象存储均可）。键名 camelCase。
+cellId = "__VRT_CELL__"
+listenerDir = "__VRT_ROOT__/provider/listeners"
+metricsListen = "__VRT_PROVIDER_METRICS__"                # B12: 仅 /metrics(内部)
+# T25/L8: cursor HMAC secret 从 init 生成的 0600 文件读 —
+# 不经 env/compose 明文。缺失或非 0600 时 provider fail closed。
+cursorSecretFile = "__VRT_ROOT__/keys/cursor.secret"
+
+[desired]
+path = "__VRT_ROOT__/desired/envelope.json"
+trustedKeys = [
+  { keyId = "__VRT_KEY_ID__", publicKey = "__VRT_PUBKEY__" },  # vrt init 渲染
+]
+reloadMs = 1000
+graceVersions = 1
+
+# T17: 本地文件系统后端（digest 文件名防穿越、0600 原子写、
+# tenant→namespace/bucket 目录隔离、与内存后端一致的 keyset/分页语义）。
+# 也可用 kvrocks/s3（平台后端并列，二者互斥 —— 同时配置会被拒绝）。
+[kv]
+dir = "__VRT_ROOT__/provider/data/kv"
+
+[r2]
+dir = "__VRT_ROOT__/provider/data/r2"
+
+# T21: 静态资源内容寻址存储（vrt deploy --assets 目录写入；
+# vrt-host 校验存在性；provider 按 digest 提供 /internal/assets/v1/fetch）。
+[assets]
+dir = "__VRT_ROOT__/provider/data/assets"
+# maxObjectBytes = 33554432   # 可选，默认同 S3 后端
+
+# P1: PG 数据面 —— provider 按 credentialRef 从本文件取
+# {token, endpoint, tenantSlug, credentialVersion, readOnly}，
+# 格式 {tenants: {<tenantId>: {<credentialRef>: {...}}}}。
+# 文件 0600；缺失/越权 → 引用中的 PG 绑定 fail closed
+# (PG_CREDENTIAL_UNAVAILABLE)，其余绑定不受影响。
+[pg]
+credentialsFile = "__VRT_ROOT__/secrets/pg-credentials.json"
+
+# T34: D1 数据面 —— provider → vrt-sql（内部网络 + 签名 token 认证）。
+# authSecretFile 与 vrt-sql 侧共享同一 0600 文件（vrt init 生成）；
+# 结果不确定的写不重试（单次发送，超时/失败 → D1 错误面）。
+[vrtSql]
+addr = "__VRT_SQL_ADDR__"
+authSecretFile = "__VRT_ROOT__/keys/sql-auth.secret"
+# timeoutMs = 30000

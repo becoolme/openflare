@@ -1,0 +1,15 @@
+# P3c-1 — Durable Objects e2e: SQLite storage + alarm over the real
+# workerd localDisk path. `durable_objects.bindings` + cumulative
+# `[[migrations]]` — the class's storage identity (uniqueKey) is
+# server-derived at deploy; a client can never supply it.
+name = "do-demo"
+main = "main.js"
+compatibility_date = "2024-09-25"
+routes = ["do.vrt.local/*"]
+
+[durable_objects]
+bindings = [{ name = "COUNTER", class_name = "Counter" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Counter"]

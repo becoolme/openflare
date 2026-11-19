@@ -1,0 +1,24 @@
+# OpenFlare Rust workspace.
+#
+# snapshot-protocol: signed desired-state snapshot protocol shared by every
+# runtime component. vrt-config: deploy manifest -> workerd capnp config and
+# content-addressed version bundles. vrt-provider: binding provider (KV, R2,
+# queues, ...). vrt-securefs: hardened shared-filesystem helpers. vrt-host:
+# per-tenant workerd supervisor + ingress. cell-controller: desired-state
+# consumer / orchestrator. vrt-local: standalone (Docker) management plane.
+# vrt-sql: D1 / Durable Object SQL storage. vrt-objstore, vrt-metrics: shared
+# object-store and metrics helpers.
+[workspace]
+resolver = "2"
+members = [
+    "snapshot-protocol",
+    "vrt-config",
+    "vrt-provider",
+    "vrt-securefs",
+    "vrt-host",
+    "cell-controller",
+    "vrt-local",
+    "vrt-metrics",
+    "vrt-objstore",
+    "vrt-sql",
+]

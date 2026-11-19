@@ -1,0 +1,11 @@
+{
+  "result": {
+    "error": {
+      "message": "step blew up",
+      "name": "WorkflowFatalError"
+    },
+    "status": "errored"
+  },
+  "seq": 6,
+  "status": "DONE"
+}

@@ -1,0 +1,73 @@
+# VRT 平台模式 —— vrt-host 示例配置（pod 模式：cell-controller 经
+# FileEnvelopePodChannel 投递 envelope+assignment）。
+# 部署时替换 __VRT_*__ 占位符；不含真实密钥。键名为 serde camelCase。
+cellId = "cell-mvp-1"
+workerdBinary = "__WORKERD__"                           # 固定版本 workerd 绝对路径
+workDir = "__VRT_ROOT__/pods/pod-0/work"                # 0700
+cacheDir = "__VRT_ROOT__/pods/pod-0/cache"              # 0700
+listenAddr = "127.0.0.1:8080"
+controlListen = "127.0.0.1:9091"                        # readyz/healthz（loopback 强制）
+# P3c-1: DO storage root — K8s 下必须挂持久卷（pod 重建后数据仍在；
+# 跨 cell 的 placement/fencing 为 P3c-2，未接入前 DO 仅本 pod 可用）。
+doStorageDir = "__VRT_ROOT__/pods/pod-0/do"
+allowLocalDurability = true # RV-R66: dev example, single-copy DO state
+
+[desired]
+path = "__VRT_ROOT__/pods/pod-0/envelope.json"          # FileEnvelopePodChannel 写入
+podId = "pod-0"                                         # 与 assignment.podId 绑定
+assignmentFile = "__VRT_ROOT__/pods/pod-0/assignment.json"
+trustedKeys = [
+  { keyId = "bf29c9743adb0a97f43ae4bc", publicKey = "MCowBQYDK2VwAyEAO4cbNjsO7FQzisOvZshKKMa67lIim3ikig7RdntOAZM=" },
+]
+reloadMs = 1000
+graceVersions = 1
+
+[render]
+mode = "capnp"
+# T16/B3：params 由 facade manifest 启动时推导（与 paramsFile 互斥，
+# 两者同时配置 = 两份真相，validate 拒绝启动）
+facadeManifest = "__VRT_ROOT__/facade/manifest.json"
+# H5-r1: binding-backend 按租户派生 —— 指向 provider 的
+# listenerDir（每个租户渲染为 <dir>/<seg(tenant)>.sock，与 provider
+# 绑定路径逐字节一致）。assignmentFile 模式下禁止 verbatim
+# bindingBackendSocket（静态 socket 会让全部租户共用同一个租户
+# 监听器 —— 跨租户越权）。
+bindingBackendDir = "__VRT_ROOT__/provider/listeners"
+systemCompatDate = "2024-09-25"
+systemCompatFlags = []
+secretsFile = "__VRT_ROOT__/secrets/render-secrets.json"  # 0600，{tenantId:{ref:value}}
+extraArgs = []
+
+[bundles]                                                # T15/B2 控制面 bundle 拉取
+baseUrl = "https://cp.internal/api/internal/clusters/cl_mvp_1"
+tokenFile = "__VRT_ROOT__/secrets/cell-token"              # 0600
+requestTimeoutMs = 10000
+deadlineMs = 30000
+maxAttempts = 3
+maxBytes = 33554432
+
+[supervisor]
+readyTimeoutMs = 10000
+probeTimeoutMs = 200
+killGraceMs = 5000
+backoffBaseMs = 200
+backoffMaxMs = 10000
+# T27/N0: the failure window must hold (failThreshold-1) launch cycles
+# — (5-1)×(10s ready + 10s max backoff) = 80s ≤ 90s.
+failWindowMs = 120000
+
+[limits]
+# maxRssBytes = 268435456
+# maxFds = 1024
+
+[ingress]
+requestTimeoutMs = 30000
+connectTimeoutMs = 500
+maxBodyBytes = 1048576
+# MIG-7: match deploy/k8s — Traefik's X-Forwarded-Proto is honored
+# only from the pod CIDR; every other source fails closed to http.
+forwardedProto = "trusted-proxy-header"
+forwardedProtoTrusted = ["10.42.0.0/16"]
+
+[baseEnv]
+# VRT_EXTRA = "value"

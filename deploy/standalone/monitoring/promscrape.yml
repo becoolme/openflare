@@ -1,0 +1,19 @@
+# B12: standalone monitoring scrape config — internal metrics ports
+# only (never published to the host). 30s interval matches the
+# platform's vmagent cadence.
+scrape_configs:
+  - job_name: vrt-host
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["vrt-host:9494"]
+        labels: { component: vrt-host }
+  - job_name: vrt-provider
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["vrt-provider:9493"]
+        labels: { component: vrt-provider }
+  - job_name: vrt-sql
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["vrt-sql:9492"]
+        labels: { component: vrt-sql }

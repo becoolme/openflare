@@ -1,0 +1,135 @@
+# syntax=docker/dockerfile:1
+# vrt-local — standalone all-in-one (vrt mgmt + vrt-host + vrt-provider).
+# THE canonical standalone image (T24/K2): deploy/standalone/Dockerfile
+# is a pointer to this file; compose builds ONLY this Dockerfile.
+#
+# workerd is NEVER downloaded/built by this repo. Pick a source:
+#   WORKERD_SOURCE=stub   repo's vrt-stub-workerd (smoke, no workerd)
+#   WORKERD_SOURCE=file   deploy/standalone/workerd + WORKERD_SHA256
+#                         (git-ignored, operator-provided, digest-verified)
+#   WORKERD_SOURCE=image  WORKERD_IMAGE pinned image with
+#                         /usr/local/bin/workerd
+#   WORKERD_SOURCE=none   NO workerd baked in — `vrt init --workerd
+#                         /usr/local/bin/workerd` then fails CLOSED at
+#                         boot with a clear "workerd missing" error
+#                         (never a silent stub). Compose must not use it.
+# Unknown WORKERD_SOURCE values fail the build (no such stage).
+#
+# Toolchain floor: Cargo.lock's highest declared rust-version is
+# uuid 1.28.0 → 1.89 (cargo metadata/registry manifests); the pin below
+# matches the toolchain this workspace is verified on.
+ARG RUST_IMAGE=rust:1.93.0-bookworm
+ARG WORKERD_IMAGE=debian:bookworm-slim
+ARG WORKERD_SOURCE=stub
+
+# ---------- rust builder ----------
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /build
+COPY . .
+# T24/K1: the stub requires the vrt-host `dev-stub` cargo feature —
+# building it in the same command as the real binaries is a hard
+# error (required-features gate). Two commands: release bins without
+# the feature; the stub alone with it (only the stub stage needs it).
+RUN set -eux; \
+    cargo build --release --locked \
+      -p vrt-local --bin vrt \
+      -p vrt-host --bin vrt-host \
+      -p vrt-provider --bin vrt-provider \
+      -p vrt-sql --bin vrt-sql; \
+    mkdir -p /out; \
+    cp target/release/vrt target/release/vrt-host target/release/vrt-provider \
+       target/release/vrt-sql /out/
+
+FROM ${RUST_IMAGE} AS stub-builder
+WORKDIR /build
+COPY . .
+# T25/L10: the stub profile ALSO needs a vrt-host built WITH dev-stub
+# (the prod binary refuses mode=stub). One command produces both stub
+# artifacts; only the runtime-stub stage consumes vrt-host-devstub.
+RUN set -eux; \
+    cargo build --release --locked \
+      -p vrt-host --bin vrt-stub-workerd --bin vrt-host --features dev-stub; \
+    mkdir -p /out; \
+    cp target/release/vrt-stub-workerd /out/; \
+    cp target/release/vrt-host /out/vrt-host-devstub
+
+# ---------- workerd sources (only the selected stage builds) ----------
+FROM debian:bookworm-slim AS workerd-stub
+# The stub lands under BOTH names: /usr/local/bin/workerd keeps the
+# unique runtime layout, /usr/local/bin/vrt-stub-workerd preserves the
+# `--mode stub` default path baked into `vrt init`.
+COPY --from=stub-builder /out/vrt-stub-workerd /opt/vrt/workerd
+COPY --from=stub-builder /out/vrt-stub-workerd /opt/vrt/vrt-stub-workerd
+
+FROM debian:bookworm-slim AS workerd-file
+ARG WORKERD_SHA256
+COPY deploy/standalone/workerd /workerd
+RUN set -eux; \
+    test -n "${WORKERD_SHA256:-}" || { echo "FATAL: WORKERD_SHA256 required"; exit 1; }; \
+    echo "${WORKERD_SHA256}  /workerd" | sha256sum -c -; \
+    install -D -m 0755 /workerd /opt/vrt/workerd
+
+FROM ${WORKERD_IMAGE} AS workerd-image
+RUN set -eux; \
+    test -x /usr/local/bin/workerd || { echo "FATAL: WORKERD_IMAGE lacks /usr/local/bin/workerd"; exit 1; }; \
+    install -D -m 0755 /usr/local/bin/workerd /opt/vrt/workerd
+
+FROM debian:bookworm-slim AS workerd-none
+# Empty pick — /usr/local/bin/workerd simply never lands. Runtime
+# stays consistent; vrt init fails closed naming the missing path.
+# `.keep` exists so the runtime COPY below always has a source.
+RUN install -d /opt/vrt && touch /opt/vrt/.keep
+
+FROM workerd-${WORKERD_SOURCE} AS workerd-pick
+
+# ---------- runtime ----------
+# debian-slim (not distroless): the supervisor's support contract needs
+# coreutils for state-dir inspection; root fs stays read-only — writable
+# state is the mounted /data volume only.
+FROM debian:bookworm-slim AS runtime
+ARG VRT_UID=10001
+ARG VRT_GID=10001
+# T25/L14: workerd's outbound-network TLS needs CA roots —
+# without them every external fetch dies at startup.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid "${VRT_GID}" vrt; \
+    useradd --system --uid "${VRT_UID}" --gid vrt --home-dir /data vrt; \
+    install -d -o vrt -g vrt -m 0700 /data /tmp /data/objstore
+
+COPY --from=builder /out/vrt /out/vrt-host /out/vrt-provider /out/vrt-sql /usr/local/bin/
+# Unique runtime layout: workerd ALWAYS lands at /usr/local/bin/workerd
+# (or nowhere under WORKERD_SOURCE=none). Nothing else may install a
+# second workerd path — compose and `vrt init` share this contract.
+COPY --from=workerd-pick /opt/vrt/ /opt/vrt/
+RUN set -eux; \
+    if [ -f /opt/vrt/workerd ]; then \
+      install -m 0755 /opt/vrt/workerd /usr/local/bin/workerd; \
+    fi; \
+    if [ -f /opt/vrt/vrt-stub-workerd ]; then \
+      install -m 0755 /opt/vrt/vrt-stub-workerd /usr/local/bin/vrt-stub-workerd; \
+    fi; \
+    rm -f /opt/vrt/workerd /opt/vrt/vrt-stub-workerd /opt/vrt/.keep
+# D6+T25/L3: facade dir layout = {manifest.json, dist/…} — the SAME
+# convention `vrt init` uses for a bare-metal `--facade-dist facade/`.
+# A module's bytes live at <dir>/dist/<module.name>.
+COPY facade/manifest.json /usr/share/vrt/facade/manifest.json
+COPY facade/dist /usr/share/vrt/facade/dist
+
+USER vrt
+WORKDIR /data
+VOLUME ["/data"]
+CMD ["/usr/local/bin/vrt"]
+
+# ---------- runtime-stub ----------
+# T25/L10: stub-profile image — identical runtime PLUS a vrt-host that
+# understands render mode=stub. The prod image's host binary is never
+# built with dev-stub (a stub that could leak into prod is fail-closed).
+# Built only when the compose stub overlay selects `target: runtime-stub`.
+FROM runtime AS runtime-stub
+USER root
+COPY --from=stub-builder /out/vrt-host-devstub /usr/local/bin/vrt-host
+USER vrt
+CMD ["/usr/local/bin/vrt"]

@@ -1,0 +1,9 @@
+{
+  "body": {
+    "code": "VRT_FENCED",
+    "error": "writer is fenced (epoch 7 expired)",
+    "retryable": true,
+    "success": false
+  },
+  "status": 200
+}

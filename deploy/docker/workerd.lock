@@ -1,0 +1,14 @@
+{
+  "version": "1.20260916.1",
+  "artifacts": {
+    "linux-x64": {
+      "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20260916.1.tgz",
+      "integrity": "sha512-a4gRHOI2Iv9wRbFkSGqcDFyfgo4pthTKeBUkdKhL7fxyNUghPNs9rHw+d2Q9aZyeOW2TDa2FI7ELg09eDJOPxA==",
+      "binarySha256": "fcaac1783cbd1cafd6e400ba73250aca04464cf4222cd9288404358fec7d5c29"
+    },
+    "linux-arm64": {
+      "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-1.20260916.1.tgz",
+      "integrity": "sha512-qWIZZtd1ATaRI53hKBTxpLKGQJcwOwpPsqfIUaRv8ouq2yJkzJxlG9hReacOjpSh1br3edPxysNa5KBOkqpn9Q=="
+    }
+  }
+}

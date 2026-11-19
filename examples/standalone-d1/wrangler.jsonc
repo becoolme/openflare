@@ -1,0 +1,13 @@
+// T34 — D1 binding via wrangler family. `database_id` is a USER-side
+// identifier only: the runtime databaseId is server-derived from the
+// declaration at pack time (sha256("vrt-d1:"+id)[:26]) and covered by
+// the signed snapshot — the worker can never pick an arbitrary id.
+{
+  "name": "d1-demo",
+  "main": "main.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["d1.vrt.local/*"],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "d1-demo-db", "database_id": "standalone-d1-demo" },
+  ],
+}

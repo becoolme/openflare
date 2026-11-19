@@ -1,0 +1,198 @@
+# VRT standalone — one-compose quick start.
+#
+#   WORKERD_SOURCE=file WORKERD_SHA256=$(shasum -a256 deploy/standalone/workerd | cut -d' ' -f1) \
+#     docker compose -f deploy/standalone/docker-compose.yml up --build
+#
+# WORKERD_SOURCE is REQUIRED for `build`/`up --build` (T25/L10+M5 —
+# no silent stub default). The `:-unset-required` sentinel keeps
+# non-build ops (`config`, `down`, `exec`) working without the env
+# set: docker's stage resolution then fails the BUILD with
+# `target stage "workerd-unset-required" could not be found`, which
+# names the missing variable — readable, still fail closed.
+#   file  — deploy/standalone/workerd (git-ignored) + WORKERD_SHA256
+#   image — WORKERD_IMAGE pinned image containing /usr/local/bin/workerd
+# or use a pinned image: WORKERD_SOURCE=image WORKERD_IMAGE=repo/workerd@sha256:…
+# The stub smoke profile is docker-compose.stub.yml.
+
+name: vrt-standalone
+
+x-vrt-common: &vrt-common
+  user: "${VRT_UID:-10001}:${VRT_GID:-10001}"
+  volumes:
+    - vrt-data:/data
+  restart: unless-stopped
+  # Resource-limit examples (compose v3 keys; honored by docker run
+  # --memory/--cpus equivalents under Swarm/k8s too):
+  # deploy:
+  #   resources:
+  #     limits: { cpus: "2.0", memory: 512M }
+
+x-vrt-image: &vrt-image
+  # T24/K4: ONE build — vrt-init is the only service carrying `build:`;
+  # every service shares the resulting local tag. `pull_policy: never`
+  # fails fast instead of pulling a nonexistent registry image; the
+  # builder overrides it with `build` so compose builds on demand.
+  image: vrt-standalone:${VRT_IMAGE_TAG:-local}
+  pull_policy: never
+
+services:
+  vrt-init:
+    <<: [*vrt-common, *vrt-image]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.vrt-local
+      # T25/L10: prod image target — vrt-host WITHOUT dev-stub.
+      target: runtime
+      args:
+        # T25/L10: NO stub default — a bare `up` must fail closed with
+        # a clear message instead of silently rebuilding a stub image.
+        WORKERD_SOURCE: ${WORKERD_SOURCE:-unset-required}
+        WORKERD_IMAGE: ${WORKERD_IMAGE:-debian:bookworm-slim}
+        WORKERD_SHA256: ${WORKERD_SHA256:-}
+        VRT_UID: ${VRT_UID:-10001}
+        VRT_GID: ${VRT_GID:-10001}
+    pull_policy: build
+    restart: "no"
+    entrypoint: ["/usr/local/bin/vrt"]
+    command:
+      - init
+      - --root
+      - /data
+      - --cell
+      - ${VRT_CELL:-local}
+      - --tenant
+      - ${VRT_TENANT:-local}
+      # D5: no --mode — vrt init detects the runtime kind from
+      # `workerd --version`; an explicit --mode must AGREE with it.
+      # The path is the unique runtime layout (/usr/local/bin/workerd);
+      # WORKERD_SOURCE=none leaves it absent → init fails closed.
+      - --workerd
+      - /usr/local/bin/workerd
+      - --ingress-listen
+      - 0.0.0.0:8080
+      # B12: metrics binds on all interfaces INSIDE the compose
+      # network (never published to the host — see `ports:`), so the
+      # optional `monitoring` profile can scrape them.
+      - --metrics-listen
+      - 0.0.0.0:9494
+      - --provider-metrics-listen
+      - 0.0.0.0:9493
+      - --vrt-sql-metrics-listen
+      - 0.0.0.0:9492
+
+  vrt:
+    <<: [*vrt-common, *vrt-image]
+    depends_on:
+      vrt-init:
+        condition: service_completed_successfully
+      # T37b-r4: the netns owner must exist before `vrt` joins it.
+      vrt-host:
+        condition: service_started
+    # T37b-r4: `vrt serve` (queue dispatcher + cron) dials vrt-host's
+    # control listener, which is LOOPBACK-only by design (config.rs
+    # rejects non-loopback controlListen — it is unauthenticated).
+    # In the split-container topology loopback only resolves if `vrt`
+    # shares vrt-host's network namespace — the same reachability the
+    # bare-metal single-host layout has for free. `vrt serve` binds no
+    # TCP listener — its mgmt is a unix socket under /data — so the shared
+    # netns exposes nothing extra. Caveat: `force-recreate` of
+    # vrt-host orphans this netns — recreate `vrt` with it.
+    network_mode: "service:vrt-host"
+    entrypoint: ["/usr/local/bin/vrt"]
+    # Control plane only in compose mode — the host/provider run in
+    # their own containers (supervision happens per-container).
+    command: [serve, --root, /data]
+    healthcheck:
+      # Unix-socket healthz via the CLI's own probe endpoint.
+      test: ["CMD", "/usr/local/bin/vrt", "health", "--root", "/data"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  vrt-host:
+    <<: [*vrt-common, *vrt-image]
+    depends_on:
+      vrt-init:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/vrt-host"]
+    command: ["--config", "/data/config/vrt-host.toml"]
+    ports:
+      - "${VRT_BIND:-127.0.0.1}:${VRT_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/vrt", "probe", "--url", "http://127.0.0.1:9091/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+
+  vrt-provider:
+    <<: [*vrt-common, *vrt-image]
+    depends_on:
+      vrt-init:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/vrt-provider"]
+    command: ["--config", "/data/config/vrt-provider.toml"]
+    healthcheck:
+      # D8: connect every listener socket — liveness, not file-exists.
+      test: ["CMD", "/usr/local/bin/vrt", "probe", "--dir-sockets", "/data/provider/listeners"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # T34: D1 data plane — persistence level is LOCAL FSYNC ONLY
+  # (no replication, single writer, epoch=1). The provider reaches
+  # vrt-sql over the internal network with a signed-token HMAC;
+  # rootfs is read-only, SQLite temp files go to a tmpfs, durable
+  # data lives only on the /data volume.
+  vrt-sql:
+    <<: [*vrt-common, *vrt-image]
+    volumes:
+      - vrt-data:/data
+      # T36: dedicated object-store volume — manifest/segments/snapshots
+      # live here (fs backend), independent of the mutable db dir.
+      - vrt-sql-objects:/data/objstore
+    depends_on:
+      vrt-init:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/vrt-sql"]
+    command: ["--config", "/data/config/vrt-sql.toml"]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/vrt", "probe", "--url", "http://127.0.0.1:8090/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # B12: optional monitoring — `docker compose --profile monitoring up`.
+  # VictoriaMetrics single-node scrapes the internal /metrics ports
+  # every 30s (7d retention); query UI on ${VM_BIND:-127.0.0.1}:8428.
+  victoria-metrics:
+    profiles: ["monitoring"]
+    image: ${VM_IMAGE:-victoriametrics/victoria-metrics:v1.108.0}
+    restart: unless-stopped
+    command:
+      - -promscrape.config=/etc/vm/promscrape.yml
+      - -retentionPeriod=7d
+      - -httpListenAddr=0.0.0.0:8428
+    volumes:
+      - ./monitoring/promscrape.yml:/etc/vm/promscrape.yml:ro
+      - vm-data:/victoria-metrics-data
+    ports:
+      - "${VM_BIND:-127.0.0.1}:${VM_PORT:-8428}:8428"
+    depends_on:
+      vrt-host:
+        condition: service_started
+
+volumes:
+  # Plain named volume: Docker copies the image's /data ownership
+  # (vrt:vrt 0700) on first create — no manual chown needed.
+  vrt-data:
+  # T36: vrt-sql object persistence (fs backend) — separate volume so
+  # manifest/segment data survives independently of db file churn.
+  vrt-sql-objects:
+  vm-data:

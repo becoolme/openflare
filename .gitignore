@@ -1,0 +1,12 @@
+/target
+# per-crate target dirs (test scratch, e.g. vrt-host/target/tmp-*)
+*/target/
+
+# Operator-provided workerd binaries consumed by Docker build context
+# (huge, downloaded once — never commit; see deploy/standalone/README.md).
+deploy/standalone/workerd
+deploy/docker/workerd
+
+# local cargo home / node deps
+.cargo-home/
+node_modules/

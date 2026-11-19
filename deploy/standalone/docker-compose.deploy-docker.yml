@@ -1,0 +1,9 @@
+# T24/K2: there is exactly ONE vrt-local Dockerfile —
+# deploy/docker/Dockerfile.vrt-local (deploy/standalone/Dockerfile is a
+# pointer to it). This overlay exists for pipelines that pin the build
+# explicitly; it sets the same canonical file on the single builder
+# service. See docker-compose.yml for the shared-image design.
+services:
+  vrt-init:
+    build:
+      dockerfile: deploy/docker/Dockerfile.vrt-local

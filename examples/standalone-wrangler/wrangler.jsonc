@@ -1,0 +1,23 @@
+// T31/C4 — the wrangler family is a first-class standalone config
+// source: same candidate order + env semantics as the platform packer
+// (wrangler.json > wrangler.jsonc > wrangler.toml; vrt.toml wins).
+{
+  "name": "wrangler-demo",
+  "main": "main.js",
+  "compatibility_date": "2024-09-25",
+  // plain-FQDN routes map to standalone hostnames
+  "routes": ["wrangler.vrt.local/*"],
+  "vars": {
+    "GREETING": "hello from wrangler.jsonc",
+    "LIMIT": 42, // non-string vars JSON-encode ("42")
+  },
+  "kv_namespaces": [
+    // no `id` — standalone derives the namespace from the binding name
+    { "binding": "CACHE" },
+  ],
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    "not_found_handling": "404-page",
+  },
+}

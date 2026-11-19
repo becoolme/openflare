@@ -1,0 +1,29 @@
+# syntax=docker/dockerfile:1
+# vrt-sql — D1 data plane (DO-backed SQLite cell store). Pure Rust; no workerd.
+# debian-slim over distroless: same support contract as vrt-host —
+# read-only root in manifests; writable state is the mounted /data only.
+ARG RUST_IMAGE=rust:1.93.0-bookworm
+ARG DEBIAN_IMAGE=debian:bookworm-slim
+
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /build
+COPY . .
+RUN set -eux; \
+    cargo build --release --locked -p vrt-sql --bin vrt-sql; \
+    install -D -m 0755 target/release/vrt-sql /out/vrt-sql
+
+FROM ${DEBIAN_IMAGE} AS runtime
+ARG VRT_UID=10001
+ARG VRT_GID=10001
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --system --gid "${VRT_GID}" vrt; \
+    useradd --system --uid "${VRT_UID}" --gid vrt --home-dir /data vrt; \
+    install -d -o vrt -g vrt -m 0700 /data /tmp
+COPY --from=builder /out/vrt-sql /usr/local/bin/vrt-sql
+USER vrt
+WORKDIR /data
+VOLUME ["/data"]
+CMD ["/usr/local/bin/vrt-sql", "/etc/vrt/vrt-sql.toml"]

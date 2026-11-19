@@ -1,0 +1,6 @@
+{
+  "comment": "VersionBundle stored document produced by server/src/services/workerRuntime — regenerate with VRT_WRITE_FIXTURES=1",
+  "objectKey": "workers/v1/bundles/9649f1009d0c379273ed5990eaea1359f1ad643dde42a47e1afdf4f88874f238",
+  "digest": "9649f1009d0c379273ed5990eaea1359f1ad643dde42a47e1afdf4f88874f238",
+  "storedDocument": "{\"compatibilityDate\":\"2024-09-25\",\"compatibilityFlags\":[\"nodejs_compat\"],\"digest\":\"9649f1009d0c379273ed5990eaea1359f1ad643dde42a47e1afdf4f88874f238\",\"mainModule\":\"index.js\",\"modules\":[{\"dataBase64\":\"AAECAw==\",\"name\":\"bin/blob.bin\",\"type\":\"data\"},{\"dataBase64\":\"AGFzbQ==\",\"name\":\"bin/mod.wasm\",\"type\":\"wasm\"},{\"name\":\"data/hello.txt\",\"text\":\"hello vrt\",\"type\":\"text\"},{\"name\":\"data/table.json\",\"text\":\"{\\\"answer\\\":42,\\\"list\\\":[1,2,3]}\",\"type\":\"json\"},{\"name\":\"index.js\",\"text\":\"export default { async fetch() { return new Response(\\\"ok\\\") } }\",\"type\":\"esModule\"},{\"name\":\"lib/util.js\",\"text\":\"module.exports = {}\",\"type\":\"commonJs\"}],\"schemaVersion\":1}"
+}

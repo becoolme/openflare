@@ -1,0 +1,94 @@
+# VRT 独立模式 —— vrt-host 示例配置。
+# 与 celld 形态一致：单实例、单一可信所有者。无 cell-controller/
+# assignment —— desired envelope 由 vrt-local 本地签名后直接落盘；
+# bundle 用本地目录源（objects/<digest>，与 vrt-local 写入侧一致）。
+# __VRT_ROOT__ = `vrt init` 的根目录（如 ~/.vrt）。键名 camelCase。
+cellId = "__VRT_CELL__"
+workerdBinary = "__WORKERD__"
+workDir = "__VRT_ROOT__/work"
+cacheDir = "__VRT_ROOT__/objects"                        # bundle 缓存目录（host 写）
+listenAddr = "__VRT_LISTEN__"
+controlListen = "__VRT_CONTROL__"                         # 可选；本地观测用
+metricsListen = "__VRT_METRICS__"                         # B12: 仅 /metrics(内部,勿公网发布)
+# P3c-1: Durable Object 存储根 —— <dir>/<seg(tenant)>/<workerId>/<uniqueKey>/。
+# 必须在 workDir 之外（gen-* 目录会被清扫）；缺失 → DO 租户装配即拒绝。
+doStorageDir = "__VRT_ROOT__/do"
+allowLocalDurability = true # RV-R66: dev example, single-copy DO state
+
+[bundles]
+# T25/L5: ONE object convention — vrt-local deploy/seed 写
+# `objects/<digest>`，host 的本地 bundle 源读同一目录。
+dir = "__VRT_ROOT__/objects"
+
+[desired]
+path = "__VRT_ROOT__/desired/envelope.json"              # vrt-local deploy 原子写入
+trustedKeys = [
+  { keyId = "__VRT_KEY_ID__", publicKey = "__VRT_PUBKEY__" },  # vrt init 渲染
+]
+reloadMs = 1000
+graceVersions = 1
+
+[render]
+mode = "capnp"
+facadeManifest = "__VRT_ROOT__/facade/manifest.json"
+# T25/L13: 指向 provider 的租户 listener socket —
+# provider 按 <listenerDir>/<enc(tenant)>.sock 绑定，两边共用
+# vrt_securefs::socket_path 派生（vrt init 渲染）。
+bindingBackendSocket = "__VRT_BACKEND_SOCK__"
+systemCompatDate = "2024-09-25"
+systemCompatFlags = []
+secretsFile = "__VRT_ROOT__/secrets/secrets.json"         # vrt-local secret put 维护 (0600)
+varsFile = "__VRT_ROOT__/vars/vars.json"                  # vrt-local deploy 维护 (0600)
+# T17/F1: 两个文件都在每次 converge 重读 + 权限校验 —— secret/var 变更
+# 无需重启即生效；读取失败 → render-inputs-unavailable，旧代继续服务。
+
+
+# T21: ASSETS 物化 —— 与 provider 共享的内容寻址存储；standalone
+# 由 `vrt deploy` 预写入（无 baseUrl → 缺失即 fail closed）。
+[assets]
+dir = "__VRT_ROOT__/provider/data/assets"
+
+# P3c-2: DO 放置 lease + 快照 —— 与 vrt-sql `[persistence]` 同一套
+# 键面（backend/fs/s3/leaseMs/clockSkewMarginMs）。standalone 用 fs
+# 后端（与 vrt-sql 对象卷同根的 `objstore/do` 子目录——命名空间隔离，
+# 不与 D1 对象混写）。CAS 初始化/自检失败 → 启动即拒（fail closed，
+# 绝不回落 LocalPlacement）。
+[placement]
+backend = "fs"
+leaseMs = 30000
+clockSkewMarginMs = 5000
+[placement.fs]
+root = "__VRT_ROOT__/objstore/do"
+
+# P3c-2: 周期快照节奏（ms）。interval 下限 60s、e2e 手动触发走
+# `POST /v1/do/snapshot`（loopback 控制面）。
+[doSnapshots]
+intervalMs = 300000
+jitterMs = 30000
+
+[supervisor]
+readyTimeoutMs = 10000
+# T27/N0: must satisfy failThreshold*(readyTimeoutMs+backoffMaxMs)
+# — defaults 5×(10s+5s)=75s → 90s window.
+failWindowMs = 90000
+
+# C1: per-tenant Cache API — every tenant worker gets
+# `cacheApiOutbound` bound to `<workDir>/cache/<seg(tenant)>.sock`
+# (0711 root, 0600 socket chown'd to the tenant). Bare section =
+# defaults (8MiB entry / 128MiB tenant / 512MiB service stored,
+# 64MiB global / 32MiB per-tenant in-flight PUT bytes — C1-r2).
+# Absent ⇒ no emit; `caches.*` throws `No Cache was configured`.
+[cache]
+# maxEntryBytes = 8388608
+# tenantBytes = 134217728
+# globalBytes = 536870912
+# globalInflightBytes = 67108864
+# tenantInflightBytes = 33554432
+
+[ingress]
+requestTimeoutMs = 30000
+connectTimeoutMs = 500
+maxBodyBytes = 1048576
+# MIG-7: standalone is reached directly over plaintext — the
+# `fixed-http` default is correct here (client headers are always
+# stripped; nothing promotes the scheme).
