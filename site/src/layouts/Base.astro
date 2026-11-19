@@ -4,6 +4,11 @@ interface Props {
   description: string;
 }
 const { title, description } = Astro.props;
+
+// Optional Plausible-compatible analytics, set at build time.
+// Both must be set, otherwise no script is emitted.
+const analyticsDomain = import.meta.env.PUBLIC_ANALYTICS_DOMAIN;
+const analyticsSrc = import.meta.env.PUBLIC_ANALYTICS_SRC;
 ---
 <!doctype html>
 <html lang="en">
@@ -20,6 +25,9 @@ const { title, description } = Astro.props;
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" />
+    {analyticsDomain && analyticsSrc && (
+      <script is:inline defer data-domain={analyticsDomain} src={analyticsSrc}></script>
+    )}
   </head>
   <body>
     <div style="background: #FAFAF7; color: #0F1A2E; font-family: Geist, Inter, system-ui, sans-serif; font-size: 16px; line-height: 1.6">
