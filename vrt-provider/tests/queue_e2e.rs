@@ -1,9 +1,9 @@
-//! T37 全链路对抗测试（in-process）：
-//!   facade 模拟请求 → provider `tenant_router` → Authorizer →
-//!   QueueClient(ServiceAuth) → 真 vrt-sql axum app → SqliteQueueBackend。
-//! 覆盖：授权路由（queueId 只来自签名 desired snapshot）、伪造资源头、
-//! 跨租户队列写入、D1 binding 调队列端点的 kind-mismatch fail-closed、
-//! broker wire → metrics 往返。
+//! T37 full-path adversarial test (in-process):
+//!   facade simulated request -> provider `tenant_router` -> Authorizer ->
+//!   QueueClient(ServiceAuth) -> real vrt-sql axum app -> SqliteQueueBackend.
+//! Covers: authorization routing (queueId comes only from the signed desired snapshot), forged resource headers,
+//! cross-tenant queue writes, a D1 binding calling queue endpoints failing closed on kind mismatch,
+//! broker wire -> metrics round trip.
 
 mod support;
 
@@ -19,9 +19,9 @@ use vrt_provider::server::{tenant_router, TenantService};
 const QUEUE_ID: &str = "qqqqqqqqqqqqqqqqqqqqqqqqqq";
 const OTHER_QUEUE_ID: &str = "zzzzzzzzzzzzzzzzzzzzzzzzzz";
 
-/// vrt-sql scratch db root — `target/tmp/` 仓库约定（不落 /tmp）。
-/// T37r2：Drop guard——以前裸 PathBuf 随测试进程退出而永不清理，
-/// 挂死/崩溃各留一个 `queue-e2e-*` 目录；无论成败现在都回收。
+/// vrt-sql scratch db root -- the `target/tmp/` repo convention (does not land in /tmp).
+/// T37r2: Drop guard -- previously a bare PathBuf was never cleaned up when the test process exited,
+/// each hang/crash left a `queue-e2e-*` directory; now it is reclaimed regardless of outcome.
 struct ScratchDir(std::path::PathBuf);
 
 impl ScratchDir {
@@ -32,9 +32,9 @@ impl ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        // axum server task 是 in-process 的，可能仍在写——unix 上
-        // remove_dir_all 对已打开文件安全；失败只告警不 panic
-        //（清理绝不能让绿测试变红）。
+        // The axum server task is in-process and may still be writing -- on unix
+        // remove_dir_all is safe for open files; a failure only warns and does not panic
+        // (cleanup must never turn a green test red).
         if let Err(e) = std::fs::remove_dir_all(&self.0) {
             eprintln!("scratch cleanup {}: {e}", self.0.display());
         }
@@ -150,7 +150,7 @@ async fn producer_send_batch_metrics_roundtrip() {
     let svc = svc_with_queue(Some(client), &f);
     let base = format!("/internal/bindings/v1/queue/{}~Q", WORKER);
 
-    // POST /message — raw body + broker headers。
+    // POST /message -- raw body + broker headers.
     let (st, body) = call(
         svc.clone(),
         "POST",
@@ -160,14 +160,14 @@ async fn producer_send_batch_metrics_roundtrip() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
-    // broker 响应形状 {metadata:{metrics:{backlogCount,…}}}。
+    // broker response shape {metadata:{metrics:{backlogCount,...}}}.
     assert_eq!(
         body["metadata"]["metrics"]["backlogCount"].as_i64(),
         Some(1),
         "{body}"
     );
 
-    // POST /batch — JSON {messages:[…base64…]}。
+    // POST /batch -- JSON {messages:[...base64...]}.
     let batch = serde_json::json!({
         "messages": [
             {"contentType": "text", "body": "aGk="},
@@ -190,8 +190,8 @@ async fn producer_send_batch_metrics_roundtrip() {
         "{body}"
     );
 
-    // metrics — provider 侧走 POST（dispatch 全局 POST-only；
-    // facade 把 broker 的 GET /metrics 翻译成 POST）。
+    // metrics -- the provider side goes via POST (dispatch is globally POST-only;
+    // the facade translates the broker's GET /metrics into POST).
     let (st, body) = call(
         svc.clone(),
         "POST",
@@ -206,9 +206,9 @@ async fn producer_send_batch_metrics_roundtrip() {
 
 #[tokio::test]
 async fn forged_resource_header_cannot_redirect_queue() {
-    // 伪造 x-open-compute-namespace-resource-id = 另一租户的 queueId：
-    // Authorizer 拿 desired snapshot 里的 queueId 与身份头比对 →
-    // ResourceMismatch → 403，伪造的目标队列永远收不到消息。
+    // Forged x-open-compute-namespace-resource-id = another tenant's queueId:
+    // the Authorizer compares the queueId in the desired snapshot against the identity header ->
+    // ResourceMismatch -> 403, the forged target queue never receives the message.
     let (sql_addr, _tmp) = spawn_vrt_sql("rt").await;
     let f = fixture();
     let client = Arc::new(
@@ -229,7 +229,7 @@ async fn forged_resource_header_cannot_redirect_queue() {
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    // 目标队列必须仍为空——伪造未被送达。
+    // The target queue must still be empty -- the forgery was not delivered.
     let (st2, body) = call(
         svc,
         "POST",
@@ -256,7 +256,7 @@ async fn wrong_binding_and_kind_mismatch_fail_closed() {
     );
     let svc = svc_with_queue(Some(client), &f);
 
-    // 未声明的 binding 名 → authorize 拒。
+    // Undeclared binding name -> authorize rejects.
     let (st, _) = call(
         svc.clone(),
         "POST",
@@ -267,7 +267,7 @@ async fn wrong_binding_and_kind_mismatch_fail_closed() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 
-    // bindingId 指向不存在的 worker（伪造 workerId）。
+    // bindingId points at a nonexistent worker (forged workerId).
     let mut h = queue_headers("Q", QUEUE_ID);
     h.retain(|(k, _)| k != "x-open-compute-worker-id");
     h.push(("x-open-compute-worker-id".to_string(), "ghost".to_string()));
@@ -281,7 +281,7 @@ async fn wrong_binding_and_kind_mismatch_fail_closed() {
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 
-    // 队列后端未配置 → 503（fail closed，不静默成功）。
+    // Queue backend not configured -> 503 (fail closed, no silent success).
     let svc_none = svc_with_queue(None, &f);
     let (st, _) = call(
         svc_none,
@@ -296,10 +296,10 @@ async fn wrong_binding_and_kind_mismatch_fail_closed() {
 
 #[tokio::test]
 async fn cross_tenant_queue_unwritable() {
-    // team-other 的队列 binding 授权在 team-other 下——TENANT 的
-    // TenantService 处理它时 tenant 不匹配 → 拒。等价于"租户 X 的
-    // binding 写租户 Y 的 queueId"的反向：资源属于谁由快照决定，
-    // 不由请求决定。
+    // team-other's queue binding is authorized under team-other -- when TENANT's
+    // TenantService handles it the tenant does not match -> rejected. The reverse of "a binding of tenant X
+    // writing tenant Y's queueId": who owns a resource is decided by the snapshot,
+    // not by the request.
     let (sql_addr, _tmp) = spawn_vrt_sql("rt").await;
     let f = fixture();
     let client = Arc::new(
@@ -311,7 +311,7 @@ async fn cross_tenant_queue_unwritable() {
         .unwrap(),
     );
     let svc = svc_with_queue(Some(client), &f);
-    // w-other/Q 属于 team-other：TENANT listener 上拒绝。
+    // w-other/Q belongs to team-other: rejected on the TENANT listener.
     let binding = vrt_provider::identity::binding_id("w-other", "Q");
     let h = standard_headers(&binding, "w-other", "v-other", DIGEST2, OTHER_QUEUE_ID, 7);
     let (st, _) = call(
@@ -327,7 +327,7 @@ async fn cross_tenant_queue_unwritable() {
 
 #[tokio::test]
 async fn permission_denied_read_only_binding() {
-    // permissions.read 的 queue binding 不能写。
+    // A queue binding with permissions.read cannot write.
     let (sql_addr, _tmp) = spawn_vrt_sql("rt").await;
     let f = fixture();
     let store = store_with(
@@ -378,7 +378,7 @@ async fn permission_denied_read_only_binding() {
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
-    // metrics 只读 → 允许。
+    // metrics is read-only -> allowed.
     let (st, _) = call(
         svc,
         "POST",

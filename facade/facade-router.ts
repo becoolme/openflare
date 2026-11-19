@@ -35,8 +35,8 @@ import {
 const ASSET_ROUTE_HEADER = "x-vrt-asset-route";
 
 /// F0.4: every silent branch emits a structured diagnostic — the
-/// fallback must be observable (AGENTS.md: 兜底必须可观测，不能静默
-/// 吞错). Log shape is fixed: code + digest prefix + error name/code;
+/// fallback must be observable (AGENTS.md: fallbacks must be observable, never silently
+/// swallow errors). Log shape is fixed: code + digest prefix + error name/code;
 /// never props, tokens, or request headers.
 function routeError(
   code: RouteErrorReason,

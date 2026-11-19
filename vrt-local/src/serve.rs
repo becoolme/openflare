@@ -696,8 +696,8 @@ async fn queue_dispatch_loop(root: &Path) {
 }
 
 /// `[vrtSql] addr`/`authSecretFile` out of `config/vrt-provider.toml`.
-/// T37b-r4: `vrt queue-metrics`（CLI 诊断）与 dispatcher/cron 共用
-/// 同一读取路径。
+/// T37b-r4: `vrt queue-metrics` (CLI diagnostics) shares the same read path
+/// with the dispatcher/cron.
 pub fn provider_sql(root: &Path) -> Option<(String, std::path::PathBuf)> {
     let text =
         std::fs::read_to_string(crate::layout::config_dir(root).join("vrt-provider.toml")).ok()?;

@@ -1,6 +1,6 @@
-//! SqlEngine trait + RusqliteEngine（§10 trait 草案的 P3a 实现）。
+//! SqlEngine trait + RusqliteEngine (the P3a implementation of the section 10 trait draft).
 //!
-//! 持久化等级（T33）：仅本地 fsync，无复制；epoch 字段已预留。
+//! Durability level (T33): local fsync only, no replication; the epoch field is reserved.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,9 +17,9 @@ use thiserror::Error;
 use crate::paths::{self, PathError};
 use crate::security;
 
-// ---------- wire 类型（与 D1 协议对齐，§2 表） ----------
+// ---------- wire types (aligned with the D1 protocol, section 2 table) ----------
 
-/// `Value = number | string | null | number[]`（number[] → BLOB）。
+/// `Value = number | string | null | number[]` (number[] -> BLOB).
 #[derive(Debug, Clone, PartialEq)]
 pub enum SqlValue {
     Null,
@@ -56,7 +56,7 @@ impl<'de> Deserialize<'de> for SqlValue {
             }
             serde_json::Value::String(t) => Ok(SqlValue::Text(t)),
             serde_json::Value::Array(items) => {
-                // number[] → BLOB；元素非 number 即 schema 违规
+                // number[] -> BLOB; a non-number element is a schema violation
                 let mut out = Vec::with_capacity(items.len());
                 for it in items {
                     match it.as_u64().filter(|u| *u <= 255) {
@@ -82,7 +82,7 @@ pub struct SqlStmt {
     pub params: Option<Vec<SqlValue>>,
 }
 
-/// `?resultsFormat=`：非法/缺省回落 ARRAY_OF_OBJECTS（miniflare `.catch`）。
+/// `?resultsFormat=`: invalid/missing falls back to ARRAY_OF_OBJECTS (miniflare `.catch`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultsFormat {
     ArrayOfObjects,
@@ -119,7 +119,7 @@ pub struct QueryResult {
     pub meta: Meta,
 }
 
-// ---------- 错误 ----------
+// ---------- errors ----------
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -133,12 +133,12 @@ pub enum EngineError {
     Fenced(u64),
     #[error("database already open (single writer)")]
     AlreadyOpen,
-    /// T35c：id 已被 DROP op tombstone（内存集 + 磁盘 `.dropped`
-    /// marker）。fail closed，wire 面映射为 `{success:false}`。
+    /// T35c: the id was tombstoned by a DROP op (in-memory set + on-disk `.dropped`
+    /// marker). Fail closed; the wire surface maps it to `{success:false}`.
     #[error("database dropped")]
     Dropped,
-    /// T36：暂态不可用（lease 在别处存活/持久层不可达/恢复失败）。
-    /// wire 映射 503 + `code:"VRT_UNAVAILABLE"` + retryable。
+    /// T36: transiently unavailable (lease alive elsewhere / persistence layer unreachable / restore failed).
+    /// Wire maps it to 503 + `code:"VRT_UNAVAILABLE"` + retryable.
     #[error("unavailable: {0}")]
     Unavailable(&'static str),
     /// RV-R71: the call's deadline expired BEFORE anything was
@@ -160,7 +160,7 @@ pub enum EngineError {
 }
 
 impl EngineError {
-    /// wire `{error}` 文本（golden 比对对象）。
+    /// Wire `{error}` text (the object golden compares against).
     pub fn wire_message(&self) -> String {
         match self {
             EngineError::Sqlite(e) => e.to_string(),
@@ -169,7 +169,7 @@ impl EngineError {
     }
 }
 
-// ---------- trait（§10 草案 P3a 裁剪：同步引擎） ----------
+// ---------- trait (section 10 draft, trimmed for P3a: synchronous engine) ----------
 
 /// RV-R71: set by the engine the moment `tx.commit()` returns Ok, so a
 /// caller that abandons a blocking call at its deadline can tell
@@ -218,7 +218,7 @@ fn mark_committed() {
 pub struct TxnCtx {
     pub epoch: u64,
     pub deadline: Instant,
-    /// `(epoch, seq)` 去重键；None = 不去重（兼容直连测试）。
+    /// `(epoch, seq)` dedup key; None = no dedup (compatible with direct-connect tests).
     pub dedup: Option<(u64, u64)>,
 }
 
@@ -228,25 +228,25 @@ pub struct Snapshot;
 
 #[async_trait::async_trait]
 pub trait SqlEngine: Send + Sync {
-    /// 单事务执行整批；失败全批回滚只回首错。
-    /// resultsFormat 属 wire 关注点，trait 默认对象数组口径。
+    /// Execute the whole batch in a single transaction; on failure the whole batch rolls back and only the first error is returned.
+    /// resultsFormat is a wire concern; the trait defaults to the array-of-objects form.
     async fn query_batch(
         &self,
         batch: &[SqlStmt],
         ctx: &TxnCtx,
     ) -> Result<Vec<QueryResult>, EngineError>;
-    /// 当前提交位点（裸 lsn；HMAC/定宽封装在 wire 层 BookmarkSigner）。
+    /// Current commit position (bare lsn; HMAC/fixed-width wrapping lives in the wire-layer BookmarkSigner).
     async fn bookmark(&self) -> Result<u64, EngineError>;
-    /// 强制 checkpoint，返回可上传的 LTX 段（P3a 未实现复制→报错）。
+    /// Force a checkpoint and return the uploadable LTX segment (replication is not implemented in P3a -> error).
     async fn checkpoint(&self) -> Result<LtxSegment, EngineError>;
-    /// 从快照恢复（P3a 未实现→报错）。
+    /// Restore from a snapshot (not implemented in P3a -> error).
     async fn restore(&self, snap: &Snapshot) -> Result<(), EngineError>;
     fn size_bytes(&self) -> u64;
 }
 
-// ---------- 引擎 ----------
+// ---------- engine ----------
 
-/// 请求负载的定式 digest（dedup 撞键检测用，含 sql+params）。
+/// Canonical digest of the request payload (used for dedup key-collision detection; covers sql+params).
 fn req_digest(stmts: &[&SqlStmt]) -> String {
     let mut h = sha2::Sha256::new();
     for q in stmts {
@@ -275,7 +275,7 @@ fn req_digest(stmts: &[&SqlStmt]) -> String {
                 }
             }
         }
-        h.update([0xffu8]); // 语句分隔
+        h.update([0xffu8]); // statement separator
     }
     hex::encode(h.finalize())
 }
@@ -289,10 +289,10 @@ const DEDUP_DDL: &str = "CREATE TABLE IF NOT EXISTS _vrt_dedup(
     PRIMARY KEY (epoch, seq)
 )";
 
-/// miniflare 同款非空判定：`sql.replace(/^\s+--.*/gm, "").trim().len() > 0`
-/// （database.worker.js:175-176）。注意 `\s+` 可吞换行："空白行+注释行"
-/// 整体剥；而 `--` 直接贴在行首（行内无前置空白）不剥——串首的
-/// `"-- comment"` 会原样到达 SQLite 报 "did not contain a statement"。
+/// The same non-empty check as miniflare: `sql.replace(/^\s+--.*/gm, "").trim().len() > 0`
+/// (database.worker.js:175-176). Note `\s+` can swallow newlines: "blank line + comment line"
+/// is stripped as a whole; but `--` directly at line start (no leading whitespace on the line) is not stripped -- a string-initial
+/// `"-- comment"` reaches SQLite unchanged and reports "did not contain a statement".
 fn is_nonempty_sql(sql: &str) -> bool {
     !strip_comment_lines(sql).iter().all(|&b| is_sql_space(b))
 }
@@ -301,8 +301,8 @@ fn is_sql_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
-/// `/^\s+--.*/gm` 的手工等价物：在"行首位置"(pos0 或换行之后)起，
-/// 若连续空白字符后是 `--`，则剥掉从行首到该行尾（不含换行符）。
+/// Hand-written equivalent of `/^\s+--.*/gm`: starting at a "line-start position" (pos0 or after a newline),
+/// if consecutive whitespace is followed by `--`, strip from line start to line end (newline excluded).
 fn strip_comment_lines(sql: &str) -> Vec<u8> {
     let b = sql.as_bytes();
     let n = b.len();
@@ -316,7 +316,7 @@ fn strip_comment_lines(sql: &str) -> Vec<u8> {
                 j += 1;
             }
             if j > i && j + 1 < n && b[j] == b'-' && b[j + 1] == b'-' {
-                // 命中：丢弃 [i, 下一个换行符)
+                // Hit: discard [i, next newline)
                 let mut k = j;
                 while k < n && b[k] != b'\n' {
                     k += 1;
@@ -335,34 +335,34 @@ fn strip_comment_lines(sql: &str) -> Vec<u8> {
 
 struct EngineInner {
     conn: Connection,
-    /// 引擎内部语句的 authorizer 旁路（仅引擎代码置位）
+    /// Authorizer bypass for engine-internal statements (set only by engine code)
     internal: security::InternalFlag,
-    /// T36：页面大小（段编码/快照解析）。
+    /// T36: page size (segment encoding / snapshot parsing).
     page_size: u32,
-    /// T36：已提交的 WAL 帧下标水位（mxFrame）。只在单写者锁内
-    /// 读写；PASSIVE checkpoint 观测，TRUNCATE 后归零。
+    /// T36: committed WAL frame index watermark (mxFrame). Read and written only
+    /// under the single-writer lock; observed by PASSIVE checkpoint, zeroed after TRUNCATE.
     wal_frames: u64,
-    /// RV-R31 #1：当前 WAL 代际盐对——帧截取只认本代际。
-    /// `None` = 未播种（open/TRUNCATE 后的第一次捕获按当时
-    /// header 播种，水位为 0 时代际切换无需区分）。
+    /// RV-R31 #1: current WAL generation salt pair -- frame capture only accepts this generation.
+    /// `None` = not seeded (the first capture after open/TRUNCATE seeds from the then-current
+    /// header; when the watermark is 0 no generation-switch distinction is needed).
     wal_salt: Option<(u32, u32)>,
-    /// RV-R31 #1：水位帧之后的累计 checksum——下一段帧链的
-    /// 校验种子。TRUNCATE 后随代际清 0。
+    /// RV-R31 #1: cumulative checksum after the watermark frame -- the
+    /// verification seed for the next frame chain. Cleared to 0 with the generation after TRUNCATE.
     wal_cksum: (u32, u32),
-    /// RV-R31 #1：WAL 校验和字节序（header magic 末位）。
+    /// RV-R31 #1: WAL checksum byte order (last bit of the header magic).
     wal_be: bool,
-    /// T36：lease + 持久化槽（persistence backend 存在时）。
+    /// T36: lease + persistence slot (when a persistence backend exists).
     persist: Option<PersistSlot>,
 }
 
-/// T36：引擎持有的持久化状态（在 inner 锁内维护——所有持久化
-/// 操作与本地提交同属单写者临界区，顺序天然串行）。
+/// T36: persistence state held by the engine (maintained under the inner lock -- all persistence
+/// operations and the local commit share the single-writer critical section, so ordering is naturally serial).
 struct PersistSlot {
     handle: crate::persist::ManifestHandle,
     persister: std::sync::Arc<crate::persist::Persister>,
-    /// T36b：checkpoint 动态间隔（commits）——失败指数翻倍，
-    /// 封顶 `every*64`；成功归零时回到 `every`。防"快照超限/
-    /// store 抖动 → 每次提交都重传整库"的病态循环。
+    /// T36b: dynamic checkpoint interval (commits) -- doubles on failure,
+    /// capped at `every*64`; resets to `every` on success. Prevents the pathological loop of
+    /// "snapshot over limit / store flapping -> whole db re-uploaded on every commit".
     ckpt_gap: u64,
 }
 
@@ -372,31 +372,31 @@ pub struct RusqliteEngine {
     served_by: String,
     #[allow(dead_code)]
     database_id: String,
-    /// T35c：registry drop_db 在摘除引擎的同一临界区内置位。
-    /// query_batch 入口与 commit 前各查一次——摘除后到目录 rename/
-    /// 删除窗口内的新写入不再可能"成功但随即被删"。
+    /// T35c: registry drop_db sets this inside the same critical section that removes the engine.
+    /// Checked once at query_batch entry and once before commit -- new writes in the window between removal and directory rename/
+    /// deletion can no longer "succeed and then get deleted".
     dropped: AtomicBool,
-    /// T36：lease 丢失/持久化失败 → fenced；此后一切读写被拒，
-    /// registry 摘除后经恢复路径重建。
+    /// T36: lease lost / persistence failed -> fenced; afterwards all reads and writes are rejected,
+    /// and the registry rebuilds via the recovery path after removal.
     fenced: AtomicBool,
-    /// T36b：最近一次 checkpoint 因快照超限被拒（诊断/告警面）。
+    /// T36b: the latest checkpoint was rejected for exceeding the snapshot limit (diagnostics/alerting surface).
     snapshot_over_cap: AtomicBool,
-    /// T36：写者 epoch（bookmark 的 epoch 分量；无持久化时为 1，
-    /// 等价旧行为——旧 bookmark 的 epoch 字段来自调用方）。
+    /// T36: writer epoch (the epoch component of bookmarks; 1 without persistence,
+    /// equivalent to the old behavior -- the old bookmark's epoch field came from the caller).
     lease_epoch: AtomicU64,
-    /// T36：上次续租失败但仍在 margin 内（诊断/metric 读取）。
+    /// T36: the last renewal failed but is still within the margin (read for diagnostics/metrics).
     degraded: AtomicBool,
-    /// T36：db 文件路径（WAL 旁车定位）。
+    /// T36: db file path (to locate the WAL sidecar).
     db_file: PathBuf,
-    _lock_file: std::fs::File, // 保持 flock 至 drop
+    _lock_file: std::fs::File, // keeps the flock until drop
 }
 
 impl RusqliteEngine {
-    /// 打开（必要时创建）数据库文件；进程内由 Registry 保证唯一打开，
-    /// flock(LOCK_EX|LOCK_NB) 覆盖跨进程重复打开（fail closed）。
+    /// Open (creating if necessary) the database file; the Registry guarantees a single open within the process,
+    /// and flock(LOCK_EX|LOCK_NB) covers duplicate opens across processes (fail closed).
     pub fn open(db_root: &Path, database_id: &str) -> Result<Self, EngineError> {
-        // T35c tombstone：先查 `.dropped` marker 再 derive——
-        // derive_db_file 会建目录，顺序反了会让已删除的 id "复活"。
+        // T35c tombstone: check the `.dropped` marker first, then derive --
+        // derive_db_file creates directories; the reverse order would "resurrect" a deleted id.
         if paths::marker_exists(db_root, database_id)? {
             return Err(EngineError::Dropped);
         }
@@ -404,9 +404,9 @@ impl RusqliteEngine {
         Self::open_file_opts(&db_file, database_id, false)
     }
 
-    /// T36：`wal_capture=true`（持久化启用）时关闭 auto-checkpoint
-    /// 并在 open 时 TRUNCATE checkpoint：此后 WAL 文件只在我们的显式
-    /// checkpoint 时回缩，字节水位捕获才成立（`persist_commit`）。
+    /// T36: when `wal_capture=true` (persistence enabled), disable auto-checkpoint
+    /// and TRUNCATE-checkpoint at open: from then on the WAL file only shrinks on our explicit
+    /// checkpoint, which makes byte-watermark capture valid (`persist_commit`).
     pub fn open_opts(
         db_root: &Path,
         database_id: &str,
@@ -419,7 +419,7 @@ impl RusqliteEngine {
         Self::open_file_opts(&db_file, database_id, wal_capture)
     }
 
-    /// 测试/嵌入式直接指定文件路径（仍走 flock + 安全初始化）。
+    /// Tests/embedded use: specify the file path directly (still goes through flock + safe initialization).
     pub fn open_file(db_file: &Path, database_id: &str) -> Result<Self, EngineError> {
         Self::open_file_opts(db_file, database_id, false)
     }
@@ -432,8 +432,8 @@ impl RusqliteEngine {
         if let Some(parent) = db_file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // 文件锁：旁车 {db}.lock（不锁 db 本体——macOS 上 flock 走 fcntl
-        // 实现，会与 SQLite 自身 POSIX 锁冲突产生 SQLITE_BUSY）。
+        // File lock: sidecar {db}.lock (the db itself is not locked -- on macOS flock goes through fcntl
+        // and would conflict with SQLite's own POSIX locks, producing SQLITE_BUSY).
         let lock_path = db_file.with_extension("lock");
         let lock_file = std::fs::OpenOptions::new()
             .read(true)
@@ -452,14 +452,14 @@ impl RusqliteEngine {
         )?;
         let internal = security::configure(&conn)?;
         internal.set(true);
-        // T36：wal_capture 关 auto-checkpoint——WAL 只允许被我们的显式
-        // checkpoint 回缩，文件字节水位成为单调序列（capture 正确性）。
-        // RV-R31 #2：持久化库 commit 返回前必须 fsync WAL——
-        // `.vrt-lsn` 标记承诺"本地文件已达 manifest.lsn"；
-        // synchronous=NORMAL 下 commit 落 OS 缓冲即返回，掉电后
-        // WAL 尾部丢失而标记仍在 → 认领时少数据被信任（fail
-        // closed 改为 FULL；代价是每提交一次 fsync，远小于同步
-        // 上传段的对象存储 RTT）。无持久化的库无此承诺，不动。
+        // T36: wal_capture disables auto-checkpoint -- the WAL may only shrink on our explicit
+        // checkpoint, making the file byte watermark a monotonic sequence (capture correctness).
+        // RV-R31 #2: a persistent db must fsync the WAL before commit returns --
+        // the `.vrt-lsn` marker promises "the local file has reached manifest.lsn";
+        // under synchronous=NORMAL commit returns once data is in OS buffers; after power loss the
+        // WAL tail is lost while the marker remains -> at claim time the missing data is trusted (fail
+        // closed: switched to FULL; the cost is one fsync per commit, far below the object-store RTT of
+        // synchronously uploading a segment). Dbs without persistence make no such promise and are untouched.
         let init_sql = if wal_capture {
             "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; PRAGMA synchronous=FULL;"
         } else {
@@ -471,9 +471,9 @@ impl RusqliteEngine {
         let page_size = conn
             .query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))
             .unwrap_or(4096);
-        // T36：capture 模式下 open 即 TRUNCATE——已提交帧归并进 db
-        // 文件、崩溃残留的死帧一并清除，wal 文件归零，水位从 0 起算。
-        // busy → fail closed（单连接 open 期不应 busy）。
+        // T36: in capture mode TRUNCATE at open -- committed frames are merged into the db
+        // file, dead frames left by a crash are cleared too, the wal file is zeroed, and the watermark starts from 0.
+        // busy -> fail closed (a single connection should not be busy during open).
         let wal_frames = if wal_capture {
             match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                 r.get::<_, i64>(0)
@@ -517,8 +517,8 @@ impl RusqliteEngine {
         })
     }
 
-    /// T36：registry 在 claim 成功后安装持久化状态；commit_lsn 与
-    /// 写者 epoch 对齐 manifest（跨接管不回退）。
+    /// T36: the registry installs persistence state after a successful claim; commit_lsn and
+    /// the writer epoch are aligned with the manifest (never rolled back across takeovers).
     pub fn install_persistence(
         &self,
         handle: crate::persist::ManifestHandle,
@@ -534,22 +534,22 @@ impl RusqliteEngine {
         });
     }
 
-    /// T36：本引擎是否已 fenced（lease 丢失或持久化失败）。
+    /// T36: whether this engine is already fenced (lease lost or persistence failed).
     pub fn is_fenced(&self) -> bool {
         self.fenced.load(Ordering::SeqCst)
     }
-    /// T36：标记 fenced（后续读写全拒）。swap 保证同一引擎多次
-    /// fence 只 +1 一次（配合 Drop 的 -1，gauge 不泄漏）。
+    /// T36: mark fenced (all later reads and writes are rejected). The swap ensures the same engine
+    /// fencing multiple times counts only +1 (paired with the -1 in Drop, so the gauge does not leak).
     fn fence(&self, epoch: u64) -> EngineError {
         if !self.fenced.swap(true, Ordering::SeqCst) {
             crate::metrics::set_fenced_dbs_delta(1);
         }
         EngineError::Fenced(epoch)
     }
-    /// T36b：优雅停机——inner 锁内 CAS `expires_at=now`（epoch/
-    /// holder/lsn 不变），随后强制 fence：本引擎此后不得再写
-    /// （即使 release 因 store 错误未完成——fencing 是底线）。
-    /// 由 `EngineRegistry::release_leases` 调用。
+    /// T36b: graceful shutdown -- CAS `expires_at=now` under the inner lock (epoch/
+    /// holder/lsn unchanged), then force fence: this engine must not write again
+    /// (even if release did not complete due to a store error -- fencing is the baseline).
+    /// Called by `EngineRegistry::release_leases`.
     pub fn release_lease(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let epoch = self.lease_epoch();
@@ -569,15 +569,15 @@ impl RusqliteEngine {
         let _ = self.fence(epoch);
     }
 
-    /// T36：degraded（续租失败但 lease 有效）观察口。
+    /// T36: degraded (renewal failed but lease valid) observation hook.
     pub fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::SeqCst)
     }
 
-    /// T36：lease 门槛（§4.3）——`expiry-margin > now` 才可用；
-    /// 到点先续租；续租失败但未到期 → degraded（读放行写照走，
-    /// publish 自带 CAS 兜底）；已不可用 → 续一次，失败 fenced。
-    /// 前置：持有 inner 锁。
+    /// T36: lease gate (section 4.3) -- usable only if `expiry-margin > now`;
+    /// renew when due; renewal failure but not yet expired -> degraded (reads allowed, writes proceed,
+    /// publish has its own CAS backstop); already unusable -> renew once, fenced on failure.
+    /// Precondition: holds the inner lock.
     /// RV-R71: take the single-writer lock but give up at `deadline`
     /// (poll `try_lock`; std `Mutex` has no timed lock). A hung
     /// persistence call holding the lock can therefore pin at most the
@@ -627,7 +627,7 @@ impl RusqliteEngine {
                         return Err(self.fence(epoch));
                     }
                     Err(e) => {
-                        // 续租失败但 lease 有效 → degraded。
+                        // Renewal failed but lease valid -> degraded.
                         slot.handle.degraded = true;
                         self.degraded.store(true, Ordering::SeqCst);
                         crate::metrics::lease_renew_failure("store");
@@ -637,7 +637,7 @@ impl RusqliteEngine {
             }
             return Ok(());
         }
-        // lease 不可用 → 续租是唯一自救；任何失败都 fenced。
+        // Lease unusable -> renewal is the only self-rescue; any failure fences.
         match p.renew_until(&self.database_id, &mut slot.handle, Some(deadline)) {
             Ok(()) => {
                 self.degraded.store(false, Ordering::SeqCst);
@@ -651,25 +651,25 @@ impl RusqliteEngine {
         }
     }
 
-    /// T36 §4.2 方案 1：本提交产生的 WAL 帧 → vrt-seg v1 → 同步
-    /// 上传 → CAS manifest lsn → 返回新 lsn。只读事务返回 None。
-    /// 前置：tx 已 commit，持有 inner 锁（单写者临界区）。
+    /// T36 section 4.2 option 1: the WAL frames produced by this commit -> vrt-seg v1 -> synchronous
+    /// upload -> CAS manifest lsn -> return the new lsn. Read-only transactions return None.
+    /// Precondition: tx is committed and the inner lock is held (single-writer critical section).
     ///
-    /// RV-R31 #1：截取上限 = 验证链中最后一个 **commit 帧**
-    /// （`commit_db_size≠0`），不是物理文件末尾。回滚 spill 死帧
-    /// 留在 mxFrame 之后，其 checksum 仍是本链合法延续——链验证
-    /// 无法剔除，只有 commit 边界能；反之新提交也可能完全落在旧
-    /// 文件长度内（物理零增长，旧 `len==0` 判只读 → 丢已确认
-    /// 写）。判定"有无新帧"用验证后的帧数而非文件长度。
+    /// RV-R31 #1: the capture upper bound = the last **commit frame** in the verified chain
+    /// (`commit_db_size!=0`), not the physical end of file. Rolled-back spill dead frames
+    /// remain after mxFrame, and their checksum is still a legitimate continuation of this chain -- chain verification
+    /// cannot exclude them, only the commit boundary can; conversely a new commit may also fall entirely within the old
+    /// file length (zero physical growth; the old `len==0` read-only check -> dropped confirmed
+    /// writes). "Are there new frames" is judged by the verified frame count, not the file length.
     ///
-    /// 代际锚定：`wal_frames>0` 时 header salt 必须等于已播种
-    /// 代际，否则 WAL 在锁外被重建 → fail closed；水位 0 按当前
-    /// header 播种（open/TRUNCATE 后第一写的正确起点）。水位处
-    /// 连一帧都验证不了而文件确有尾部字节 = 簿记与现实脱节 →
-    /// fail closed。
+    /// Generation anchoring: when `wal_frames>0` the header salt must equal the seeded
+    /// generation, otherwise the WAL was rebuilt outside the lock -> fail closed; watermark 0 seeds from the current
+    /// header (the correct starting point for the first write after open/TRUNCATE). If not even one frame
+    /// can be verified at the watermark while the file does have tail bytes = bookkeeping diverged from reality ->
+    /// fail closed.
     ///
-    /// 不用 `PRAGMA wal_checkpoint` 读 mxFrame——PASSIVE checkpoint
-    /// 完成后 SQLite 重置 WAL（mxFrame 归 0），水位自证失效。
+    /// Do not read mxFrame via `PRAGMA wal_checkpoint` -- after a PASSIVE checkpoint
+    /// completes SQLite resets the WAL (mxFrame goes to 0), invalidating the watermark's self-proof.
     fn persist_commit(
         &self,
         inner: &mut EngineInner,
@@ -686,10 +686,10 @@ impl RusqliteEngine {
         };
         if wal_len < crate::wal::WAL_HDR as u64 {
             if wal_len == 0 && inner.wal_frames == 0 {
-                // TRUNCATE 后 wal 尚未重建（纯读批次）——无新帧。
+                // After TRUNCATE the wal has not been rebuilt yet (read-only batch) -- no new frames.
                 return Ok(None);
             }
-            // 水位非 0 而文件消失/撕裂 → 锁外干预，fail closed。
+            // Watermark non-zero but the file is gone/torn -> outside interference, fail closed.
             return Err(EngineError::Message("wal header torn".into()));
         }
         let f = std::fs::File::open(&wal_path)
@@ -733,16 +733,16 @@ impl RusqliteEngine {
             return Err(EngineError::Message("wal watermark regressed".into()));
         }
         if wal_len == start {
-            return Ok(None); // 物理尾部恰在水位 → 无新字节
+            return Ok(None); // physical tail exactly at the watermark -> no new bytes
         }
         let len = wal_len - start;
         let mut buf = vec![0u8; len as usize];
         f.read_exact_at(&mut buf, start)
             .map_err(|e| EngineError::Message(format!("wal read: {e}")))?;
-        // 逐帧验证 salt + 累计 checksum（防撕裂/异代际帧入段）；
-        // 截取上限 = 链中最后一个 commit 帧——其后合法延续帧是
-        // 回滚 spill 死帧，不编码、不进水位（SQLite 下次写会覆写
-        // 该区域，水位不被死帧污染）。
+        // Verify salt + cumulative checksum frame by frame (to keep torn/other-generation frames out of the segment);
+        // capture upper bound = the last commit frame in the chain -- the legitimate continuation frames after it are
+        // rolled-back spill dead frames; they are neither encoded nor counted into the watermark (SQLite's next write overwrites
+        // that region, so the watermark is not polluted by dead frames).
         let (_vend, heads, _ck) = crate::wal::scan_frames(&buf, 0, ps, be, salt, cksum_seed);
         if heads.is_empty() {
             return Err(EngineError::Message(
@@ -750,7 +750,7 @@ impl RusqliteEngine {
             ));
         }
         let Some(last_commit) = heads.iter().rposition(|h| h.commit_db_size != 0) else {
-            // 链上全是非 commit 帧 = 纯死帧尾巴——无新提交。
+            // Only non-commit frames on the chain = a pure dead-frame tail -- no new commit.
             return Ok(None);
         };
         let take = last_commit + 1;
@@ -782,8 +782,8 @@ impl RusqliteEngine {
             frames,
         };
         let bytes = crate::seg::encode(&segment);
-        // sidecar 记 WAL 物理帧数（含死帧尾）——认领时本地文件
-        // 完整性核对基准（截短/塞垃圾都偏离它）。
+        // The sidecar records the WAL physical frame count (including the dead-frame tail) -- the baseline for
+        // the local-file integrity check at claim time (truncation / junk bytes both deviate from it).
         let file_frames = (wal_len - crate::wal::WAL_HDR as u64) / fsz;
         let slot = inner.persist.as_mut().expect("persist slot");
         let p = slot.persister.clone();
@@ -813,9 +813,9 @@ impl RusqliteEngine {
                 return Err(fenced);
             }
         }
-        // 周期 checkpoint：TRUNCATE wal + 上传快照 + GC 旧段。
-        // T36b：触发用动态 `ckpt_gap`（失败指数退避）而非固定
-        // `every`——超限/抖动库不随每次提交重试整库上传。
+        // Periodic checkpoint: TRUNCATE wal + upload snapshot + GC old segments.
+        // T36b: trigger on the dynamic `ckpt_gap` (exponential backoff on failure) rather than the fixed
+        // `every` -- over-limit/flapping dbs do not retry a whole-db upload on every commit.
         let every = p.config().checkpoint_every_commits;
         let gap_due = every > 0
             && inner
@@ -825,7 +825,7 @@ impl RusqliteEngine {
                 .unwrap_or(false);
         if gap_due {
             if let Err(e) = self.checkpoint_now(inner) {
-                // checkpoint 失败不致命（段链仍完整）；lease 丢失则 fenced。
+                // Checkpoint failure is not fatal (the segment chain is still complete); lease loss -> fenced.
                 let (reason, is_cap) = match &e {
                     EngineError::Message(m) if m.starts_with("checkpoint: snapshot over cap") => {
                         ("snapshot_over_cap", true)
@@ -840,8 +840,8 @@ impl RusqliteEngine {
                 if matches!(e, EngineError::Fenced(_)) {
                     return Err(e);
                 }
-                // 退避：gap 翻倍封顶 every*64——本次失败已消费本次
-                // commits_since_ckpt 触发位，下一次触发在 +gap 提交后。
+                // Backoff: gap doubles, capped at every*64 -- this failure already consumed this
+                // commits_since_ckpt trigger bit; the next trigger comes after +gap commits.
                 if let Some(slot) = inner.persist.as_mut() {
                     slot.handle.commits_since_ckpt = 0;
                     slot.ckpt_gap =
@@ -855,7 +855,7 @@ impl RusqliteEngine {
         Ok(Some(new_lsn))
     }
 
-    /// T36：TRUNCATE checkpoint + 快照上传（inner 锁内）。
+    /// T36: TRUNCATE checkpoint + snapshot upload (under the inner lock).
     fn checkpoint_now(&self, inner: &mut EngineInner) -> Result<(), EngineError> {
         let Some(slot) = inner.persist.as_mut() else {
             return Ok(());
@@ -871,15 +871,15 @@ impl RusqliteEngine {
         inner.internal.clone().set(false);
         match ck {
             Ok(0) => {
-                // TRUNCATE 重置 mxFrame 并换 WAL 代际（salt1++）——
-                // 水位归零的同时代际锚定也清 0，下一次捕获按新
-                // header 重新播种。
+                // TRUNCATE resets mxFrame and switches the WAL generation (salt1++) --
+                // the watermark is zeroed and the generation anchor is cleared to 0 as well; the next capture
+                // reseeds from the new header.
                 inner.wal_frames = 0;
                 inner.wal_salt = None;
                 inner.wal_cksum = (0, 0);
             }
             Ok(_) => {
-                // busy：有未 checkpoint 帧——本次跳过（下次再试）。
+                // busy: there are un-checkpointed frames -- skip this time (retry next time).
                 return Ok(());
             }
             Err(e) => return Err(EngineError::Sqlite(e)),
@@ -895,7 +895,7 @@ impl RusqliteEngine {
         })
     }
 
-    /// size_after：pragma_*() 函数被 authorizer 拒，走 internal 旁路。
+    /// size_after: pragma_*() functions are rejected by the authorizer; go through the internal bypass.
     fn size_after(conn: &Connection, internal: &security::InternalFlag) -> i64 {
         internal.set(true);
         let r = conn
@@ -909,43 +909,43 @@ impl RusqliteEngine {
         r
     }
 
-    /// 单事务执行整批；任一失败全批回滚只回首错（§3）。
-    /// `format` 只影响 results 形状，不影响执行语义。
+    /// Execute the whole batch in a single transaction; any failure rolls back the whole batch and only the first error is returned (section 3).
+    /// `format` affects only the shape of results, not execution semantics.
     pub fn query_batch_sync(
         &self,
         batch: &[SqlStmt],
         ctx: &TxnCtx,
         format: ResultsFormat,
     ) -> Result<Vec<QueryResult>, EngineError> {
-        // T35c：drop 已摘除本引擎 → 直接拒（防"写成功但目录已删"）。
+        // T35c: drop has already removed this engine -> reject directly (prevents "write succeeded but directory already deleted").
         if self.dropped.load(Ordering::SeqCst) {
             return Err(EngineError::Dropped);
         }
-        // T36：fenced 引擎一切读写拒（恢复由 registry 重建）。
+        // T36: a fenced engine rejects all reads and writes (recovery is rebuilt by the registry).
         if self.fenced.load(Ordering::SeqCst) {
             return Err(EngineError::Fenced(self.lease_epoch.load(Ordering::SeqCst)));
         }
         let mut inner = self.lock_inner(ctx.deadline)?;
-        // T36：lease 门槛（§4.3）——读与写同一判定。
+        // T36: lease gate (section 4.3) -- reads and writes use the same decision.
         self.ensure_lease(&mut inner, ctx.deadline)?;
         let internal = inner.internal.clone();
-        // T36：intent lsn 在 tx 创建前取出（tx 持有 inner.conn 可变
-        // 借用期间无法再访问 inner）。
+        // T36: take the intent lsn before the tx is created (while tx holds a mutable borrow of inner.conn,
+        // inner cannot be accessed again).
         let persist_intent = inner
             .persist
             .as_ref()
             .map(|s| (s.persister.clone(), s.handle.lsn + 1));
 
-        // 与 miniflare 一致的过滤语义
+        // Same filter semantics as miniflare
         let stmts: Vec<&SqlStmt> = batch.iter().filter(|q| is_nonempty_sql(&q.sql)).collect();
         if stmts.is_empty() {
             return Err(EngineError::Message("No SQL statements detected.".into()));
         }
 
-        // 去重命中 → 不重放（账本在库内同事务提交，见 §3 R4；
-        // _vrt_dedup 对用户拒读，引擎走 internal 旁路）
-        // S4：dedup epoch 必须等于当前写者 epoch——跨 epoch 的 seq
-        // 重放可能把旧位点的结果当新位点提交，fail closed。
+        // Dedup hit -> no replay (the ledger commits in the same transaction inside the db, see section 3 R4;
+        // _vrt_dedup is unreadable by users, the engine goes through the internal bypass)
+        // S4: the dedup epoch must equal the current writer epoch -- replaying a seq
+        // across epochs could commit an old position's result as a new position's, fail closed.
         if let Some((depoch, _)) = ctx.dedup {
             if depoch != ctx.epoch {
                 return Err(EngineError::Message(format!(
@@ -954,9 +954,9 @@ impl RusqliteEngine {
                 )));
             }
         }
-        // T34b: dedup 键按 idempotency-key 语义校验负载——同
-        // (epoch,seq) 但负载不同 ⇒ seq 分配撞键（provider 重启回绕
-        // 等），fail closed 而非回放旧结果。判别式字节编码，免序列化歧义。
+        // T34b: the dedup key validates the payload with idempotency-key semantics -- same
+        // (epoch,seq) but different payload => seq allocation collision (provider restart wraparound,
+        // etc.), fail closed rather than replay the old result. Discriminated byte encoding avoids serialization ambiguity.
         let req_sha = ctx.dedup.map(|_| req_digest(&stmts));
         if let Some((depoch, dseq)) = ctx.dedup {
             internal.set(true);
@@ -980,7 +980,7 @@ impl RusqliteEngine {
         let tx = inner.conn.transaction().map_err(EngineError::Sqlite)?;
         let deadline = ctx.deadline;
 
-        // 每语句超时：progress handler 周期性检查 deadline（§3 R5）
+        // Per-statement timeout: the progress handler periodically checks the deadline (section 3 R5)
         security::arm_deadline(&tx, deadline);
 
         let mut out = Vec::with_capacity(stmts.len());
@@ -991,8 +991,8 @@ impl RusqliteEngine {
                 failed = Some(EngineError::Timeout);
                 break;
             }
-            // `VACUUM`/`VACUUM INTO` 语句文本预检（authorizer 无 VACUUM
-            // action code；裸 VACUUM 内部 Attach{''} 与用户 ATTACH 不可分）
+            // Text pre-check for `VACUUM`/`VACUUM INTO` statements (the authorizer has no VACUUM
+            // action code; a bare VACUUM's internal Attach{''} is indistinguishable from a user ATTACH)
             if security::looks_like_vacuum(&q.sql) {
                 failed = Some(EngineError::Message(
                     "not authorized: VACUUM is disabled".into(),
@@ -1061,11 +1061,11 @@ impl RusqliteEngine {
 
         let result = match failed {
             Some(e) => {
-                drop(tx); // 回滚整批（含 dedup 行——业务失败账本不落盘）
+                drop(tx); // roll back the whole batch (including dedup rows -- the ledger of a failed business op is not persisted)
                 Err(e)
             }
             None => {
-                // dedup 账本与业务同事务提交
+                // The dedup ledger commits in the same transaction as the business writes
                 if let Some((depoch, dseq)) = ctx.dedup {
                     let result_json = serde_json::to_string(&out)
                         .map_err(|e| EngineError::Message(e.to_string()))?;
@@ -1086,29 +1086,29 @@ impl RusqliteEngine {
                     internal.set(false);
                     r.map_err(EngineError::Sqlite)?;
                 }
-                // T35c：commit 前终检——批次执行期间被 drop 时回滚并报错，
-                // 不让写入落在已 rename 进 .trash 的文件上还返回成功。
+                // T35c: final check before commit -- if dropped during batch execution, roll back and report an error,
+                // so writes never land on a file already renamed into .trash and still return success.
                 if self.dropped.load(Ordering::SeqCst) {
                     drop(tx);
                     return Err(EngineError::Dropped);
                 }
-                // T36：commit 前写 intent lsn（防"本地已提交未 ack
-                // 被信任"——崩溃窗口的未持久化提交会让 sidecar 超出
-                // manifest.lsn，claim 强制恢复清掉）。
+                // T36: write the intent lsn before commit (prevents "committed locally but not acked
+                // being trusted" -- an unpersisted commit in the crash window would leave the sidecar ahead of
+                // manifest.lsn; claim forces recovery to clear it).
                 if let Some((p, lsn)) = &persist_intent {
                     if p.mark_intent(&self.database_id, *lsn).is_err() {
-                        // RV-R31 #2：意图标记写不进盘 = 本地持久层
-                        // 不可信——回滚本批并拒 ack（fail closed）。
+                        // RV-R31 #2: if the intent marker cannot be written to disk = the local persistence layer
+                        // is untrustworthy -- roll back this batch and refuse to ack (fail closed).
                         drop(tx);
                         return Err(EngineError::Unavailable("local intent marker write failed"));
                     }
                 }
                 tx.commit().map_err(EngineError::Sqlite)?;
                 mark_committed();
-                // T36 §4.2：有持久化 → ack 前段上传+manifest CAS
-                // （锁内串行，失败 fenced 不 ack）；无持久化保持旧语义。
+                // T36 section 4.2: with persistence -> segment upload + manifest CAS before ack
+                // (serial under the lock; failure fences and does not ack); without persistence the old semantics are kept.
                 if inner.persist.is_some() {
-                    // conn 借用已随 tx 释放——直接以 inner 调。
+                    // the conn borrow was released along with tx -- call directly on inner.
                     match self.persist_commit(&mut inner, ctx.deadline) {
                         Ok(_) => Ok(out),
                         Err(e) => Err(e),
@@ -1123,18 +1123,18 @@ impl RusqliteEngine {
         result
     }
 
-    /// T37：引擎内部事务 —— QueueBackend 等非用户 SQL 面的唯一
-    /// 提交路径（pub(crate)：租户 `/query` 路径不可达）。与
-    /// `query_batch_sync` 共享全部不变式：dropped/fenced 门槛、lease
-    /// 门槛、deadline 进度句柄、commit 前 dropped 终检、intent lsn、
-    /// commit → persist_commit ack 前持久化；整段在 InternalFlag 旁路
-    /// 下执行（`_vrt_q_*` 内部表可达），无 dedup 账本、无结果集物化。
+    /// T37: engine-internal transaction -- the only commit path for non-user-SQL surfaces
+    /// such as QueueBackend (pub(crate): unreachable from the tenant `/query` path). Shares all invariants with
+    /// `query_batch_sync`: dropped/fenced gate, lease
+    /// gate, deadline progress handle, final dropped check before commit, intent lsn,
+    /// commit -> persist_commit persistence before ack; the whole thing runs under the InternalFlag bypass
+    /// (the `_vrt_q_*` internal tables are reachable), with no dedup ledger and no result-set materialization.
     ///
-    /// `f` 同步执行、不得跨 await（本方法本身同步持锁）；
-    /// `&Transaction` 借用不逃出闭包（T 与句柄类型分离，无法返回
-    /// 句柄）；f Err → 全批回滚、不推进 lsn、不 persist。
-    /// InternalFlag 经 RAII guard 复位——f panic 时同样复位，
-    /// panic 被 catch_unwind 收拢为 Err（不毒化 inner 锁）。
+    /// `f` runs synchronously and must not cross an await (this method itself holds the lock synchronously);
+    /// the `&Transaction` borrow does not escape the closure (T is separate from the handle type, so a
+    /// handle cannot be returned); f Err -> whole batch rolled back, lsn not advanced, no persist.
+    /// InternalFlag is reset via an RAII guard -- reset on f panic too,
+    /// and the panic is caught by catch_unwind and collected as Err (does not poison the inner lock).
     pub(crate) fn exec_internal<T>(
         &self,
         ctx: &TxnCtx,
@@ -1156,7 +1156,7 @@ impl RusqliteEngine {
 
         let tx = inner.conn.transaction().map_err(EngineError::Sqlite)?;
         security::arm_deadline(&tx, ctx.deadline);
-        // Drop-guard：f 提前 return / Err / panic 都复位旁路标志。
+        // Drop guard: the bypass flag is reset whether f returns early / Errs / panics.
         struct FlagReset(security::InternalFlag);
         impl Drop for FlagReset {
             fn drop(&mut self) {
@@ -1182,8 +1182,8 @@ impl RusqliteEngine {
                 }
                 if let Some((p, lsn)) = &persist_intent {
                     if p.mark_intent(&self.database_id, *lsn).is_err() {
-                        // RV-R31 #2：同 query_batch_sync——标记失败
-                        // 即本地持久层不可信，回滚拒 ack。
+                        // RV-R31 #2: same as query_batch_sync -- marker failure
+                        // means the local persistence layer is untrustworthy; roll back and refuse to ack.
                         drop(tx);
                         return Err(EngineError::Unavailable("local intent marker write failed"));
                     }
@@ -1210,17 +1210,17 @@ impl RusqliteEngine {
         result
     }
 
-    /// 当前提交位点（bookmark 的 lsn 来源）。
+    /// Current commit position (the source of the bookmark's lsn).
     pub fn commit_lsn(&self) -> u64 {
         self.commit_lsn.load(Ordering::SeqCst)
     }
 
-    /// T36：写者 lease epoch（bookmark 的 epoch 分量）。
+    /// T36: writer lease epoch (the epoch component of bookmarks).
     pub fn lease_epoch(&self) -> u64 {
         self.lease_epoch.load(Ordering::SeqCst)
     }
 
-    /// T36b：段链长度（lsn - 基线快照 lsn）；无 persist → None。
+    /// T36b: segment chain length (lsn - base snapshot lsn); no persist -> None.
     pub fn chain_len(&self) -> Option<u64> {
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.persist.as_ref().map(|s| {
@@ -1230,7 +1230,7 @@ impl RusqliteEngine {
         })
     }
 
-    /// T36：本引擎是否挂了持久化。
+    /// T36: whether this engine has persistence attached.
     pub fn persistence_enabled(&self) -> bool {
         self.inner.lock().unwrap().persist.is_some()
     }
@@ -1275,7 +1275,7 @@ fn format_rows(
     rows: Vec<Vec<serde_json::Value>>,
 ) -> serde_json::Value {
     match format {
-        // miniflare：ROWS_AND_COLUMNS → {columns, rows}；其余（含 NONE）→ 对象数组
+        // miniflare: ROWS_AND_COLUMNS -> {columns, rows}; the rest (including NONE) -> array of objects
         ResultsFormat::RowsAndColumns => serde_json::json!({ "columns": cols, "rows": rows }),
         _ => serde_json::Value::Array(
             rows.iter()
@@ -1298,7 +1298,7 @@ fn value_to_json(v: rusqlite::types::ValueRef) -> Result<serde_json::Value, Engi
         rusqlite::types::ValueRef::Real(f) => serde_json::json!(f),
         rusqlite::types::ValueRef::Text(t) => serde_json::json!(String::from_utf8_lossy(t)),
         rusqlite::types::ValueRef::Blob(b) => {
-            // miniflare convertRows：BLOB → 字节数组
+            // miniflare convertRows: BLOB -> byte array
             serde_json::json!(b.iter().map(|x| *x).collect::<Vec<u8>>())
         }
     })
@@ -1310,39 +1310,39 @@ fn lock_file_fd(f: &std::fs::File) -> libc::c_int {
     f.as_raw_fd()
 }
 
-// ---------- Registry：进程内单写者 map + drop tombstone ----------
+// ---------- Registry: in-process single-writer map + drop tombstone ----------
 
-/// engines 与 tombstones 共享一把锁：drop_db 的 marker→tombstone→evict
-/// →flag→rename 与 get() 的 tombstone/marker 检查在同一临界区完成，
-/// 不存在"摘除后、删除前"可重新打开的窗口（T35c）。
-/// T37r：Registry 键 = (kind, databaseId)。同一 id 的 D1 库与 Queue
-/// 库是两个互不相交的引擎/库/marker 命名空间。
+/// engines and tombstones share one lock: drop_db's marker->tombstone->evict
+/// ->flag->rename and get()'s tombstone/marker check complete in the same critical section,
+/// so there is no window between "removed" and "deleted" where the db can be reopened (T35c).
+/// T37r: Registry key = (kind, databaseId). A D1 db and a Queue
+/// db with the same id are two disjoint engine/db/marker namespaces.
 pub type EngineKey = (crate::paths::ResourceKind, String);
 
 #[derive(Default)]
 struct RegistryState {
     engines: HashMap<EngineKey, Arc<RusqliteEngine>>,
-    /// 本进程内已 DROP 的 (kind,id)；磁盘 `.dropped` marker 是持久
-    /// 副本（重启后由两个 root 各自的 scan_dropped_ids 预灌 +
-    /// get() 冷路径 stat 兜底）。
+    /// (kind,id) pairs already DROPped within this process; the on-disk `.dropped` marker is the persistent
+    /// copy (after restart it is pre-filled by each of the two roots' scan_dropped_ids +
+    /// the get() cold-path stat fallback).
     tombstones: HashSet<EngineKey>,
-    /// T36：诊断视图（`/internal/dbs`）——每库的 lease/位点/状态。
+    /// T36: diagnostics view (`/internal/dbs`) -- per-db lease/position/state.
     diag: HashMap<EngineKey, DbDiag>,
-    /// T36b：停机中——拒绝新 get/claim（防释放后同进程重夺）。
+    /// T36b: shutting down -- reject new get/claim (prevents the same process re-acquiring after release).
     closing: bool,
     /// RV-R71: single-flight cold opens. One in-progress open per key;
     /// same-key callers wait on the slot (with a deadline) instead of
     /// re-running claim/restore, and no caller holds the global lock
     /// while the object store is being talked to.
     opening: HashMap<EngineKey, Arc<OpenSlot>>,
-    /// 2026-11-15：恢复失败（快照/段损坏、sha 不符等 fail-closed）的
-    /// 每库有界指数退避：(连续失败次数, 下次允许重试时刻)。窗口内的
-    /// `get` 直接 503，不再重复拉取快照/段（修复前对同一库每个请求
-    /// 都全量重下 + 重算，143 次紧循环）。成功恢复即清除。
+    /// 2026-11-15: per-db bounded exponential backoff for restore failures (fail-closed cases such as
+    /// corrupt snapshot/segment or sha mismatch): (consecutive failure count, next allowed retry time). Within the window
+    /// `get` returns 503 directly and no longer re-fetches the snapshot/segments (before the fix every request for the same db
+    /// re-downloaded and recomputed everything, 143 tight-loop iterations). Cleared on successful restore.
     restore_backoff: HashMap<EngineKey, (u32, std::time::Instant)>,
 }
 
-/// 恢复失败退避的默认基数/上限：1s、2s、4s … 封顶 5min。
+/// Default base/cap of the restore-failure backoff: 1s, 2s, 4s ... capped at 5min.
 pub const RESTORE_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(1);
 pub const RESTORE_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
@@ -1440,11 +1440,11 @@ impl Drop for OpenGuard<'_> {
     }
 }
 
-/// T36：只读诊断条目（JSON camelCase——`/internal/dbs` 对外形状）。
+/// T36: read-only diagnostic entry (JSON camelCase -- the outward shape of `/internal/dbs`).
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DbDiag {
-    /// T37r：资源种类（`/internal/dbs` 输出 `"kind":"d1"|"queue"`）。
+    /// T37r: resource kind (`/internal/dbs` outputs `"kind":"d1"|"queue"`).
     pub kind: crate::paths::ResourceKind,
     pub database_id: String,
     pub epoch: u64,
@@ -1453,11 +1453,11 @@ pub struct DbDiag {
     pub degraded: bool,
     pub fenced: bool,
     pub dropped: bool,
-    /// T36b：最近一次 checkpoint 因 `snapshotMaxBytes` 超限被拒
-    /// （该库恢复成本随段链长线性增长，见 §4.5）。
+    /// T36b: the latest checkpoint was rejected for exceeding `snapshotMaxBytes`
+    /// (this db's restore cost grows linearly with segment chain length, see section 4.5).
     pub snapshot_over_cap: bool,
-    /// T36b：当前段链长度（lsn - snapshot.lsn）——恢复需重放的
-    /// 段数；随 snapshot 推进归零。
+    /// T36b: current segment chain length (lsn - snapshot.lsn) -- the number of segments
+    /// a restore must replay; zeroed as the snapshot advances.
     pub chain_len: u64,
 }
 
@@ -1469,25 +1469,25 @@ impl Drop for RusqliteEngine {
     }
 }
 
-/// T36：Registry 可 Clone（共享同一 state/db_root，persist 仅
-/// 启动时装配——`with_persister` 返回新实例覆盖 AppState 内 registry，
-/// 语义不变）。
+/// T36: Registry is Clone (shares the same state/db_root; persist is only
+/// assembled at startup -- `with_persister` returns a new instance that overrides the registry inside AppState,
+/// semantics unchanged).
 #[derive(Clone)]
 pub struct EngineRegistry {
     state: std::sync::Arc<Mutex<RegistryState>>,
-    /// D1 本地根（`…/dbs`，T36 布局不变）。
+    /// D1 local root (`.../dbs`, T36 layout unchanged).
     db_root: PathBuf,
-    /// T37r：Queue 本地根（`…/queues`，与 db_root 同级派生）。
+    /// T37r: Queue local root (`.../queues`, derived as a sibling of db_root).
     queue_root: PathBuf,
-    /// T36/T37r：对象存储持久化面——每种 kind 一个 Persister
-    /// （对象键前缀与本地 root 各绑定），`[persistence]` ≠ none 时装配。
+    /// T36/T37r: object-store persistence surface -- one Persister per kind
+    /// (object-key prefix and local root each bound), assembled when `[persistence]` != none.
     persist: Option<PersisterPair>,
     restore_backoff_base: std::time::Duration,
     restore_backoff_max: std::time::Duration,
 }
 
-/// T37r：按 kind 分面的 Persister 对——D1 写 `db/{id}`/`dbs/`，
-/// Queue 写 `q/{id}`/`queues/`。
+/// T37r: Persister pair split by kind -- D1 writes `db/{id}`/`dbs/`,
+/// Queue writes `q/{id}`/`queues/`.
 /// RV-R53.3: per-round bound on tombstoned-database GC — one round
 /// never scans more than this many local markers, so a big backlog
 /// can't wedge the periodic task.
@@ -1529,17 +1529,17 @@ impl PersisterPair {
     }
 }
 
-/// 引擎摘除后等待在途 Arc 归还的上限（覆盖默认事务预算数倍；
-/// 超时仍继续删——flock/fd 不阻塞 unlink+rename）。
+/// Upper bound on waiting for in-flight Arcs to be returned after an engine is removed (several times the default transaction budget;
+/// deletion proceeds after a timeout -- flock/fd do not block unlink+rename).
 const DROP_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl EngineRegistry {
     pub fn new(db_root: PathBuf) -> Self {
         let queue_root = paths::queue_root_for(&db_root);
-        // 启动清扫 .trash（上次崩溃留下的已 tombstone 残骸），
-        // 并把盘上 .dropped marker 预灌进内存 tombstone set——两个
-        // root 各自扫描，tombstone 键带 kind（同一 id 的 D1 drop 不
-        // 影响 Queue）。
+        // Startup sweep of .trash (already-tombstoned debris left by a previous crash),
+        // and pre-fill the in-memory tombstone set from on-disk .dropped markers -- the two
+        // roots are scanned separately, and tombstone keys carry kind (a D1 drop of the same id does not
+        // affect Queue).
         paths::sweep_trash(&db_root);
         paths::sweep_trash(&queue_root);
         let tombstones: HashSet<EngineKey> = paths::scan_dropped_ids(&db_root)
@@ -1568,7 +1568,7 @@ impl EngineRegistry {
         }
     }
 
-    /// 覆盖恢复失败退避参数（测试与运维调参）。
+    /// Override the restore-failure backoff parameters (tests and operational tuning).
     pub fn with_restore_backoff(
         mut self,
         base: std::time::Duration,
@@ -1579,7 +1579,7 @@ impl EngineRegistry {
         self
     }
 
-    /// 记录一次恢复失败并返回本次退避时长（base·2^(n-1)，封顶 max）。
+    /// Record a restore failure and return this backoff duration (base*2^(n-1), capped at max).
     fn note_restore_failure(&self, key: &EngineKey) -> (u32, std::time::Duration) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let n = state
@@ -1598,15 +1598,15 @@ impl EngineRegistry {
         (n, wait)
     }
 
-    /// T36/T37r：安装持久化面（service 启动时调用；none backend 不装）。
-    /// 两种 kind 的 Persister 必须同时装配——只装 D1 会让 queue
-    /// 静默走纯本地路径（持久化缺口 fail closed 原则拒绝）。
+    /// T36/T37r: install the persistence surface (called at service startup; not installed for the none backend).
+    /// Persisters for both kinds must be installed together -- installing only D1 would make queue
+    /// silently take the pure-local path (rejected by the fail-closed principle on persistence gaps).
     pub fn with_persisters(mut self, pair: PersisterPair) -> Self {
         self.persist = Some(pair);
         self
     }
 
-    /// kind → 本地 root。
+    /// kind -> local root.
     fn root_for(&self, kind: crate::paths::ResourceKind) -> &Path {
         match kind {
             crate::paths::ResourceKind::D1 => &self.db_root,
@@ -1614,12 +1614,12 @@ impl EngineRegistry {
         }
     }
 
-    /// T36：诊断快照（只读，auth 保护端点用）。
+    /// T36: diagnostics snapshot (read-only, for the auth-protected endpoint).
     pub fn diagnostics(&self) -> Vec<DbDiag> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<DbDiag> = state.diag.values().cloned().collect();
-        // T36b：活引擎实时充实（degraded/over_cap/chain_len 随提交
-        // 变化，diag map 只在 claim 时快照一次）。
+        // T36b: enrich with live engines (degraded/over_cap/chain_len change
+        // with commits; the diag map is snapshotted only once at claim time).
         for d in out.iter_mut() {
             if let Some(e) = state.engines.get(&(d.kind, d.database_id.clone())) {
                 d.degraded = e.is_degraded();
@@ -1633,12 +1633,12 @@ impl EngineRegistry {
         out
     }
 
-    /// 取得（或惰性打开）databaseId 的写句柄。重复打开同 (kind,id)
-    /// 走同一句柄；跨进程重复打开由 flock fail closed；已 DROP 的
-    /// (kind,id) 永远拒绝（另一 kind 不受影响）。
-    /// T36：persistence 开启时，冷打开 = manifest claim（lease 认领/
-    /// 接管/tombstone/held-elsewhere）→ 必要时快照+段恢复 → 装 lease。
-    /// fenced 引擎在锁内摘除后走同一冷路径自愈。
+    /// Get (or lazily open) the write handle for databaseId. Repeated opens of the same (kind,id)
+    /// go through the same handle; duplicate opens across processes fail closed via flock; a DROPped
+    /// (kind,id) is rejected forever (the other kind is unaffected).
+    /// T36: with persistence on, a cold open = manifest claim (lease claim/
+    /// takeover/tombstone/held-elsewhere) -> snapshot+segment restore if needed -> install lease.
+    /// A fenced engine self-heals via the same cold path after being removed under the lock.
     pub fn get(
         &self,
         kind: crate::paths::ResourceKind,
@@ -1666,7 +1666,7 @@ impl EngineRegistry {
         let key: EngineKey = (kind, database_id.into());
         let slot = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            // T36b：停机中——全部新访问拒为 503。
+            // T36b: shutting down -- all new access is rejected as 503.
             if state.closing {
                 return Err(EngineError::Unavailable("service shutting down"));
             }
@@ -1677,7 +1677,7 @@ impl EngineRegistry {
                     return Ok(e.clone());
                 }
             }
-            // tombstone 检查在锁内：与 drop_db 的写 marker/tombstone 串行。
+            // The tombstone check is under the lock: serialized with drop_db's marker/tombstone writes.
             if state.tombstones.contains(&key)
                 || paths::marker_exists(self.root_for(kind), database_id)
                     .map_err(|e| EngineError::Message(format!("tombstone check: {e}")))?
@@ -1693,7 +1693,7 @@ impl EngineRegistry {
                 drop(state);
                 return existing.wait(wait_deadline);
             }
-            // 恢复失败退避窗口内：直接 503（fail closed，不重复下载）。
+            // Within the restore-failure backoff window: 503 directly (fail closed, no repeated download).
             if let Some((_, until)) = state.restore_backoff.get(&key) {
                 if std::time::Instant::now() < *until {
                     return Err(EngineError::Unavailable(
@@ -1746,9 +1746,9 @@ impl EngineRegistry {
         result
     }
 
-    /// 冷打开（**不持全局锁**）：persistence → claim/restore/install。
-    /// 返回引擎与待写入的 diag 条目（由调用方在锁内发布）。
-    /// T37r：kind 决定 Persister（对象键前缀）与本地 root。
+    /// Cold open (**without holding the global lock**): persistence -> claim/restore/install.
+    /// Returns the engine and the diag entry to be written (published by the caller under the lock).
+    /// T37r: kind decides the Persister (object-key prefix) and the local root.
     fn open_claimed(
         &self,
         kind: crate::paths::ResourceKind,
@@ -1784,19 +1784,19 @@ impl EngineRegistry {
                 ));
             }
             crate::persist::ClaimOutcome::Tombstoned => {
-                // 持久层 tombstone → 本地 marker 也落（离线同样拒开）；
-                // 内存 tombstone 由调用方在锁内补。
+                // Persistence-layer tombstone -> write the local marker too (offline opens are likewise refused);
+                // the in-memory tombstone is added by the caller under the lock.
                 let _ = paths::write_marker(self.root_for(kind), database_id);
                 return Err(EngineError::Dropped);
             }
         };
         if let Some(plan) = &restore {
-            // RV-R31 #5：恢复期间租约按半周期续租——传 &mut
-            // handle，续租失败即中止恢复（fail closed，库不打开）。
+            // RV-R31 #5: during restore the lease is renewed every half period -- pass &mut
+            // handle; a renewal failure aborts the restore (fail closed, the db is not opened).
             p.restore(database_id, plan, &mut handle).map_err(|e| {
                 crate::metrics::persistence_failure("restore");
-                // 仅"数据损坏/校验不符"类失败进入有界退避：它们不会自愈，
-                // 重试只是重复下载；瞬时存储/续租错误保持即时重试。
+                // Only "data corruption / verification mismatch" failures enter bounded backoff: they do not self-heal,
+                // retrying merely repeats the download; transient store/renewal errors keep retrying immediately.
                 if matches!(e, crate::persist::PersistError::Corrupt(_)) {
                     let (n, wait) = self.note_restore_failure(&(kind, database_id.to_string()));
                     crate::metrics::restore_corrupt_backoff();
@@ -1837,16 +1837,16 @@ impl EngineRegistry {
         Ok((e, Some(diag)))
     }
 
-    /// T36b：停机起点——此后 `get()` 一律 `Unavailable`（§4.3 读
-    /// 规则之上：停机即停服务）。diag 保留末态供停机中查询。
+    /// T36b: shutdown starting point -- from then on `get()` always returns `Unavailable` (on top of the section 4.3 read
+    /// rule: shutdown stops service). diag keeps its last state for queries during shutdown.
     pub fn begin_shutdown(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closing = true;
     }
 
-    /// T36b：优雅释放全部在持 lease——inner 锁内 CAS `expires_at=
-    /// now`，各引擎独立失败（warn 继续），总耗时受 `deadline` 上限
-    /// （每库一次 store 往返，超截止即停——剩余库等 lease 自然过期）。
+    /// T36b: gracefully release all held leases -- CAS `expires_at=
+    /// now` under the inner lock, each engine fails independently (warn and continue), total time bounded by `deadline`
+    /// (one store round trip per db, stop at the deadline -- remaining dbs wait for their leases to expire naturally).
     pub fn release_leases(&self, deadline: std::time::Instant) {
         let engines: Vec<(EngineKey, Arc<RusqliteEngine>)> = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1865,8 +1865,8 @@ impl EngineRegistry {
         }
     }
 
-    /// T36：摘除 fenced 引擎（wire 在 Fenced 后调用——下次 get 走
-    /// 恢复路径）。diag 标记 fenced。
+    /// T36: remove a fenced engine (called by wire after Fenced -- the next get goes through the
+    /// recovery path). diag is marked fenced.
     pub fn evict_fenced(&self, kind: crate::paths::ResourceKind, database_id: &str, epoch: u64) {
         let key: EngineKey = (kind, database_id.into());
         let mut state = self.state.lock().unwrap();
@@ -1892,13 +1892,13 @@ impl EngineRegistry {
         }
     }
 
-    /// DROP（T35b 接口 / T35c 并发安全重写）。
+    /// DROP (T35b interface / T35c concurrency-safe rewrite).
     ///
-    /// 锁内原子段：写持久 marker → 置内存 tombstone → 摘除引擎并置其
-    /// dropped 标志 → leaf 目录原子 rename 到 `{db_root}/.trash/`。
-    /// 锁外：有界等在途 Arc 归还（DROP_DRAIN），再 remove_dir_all。
-    /// 任一阶段失败：marker/tombstone 已提交，重试安全续跑（幂等）。
-    /// Ok(false) 仅当该 id 从未存在且未 tombstone。
+    /// Atomic section under the lock: write the persistent marker -> set the in-memory tombstone -> remove the engine and set its
+    /// dropped flag -> atomically rename the leaf directory into `{db_root}/.trash/`.
+    /// Outside the lock: bounded wait for in-flight Arcs to be returned (DROP_DRAIN), then remove_dir_all.
+    /// Failure in any phase: marker/tombstone are already committed, retry resumes safely (idempotent).
+    /// Ok(false) only when the id never existed and is not tombstoned.
     pub fn drop_db(
         &self,
         kind: crate::paths::ResourceKind,
@@ -1907,11 +1907,11 @@ impl EngineRegistry {
         crate::paths::validate_database_id(database_id)
             .map_err(|_| EngineError::Message("invalid database id".into()))?;
 
-        // T36 §7：先 CAS manifest tombstone（fence 所有在租/过期
-        // 写者），成功后再本地清理。失败 → retryable 错误，本地不删
-        // （控制面 DROP op 会重派）。幂等：已 tombstone 直接过。
-        // T37r：tombstone/marker/摘除全部按 kind 分面——同一 id 另
-        // 一 kind 的库不受影响。
+        // T36 section 7: first CAS the manifest tombstone (fencing every leased/expired
+        // writer), then clean up locally on success. Failure -> retryable error, nothing deleted locally
+        // (the control plane DROP op is redispatched). Idempotent: already tombstoned passes straight through.
+        // T37r: tombstone/marker/removal are all split by kind -- a db of the same id in the other
+        // kind is unaffected.
         if let Some(p) = self.persist.as_ref().map(|pp| pp.for_kind(kind)) {
             p.tombstone(database_id).map_err(|e| {
                 crate::metrics::persistence_failure("tombstone");
@@ -1933,7 +1933,7 @@ impl EngineRegistry {
                 || paths::marker_exists(root, database_id)
                     .map_err(|e| EngineError::Message(format!("drop tombstone check: {e}")))?;
             if !tombstoned {
-                // 先写持久 marker——失败则在任何状态改变前返回。
+                // Write the persistent marker first -- on failure return before any state changes.
                 paths::write_marker(root, database_id)
                     .map_err(|e| EngineError::Message(format!("drop marker: {e}")))?;
                 state.tombstones.insert(key.clone());
@@ -1944,12 +1944,12 @@ impl EngineRegistry {
             }
             let engine = state.engines.remove(&key);
             if let Some(e) = &engine {
-                // 同一临界区置标志：此后该引擎新批次与 commit 前终检
-                // 都会被拒。
+                // Set the flag in the same critical section: from then on this engine's new batches and its pre-commit final check
+                // are rejected.
                 e.dropped.store(true, Ordering::SeqCst);
             }
-            // leaf → .trash/{id}-{nonce}（同文件系统原子 rename）。leaf
-            // 缺失：非"删一半"，表示 db 文件从未创建或已进 .trash/已删。
+            // leaf -> .trash/{id}-{nonce} (atomic rename on the same filesystem). Missing
+            // leaf: not "half deleted"; it means the db file was never created or has already gone into .trash/ or been deleted.
             let leaf = crate::paths::derive_db_dir_readonly(root, database_id)
                 .map_err(|e| EngineError::Message(format!("drop path derive: {e}")))?;
             let mut trashed = false;
@@ -1966,22 +1966,22 @@ impl EngineRegistry {
                 trashed = true;
             }
             existed = engine.is_some() || trashed;
-            // `dropped` 报告的是本次调用是否删到实体——已 tombstone
-            // 的重试幂等返回 false（与 T35b 契约一致），tombstone 仍
-            // 生效：任何后续 get() 永远 Dropped。
+            // `dropped` reports whether this call deleted an entity -- a retry on an already
+            // tombstoned id returns false idempotently (consistent with the T35b contract), and the tombstone still
+            // holds: any later get() is always Dropped.
             evicted = engine;
-        } // 锁释放：tombstone 已生效，get() 从此刻起一律 Dropped
+        } // lock released: the tombstone is in effect, get() is always Dropped from this moment on
 
         if let Some(e) = evicted {
-            // 在途请求可能仍持有 Arc —— 有界等待其归还，绝不无限等。
-            // 阻塞睡眠只发生在调用方 spawn_blocking 的工作线程上。
+            // In-flight requests may still hold an Arc -- wait for it to be returned with a bound, never indefinitely.
+            // The blocking sleep happens only on the caller's spawn_blocking worker thread.
             let deadline = std::time::Instant::now() + DROP_DRAIN;
             while Arc::strong_count(&e) > 1 && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             drop(e);
         }
-        // .trash 整体清除（含 drain 超时残留；下一次 drop/重启清扫兜底）。
+        // Remove .trash as a whole (including leftovers from drain timeout; the next drop/restart sweep is the backstop).
         if let Ok(tdir) = paths::ensure_trash_dir(root) {
             if let Ok(entries) = std::fs::read_dir(&tdir) {
                 for e in entries.flatten() {
@@ -2023,8 +2023,8 @@ impl EngineRegistry {
                     Ok(crate::persist::GcTombstonedOutcome::Reclaimed(freed)) => {
                         out.reclaimed += 1;
                         out.objects_freed += freed;
-                        // best-effort 哨兵；写失败只是下轮重扫一次，
-                        // 幂等且便宜。
+                        // best-effort sentinel; a failed write only means one more rescan next round,
+                        // idempotent and cheap.
                         let _ = crate::paths::write_gc_done(root, &id);
                         tracing::info!(
                             kind = ?kind,
@@ -2056,8 +2056,8 @@ impl EngineRegistry {
         out
     }
 
-    /// 测试探针：id 是否已 tombstone（内存集或盘上 marker）。
-    /// 并发测试用它判定"DROP 已完成"，之后 get() 必须一律失败。
+    /// Test probe: whether the id is tombstoned (in-memory set or on-disk marker).
+    /// Concurrency tests use it to decide "DROP has completed", after which get() must always fail.
     #[doc(hidden)]
     pub fn state_tombstoned_for_test(
         &self,

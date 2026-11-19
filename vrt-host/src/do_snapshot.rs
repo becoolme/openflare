@@ -115,15 +115,15 @@ pub fn upload_snapshot(
 /// held lease; overwriting it would LOSE post-snapshot commits —
 /// fail closed instead of clobbering).
 ///
-/// RV-R31 #4：本地非空且 `allow_replace=false` 时不是无条件放行
-/// ——先用快照 meta 判定本地目录是否"恰是某次恢复的产物"：本地
-/// 文件集合 ⊆ meta.files 且无 sha256/size/integrity 不符 → 放行
-/// （本地数据就是该快照）；任何缺失/不符 → 掉电幽灵，必须重拉
-/// （结构化 warn + `vrt_host_do_restore_local_corrupt_total`）；
-/// 含快照外文件（-wal/-shm/外来写入、目录无法枚举）→ 活体目录
-/// → local-wins 不动。校验失败的目录从不被删除——restore 只走
-/// "验证过的 stage 整体换入" 的原子路径（r24 sweep 语义不变：
-/// 这里不产孤儿判定，只产"本地不完整"判定）。
+/// RV-R31 #4: when the local dir is non-empty and `allow_replace=false` it is not passed unconditionally --
+/// first use the snapshot meta to decide whether the local directory is "exactly the product of a past restore": local
+/// file set is a subset of meta.files with no sha256/size/integrity mismatch -> pass
+/// (the local data is that snapshot); any missing/mismatching file -> power-loss ghost, must re-pull
+/// (structured warn + `vrt_host_do_restore_local_corrupt_total`);
+/// files outside the snapshot (-wal/-shm/foreign writes, directory cannot be enumerated) -> live directory
+/// -> local-wins, left untouched. A directory that fails verification is never deleted -- restore only takes
+/// the atomic path of "swap in a verified stage as a whole" (r24 sweep semantics unchanged:
+/// this makes no orphan determination, only a "local incomplete" determination).
 ///
 /// Stages into `<class_dir>.restore-tmp`, verifies sha256 + size +
 /// `PRAGMA integrity_check`, then atomically renames into place.
@@ -176,8 +176,8 @@ pub fn restore_snapshot(
                     detail = %detail,
                     "do local dir failed snapshot-meta verification; restoring"
                 );
-                // fall through：走与 allow_replace 相同的 stage →
-                // verify → backup-rename → place 原子换入路径。
+                // fall through: take the same stage ->
+                // verify -> backup-rename -> place atomic swap-in path as allow_replace.
             }
         }
     }
@@ -232,23 +232,23 @@ pub fn restore_snapshot(
     Ok(true)
 }
 
-/// 本地目录相对某次快照的判定（RV-R31 #4）。
+/// Determination of a local directory relative to a snapshot (RV-R31 #4).
 enum LocalDirState {
-    /// 本地文件集合 ⊆ 快照清单且 sha256/size/integrity 全部相符——
-    /// 该目录就是某次恢复的产物，放行不拉。
+    /// Local file set is a subset of the snapshot manifest and sha256/size/integrity all match --
+    /// the directory is the product of a past restore; pass, no pull.
     Intact,
-    /// 含快照清单之外的文件（-wal/-shm/外来文件/symlink/枚举失败）
-    /// ——活体目录，local-wins，绝不覆盖。
+    /// Contains files outside the snapshot manifest (-wal/-shm/foreign files/symlink/enumeration failure)
+    /// -- a live directory, local-wins, never overwritten.
     Live,
-    /// ⊆ 清单但校验失败（缺文件/大小/sha/integrity 不符）——掉电
-    /// 幽灵，必须恢复。
+    /// A subset of the manifest but verification fails (missing file / size / sha / integrity mismatch) -- power-loss
+    /// ghost, must be restored.
     Corrupt(String),
 }
 
 fn local_restore_state(dir: &Path, meta: &SnapshotMeta) -> LocalDirState {
     let mut files = Vec::new();
     if collect_local_files(dir, dir, &mut files).is_err() {
-        return LocalDirState::Live; // 枚举不了 → 无法判定 → 按活体保守处理
+        return LocalDirState::Live; // cannot enumerate -> cannot determine -> conservatively treat as live
     }
     let meta_paths: std::collections::HashSet<&str> =
         meta.files.iter().map(|f| f.path.as_str()).collect();
@@ -263,8 +263,8 @@ fn local_restore_state(dir: &Path, meta: &SnapshotMeta) -> LocalDirState {
     }
 }
 
-/// 收集目录下全部非目录条目的相对路径（`/` 分隔）——symlink、
-/// socket、fifo 一律按"文件"计入（不在 meta 清单 → 活体）。
+/// Collect the relative paths (`/`-separated) of all non-directory entries under a directory -- symlink,
+/// socket, fifo all count as "files" (not in the meta manifest -> live).
 fn collect_local_files(
     root: &Path,
     dir: &Path,
@@ -314,10 +314,10 @@ pub fn local_dir_epoch(scope: &PlacementScope) -> Option<u64> {
         .as_u64()
 }
 
-/// Persist the acquiring epoch beside `class_dir`（tmp → fsync →
-/// rename → fsync 目录；RV-R31 #4——标记是启动期信任判定凭据，
-/// 必须耐久；仍是 best-effort：写不进盘时按"未知来源"处理，
-/// fail closed 方向不变）。
+/// Persist the acquiring epoch beside `class_dir` (tmp -> fsync ->
+/// rename -> fsync directory; RV-R31 #4 -- the marker is the startup trust-decision credential and
+/// must be durable; still best-effort: when it cannot be written to disk it is treated as "unknown origin",
+/// and the fail-closed direction is unchanged).
 pub fn mark_local_dir_epoch(scope: &PlacementScope, epoch: u64) {
     let p = sibling_epoch_file(scope);
     let body = format!("{{\"epoch\":{epoch}}}");

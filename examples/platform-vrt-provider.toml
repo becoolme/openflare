@@ -1,4 +1,4 @@
-# VRT 平台模式 —— vrt-provider（binding-backend）示例配置。键名 camelCase。
+# VRT platform mode -- vrt-provider (binding-backend) example config. Key names are camelCase.
 cellId = "cell-mvp-1"
 listenerDir = "__VRT_ROOT__/provider/listeners"          # 0700
 operationTimeoutMs = 30000
@@ -8,7 +8,7 @@ bodyReadTimeoutMs = 30000
 drainTimeoutMs = 30000
 
 [desired]
-path = "__VRT_ROOT__/pods/pod-0/envelope.json"           # 与 vrt-host 读同一份签名 envelope
+path = "__VRT_ROOT__/pods/pod-0/envelope.json"           # reads the same signed envelope as vrt-host
 trustedKeys = [
   { keyId = "bf29c9743adb0a97f43ae4bc", publicKey = "MCowBQYDK2VwAyEAO4cbNjsO7FQzisOvZshKKMa67lIim3ikig7RdntOAZM=" },
 ]
@@ -16,7 +16,7 @@ reloadMs = 1000
 graceVersions = 1
 
 [kvrocks]
-urlEnv = "VRT_KVROCKS_URL"                               # 凭据经 env，不写入配置
+urlEnv = "VRT_KVROCKS_URL"                               # credentials come via env, not written into the config
 
 [s3]
 endpoint = "https://s3.internal.example"
@@ -24,4 +24,4 @@ region = "vrt"
 bucket = "vrt-r2-prod"
 accessKeyEnv = "VRT_R2_BINDING_ACCESS_KEY"
 secretKeyEnv = "VRT_R2_BINDING_SECRET_KEY"
-conditionalWrites = true                                 # 后端不支持时条件 put 失败而非降级
+conditionalWrites = true                                 # if the backend does not support it, conditional put fails instead of degrading

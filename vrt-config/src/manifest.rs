@@ -447,7 +447,7 @@ mod tests {
             "lib/util.js",
             ".hidden",
             "a-b_c.d@e.js",
-            "中文字.js",
+            "\u{4e2d}\u{6587}\u{5b57}.js",
             &"x".repeat(MAX_MODULE_NAME_LEN),
         ] {
             assert!(valid_module_name(good), "rejected {good:?}");

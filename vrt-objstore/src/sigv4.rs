@@ -1,7 +1,7 @@
-//! AWS SigV4 签名 + path-style 请求 —— 从 vrt-provider::r2::s3
-//! **逐字抽取**为共享实现（T36）。vrt-provider 与 vrt-sql persistence
-//! 的 S3 后端共用；签名算法、canonical request、header 集合与原版
-//! 逐位一致，provider 行为不变。
+//! AWS SigV4 signing + path-style requests -- extracted **verbatim** from vrt-provider::r2::s3
+//! as a shared implementation (T36). Shared by vrt-provider and the vrt-sql persistence
+//! S3 backend; the signing algorithm, canonical request and header set are bit-for-bit identical
+//! to the original, so provider behavior is unchanged.
 
 use hmac::{Hmac, Mac};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -18,7 +18,7 @@ impl SecretString {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
-    /// 暴露明文（仅签名用途；绝不进日志）。
+    /// Expose the plaintext (for signing only; never into logs).
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -36,20 +36,20 @@ impl Clone for SecretString {
     }
 }
 
-/// 待签名请求（与 provider 原 `SignedRequest` 字段一致）。
+/// Request to be signed (fields match the provider's original `SignedRequest`).
 #[derive(Debug)]
 pub struct SignedRequest {
     pub method: reqwest::Method,
-    /// `/bucket/key` 形态绝对路径（调用方已拼好、已校验无穿越）。
+    /// Absolute path of the `/bucket/key` form (already assembled by the caller, already verified free of traversal).
     pub path: String,
-    /// query 键值对（签名内部排序+编码）。
+    /// Query key-value pairs (sorted + encoded internally during signing).
     pub query: Vec<(String, String)>,
-    /// 业务 headers（小写名，签名时 trim 值）。
+    /// Business headers (lowercase names, values trimmed when signing).
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
-/// SigV4 签名错误（仅内部失败，绝不含 secret）。
+/// SigV4 signing errors (internal failures only, never contain the secret).
 #[derive(Debug, thiserror::Error)]
 #[error("sigv4 signing failed")]
 pub struct SignError;
@@ -60,12 +60,12 @@ fn hmac(key: &[u8], data: &str) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// sha256 → lowercase hex。
+/// sha256 -> lowercase hex.
 pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
-/// RFC3986 unreserved-only percent encoding（与 provider 原版一致）。
+/// RFC3986 unreserved-only percent encoding (identical to the provider original).
 pub fn uri_escape(value: &str, encode_slash: bool) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -80,7 +80,7 @@ pub fn uri_escape(value: &str, encode_slash: bool) -> String {
     out
 }
 
-/// 从 endpoint URL 提取 `host[:port]`（与 provider 原版一致）。
+/// Extract `host[:port]` from an endpoint URL (identical to the provider original).
 pub fn host_of(endpoint: &str) -> Result<String, SignError> {
     let url = reqwest::Url::parse(endpoint).map_err(|_| SignError)?;
     let host = url.host_str().ok_or(SignError)?;
@@ -90,8 +90,8 @@ pub fn host_of(endpoint: &str) -> Result<String, SignError> {
     })
 }
 
-/// 签名器：endpoint + region + 凭据（等价 provider S3Config 的
-/// 签名相关字段子集）。
+/// Signer: endpoint + region + credentials (equivalent to the signing-related
+/// field subset of the provider's S3Config).
 pub struct Signer {
     /// Base endpoint, e.g. `https://s3.internal:9000` (no path).
     pub endpoint: String,
@@ -114,8 +114,8 @@ impl std::fmt::Debug for Signer {
 }
 
 impl Signer {
-    /// 与 provider 原 `sign()` 逐位一致（canonical request/scope/
-    /// key derivation/输出 headers 相同）。
+    /// Bit-for-bit identical to the provider's original `sign()` (canonical request/scope/
+    /// key derivation/output headers are the same).
     pub fn sign(&self, req: &SignedRequest) -> Result<HeaderMap, SignError> {
         let now = chrono::Utc::now();
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
@@ -184,8 +184,8 @@ impl Signer {
         Ok(map)
     }
 
-    /// 上线路径 URL（与 provider `send()` 内构造一致；调用方负责
-    /// path-divergence 校验）。
+    /// On-the-wire path URL (identical to the construction inside provider `send()`; the caller is responsible for
+    /// the path-divergence check).
     pub fn url_of(&self, req: &SignedRequest) -> String {
         let url = format!(
             "{}{}?{}",

@@ -1,4 +1,4 @@
-//! T34: 服务层认证/标签/配置测试。
+//! T34: service-layer auth/label/config tests.
 
 use axum::http::{HeaderMap, HeaderValue, Method};
 use vrt_sql::service::{DbLabels, ServiceAuth, AUTH_HEADER};
@@ -35,7 +35,7 @@ fn verify_rejects_tampered_epoch_seq_body_path() {
     let a = ServiceAuth::new(b"s".to_vec());
     let body = b"b";
     let tok = a.sign("POST", "/dbs/x/query", body, Some(1), Some(2));
-    // epoch 被改写（签名外 → 拒绝）
+    // epoch rewritten (outside the signature -> rejected)
     assert!(!a.verify(
         &headers_with(&tok, Some("9"), Some("2")),
         &Method::POST,
@@ -48,7 +48,7 @@ fn verify_rejects_tampered_epoch_seq_body_path() {
         "/dbs/x/query",
         body
     ));
-    // body/query/method 篡改
+    // body/query/method tampering
     assert!(!a.verify(
         &headers_with(&tok, Some("1"), Some("2")),
         &Method::POST,
@@ -67,7 +67,7 @@ fn verify_rejects_tampered_epoch_seq_body_path() {
         "/dbs/x/query",
         body
     ));
-    // 无头/畸形
+    // missing/malformed header
     assert!(!a.verify(&HeaderMap::new(), &Method::POST, "/dbs/x/query", body));
     assert!(!a.verify(
         &headers_with("garbage", None, None),
@@ -87,13 +87,13 @@ fn verify_rejects_tampered_epoch_seq_body_path() {
 fn verify_rejects_clock_skew() {
     let a = ServiceAuth::new(b"s".to_vec());
     let body = b"";
-    // 手工构造过期 ts（3 分钟前 > ±30s 窗）
+    // hand-build an expired ts (3 minutes ago > the +-30s window)
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
         - 180;
-    // 重算 mac 需要 secret —— 复用 sign 拿到 mac 段再换 ts
+    // recomputing the mac needs the secret -- reuse sign to get the mac part, then swap the ts
     let tok = a.sign("POST", "/p", body, None, None);
     let mac = tok.rsplit(':').next().unwrap();
     let stale = format!("v1:{ts}:{mac}");
@@ -106,19 +106,19 @@ fn db_labels_bounded() {
     let valid = "abcdefghijklmnopqrstuvwxyz";
     assert_eq!(l.label(valid), valid);
     assert_eq!(l.label("not-valid"), "_unknown");
-    // 超过 256 个活跃 id 后折叠
+    // fold after more than 256 active ids
     for i in 0..300u32 {
         let id = format!("{:0>26}", i);
         l.label(&id);
     }
     let fresh = "zzzzzzzzzzzzzzzzzzzzzzzzzz";
-    // 满员后新 id → _overflow；已见过的仍可命中
+    // after the table is full a new id -> _overflow; ones already seen can still hit
     assert_eq!(l.label(fresh), "_overflow");
 }
 
-/// T36b/P0-A：发布的 vrt-sql 示例配置必须能通过 ServiceConfig
-/// 校验——占位符替换与 `vrt init` 渲染相同，防止 T36 的必填
-/// `[persistence]` 把示例/fixture 变成启动即挂（d1_smoke 曾踩中）。
+/// T36b/P0-A: the published vrt-sql example config must pass ServiceConfig
+/// validation -- placeholder substitution is the same as `vrt init` rendering, preventing T36's required
+/// `[persistence]` from turning examples/fixtures into start-and-crash (d1_smoke once hit this).
 #[test]
 fn shipped_vrt_sql_example_config_validates() {
     let raw = std::fs::read_to_string(
@@ -135,7 +135,7 @@ fn shipped_vrt_sql_example_config_validates() {
         .unwrap_or_else(|e| panic!("example vrt-sql toml must parse: {e}"));
     cfg.validate()
         .unwrap_or_else(|f| panic!("example vrt-sql config must validate: {f}"));
-    // 示例必须是 fs——独立部署默认非 none（fail closed）。
+    // The example must be fs -- standalone deployments default to non-none (fail closed).
     assert_eq!(cfg.persistence.backend, "fs");
     assert!(cfg.persistence.fs.is_some());
 }

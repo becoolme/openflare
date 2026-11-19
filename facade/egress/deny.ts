@@ -3,7 +3,7 @@
 // network at all — facades talk only to BINDING_BACKEND over unix, so
 // anything reaching this worker is by definition a misroute.
 //
-// workerd's own network-service `allow = []` semantics are 未证实 on
+// workerd's own network-service `allow = []` semantics are unverified on
 // our build, so the deny is a real worker entrypoint — fetch() is a
 // typed 403, connect() throws and closes, no props/env is ever read.
 // Provably fail closed, and cheap (one tiny module).

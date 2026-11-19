@@ -228,7 +228,7 @@ fn main() {
         let _ = control.flush();
         // Deliberately keep `control` open — workerd holds the control
         // channel for the process lifetime (host-side EOF semantics are
-        // 未证实; we leak the fd, the kernel closes it on exit).
+        // unverified; we leak the fd, the kernel closes it on exit).
         std::mem::forget(control);
     }
 

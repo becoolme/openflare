@@ -350,7 +350,7 @@ fn cmd_queue_metrics(root: &Path, queue_id: &str) -> Result<(), String> {
         .unwrap_or_default()
         .as_nanos() as u64;
     let auth = signer.sign("GET", &path_query, b"", 1, seq);
-    // Bounded I/O — DNS resolve + 5s connect + 10s r/w (诊断绝不挂死).
+    // Bounded I/O — DNS resolve + 5s connect + 10s r/w (diagnostics must never hang).
     let sock_addr = std::net::ToSocketAddrs::to_socket_addrs(&authority)
         .map_err(|e| format!("resolve {authority}: {e}"))?
         .next()

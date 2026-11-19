@@ -1,9 +1,9 @@
-//! RV-R8 #1 + #7：S3 wire 级回归——
-//! * `send()` 必须把签过名的 body 真的发出去：mock S3 断言收到
-//!   的字节与 `x-amz-content-sha256` 声明的 hash 一致，GET 往返
-//!   取回同一数据。（修复前 PUT 永远上传空对象。）
-//! * `list` 命中分页上界时必须通过 `ListPage.truncated` 显式上报，
-//!   绝不静默丢尾部 key。
+//! RV-R8 #1 + #7: S3 wire-level regression --
+//! * `send()` must really send the signed body: the mock S3 asserts that the received
+//!   bytes match the hash declared by `x-amz-content-sha256`, and a GET round trip
+//!   returns the same data. (Before the fix, PUT always uploaded an empty object.)
+//! * when `list` hits the pagination bound it must report it explicitly via `ListPage.truncated`,
+//!   never silently dropping tail keys.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -18,11 +18,11 @@ fn block<T: Send>(f: impl std::future::Future<Output = T> + Send) -> T {
 
 #[derive(Default)]
 struct MockState {
-    /// key → stored bytes（path-style `/{bucket}/{key}` 的 key 部分）。
+    /// key -> stored bytes (the key part of the path-style `/{bucket}/{key}`).
     objects: BTreeMap<String, Vec<u8>>,
-    /// (method, path+query, headers, body) 全量记录。
+    /// Full record of (method, path+query, headers, body).
     requests: Vec<(String, String, Vec<(String, String)>, Vec<u8>)>,
-    /// list 行为：true → 永远 IsTruncated+token（探测截断上报）。
+    /// list behavior: true -> always IsTruncated+token (probes truncation reporting).
     list_forever_truncated: bool,
     list_pages: usize,
 }
@@ -80,7 +80,7 @@ fn serve(state: Arc<Mutex<MockState>>, listener: TcpListener) {
         let mut st = state.lock().unwrap();
         st.requests
             .push((method.clone(), path.clone(), headers.clone(), body.clone()));
-        // path-style：/{bucket}/{key}
+        // path-style: /{bucket}/{key}
         let key = path
             .split('?')
             .next()
@@ -225,8 +225,8 @@ fn put_transmits_the_signed_body_and_get_roundtrips() {
         .find(|(m, p, _, _)| m == "PUT" && p.starts_with("/b/w/seg-1.seg"))
         .expect("PUT must reach the mock");
     assert_eq!(method, "PUT");
-    // 上线 body == 原始字节，且与签名承诺的 payload hash 一致——
-    // 修复前这里是 0 字节（签名说一套、线上发另一套）。
+    // On-the-wire body == original bytes, and matches the payload hash committed to in the signature --
+    // before the fix this was 0 bytes (the signature said one thing, the wire carried another).
     assert_eq!(wire_body, &payload, "PUT body must be transmitted");
     let sha_header = headers
         .iter()
@@ -241,7 +241,7 @@ fn put_transmits_the_signed_body_and_get_roundtrips() {
     assert_eq!(cl.as_deref(), Some(payload.len().to_string().as_str()));
     drop(st);
 
-    // GET 往返：mock 存的就是线上收到的字节。
+    // GET round trip: what the mock stored is what arrived on the wire.
     let obj = block(store.get("w/seg-1.seg")).unwrap().expect("object exists");
     assert_eq!(obj.body, payload);
 }
@@ -294,8 +294,8 @@ fn empty_body_put_declares_content_length_zero() {
 fn list_reports_truncation_instead_of_silent_prefix() {
     let (store, state) = spawn_mock(true);
     let page = block(store.list("k-")).unwrap();
-    // mock 每页都给 IsTruncated+token → 拉满 LIST_FETCH_BOUND=64 页
-    // 后必须如实上报截断，绝不返回"看似完整"的短列表。
+    // The mock gives IsTruncated+token on every page -> after filling LIST_FETCH_BOUND=64 pages
+    // it must truthfully report truncation, never return a "looks complete" short list.
     assert!(page.truncated, "bounded listing must surface truncation");
     assert_eq!(page.entries.len(), 64 * 2);
     assert_eq!(state.lock().unwrap().list_pages, 64);
@@ -313,8 +313,8 @@ fn list_complete_page_is_not_truncated() {
 
 #[test]
 fn put_file_rejects_source_over_single_object_bound() {
-    // RV-R8 #7：默认 put_file 是整读缓冲路径——超界文件必须 stat
-    // 阶段即拒，不为它分配等价内存。
+    // RV-R8 #7: the default put_file is the whole-file buffering path -- an oversized file must be refused
+    // at the stat stage, without allocating equivalent memory for it.
     let store = vrt_objstore::MemoryStore::new();
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("big.bin");
@@ -328,7 +328,7 @@ fn put_file_rejects_source_over_single_object_bound() {
         }
         other => panic!("expected Unavailable, got {other:?}"),
     }
-    // 未超限的文件走通（对照）。
+    // A file within the limit goes through (control).
     let small = dir.path().join("small.bin");
     std::fs::write(&small, b"payload").unwrap();
     let out = block(store.put_file("k/ok", &small, false)).unwrap();
@@ -394,7 +394,7 @@ fn list_after_sends_start_after_cursor() {
     );
 }
 
-/// RV-R71：永远 503 的 S3；返回请求计数器。
+/// RV-R71: an S3 that always returns 503; returns the request counter.
 fn spawn_always_503(retries: u32) -> (S3Store, Arc<Mutex<usize>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -442,11 +442,11 @@ fn rv_r71_idempotent_get_retries_bounded_conditional_write_does_not() {
     assert_eq!(*count.lock().unwrap(), 1, "CAS must be single-shot");
 }
 
-/// 2026-11-15 回归：S3 `get_to_file` 返回的 sha256 必须是下载内容
-/// 的 sha256，且与 `put_file` 上传时报告的一致。修复前 s3 后端把
-/// `hasher.finalize()`（原始摘要）又喂给 `sha256_hex`——返回的是
-/// sha256(sha256(x))，致 vrt-sql restore 永远 "snapshot sha256
-/// mismatch"。
+/// 2026-11-15 regression: the sha256 returned by S3 `get_to_file` must be the sha256 of the downloaded content,
+/// and match what `put_file` reported at upload. Before the fix the s3 backend fed
+/// `hasher.finalize()` (the raw digest) into `sha256_hex` again -- returning
+/// sha256(sha256(x)), which made vrt-sql restore always fail with "snapshot sha256
+/// mismatch".
 #[test]
 fn get_to_file_sha256_matches_content_and_put_file_report() {
     let (store, _state) = spawn_mock(false);

@@ -1,4 +1,4 @@
-//! RV-R66：fs 持久层与本地库同设备 → 非 dev fail closed（已验证 2026-11-15）。
+//! RV-R66: fs persistence layer on the same device as the local db -> non-dev fails closed (verified 2026-11-15).
 #![cfg(unix)]
 
 use std::path::Path;
@@ -18,7 +18,7 @@ fn same_device_without_dev_flag_is_rejected() {
     let root = tmp("same");
     let (db, persist) = (root.join("db"), root.join("persistence"));
     std::fs::create_dir_all(&db).unwrap();
-    // persistence root 尚未创建：按最近祖先判定，同样同设备。
+    // The persistence root has not been created yet: judged by the nearest ancestor, likewise the same device.
     let err = check_fs_durability_distinct(&db, &persist, false).unwrap_err();
     assert!(matches!(err, DurabilityError::SameDevice { .. }), "{err}");
     assert!(err.to_string().contains("VRT_SQL_DURABILITY_SAME_DEVICE"));
@@ -31,7 +31,7 @@ fn same_device_with_dev_flag_is_allowed_and_reported() {
     let (db, persist) = (root.join("db"), root.join("persistence"));
     std::fs::create_dir_all(&db).unwrap();
     std::fs::create_dir_all(&persist).unwrap();
-    // Ok(true) = 豁免生效，调用方须告警。
+    // Ok(true) = exemption applies, the caller must warn.
     assert_eq!(check_fs_durability_distinct(&db, &persist, true), Ok(true));
     let _ = std::fs::remove_dir_all(&root);
 }

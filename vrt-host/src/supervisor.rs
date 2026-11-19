@@ -1329,7 +1329,7 @@ struct LiveGen {
     cron_slots: Arc<BTreeMap<String, Arc<EndpointSlot>>>,
     watcher: JoinHandle<()>,
     /// Control channel kept open for the generation's lifetime — whether
-    /// real workerd reacts to control-fd EOF is 未证实.
+    /// real workerd reacts to control-fd EOF is unverified.
     _control: tokio::net::UnixStream,
     work_dir: PathBuf,
     /// P3c-2: this generation's held DO placement leases.

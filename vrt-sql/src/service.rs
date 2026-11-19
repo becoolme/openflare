@@ -1,17 +1,17 @@
-//! vrt-sql 服务层（T34）：服务间认证、配置、有界并发与指标。
+//! vrt-sql service layer (T34): service-to-service auth, config, bounded concurrency and metrics.
 //!
-//! 认证模型：只有 provider 能调用 vrt-sql。双方共享 0600 secret 文件；
-//! 客户端对
+//! Auth model: only the provider may call vrt-sql. Both sides share a 0600 secret file;
+//! the client does
 //!   `"{ts}|{method}|{path}?{query}|{sha256hex(body)}|{epoch}|{seq}"`
-//! 做 HMAC-SHA256，放 `x-vrt-sql-auth: v1:<ts>:<mac-hex>`。
-//! 覆盖 epoch/seq/query 是为了让中间人无法改写 resultsFormat 与
-//! 去重语义；ts 窗口 ±30s（容忍时钟漂移），超窗拒绝，常量时间比较。
-//! 验签通过之前绝不读取 `x-vrt-epoch`/`x-vrt-seq`——这两个值只在
-//! 认证后才被采信（wire.rs `trusted_ctx_from_headers`）。
+//! HMAC-SHA256 and puts it in `x-vrt-sql-auth: v1:<ts>:<mac-hex>`.
+//! Covering epoch/seq/query keeps a man-in-the-middle from rewriting resultsFormat and
+//! dedup semantics; the ts window is +-30s (tolerating clock drift), out-of-window requests are rejected, constant-time comparison.
+//! `x-vrt-epoch`/`x-vrt-seq` are never read before the signature verifies -- these two values are only
+//! trusted after authentication (wire.rs `trusted_ctx_from_headers`).
 //!
-//! 重放：窗口内同签名重放的写由 `_vrt_dedup`(epoch,seq) 兜住；读
-//! 重放可接受（文档已写明）。body 长度先验后读，超限直接拒——防
-//! 未认证大包耗内存；认证失败计 `outcome="unauthorized"`。
+//! Replay: writes replayed with the same signature inside the window are caught by `_vrt_dedup`(epoch,seq); read
+//! replays are acceptable (documented). Body length is checked before reading, and oversize is rejected outright -- guards against
+//! unauthenticated large bodies eating memory; auth failures count as `outcome="unauthorized"`.
 
 use axum::http::{HeaderMap, Method};
 use hmac::{Hmac, Mac};
@@ -21,117 +21,117 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-/// 认证请求头。
+/// Auth request header.
 pub const AUTH_HEADER: &str = "x-vrt-sql-auth";
-/// 认证时钟容差（秒）——±30s。
+/// Auth clock tolerance (seconds) -- +-30s.
 pub const AUTH_SKEW_SECS: i64 = 30;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// 服务配置（JSON/TOML，deny_unknown_fields）。
+/// Service config (JSON/TOML, deny_unknown_fields).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServiceConfig {
-    /// 数据库根目录（0700，内部派生 sha256 shard）。
+    /// Database root directory (0700; sha256 shards are derived inside).
     pub db_root: PathBuf,
-    /// unix socket：`{unixDir}/vrt-sql.sock`。
+    /// unix socket: `{unixDir}/vrt-sql.sock`.
     #[serde(default)]
     pub unix_dir: Option<PathBuf>,
-    /// TCP 监听 `ip:port`（内部网络）。unixDir 与 listenTcp 恰设一个。
+    /// TCP listen `ip:port` (internal network). Exactly one of unixDir and listenTcp must be set.
     #[serde(default)]
     pub listen_tcp: Option<String>,
-    /// bookmark HMAC key 文件（0600，≤4KiB）。
+    /// bookmark HMAC key file (0600, <=4KiB).
     pub bookmark_secret_file: PathBuf,
-    /// 服务间认证 secret 文件（0600，≤4KiB；provider 持有同一份）。
+    /// Service-to-service auth secret file (0600, <=4KiB; the provider holds the same copy).
     pub auth_secret_file: PathBuf,
-    /// 内部 metrics TCP 监听；不公开。
+    /// Internal metrics TCP listen; not public.
     #[serde(default)]
     pub metrics_listen: Option<String>,
-    /// 全局在途并发上限（try_acquire，超限 429）。
+    /// Global in-flight concurrency cap (try_acquire, 429 when exceeded).
     #[serde(default = "default_global_concurrency")]
     pub global_concurrency: usize,
-    /// 单请求事务预算（ms）。
+    /// Per-request transaction budget (ms).
     #[serde(default = "default_operation_timeout_ms")]
     pub operation_timeout_ms: u64,
-    /// 优雅退出排空上限（ms）。
+    /// Graceful-shutdown drain cap (ms).
     #[serde(default = "default_drain_ms")]
     pub drain_timeout_ms: u64,
-    /// 请求体上限（字节）——读 body 前先验。
+    /// Request body cap (bytes) -- checked before reading the body.
     #[serde(default = "default_body_max")]
     pub body_max_bytes: usize,
-    /// T36 §4：对象存储持久化。**必填**（fail closed：缺失 → 启动
-    /// 失败）。`backend="none"` 仅在 `allowDevBackend=true` 时允许（RV-R72）。
+    /// T36 section 4: object-store persistence. **Required** (fail closed: missing -> startup
+    /// failure). `backend="none"` is allowed only when `allowDevBackend=true` (RV-R72).
     pub persistence: PersistenceConfig,
 }
 
-/// T36 `[persistence]`（§4）。键名 camelCase 与 ServiceConfig 一致。
+/// T36 `[persistence]` (section 4). Key names are camelCase, consistent with ServiceConfig.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PersistenceConfig {
-    /// `fs`（standalone 默认）| `s3` | `none`（测试/dev，WARN）。
+    /// `fs` (standalone default) | `s3` | `none` (test/dev, WARN).
     pub backend: String,
-    /// RV-R72：显式 dev 开关。`backend="none"`（无复制、D1 写入只做本地
-    /// fsync）与 s3 非 loopback `http://` endpoint 仅在此为 true 时允许。
-    /// 生产 overlay 禁止出现该键（`vrt-k8s-check` 校验）。
+    /// RV-R72: explicit dev switch. `backend="none"` (no replication, D1 writes only do local
+    /// fsync) and non-loopback `http://` s3 endpoints are allowed only when this is true.
+    /// Production overlays must not contain this key (checked by `vrt-k8s-check`).
     #[serde(default)]
     pub allow_dev_backend: bool,
-    /// RV-R66：`backend="fs"` 的持久层根与本地库 `dbRoot` 位于同一块
-    /// 设备（`st_dev` 相同）时，"持久层"与本地库同生共死——D1/Queue
-    /// 实际单份。默认 false → 启动 fail closed
-    /// （[`check_fs_durability_distinct`]）；仅 dev/internal-test 显式置
-    /// true 以承认"无灾备"。生产 overlay 禁止出现（`vrt-k8s-check`）。
+    /// RV-R66: when the `backend="fs"` persistence root and the local `dbRoot` sit on the same
+    /// device (same `st_dev`), the "persistence layer" lives and dies with the local db -- D1/Queue
+    /// effectively have a single copy. Default false -> startup fails closed
+    /// ([`check_fs_durability_distinct`]); only dev/internal-test should explicitly set it to
+    /// true to acknowledge "no disaster recovery". Production overlays must not contain it (`vrt-k8s-check`).
     #[serde(default)]
     pub allow_same_device_durability: bool,
-    /// `backend="fs"` 必填。
+    /// Required for `backend="fs"`.
     #[serde(default)]
     pub fs: Option<FsPersistence>,
-    /// `backend="s3"` 必填。
+    /// Required for `backend="s3"`.
     #[serde(default)]
     pub s3: Option<S3Persistence>,
-    /// lease 时长（ms）。
+    /// Lease duration (ms).
     #[serde(default = "default_lease_ms")]
     pub lease_ms: u64,
-    /// 时钟漂移安全边际（ms）：lease 仅在 `expiry-margin > now`
-    /// 时视作可用（§4.3 读写同一门槛）。
+    /// Clock-skew safety margin (ms): the lease is considered usable only while `expiry-margin > now`
+    /// (the same read/write gate, section 4.3).
     #[serde(default = "default_margin_ms")]
     pub clock_skew_margin_ms: u64,
-    /// 写者 holder 标识；缺省 = `hostname:pid:start_nanos`。
+    /// Writer holder identifier; defaults to `hostname:pid:start_nanos`.
     #[serde(default)]
     pub holder: Option<String>,
-    /// 每 N 个已持久化提交做一次 checkpoint/snapshot（0=禁用）。
+    /// Run a checkpoint/snapshot every N persisted commits (0 = disabled).
     #[serde(default = "default_ckpt_commits")]
     pub checkpoint_every_commits: u64,
-    /// tombstone/段保留窗（ms），GC 惰性执行。
+    /// Tombstone/segment retention window (ms); GC runs lazily.
     #[serde(default = "default_retention_ms")]
     pub retention_ms: u64,
-    /// 快照字节上限（T36b）：超限库靠段链恢复（成本随链长线性）。
-    /// 默认 256MiB——覆盖常规 D1 库量级；s3 后端上传在内存中
-    /// 进行，校验强制 ≤256MiB（fail closed）；fs 流式不受内存约束。
+    /// Snapshot byte cap (T36b): databases over it recover via the segment chain (cost grows linearly with chain length).
+    /// Defaults to 256MiB -- covers typical D1 database sizes; the s3 backend uploads in memory,
+    /// validation forces <=256MiB (fail closed); fs streams and is not memory-bound.
     #[serde(default = "default_snapshot_max_bytes")]
     pub snapshot_max_bytes: u64,
-    /// MIG-9：启动自检重试总预算（ms）。瞬时对端未就绪（R2/DNS/
-    /// 网络慢启动）在预算内指数退避；预算尽仍败 → 进程退出非 0。
-    /// 认证类/非重试错误不受预算控制，立即 fail closed。
-    /// 须 < K8s startupProbe 的 periodSeconds×failureThreshold。
+    /// MIG-9: total startup self-check retry budget (ms). A transiently not-ready peer (R2/DNS/
+    /// slow network start) backs off exponentially within the budget; if it still fails when the budget is spent -> the process exits non-zero.
+    /// Auth-class/non-retryable errors are not governed by the budget and fail closed immediately.
+    /// Must be < the K8s startupProbe periodSeconds x failureThreshold.
     #[serde(default = "default_self_check_budget_ms")]
     pub self_check_budget_ms: u64,
-    /// MIG-9：首次退避（ms）。
+    /// MIG-9: first backoff (ms).
     #[serde(default = "default_self_check_initial_backoff_ms")]
     pub self_check_initial_backoff_ms: u64,
-    /// MIG-9：退避上限（ms），×2 增长到此封顶。
+    /// MIG-9: backoff cap (ms); grows x2 up to this ceiling.
     #[serde(default = "default_self_check_max_backoff_ms")]
     pub self_check_max_backoff_ms: u64,
 }
 
-/// RV-R66：同设备持久层的 typed 启动错误（fail closed）。
+/// RV-R66: typed startup error for a same-device persistence layer (fail closed).
 #[derive(Debug, PartialEq, Eq)]
 pub enum DurabilityError {
-    /// persistence root 与 dbRoot 在同一 `st_dev`：无独立副本。
+    /// persistence root and dbRoot are on the same `st_dev`: no independent copy.
     SameDevice {
         db_root: PathBuf,
         persist_root: PathBuf,
     },
-    /// 无法确认两路径所在设备（stat 失败）——无法证明独立即拒绝。
+    /// Cannot determine the device of the two paths (stat failed) -- refuse, since independence cannot be proven.
     Unverifiable(String),
 }
 
@@ -155,7 +155,7 @@ impl std::fmt::Display for DurabilityError {
 
 impl std::error::Error for DurabilityError {}
 
-/// 最近的已存在祖先（含自身）——root 目录可能尚未创建。
+/// Nearest existing ancestor (including itself) -- the root directory may not have been created yet.
 fn nearest_existing(p: &std::path::Path) -> Option<PathBuf> {
     let mut cur = Some(p);
     while let Some(c) = cur {
@@ -167,9 +167,9 @@ fn nearest_existing(p: &std::path::Path) -> Option<PathBuf> {
     None
 }
 
-/// RV-R66：`fs` 持久层必须与本地库不同设备，除非显式 dev 豁免。
-/// 豁免生效时返回 `Ok(true)`（调用方须告警"无灾备"），独立设备
-/// `Ok(false)`。无法确认设备 → `Err`（fail closed，不当作独立）。
+/// RV-R66: the `fs` persistence layer must be on a different device from the local db, unless an explicit dev exemption applies.
+/// When the exemption applies, returns `Ok(true)` (the caller must warn "no disaster recovery"); for an independent device
+/// `Ok(false)`. If the device cannot be determined -> `Err` (fail closed, not treated as independent).
 #[cfg(unix)]
 pub fn check_fs_durability_distinct(
     db_root: &std::path::Path,
@@ -197,36 +197,36 @@ pub fn check_fs_durability_distinct(
     })
 }
 
-/// `[persistence.fs]`。
+/// `[persistence.fs]`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FsPersistence {
-    /// 对象根目录（独立卷建议）。
+    /// Object root directory (a separate volume is recommended).
     pub root: PathBuf,
 }
 
-/// `[persistence.s3]`。凭据走 0600 文件（绝不内联 secret）。
+/// `[persistence.s3]`. Credentials come from 0600 files (secrets are never inlined).
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct S3Persistence {
-    /// Base endpoint `https://host[:port]`（path-style）。
+    /// Base endpoint `https://host[:port]` (path-style).
     pub endpoint: String,
-    /// Signing region。
+    /// Signing region.
     pub region: String,
-    /// Physical bucket。
+    /// Physical bucket.
     pub bucket: String,
-    /// access key 文件（0600）。
+    /// access key file (0600).
     pub access_key_file: PathBuf,
-    /// secret key 文件（0600）。
+    /// secret key file (0600).
     pub secret_key_file: PathBuf,
-    /// 后端支持 S3 条件写（If-Match/If-None-Match）。false → CAS
-    /// fail closed（§12 未证实项：R2/MinIO 兼容性需真机核实）。
+    /// Whether the backend supports S3 conditional writes (If-Match/If-None-Match). false -> CAS
+    /// fails closed (section 12 unconfirmed item: R2/MinIO compatibility must be verified on real hardware).
     #[serde(default = "default_conditional_writes")]
     pub conditional_writes: bool,
-    /// 请求超时（ms）。
+    /// Request timeout (ms).
     #[serde(default = "default_s3_timeout_ms")]
     pub timeout_ms: u64,
-    /// 对象 key 前缀（多部署共 bucket 时隔离）。
+    /// Object key prefix (isolation when multiple deployments share a bucket).
     #[serde(default)]
     pub prefix: String,
 }
@@ -237,11 +237,11 @@ fn default_lease_ms() -> u64 {
 fn default_margin_ms() -> u64 {
     500
 }
-/// T36b 快照上限默认：256MiB（s3 内存上传的硬顶；fs 流式可放宽）。
+/// T36b snapshot cap default: 256MiB (hard ceiling for s3 in-memory upload; fs streaming may relax it).
 fn default_snapshot_max_bytes() -> u64 {
     256 * 1024 * 1024
 }
-/// s3 后端快照字节硬上限——上传路径把对象读进内存签名。
+/// Hard cap on s3 backend snapshot bytes -- the upload path reads the object into memory to sign it.
 const S3_SNAPSHOT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 fn default_ckpt_commits() -> u64 {
     64
@@ -279,7 +279,7 @@ fn default_body_max() -> usize {
 }
 
 impl ServiceConfig {
-    /// fail-closed 校验。
+    /// fail-closed validation.
     pub fn validate(&self) -> Result<(), &'static str> {
         match (self.unix_dir.is_some(), self.listen_tcp.is_some()) {
             (true, false) | (false, true) => {}
@@ -301,7 +301,7 @@ impl ServiceConfig {
                 return Err("metricsListen");
             }
         }
-        // T36 persistence 校验（fail closed）。
+        // T36 persistence validation (fail closed).
         match self.persistence.backend.as_str() {
             "none" => {
                 if !self.persistence.allow_dev_backend {
@@ -322,7 +322,7 @@ impl ServiceConfig {
                 if s3.endpoint.is_empty() || s3.bucket.is_empty() || s3.region.is_empty() {
                     return Err("persistence.s3 endpoint/bucket/region");
                 }
-                // RV-R72：endpoint 解析校验（https；http 仅 loopback/dev）。
+                // RV-R72: endpoint parse validation (https; http only for loopback/dev).
                 if vrt_objstore::endpoint::validate_object_store_endpoint(
                     &s3.endpoint,
                     self.persistence.allow_dev_backend,
@@ -331,7 +331,7 @@ impl ServiceConfig {
                 {
                     return Err("persistence.s3.endpoint must be https (http only loopback, <svc>.<ns>.svc:port, or allowDevBackend)");
                 }
-                // T36b：s3 快照上传为内存路径——超限 fail closed。
+                // T36b: s3 snapshot upload is an in-memory path -- over the cap fails closed.
                 if self.persistence.snapshot_max_bytes > S3_SNAPSHOT_MAX_BYTES {
                     return Err("persistence.snapshotMaxBytes exceeds s3 in-memory cap (256MiB)");
                 }
@@ -339,12 +339,12 @@ impl ServiceConfig {
             _ => return Err("persistence.backend must be fs|s3|none"),
         }
         if self.persistence.lease_ms <= self.persistence.clock_skew_margin_ms * 4 {
-            // margin 必须显著小于 lease（默认 500ms vs 15s）。
+            // margin must be much smaller than lease (default 500ms vs 15s).
             return Err("persistence.leaseMs too small vs clockSkewMarginMs");
         }
-        // MIG-9：自检重试参数边界——预算/退避必须为正且自洽；
-        // 预算封顶 10 分钟（更长应靠 pod restart policy，不是
-        // 单次启动自检）。
+        // MIG-9: self-check retry parameter bounds -- budget/backoff must be positive and self-consistent;
+        // the budget is capped at 10 minutes (anything longer should rely on the pod restart policy, not
+        // a single startup self-check).
         let p = &self.persistence;
         if p.self_check_initial_backoff_ms == 0 || p.self_check_max_backoff_ms == 0 {
             return Err("persistence.selfCheck* backoff must be > 0");
@@ -359,9 +359,9 @@ impl ServiceConfig {
     }
 }
 
-/// 0600 secret 文件加载（RV-R72：委托 `vrt_securefs::load_service_secret`，
-/// 三个 binary 共用同一规范化：仅去尾部一个换行、内部空白拒绝、最小长度、
-/// 占位值拒绝）。绝不打印内容。
+/// Load a 0600 secret file (RV-R72: delegates to `vrt_securefs::load_service_secret`,
+/// shared by all three binaries with the same normalization: strip only one trailing newline, reject internal whitespace, minimum length,
+/// reject placeholder values). Never prints the content.
 pub fn load_secret_0600(
     path: &std::path::Path,
     purpose: vrt_securefs::SecretPurpose,
@@ -369,8 +369,8 @@ pub fn load_secret_0600(
     Ok(vrt_securefs::load_service_secret(path, purpose)?.into_bytes())
 }
 
-/// 签名 token，双向共用：provider 调 [`ServiceAuth::sign`]，vrt-sql
-/// 调 [`ServiceAuth::verify`]。
+/// Signed token, shared both ways: the provider calls [`ServiceAuth::sign`], vrt-sql
+/// calls [`ServiceAuth::verify`].
 #[derive(Clone)]
 pub struct ServiceAuth {
     secret: Vec<u8>,
@@ -397,7 +397,7 @@ impl ServiceAuth {
         Self { secret }
     }
 
-    /// 被签名消息（epoch/seq 缺省为 `-`）。
+    /// The signed message (epoch/seq default to `-`).
     fn message(
         ts: i64,
         method: &str,
@@ -412,8 +412,8 @@ impl ServiceAuth {
         )
     }
 
-    /// 客户端签名：`v1:<ts>:<mac64>`。`epoch`/`seq` 为将发送的头值
-    /// （或 None），必须与实际上送一致——签名覆盖它们。
+    /// Client signing: `v1:<ts>:<mac64>`. `epoch`/`seq` are the header values about to be sent
+    /// (or None) and must match what is actually sent -- the signature covers them.
     pub fn sign(
         &self,
         method: &str,
@@ -435,8 +435,8 @@ impl ServiceAuth {
         format!("v1:{ts}:{}", hex::encode(m))
     }
 
-    /// 服务端验签：格式/时钟/HMAC 任一不符 → false（fail closed）。
-    /// `epoch`/`seq` 传原始头值（缺失 → "-"），签名之后由调用方解析。
+    /// Server-side verification: any mismatch in format/clock/HMAC -> false (fail closed).
+    /// `epoch`/`seq` take the raw header values (missing -> "-"); the caller parses them after the signature.
     pub fn verify(
         &self,
         headers: &HeaderMap,
@@ -487,8 +487,8 @@ impl ServiceAuth {
     }
 }
 
-/// 有界 databaseId → metrics label：≤256 个活跃 id，其余折叠
-/// `_overflow`（workers-runtime-metrics.md 基数规则；非法值 `_unknown`）。
+/// Bounded databaseId -> metrics label: <=256 active ids, the rest are folded into
+/// `_overflow` (workers-runtime-metrics.md cardinality rule; invalid values become `_unknown`).
 #[derive(Default)]
 pub struct DbLabels {
     seen: Mutex<std::collections::HashSet<String>>,

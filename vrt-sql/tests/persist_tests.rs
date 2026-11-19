@@ -1,5 +1,5 @@
-//! T36 对抗测试：lease 夺占 / 上传失败 / kill -9 恢复 / 段损坏 /
-//! fs CAS 并发 / lease 临界 / adopt 升级 / drop tombstone / GC。
+//! T36 adversarial tests: lease seizure / upload failure / kill -9 recovery / segment corruption /
+//! fs CAS concurrency / lease boundary / adopt upgrade / drop tombstone / GC.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use vrt_sql::paths::ResourceKind::{self, D1};
 use vrt_sql::persist::{Manifest, PersistConfig, Persister};
 use vrt_sql::seg;
 
-const DB: &str = "abcdefghijklmnopqrstuvwxyz"; // 26 小写字母，合法 id
+const DB: &str = "abcdefghijklmnopqrstuvwxyz"; // 26 lowercase letters, a legal id
 
 fn stmt(sql: &str) -> SqlStmt {
     SqlStmt {
@@ -53,7 +53,7 @@ fn persister(
             lease_ms: 10_000,
             clock_skew_margin_ms: 500,
             holder: holder.into(),
-            checkpoint_every_commits: 0, // 测试默认关，按需开
+            checkpoint_every_commits: 0, // off by default in tests, enable on demand
             retention_ms: 60_000,
             snapshot_max_bytes: 1 << 30,
         },
@@ -63,8 +63,8 @@ fn persister(
     ))
 }
 
-/// T37r：注册表需要两种 kind 的 Persister——queue 侧与 D1 共享
-/// store/cfg/clock，root 取 `dbs` 的同级 `queues/`。
+/// T37r: the registry needs a Persister for each of the two kinds -- the queue side shares
+/// store/cfg/clock with D1, and root is the `queues/` sibling of `dbs`.
 fn pair(root: &std::path::Path, d1: Arc<Persister>) -> vrt_sql::engine::PersisterPair {
     vrt_sql::engine::PersisterPair {
         d1: d1.clone(),
@@ -82,7 +82,7 @@ fn registry(root: PathBuf, p: Arc<Persister>) -> EngineRegistry {
     EngineRegistry::new(root.clone()).with_persisters(pair(&root, p))
 }
 
-/// ---------- §4.1 lease 夺占：A 过期 → B epoch+1 接管 → A fenced ----------
+/// ---------- section 4.1 lease seizure: A expires -> B takes over at epoch+1 -> A fenced ----------
 
 #[test]
 fn takeover_fences_expired_writer() {
@@ -101,22 +101,22 @@ fn takeover_fences_expired_writer() {
     assert_eq!(ea.lease_epoch(), 1);
     assert_eq!(ea.commit_lsn(), 2);
 
-    // A 的写者 lease 过期 → B 接管 epoch+1。
+    // A's writer lease expires -> B takes over at epoch+1.
     clock.advance(20_000);
     let eb = reg_b.get(D1, DB).unwrap();
     assert_eq!(eb.lease_epoch(), 2);
-    assert_eq!(eb.commit_lsn(), 2); // 接管后 lsn 不回退
+    assert_eq!(eb.commit_lsn(), 2); // lsn does not go backwards after takeover
     assert_eq!(read_i64(&eb, "SELECT count(*) AS count FROM t"), 1);
 
-    // A 再写 → Fenced（lease 已失）。
+    // A writes again -> Fenced (lease lost).
     let err = write(&ea, "INSERT INTO t VALUES (99)").unwrap_err();
     assert!(matches!(err, EngineError::Fenced(_)), "{err:?}");
-    // A 的读同样被拒（§4.3 lease 不可用一律拒）。
+    // A's reads are rejected as well (section 4.3: an unusable lease always rejects).
     assert!(ea
         .query_batch_sync(&[stmt("SELECT 1")], &ctx(), ResultsFormat::ArrayOfObjects)
         .is_err());
 
-    // A 的孤儿段（手工植入其旧 epoch 键空间）不进 manifest。
+    // A's orphan segment (hand-planted in its old epoch key space) does not enter the manifest.
     let orphan = seg::Segment {
         database_id: DB.into(),
         epoch: 1,
@@ -129,16 +129,16 @@ fn takeover_fences_expired_writer() {
     let orphan_key = seg::seg_key(D1, DB, 1, 3);
     vrt_objstore::block_on_store(store.put(&orphan_key, &seg::encode(&orphan))).unwrap();
 
-    // B 读到的不含 A 的过期写（A 的 99 从未进 manifest 链）。
+    // What B reads does not include A's expired write (A's 99 never entered the manifest chain).
     assert_eq!(read_i64(&eb, "SELECT count(*) AS count FROM t"), 1);
 
-    // B 继续写推进 manifest；恢复时孤儿段被 GC/忽略。
+    // B keeps writing and advances the manifest; orphan segments are GC'd/ignored on restore.
     write(&eb, "INSERT INTO t VALUES (2)").unwrap();
     let eb2 = reg_b.get(D1, DB).unwrap();
     assert_eq!(eb2.commit_lsn(), 3);
 }
 
-/// ---------- §4.2 上传失败：不 ack、不残留已提交未持久化数据 ----------
+/// ---------- section 4.2 upload failure: no ack, no committed-but-unpersisted data left behind ----------
 
 #[test]
 fn publish_failure_no_phantom_commit() {
@@ -153,25 +153,25 @@ fn publish_failure_no_phantom_commit() {
     write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
     write(&e, "INSERT INTO t VALUES (1)").unwrap();
 
-    // 注入一次 put 失败 → 写返回错误（不 ack）。
+    // Inject one put failure -> the write returns an error (no ack).
     mem.inject_put_failures(vec![StoreError::unavailable(true, "injected")]);
     let err = write(&e, "INSERT INTO t VALUES (2)").unwrap_err();
     assert!(matches!(err, EngineError::Fenced(_)), "{err:?}");
 
-    // 引擎 fenced → 释放 Arc（还 flock）→ evict → 重新 claim
-    // （lease 仍是我们的 → 恢复）。
+    // Engine fenced -> release the Arc (returns the flock) -> evict -> claim again
+    // (the lease is still ours -> restore).
     let epoch = e.lease_epoch();
     drop(e);
     reg.evict_fenced(D1, DB, epoch);
     let e2 = reg.get(D1, DB).unwrap();
-    // 未 ack 的 INSERT (2) 已被恢复清掉——本地绝不保留幽灵提交。
+    // The un-acked INSERT (2) was cleared by the restore -- locally there is never a ghost commit.
     assert_eq!(read_i64(&e2, "SELECT count(*) AS count FROM t"), 1);
 }
 
-/// ---------- kill -9：已 ack 全在、未 ack 不在 ----------
+/// ---------- kill -9: everything acked is present, nothing un-acked is ----------
 
-/// 子进程入口（父测试以当前测试二进制 + env 重入）。
-/// `cargo test kill9_child_worker` 直接跑则立即返回。
+/// Child process entry (the parent test re-enters with the current test binary + env).
+/// Running `cargo test kill9_child_worker` directly returns immediately.
 #[test]
 fn kill9_child_worker() {
     if std::env::var("VRT_T36_KILL_CHILD").is_err() {
@@ -202,7 +202,7 @@ fn kill9_child_worker() {
     write(&e, "CREATE TABLE t(k INTEGER PRIMARY KEY)").unwrap();
     for k in 1..=n {
         write(&e, &format!("INSERT INTO t VALUES ({k})")).unwrap();
-        // 只有 ack 后才记 progress——父进程按 ack 数断言。
+        // progress is recorded only after the ack -- the parent asserts by the ack count.
         std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -218,7 +218,7 @@ fn kill9_child_worker() {
 #[test]
 fn kill9_recovers_acked_and_drops_unacked() {
     if std::env::var("VRT_T36_KILL_CHILD").is_ok() {
-        return; // 子进程分支
+        return; // child-process branch
     }
     const N: u64 = 1_000;
     let tmp = tempfile::tempdir().unwrap();
@@ -246,7 +246,7 @@ fn kill9_recovers_acked_and_drops_unacked() {
         .spawn()
         .unwrap();
 
-    // 等第一批 ack（子进程可能跑完全部 N——两种结果都合法）。
+    // Wait for the first batch of acks (the child may finish all N -- both outcomes are legal).
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut acked = 0u64;
     loop {
@@ -260,7 +260,7 @@ fn kill9_recovers_acked_and_drops_unacked() {
         std::thread::sleep(Duration::from_millis(20));
     }
     if child.try_wait().unwrap().is_none() {
-        child.kill().unwrap(); // SIGKILL —— kill -9 等价。
+        child.kill().unwrap(); // SIGKILL -- equivalent to kill -9.
     }
     let _ = child.wait();
     if let Ok(raw) = std::fs::read_to_string(&progress) {
@@ -268,16 +268,16 @@ fn kill9_recovers_acked_and_drops_unacked() {
     }
     assert!(acked >= 1, "child must have acked at least one txn");
 
-    // 新"进程"（新 registry + 新 holder）接管：等 lease 过期。
-    // 用 SystemClock：等 child 的 lease_ms(120s) 不现实——通过直接
-    // 重写 manifest 过期时间模拟 lease 到期（等价时钟推进）。
+    // A new "process" (new registry + new holder) takes over: wait for the lease to expire.
+    // With SystemClock: waiting out the child's lease_ms (120s) is impractical -- simulate lease expiry by directly
+    // rewriting the manifest expiry time (equivalent to advancing the clock).
     let store: Arc<dyn ObjectStore> = Arc::new(FsStore::new(store_root.clone()).unwrap());
     let mkey = seg::manifest_key(D1, DB);
     let obj = vrt_objstore::block_on_store(store.get(&mkey))
         .unwrap()
         .expect("manifest exists");
     let mut m: Manifest = serde_json::from_slice(&obj.body).unwrap();
-    m.expires_at_ms = 0; // 强制过期
+    m.expires_at_ms = 0; // force expiry
     let body = serde_json::to_vec(&m).unwrap();
     vrt_objstore::block_on_store(store.put_if_match(&mkey, &obj.meta.etag, &body)).unwrap();
 
@@ -301,7 +301,7 @@ fn kill9_recovers_acked_and_drops_unacked() {
     assert_eq!(e2.lease_epoch(), m.epoch + 1);
     assert_eq!(e2.commit_lsn(), m.lsn);
 
-    // 每个已 ack 的 k 都在；任何未 ack 的不在（max==count==acked）。
+    // Every acked k is present; no un-acked one is (max==count==acked).
     let n_rows = read_i64(&e2, "SELECT count(*) AS count FROM t");
     assert_eq!(
         n_rows,
@@ -309,17 +309,17 @@ fn kill9_recovers_acked_and_drops_unacked() {
         "lsn covers DDL+inserts; manifest.lsn={} rows={n_rows}",
         m.lsn
     );
-    // progress 只在 ack 后追加；SIGKILL 可能落在 "ack 后、追加前" 的
-    // 缝隙 → rows ∈ {acked, acked+1}，绝不能 < acked（丢 ack）。
+    // progress is appended only after the ack; SIGKILL may land in the gap between "after ack, before append"
+    // -> rows in {acked, acked+1}, and never < acked (a lost ack).
     assert!(
         n_rows == acked as i64 || n_rows == acked as i64 + 1,
-        "acked={acked} rows={n_rows} — 已 ack 事务必须全部在，至多差一个 ack/append 缝隙"
+        "acked={acked} rows={n_rows} -- all acked transactions must be present, at most one ack/append gap off"
     );
     let max_k = read_i64(&e2, "SELECT COALESCE(MAX(k),0) AS count FROM t");
     assert_eq!(max_k, n_rows, "persisted set must be a contiguous prefix");
 }
 
-/// ≥1e5 事务 fuzz（默认忽略；`--ignored` 跑）。
+/// >=1e5 transaction fuzz (ignored by default; run with `--ignored`).
 #[test]
 #[ignore = "slow: 100k-op kill -9 fuzz; run with --include-ignored"]
 fn kill9_fuzz_100k() {
@@ -327,7 +327,7 @@ fn kill9_fuzz_100k() {
     kill9_recovers_acked_and_drops_unacked();
 }
 
-/// ---------- 段损坏 / sha 不符 / seq 断档 → 恢复 fail closed ----------
+/// ---------- segment corruption / sha mismatch / seq gap -> restore fails closed ----------
 
 fn build_persisted_db(store: Arc<dyn ObjectStore>, tmp: &tempfile::TempDir, clock: Arc<dyn Clock>) {
     let p = persister(store.clone(), "A", clock, tmp.path().join("r"));
@@ -355,7 +355,7 @@ fn corrupt_segment_fails_closed() {
     let store: Arc<dyn ObjectStore> = mem.clone();
     let clock = Arc::new(TestClock::new(1_000_000));
     build_persisted_db(store.clone(), &tmp, clock.clone());
-    // 接管前先腐化 lsn=2 的段（改字节 → sha256 不符）。
+    // Before takeover, corrupt the lsn=2 segment (change bytes -> sha256 mismatch).
     let key = seg::seg_key(D1, DB, 1, 2);
     let mut body = vrt_objstore::block_on_store(store.get(&key))
         .unwrap()
@@ -374,7 +374,7 @@ fn sequence_gap_fails_closed() {
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
     let clock = Arc::new(TestClock::new(1_000_000));
     build_persisted_db(store.clone(), &tmp, clock.clone());
-    // 制造断档：删掉 lsn=2 的段（manifest.lsn=3）。
+    // Create a gap: delete the lsn=2 segment (manifest.lsn=3).
     vrt_objstore::block_on_store(store.delete(&seg::seg_key(D1, DB, 1, 2))).unwrap();
     clock.advance(20_000);
     let err = corrupt_store_claim(store, &tmp, clock);
@@ -392,21 +392,21 @@ fn bad_manifest_json_fails_closed() {
     assert!(matches!(err, EngineError::Message(_)), "{err:?}");
 }
 
-/// ---------- fs store CAS 并发：多线程同时 put_if_match 恰一成 ----------
+/// ---------- fs store CAS concurrency: many threads put_if_match at once, exactly one wins ----------
 
 #[test]
 fn fs_cas_exactly_one_winner() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Arc::new(FsStore::new(tmp.path().to_path_buf()).unwrap());
-    // 先种对象拿 etag。
+    // Seed the object first to obtain an etag.
     let etag = vrt_objstore::block_on_store(store.put("k", b"v0")).unwrap();
     let winners = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut handles = Vec::new();
     for i in 0..16 {
         let (s, e, w) = (store.clone(), etag.clone(), winners.clone());
         handles.push(std::thread::spawn(move || {
-            // 写异值：与 v0 相同内容的 CAS 是合法 no-op（etag 不变，
-            // 不使他人前置条件失效）——用互异值才能断言"恰一胜者"。
+            // write distinct values: a CAS with the same content as v0 is a legal no-op (the etag does not change,
+            // and others' preconditions are not invalidated) -- only mutually distinct values can assert "exactly one winner".
             let body = format!("w{i}").into_bytes();
             if vrt_objstore::block_on_store(s.put_if_match("k", &e, &body)).is_ok() {
                 w.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -440,35 +440,35 @@ fn fs_put_if_none_match_race() {
     assert_eq!(winners.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
-/// ---------- lease 临界：expiry-margin 边界 / 续租失败 → fenced / 恢复 ----------
+/// ---------- lease boundary: expiry-margin edge / renewal failure -> fenced / recovery ----------
 
 #[test]
 fn lease_boundary_and_recovery() {
     let tmp = tempfile::tempdir().unwrap();
     let mem = Arc::new(MemoryStore::new());
     let store: Arc<dyn ObjectStore> = mem.clone();
-    // lease_ms=10_000 margin=500：usable iff now < expires-500。
+    // lease_ms=10_000 margin=500: usable iff now < expires-500.
     let clock = Arc::new(TestClock::new(0));
     let p = persister(store.clone(), "A", clock.clone(), tmp.path().join("r"));
     let reg = registry(tmp.path().join("r"), p.clone());
     let e = reg.get(D1, DB).unwrap();
     write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
-    // claim 于 now=0：expires=10_000。usable 边界 now<9_500。
+    // claim at now=0: expires=10_000. The usable boundary is now<9_500.
     clock.set(9_499);
-    write(&e, "INSERT INTO t VALUES (1)").unwrap(); // 边界内可用
+    write(&e, "INSERT INTO t VALUES (1)").unwrap(); // usable inside the boundary
     clock.set(9_500);
-    // now == expires-margin → 不可用 → 续租 → 成功（lease 延到 19_500）。
+    // now == expires-margin -> unusable -> renew -> succeeds (lease extended to 19_500).
     write(&e, "INSERT INTO t VALUES (2)").unwrap();
     assert!(!e.is_fenced());
 
-    // 注：9_499 写时已触发 due_renew（提前量 lease/4，阈值 7000），
-    // lease 实际续到 expires=19_499 → usable 边界 now<18_999。
-    // 续租失败注入：usable 且 due_renew → degraded，写仍成功。
+    // Note: the write at 9_499 already triggered due_renew (lead time lease/4, threshold 7000),
+    // the lease was actually renewed to expires=19_499 -> usable boundary now<18_999.
+    // Renewal failure injection: usable and due_renew -> degraded, the write still succeeds.
     clock.set(18_000); // 16_499 ≤ 18_000 < 18_999
     mem.inject_put_failures(vec![StoreError::unavailable(true, "renewfail")]);
-    write(&e, "INSERT INTO t VALUES (3)").unwrap(); // degraded 写仍成（CAS 成功）
+    write(&e, "INSERT INTO t VALUES (3)").unwrap(); // a degraded write still succeeds (CAS succeeded)
     assert!(e.is_degraded());
-    // 推进到不可用边界：续租仍失败 → fenced。
+    // Advance to the unusable boundary: renewal still fails -> fenced.
     mem.inject_put_failures(vec![
         StoreError::unavailable(true, "renewfail"),
         StoreError::unavailable(true, "renewfail"),
@@ -478,9 +478,9 @@ fn lease_boundary_and_recovery() {
     let err = write(&e, "INSERT INTO t VALUES (4)").unwrap_err();
     assert!(matches!(err, EngineError::Fenced(_)), "{err:?}");
 
-    // 恢复：fenced → evict → lease 重新可得（我们是 holder）→ 自愈。
-    // 先清空残余注入（recover claim 的 CAS 不能再被污染），并归还
-    // 旧引擎 Arc（flock 释出后重开才拿得到锁）。
+    // Recovery: fenced -> evict -> the lease is obtainable again (we are the holder) -> self-heal.
+    // First clear leftover injections (the CAS of the recover claim must not be polluted again), and return
+    // the old engine's Arc (the lock can only be taken on reopen after the flock is released).
     mem.inject_put_failures(vec![]);
     let old_epoch = e.lease_epoch();
     drop(e);
@@ -489,20 +489,20 @@ fn lease_boundary_and_recovery() {
     assert_eq!(read_i64(&e2, "SELECT count(*) AS count FROM t"), 3);
 }
 
-/// ---------- adopt：旧版无 manifest 本地库迁入 ----------
+/// ---------- adopt: migrating in an old-version local db with no manifest ----------
 
 #[test]
 fn adopt_pre_manifest_local_db() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("r");
-    // 旧版写入：无持久化的 registry。
+    // Old-version write: a registry without persistence.
     {
         let reg = EngineRegistry::new(root.clone());
         let e = reg.get(D1, DB).unwrap();
         write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
         write(&e, "INSERT INTO t VALUES (42)").unwrap();
     }
-    // T36 启动：同 root 挂持久化 → adopt 上传快照 + manifest epoch=1。
+    // T36 startup: attach persistence on the same root -> adopt uploads the snapshot + manifest epoch=1.
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
     let clock = Arc::new(TestClock::new(0));
     let p = persister(store.clone(), "A", clock.clone(), root.clone());
@@ -510,14 +510,14 @@ fn adopt_pre_manifest_local_db() {
     let e = reg.get(D1, DB).unwrap();
     assert_eq!(e.lease_epoch(), 1);
     assert_eq!(read_i64(&e, "SELECT v AS count FROM t"), 42);
-    // manifest 已建且带快照基线。
+    // The manifest has been created and carries a snapshot baseline.
     let obj = vrt_objstore::block_on_store(store.get(&seg::manifest_key(D1, DB)))
         .unwrap()
         .unwrap();
     let m: Manifest = serde_json::from_slice(&obj.body).unwrap();
     assert!(m.snapshot.is_some());
     assert_eq!(m.epoch, 1);
-    // 另一写者接管后也能读到 adopt 的数据。
+    // After another writer takes over it can also read the adopted data.
     clock.advance(20_000);
     let p2 = persister(store, "B", clock, tmp.path().join("r2"));
     let reg2 = registry(tmp.path().join("r2"), p2);
@@ -525,10 +525,10 @@ fn adopt_pre_manifest_local_db() {
     assert_eq!(read_i64(&e2, "SELECT v AS count FROM t"), 42);
 }
 
-/// ---------- 启动自检：只读对象根 → self_check 必败（P0-B 复现） ----------
+/// ---------- startup self-check: read-only object root -> self_check must fail (P0-B reproduction) ----------
 
-/// 复现容器内 `vrt-sql-objects` 卷属主错误（root:root 0755 挂给
-/// uid 10001）：写探针 EACCES → self_check Err → 启动 fail closed。
+/// Reproduces the in-container `vrt-sql-objects` volume ownership error (root:root 0755 mounted to
+/// uid 10001): the write probe gets EACCES -> self_check Err -> startup fails closed.
 #[cfg(unix)]
 #[test]
 fn self_check_fails_on_readonly_store_root() {
@@ -545,11 +545,11 @@ fn self_check_fails_on_readonly_store_root() {
         err.to_string().contains("unavailable") || err.to_string().contains("Permission"),
         "unexpected: {err}"
     );
-    // 恢复权限以便 tempdir 清理。
+    // Restore permissions so the tempdir can be cleaned up.
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
-/// ---------- 失败路径可观测：claim 失败计入 persistence_failures_total ----------
+/// ---------- observable failure path: claim failure is counted in persistence_failures_total ----------
 
 fn counter_val(metric: &str, reason: &str) -> f64 {
     let text = vrt_sql::metrics::registry().render();
@@ -578,7 +578,7 @@ fn claim_failure_increments_persistence_failures_metric() {
     );
 }
 
-/// ---------- 他人有效期内 claim → HeldByOther（503，不抢） ----------
+/// ---------- claim during someone else's validity -> HeldByOther (503, no seizure) ----------
 
 #[test]
 fn held_by_other_lease_not_stolen() {
@@ -591,15 +591,15 @@ fn held_by_other_lease_not_stolen() {
     let reg_b = registry(tmp.path().join("b"), pb);
     let ea = reg_a.get(D1, DB).unwrap();
     write(&ea, "CREATE TABLE t(v INTEGER)").unwrap();
-    // A 的 lease 仍有效（now=1000 << 10_000-margin）→ B 不得抢。
+    // A's lease is still valid (now=1000 << 10_000-margin) -> B must not seize it.
     clock.set(1_000);
     let err = reg_b.get(D1, DB).err().unwrap();
     assert!(matches!(err, EngineError::Unavailable(_)), "{err:?}");
-    // B 失败后 A 不受影响。
+    // A is unaffected after B fails.
     write(&ea, "INSERT INTO t VALUES (1)").unwrap();
 }
 
-/// ---------- 优雅停机 lease 释放（T36b） ----------
+/// ---------- graceful-shutdown lease release (T36b) ----------
 
 #[test]
 fn release_lease_lets_next_holder_claim_immediately() {
@@ -612,15 +612,15 @@ fn release_lease_lets_next_holder_claim_immediately() {
     let reg_b = registry(tmp.path().join("b"), pb);
     let ea = reg_a.get(D1, DB).unwrap();
     write(&ea, "CREATE TABLE t(v INTEGER)").unwrap();
-    // A 释放（lease 远未到期——now=1000,lease 15000）。
+    // A releases (the lease is far from expiry -- now=1000, lease 15000).
     clock.set(1_000);
     reg_a.begin_shutdown();
     reg_a.release_leases(std::time::Instant::now() + std::time::Duration::from_secs(5));
-    // B 不等待即接管 epoch+1。
+    // B takes over at epoch+1 without waiting.
     let eb = reg_b.get(D1, DB).unwrap();
     assert_eq!(eb.lease_epoch(), 2);
     write(&eb, "INSERT INTO t VALUES (1)").unwrap();
-    // 释放后的 A 引擎再写 → Fenced。
+    // After release, A's engine writes again -> Fenced.
     let err = write(&ea, "INSERT INTO t VALUES (9)").err().unwrap();
     assert!(matches!(err, EngineError::Fenced(_)), "{err:?}");
 }
@@ -651,19 +651,19 @@ fn release_lease_with_store_down_does_not_hang() {
         t0.elapsed() < std::time::Duration::from_secs(4),
         "release hung"
     );
-    // closing 之后 get() 一律 Unavailable（同进程不得重夺）。
+    // After closing, get() is always Unavailable (the same process must not re-seize).
     let err = reg_a.get(D1, DB).err().unwrap();
     assert!(matches!(err, EngineError::Unavailable(_)), "{err:?}");
 }
 
-/// ---------- 快照超限：stat 短路 + 指数退避（T36b） ----------
+/// ---------- snapshot over cap: stat short-circuit + exponential backoff (T36b) ----------
 
 #[test]
 fn snapshot_over_cap_backs_off_and_reports() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
     let clock = Arc::new(TestClock::new(0));
-    // snapshot_max_bytes=1：db 永远超限；every=2。
+    // snapshot_max_bytes=1: the db is always over the cap; every=2.
     let p = Arc::new(Persister::new(
         store,
         PersistConfig {
@@ -672,9 +672,9 @@ fn snapshot_over_cap_backs_off_and_reports() {
             holder: "A".into(),
             checkpoint_every_commits: 2,
             retention_ms: 60_000,
-            // RV-R31：cap 要夹在「lsn0 基线（~20KB init 镜像，必
-            // 须随首段上传成功）」与「膨胀后的库」之间——lsn2 插
-            // 入 60KB 行后 db>cap，之后每次 checkpoint 快照都超限。
+            // RV-R31: the cap must sit between "the lsn0 baseline (~20KB init image, which
+            // must upload successfully with the first segment)" and "the bloated db" -- after lsn2 inserts
+            // a 60KB row, db>cap, and every checkpoint snapshot after that is over the cap.
             snapshot_max_bytes: 48 * 1024,
         },
         clock,
@@ -685,23 +685,23 @@ fn snapshot_over_cap_backs_off_and_reports() {
     let e = reg.get(D1, DB).unwrap();
     let cap = || counter_val("vrt_sql_persistence_failures_total", "snapshot_over_cap");
     let c0 = cap();
-    // 2 提交触发第一次 checkpoint → 超限 → gap 2→4，计数+1。
+    // The 2nd commit triggers the first checkpoint -> over the cap -> gap 2->4, count+1.
     write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
     write(&e, "INSERT INTO t VALUES (zeroblob(60000))").unwrap();
     assert_eq!(cap(), c0 + 1.0, "first over-cap attempt counted");
-    // 重置后需 4 个提交到 gap=4：第 3 个仍不尝试，第 4 个尝试 → +1。
+    // After reset 4 commits are needed to reach gap=4: the 3rd still does not attempt, the 4th attempts -> +1.
     write(&e, "INSERT INTO t VALUES (2)").unwrap();
     write(&e, "INSERT INTO t VALUES (3)").unwrap();
     write(&e, "INSERT INTO t VALUES (4)").unwrap();
     assert_eq!(cap(), c0 + 1.0, "backed off at c<4");
     write(&e, "INSERT INTO t VALUES (5)").unwrap();
     assert_eq!(cap(), c0 + 2.0, "second attempt at gap boundary");
-    // 第二次失败 gap 4→8：接下来 5 个提交（c<8）不再尝试。
+    // On the second failure gap 4->8: the next 5 commits (c<8) do not attempt.
     for i in 6..11 {
         write(&e, &format!("INSERT INTO t VALUES ({i})")).unwrap();
     }
     assert_eq!(cap(), c0 + 2.0, "gap doubled to 8 — no further attempts");
-    // 诊断暴露 snapshotOverCap + chainLen。
+    // Diagnostics expose snapshotOverCap + chainLen.
     let d = reg
         .diagnostics()
         .into_iter()
@@ -711,7 +711,7 @@ fn snapshot_over_cap_backs_off_and_reports() {
     assert!(d.chain_len >= 6, "chain_len grows: {d:?}");
 }
 
-/// ---------- drop tombstone：manifest CAS 先 fence，再本地清理 ----------
+/// ---------- drop tombstone: manifest CAS fences first, then local cleanup ----------
 
 #[test]
 fn drop_tombstone_fences_all_writers() {
@@ -724,22 +724,22 @@ fn drop_tombstone_fences_all_writers() {
     write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
 
     assert!(reg.drop_db(D1, DB).unwrap());
-    // manifest tombstone 已落。
+    // The manifest tombstone has landed.
     let obj = vrt_objstore::block_on_store(store.get(&seg::manifest_key(D1, DB)))
         .unwrap()
         .unwrap();
     let m: Manifest = serde_json::from_slice(&obj.body).unwrap();
     assert!(m.tombstone);
-    // 同进程再 get → Dropped；新 registry → 同样 Dropped（manifest 面）。
+    // get again in the same process -> Dropped; a new registry -> also Dropped (via the manifest).
     assert!(matches!(reg.get(D1, DB), Err(EngineError::Dropped)));
     let p2 = persister(store.clone(), "B", clock.clone(), tmp.path().join("r2"));
     let reg2 = registry(tmp.path().join("r2"), p2);
     assert!(matches!(reg2.get(D1, DB), Err(EngineError::Dropped)));
-    // 幂等。
+    // Idempotent.
     assert!(!reg.drop_db(D1, DB).unwrap());
 }
 
-/// ---------- 持久层不可用：启动/冷开 fail closed ----------
+/// ---------- persistence layer unavailable: startup/cold open fails closed ----------
 
 #[test]
 fn unavailable_store_fails_closed_on_claim() {
@@ -759,7 +759,7 @@ fn unavailable_store_fails_closed_on_claim() {
     assert!(matches!(err, EngineError::Unavailable(_)), "{err:?}");
 }
 
-/// ---------- seg 编解码 roundtrip + 格式闸 ----------
+/// ---------- seg encode/decode roundtrip + format gate ----------
 
 #[test]
 fn seg_encode_decode_roundtrip() {
@@ -791,19 +791,19 @@ fn seg_encode_decode_roundtrip() {
     assert_eq!(d.database_id, DB);
     assert_eq!(d.frames.len(), 2);
     assert_eq!(d.frames[1].commit_db_size, 5);
-    // 篡改 → Checksum。
+    // Tampering -> Checksum.
     let mut bad = bytes.clone();
     let n = bad.len();
     bad[n - 40] ^= 1;
     assert!(matches!(seg::decode(&bad), Err(seg::SegError::Checksum)));
-    // 截断。
+    // Truncation.
     assert!(seg::decode(&bytes[..20]).is_err());
 }
 
-// ---------- T37r：ResourceKind 命名空间 ----------
+// ---------- T37r: ResourceKind namespaces ----------
 
-/// 对象键布局显式断言：D1 `db/{id}/…`（T36 布局不变），
-/// Queue `q/{id}/…`。
+/// Explicit object-key layout assertions: D1 `db/{id}/...` (T36 layout unchanged),
+/// Queue `q/{id}/...`.
 #[test]
 fn object_keys_carry_resource_kind_namespace() {
     assert_eq!(seg::manifest_key(D1, DB), format!("db/{DB}/manifest"));
@@ -829,8 +829,8 @@ fn object_keys_carry_resource_kind_namespace() {
     );
 }
 
-/// GC 严格按 kind 前缀：queue 的 gc_orphans/gc_tombstoned 绝不触及
-/// 同 id 的 `db/{id}/` 对象，D1 亦然。
+/// GC is strictly by kind prefix: the queue's gc_orphans/gc_tombstoned never touch
+/// the `db/{id}/` objects of the same id, and vice versa for D1.
 #[test]
 fn gc_is_kind_namespaced() {
     let tmp = tempfile::tempdir().unwrap();
@@ -864,7 +864,7 @@ fn gc_is_kind_namespaced() {
     };
     let get = |k: &str| vrt_objstore::block_on_store(store.get(k)).unwrap();
 
-    // 同 id 两 kind 的对象：各 1 个孤儿段 + 各自 manifest。
+    // Objects of both kinds with the same id: one orphan segment each + each its own manifest.
     put(&seg::seg_key(D1, DB, 1, 9), b"d1-stray");
     put(&seg::seg_key(ResourceKind::Queue, DB, 1, 9), b"q-stray");
     let live = serde_json::to_vec(&vrt_sql::persist::Manifest {
@@ -884,7 +884,7 @@ fn gc_is_kind_namespaced() {
     put(&seg::manifest_key(D1, DB), &live);
     put(&seg::manifest_key(ResourceKind::Queue, DB), &live);
 
-    // queue gc_orphans：只清 q/{id}/ 下的孤儿段；db/{id}/ 孤儿原样。
+    // queue gc_orphans: only clears orphan segments under q/{id}/; db/{id}/ orphans are left as-is.
     qp.gc_orphans(
         DB,
         1,
@@ -898,7 +898,7 @@ fn gc_is_kind_namespaced() {
     assert!(get(&seg::seg_key(D1, DB, 1, 9)).is_some());
     assert!(get(&seg::manifest_key(D1, DB)).is_some());
 
-    // D1 gc_orphans：清 db/{id}/ 孤儿段；q/{id}/ 对象不受影响。
+    // D1 gc_orphans: clears orphan segments under db/{id}/; q/{id}/ objects are unaffected.
     d1.gc_orphans(
         DB,
         1,
@@ -909,12 +909,12 @@ fn gc_is_kind_namespaced() {
         0,
     );
     assert!(get(&seg::seg_key(D1, DB, 1, 9)).is_none());
-    // 重放：queue manifest/seg 不受 D1 gc 波及。
+    // Replay: the queue manifest/seg are not affected by D1 gc.
     assert!(get(&seg::manifest_key(ResourceKind::Queue, DB)).is_some());
 }
 
-/// RV-R66（已验证 2026-11-15）：GC 单次删除有上限，余量计入 deferred，下一轮
-/// 收尾；已在链上且未被基线覆盖的段绝不删。
+/// RV-R66 (verified 2026-11-15): a single GC run deletes at most a cap; the remainder is counted in deferred and the next round
+/// finishes it; segments on the chain that are not covered by the baseline are never deleted.
 #[test]
 fn gc_orphans_is_bounded_per_pass_and_keeps_live_chain() {
     use vrt_sql::persist::{EpochSpan, MAX_GC_DELETES_PER_PASS};
@@ -937,7 +937,7 @@ fn gc_orphans_is_bounded_per_pass_and_keeps_live_chain() {
     );
     let put = |k: &str| vrt_objstore::block_on_store(store.put(k, b"x")).unwrap();
     let get = |k: &str| vrt_objstore::block_on_store(store.get(k)).unwrap();
-    // 一个在链上的活段（epoch 1, lsn 1）+ N+10 个孤儿（epoch 9 不在链上）。
+    // One live segment on the chain (epoch 1, lsn 1) + N+10 orphans (epoch 9, not on the chain).
     put(&seg::seg_key(D1, DB, 1, 1));
     let extra = 10usize;
     for i in 0..(MAX_GC_DELETES_PER_PASS + extra) {
@@ -949,15 +949,15 @@ fn gc_orphans_is_bounded_per_pass_and_keeps_live_chain() {
     assert_eq!(r1.deferred, extra);
     assert_eq!(r1.failed, 0);
     assert!(get(&seg::seg_key(D1, DB, 1, 1)).is_some(), "live segment kept");
-    // 下一轮收完剩余，活段仍在。
+    // The next round finishes the rest; the live segment is still there.
     let r2 = d1.gc_orphans(DB, 1, &chain, 0);
     assert_eq!(r2.deleted, extra);
     assert_eq!(r2.deferred, 0);
     assert!(get(&seg::seg_key(D1, DB, 1, 1)).is_some());
 }
 
-/// ---------- RV-R31 #1：回滚 spill 死帧不进段；落在旧文件长度
-/// 内的提交同样生成段 ----------
+/// ---------- RV-R31 #1: dead frames from a rollback spill do not enter segments; commits that land
+/// within the old file length also produce segments ----------
 
 fn db_file(root: &std::path::Path) -> PathBuf {
     vrt_sql::paths::derive_db_file(root, DB).unwrap()
@@ -985,8 +985,8 @@ fn rollback_spill_dead_frames_excluded_and_infile_commit_publishes() {
     let lsn_before = e.commit_lsn(); // 2
     let wal_before = wal_len(&root);
 
-    // 大批次（48MB blob 行）超页缓存 → spill 进 WAL；末句失败 →
-    // 整批回滚 → 死帧留在物理尾部（mxFrame 已退回）。
+    // A large batch (48MB blob row) exceeds the page cache -> spills into the WAL; the last statement fails ->
+    // the whole batch rolls back -> dead frames stay at the physical tail (mxFrame has moved back).
     let big = "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r WHERE i<768) \
                INSERT INTO t(v) SELECT zeroblob(65536) FROM r";
     assert!(e
@@ -1002,8 +1002,8 @@ fn rollback_spill_dead_frames_excluded_and_infile_commit_publishes() {
         "rollback spill must leave dead frames in wal: {wal_before} -> {wal_dead}"
     );
 
-    // 小提交：帧完全落在死帧占据的旧文件长度内（物理零增长）。
-    // 旧逻辑 len==0 判只读会丢这批；新逻辑按验证帧数判定 → 必须出段。
+    // Small commit: its frames land entirely within the old file length occupied by dead frames (physical zero growth).
+    // The old logic treated len==0 as read-only and would drop this batch; the new logic judges by verified frame count -> a segment must be produced.
     write(&e, "INSERT INTO t VALUES (zeroblob(64))").unwrap();
     assert_eq!(e.commit_lsn(), lsn_before + 1);
     assert_eq!(
@@ -1024,7 +1024,7 @@ fn rollback_spill_dead_frames_excluded_and_infile_commit_publishes() {
     assert_eq!(s.lsn, lsn_before + 1);
     assert!(s.frames.iter().any(|f| f.commit_db_size != 0));
 
-    // 接管恢复：行级一致 + integrity_check（恢复侧有 integrity 门）。
+    // Takeover restore: row-level consistency + integrity_check (the restore side has an integrity gate).
     clock.advance(20_000);
     let p2 = persister(store.clone(), "B", clock.clone(), tmp.path().join("r2"));
     let reg2 = registry(tmp.path().join("r2"), p2);
@@ -1037,7 +1037,7 @@ fn rollback_spill_dead_frames_excluded_and_infile_commit_publishes() {
     assert!(vrt_sql::wal::integrity_ok(&db_file(&tmp.path().join("r2"))).unwrap());
 }
 
-/// ---------- RV-R31 #2：标记写失败 → commit 返回错误而非成功 ----------
+/// ---------- RV-R31 #2: marker write failure -> commit returns an error rather than success ----------
 
 #[test]
 fn sidecar_write_failure_fails_commit() {
@@ -1050,10 +1050,10 @@ fn sidecar_write_failure_fails_commit() {
     let e = reg.get(D1, DB).unwrap();
     write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
 
-    // `.vrt-lsn` 变成目录 → atomic_write 的 rename 必败 →
-    // mark_intent 返回 Err → 本批回滚、不 ack。
-    // （不用 chmod：persister 每次写前 ensure_secure_dir 会把目录
-    // 权限拉回 0700，权限位注入不可靠。）
+    // `.vrt-lsn` becomes a directory -> atomic_write's rename must fail ->
+    // mark_intent returns Err -> this batch rolls back, no ack.
+    // (No chmod: the persister calls ensure_secure_dir before every write, which pulls the directory
+    // permissions back to 0700, so permission-bit injection is unreliable.)
     let dir = db_file(&root).parent().unwrap().to_path_buf();
     let fake = dir.join(".vrt-lsn");
     std::fs::remove_file(&fake).unwrap();
@@ -1061,14 +1061,14 @@ fn sidecar_write_failure_fails_commit() {
     let err = write(&e, "INSERT INTO t VALUES (1)").unwrap_err();
     std::fs::remove_dir(&fake).unwrap();
     assert!(matches!(err, EngineError::Unavailable(_)), "{err:?}");
-    // 回滚而非部分提交。
+    // Rolled back rather than partially committed.
     assert_eq!(read_i64(&e, "SELECT count(*) AS count FROM t"), 0);
-    // 引擎未被 fence——恢复目录可写后继续正常工作。
+    // The engine was not fenced -- it keeps working normally once the directory is writable again.
     write(&e, "INSERT INTO t VALUES (2)").unwrap();
     assert_eq!(read_i64(&e, "SELECT count(*) AS count FROM t"), 1);
 }
 
-/// ---------- RV-R31 #2：sidecar 与本地 WAL 不一致 → 认领强制恢复 ----------
+/// ---------- RV-R31 #2: sidecar inconsistent with the local WAL -> claim forces restore ----------
 
 #[test]
 fn wal_prefix_mismatch_forces_restore() {
@@ -1083,7 +1083,7 @@ fn wal_prefix_mismatch_forces_restore() {
     write(&e, "INSERT INTO t VALUES (1)").unwrap();
     write(&e, "INSERT INTO t VALUES (2)").unwrap(); // lsn 3
 
-    // 崩溃前抓下完整 wal 与帧链，算出"丢掉末次提交"的前缀长度。
+    // Before the crash, capture the full wal and frame chain, and compute the prefix length that "drops the last commit".
     let walp = wal_file(&root);
     let wal_bytes = std::fs::read(&walp).unwrap();
     let hdr = vrt_sql::wal::wal_header(&wal_bytes[..vrt_sql::wal::WAL_HDR]).unwrap();
@@ -1109,8 +1109,8 @@ fn wal_prefix_mismatch_forces_restore() {
 
     drop(e);
     drop(reg);
-    // 模拟掉电残留：sidecar 记了 F 帧，盘上只剩 `last_commit` 帧
-    // 的有效前缀（链合法但比标记短——末次已 ack 提交的帧没了）。
+    // Simulate power-loss leftovers: the sidecar recorded F frames, but the disk only has the valid prefix of `last_commit` frames
+    // (the chain is legal but shorter than the marker -- the frames of the last acked commit are gone).
     let keep_bytes = vrt_sql::wal::WAL_HDR + last_commit * fsz;
     if walp.exists() {
         let f = std::fs::OpenOptions::new().write(true).open(&walp).unwrap();
@@ -1121,29 +1121,29 @@ fn wal_prefix_mismatch_forces_restore() {
     }
     let _ = std::fs::remove_file(PathBuf::from(format!("{}-shm", db_file(&root).display())));
 
-    // 同节点重启：sidecar 仍指 manifest.lsn，但 wal 已不完整——
-    // 必须走恢复；若被误信，前缀回放只会看到 lsn<3 的状态（count=1）。
+    // Same-node restart: the sidecar still points at manifest.lsn, but the wal is no longer complete --
+    // it must go through restore; if it were wrongly trusted, prefix replay would only see the state at lsn<3 (count=1).
     let p2 = persister(store.clone(), "A", clock.clone(), root.clone());
     let reg2 = registry(root.clone(), p2);
     let e2 = reg2.get(D1, DB).unwrap();
     assert_eq!(read_i64(&e2, "SELECT count(*) AS count FROM t"), 2);
 }
 
-/// ---------- RV-R31 #3：ADOPT 先合并残留 -wal 再快照 ----------
+/// ---------- RV-R31 #3: ADOPT first merges the leftover -wal, then snapshots ----------
 
 #[test]
 fn adopt_folds_leftover_wal_into_snapshot() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("r");
     {
-        // 旧版（无持久化）写入基线行。
+        // Old version (no persistence) writes the baseline row.
         let reg0 = EngineRegistry::new(root.clone());
         let e0 = reg0.get(D1, DB).unwrap();
         write(&e0, "CREATE TABLE t(v INTEGER)").unwrap();
         write(&e0, "INSERT INTO t VALUES (42)").unwrap();
     }
-    // SIGKILL 残留：另一个连接写入后不 checkpoint——wal 里有
-    // 已提交未合并的页（mem::forget 模拟进程被杀，fd/连接不关）。
+    // SIGKILL leftovers: another connection writes without checkpointing -- the wal holds
+    // committed but unmerged pages (mem::forget simulates the process being killed; the fd/connection is not closed).
     let dbf = db_file(&root);
     let conn = rusqlite::Connection::open(&dbf).unwrap();
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
@@ -1158,7 +1158,7 @@ fn adopt_folds_leftover_wal_into_snapshot() {
     );
     std::mem::forget(conn);
 
-    // ADOPT：fold → integrity → snapshot → manifest。
+    // ADOPT: fold -> integrity -> snapshot -> manifest.
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
     let clock = Arc::new(TestClock::new(0));
     let p = persister(store.clone(), "A", clock.clone(), root.clone());
@@ -1167,7 +1167,7 @@ fn adopt_folds_leftover_wal_into_snapshot() {
     assert_eq!(read_i64(&e, "SELECT count(*) AS count FROM t"), 2);
     assert_eq!(read_i64(&e, "SELECT max(v) AS count FROM t"), 43);
 
-    // 远端恢复接管：残留 wal 的数据必须也在快照里。
+    // Remote restore takeover: the leftover wal's data must also be in the snapshot.
     clock.advance(20_000);
     let p2 = persister(store, "B", clock, tmp.path().join("r2"));
     let reg2 = registry(tmp.path().join("r2"), p2);
@@ -1176,10 +1176,10 @@ fn adopt_folds_leftover_wal_into_snapshot() {
     assert_eq!(read_i64(&e2, "SELECT max(v) AS count FROM t"), 43);
 }
 
-/// ---------- RV-R31 #5：恢复期间按半周期续租 ----------
+/// ---------- RV-R31 #5: renew by half period during restore ----------
 
-/// 每次读都推进测试时钟的包装 store——模拟"恢复很慢"；可配置第
-/// N 次之后的 put* 失败（模拟续租 CAS 失败）。
+/// A wrapper store that advances the test clock on every read -- simulating "very slow restore"; can be configured so that puts
+/// fail after the Nth one (simulating a renewal CAS failure).
 struct SlowStore {
     inner: Arc<MemoryStore>,
     clock: Arc<TestClock>,
@@ -1235,7 +1235,7 @@ impl ObjectStore for SlowStore {
     }
 }
 
-/// lease_ms=10_000、每次 get 推 3_000ms → 拉 8 个段约 24s ≫ lease。
+/// lease_ms=10_000, each get advances 3_000ms -> fetching 8 segments takes ~24s >> lease.
 fn slow_persisted_db() -> (
     tempfile::TempDir,
     Arc<MemoryStore>,
@@ -1267,14 +1267,14 @@ fn slow_persisted_db() -> (
 #[test]
 fn restore_renews_lease_and_survives_past_expiry() {
     let (tmp, _inner, wrapped, clock) = slow_persisted_db();
-    clock.advance(20_000); // A 的 lease 过期 → B 接管。
+    clock.advance(20_000); // A's lease expires -> B takes over.
     let store: Arc<dyn ObjectStore> = wrapped.clone();
     let p2 = persister(store.clone(), "B", clock.clone(), tmp.path().join("b"));
     let reg2 = registry(tmp.path().join("b"), p2);
     let e2 = reg2.get(D1, DB).unwrap();
     assert_eq!(read_i64(&e2, "SELECT count(*) AS count FROM t"), 7);
-    // 恢复耗时 ~8×3s=24s > lease 10s——续租必须已发生：
-    // manifest.expires_at_ms > 接管时的初值（now_at_claim+lease）。
+    // Restore takes ~8x3s=24s > lease 10s -- renewal must have happened:
+    // manifest.expires_at_ms > the initial value at takeover (now_at_claim+lease).
     let obj = vrt_objstore::block_on_store(store.get(&seg::manifest_key(D1, DB)))
         .unwrap()
         .unwrap();
@@ -1292,8 +1292,8 @@ fn restore_renews_lease_and_survives_past_expiry() {
 #[test]
 fn restore_renew_failure_aborts_without_opening() {
     let (tmp, _inner, wrapped, clock) = slow_persisted_db();
-    // 允许恰好 1 次 put（接管 claim 的 manifest CAS）——恢复中的
-    // 续租 CAS 必败 → 恢复中止 → 库不打开。
+    // Allow exactly 1 put (the manifest CAS of the takeover claim) -- the
+    // renewal CAS during restore must fail -> restore aborts -> the db is not opened.
     wrapped
         .puts_left
         .store(1, std::sync::atomic::Ordering::SeqCst);
@@ -1303,7 +1303,7 @@ fn restore_renew_failure_aborts_without_opening() {
     let reg2 = registry(tmp.path().join("b"), p2);
     let err = reg2.get(D1, DB).err().unwrap();
     assert!(matches!(err, EngineError::Unavailable(_)), "{err:?}");
-    // 库未被打开/安装：新 db 镜像不得存在（恢复中止不产出可服务文件）。
+    // The db was not opened/installed: the new db image must not exist (an aborted restore produces no servable file).
     let dbf = db_file(&tmp.path().join("b"));
     assert!(!dbf.exists(), "aborted restore must not install db");
 }
@@ -1318,7 +1318,7 @@ fn db_keys(store: &MemoryStore, id: &str) -> Vec<String> {
         .collect()
 }
 
-/// 未到保留期：tombstone 已写但 expires 还在未来 → 对象全保留。
+/// Retention not reached: tombstone written but expires is still in the future -> all objects retained.
 #[test]
 fn gc_round_retains_fresh_tombstones() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1328,8 +1328,8 @@ fn gc_round_retains_fresh_tombstones() {
     let p = persister(store.clone(), "A", clock.clone(), tmp.path().join("r"));
     let reg = registry(tmp.path().join("r"), p);
 
-    // 活 lease（expires = now+10s）→ drop → tombstone 保留 expires，
-    // 保留期从 expires 起算 → now 距 expires 还差 10s，远小于 60s。
+    // Live lease (expires = now+10s) -> drop -> the tombstone keeps expires,
+    // retention counts from expires -> now is still 10s short of expires, far below 60s.
     let e = reg.get(D1, DB).unwrap();
     write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
     reg.drop_db(D1, DB).unwrap();
@@ -1341,8 +1341,8 @@ fn gc_round_retains_fresh_tombstones() {
     assert!(db_keys(&mem, DB).len() > 0, "within retention — kept");
 }
 
-/// 到期回收：推进时钟越过 expires+retention → 前缀清空；
-/// 本地 .dropped marker 保留（open 拒绝记录的契约）。
+/// Reclaim on expiry: advance the clock past expires+retention -> the prefix is emptied;
+/// the local .dropped marker is kept (the contract of the open-refusal record).
 #[test]
 fn gc_round_reclaims_expired_tombstones() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1369,8 +1369,8 @@ fn gc_round_reclaims_expired_tombstones() {
     assert!(reg.get(D1, DB).is_err(), "dropped db still refuses open");
 }
 
-/// 单轮上限：>GC_TOMBSTONED_MAX_PER_ROUND 个 tombstone 一轮只扫
-/// 上限个；余下下轮继续（有界，不 wedged）。
+/// Per-round cap: with more than GC_TOMBSTONED_MAX_PER_ROUND tombstones, one round only scans
+/// up to the cap; the rest continue next round (bounded, not wedged).
 #[test]
 fn gc_round_bounded_per_round() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1390,15 +1390,15 @@ fn gc_round_bounded_per_round() {
     clock.advance(1);
     let rep = reg.gc_tombstoned_round();
     assert_eq!(rep.scanned, vrt_sql::engine::GC_TOMBSTONED_MAX_PER_ROUND);
-    // `.gc-done` 哨兵把已完成项移出候选集——否则永久 marker 会
-    // 占满每轮名额饿死队尾。第二轮只剩 4 个候选且全部回收。
+    // The `.gc-done` sentinel moves finished items out of the candidate set -- otherwise permanent markers would
+    // fill every round's quota and starve the tail of the queue. The second round has only 4 candidates left, all reclaimed.
     let rep2 = reg.gc_tombstoned_round();
     assert_eq!(rep2.scanned, 4);
     assert_eq!(rep.reclaimed + rep2.reclaimed, n);
 }
 
-/// 失败隔离：一个库的 GC 失败不阻塞其余——注入一次 list 失败，
-/// 首个到期库失败、第二个仍被回收。
+/// Failure isolation: one db's GC failure does not block the rest -- inject one list failure,
+/// the first expired db fails and the second is still reclaimed.
 #[test]
 fn gc_round_failure_isolated() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1414,7 +1414,7 @@ fn gc_round_failure_isolated() {
     reg.drop_db(D1, &id_b).unwrap();
     clock.advance(1); // expires=0 tombstones → immediately eligible
 
-    // 下一次 list 失败 → 恰好砸中扫描序里的第一个库。
+    // The next list fails -> hits exactly the first db in scan order.
     mem.inject_list_failures(vec![StoreError::unavailable(true, "boom")]);
     let rep = reg.gc_tombstoned_round();
     assert_eq!(rep.failures, 1);
@@ -1422,10 +1422,10 @@ fn gc_round_failure_isolated() {
     assert_eq!(rep.reclaimed, 1, "the other db still reclaimed");
 }
 
-/// ---------- MIG-9：启动自检有界重试 ----------
+/// ---------- MIG-9: bounded startup self-check retry ----------
 
-/// 前 `fails_left` 次 put/get 返回 `Unavailable{retryable:true}`，
-/// 之后透明转发内存后端——模拟 R2 冷启动瞬时未就绪。
+/// The first `fails_left` put/get calls return `Unavailable{retryable:true}`,
+/// after which calls are transparently forwarded to the in-memory backend -- simulating R2 cold-start transient not-ready.
 struct FlakyStore {
     inner: Arc<MemoryStore>,
     fails_left: std::sync::atomic::AtomicU64,
@@ -1506,7 +1506,7 @@ fn retry_policy(budget_ms: u64) -> vrt_sql::persist::SelfCheckRetry {
     }
 }
 
-/// 前 N 次瞬时失败 → 重试后成功；probe 对象不残留。
+/// First N transient failures -> succeeds after retry; the probe object is not left behind.
 #[test]
 fn self_check_retry_succeeds_after_transient_failures() {
     let (_t, p, st) = flaky_persister(3, true);
@@ -1514,14 +1514,14 @@ fn self_check_retry_succeeds_after_transient_failures() {
     p.self_check_with_retry(&retry_policy(10_000), |_a, _e, _b, _err| logs += 1)
         .unwrap();
     assert!(logs >= 1, "retryable failures must be logged");
-    // 失败 3 次 + 成功 1 次 = put 至少被调 4 次（成功后 get/del 也计 calls）。
+    // 3 failures + 1 success = put is called at least 4 times (after success get/del also count in calls).
     assert!(
         st.calls.load(std::sync::atomic::Ordering::SeqCst) >= 4,
         "expected retried calls"
     );
 }
 
-/// 永远瞬时失败 → 预算耗尽返回错误，且退避次数有界（不无限重试）。
+/// Transient failures forever -> the budget is exhausted and an error is returned, with a bounded number of backoffs (no infinite retry).
 #[test]
 fn self_check_retry_exhausts_budget() {
     let (_t, p, st) = flaky_persister(u64::MAX, true);
@@ -1532,14 +1532,14 @@ fn self_check_retry_exhausts_budget() {
         .err()
         .unwrap();
     let calls = st.calls.load(std::sync::atomic::Ordering::SeqCst);
-    // budget=80ms, backoff 5→10→20→20...：尝试次数有界且远小于无限。
+    // budget=80ms, backoff 5->10->20->20...: attempts are bounded and far below unbounded.
     assert!(calls >= 2 && calls < 40, "calls={calls}");
     assert!(t0.elapsed() < Duration::from_secs(5), "bounded wall time");
     assert!(logs + 1 == calls as u32 || logs == calls as u32, "every retryable failure logged");
     assert!(err.to_string().contains("unavailable"), "{err}");
 }
 
-/// 认证类失败（retryable=false，如 403）不重试——单次尝试即返回。
+/// Auth-class failures (retryable=false, e.g. 403) are not retried -- a single attempt returns.
 #[test]
 fn self_check_auth_failure_never_retries() {
     let (_t, p, st) = flaky_persister(u64::MAX, false);
@@ -1557,10 +1557,10 @@ fn self_check_auth_failure_never_retries() {
     assert!(err.to_string().contains("unavailable"), "{err}");
 }
 
-/// Corrupt（probe 消失）等非 Unavailable 错误同样不重试。
+/// Non-Unavailable errors such as Corrupt (probe vanished) are likewise not retried.
 #[test]
 fn self_check_corrupt_failure_never_retries() {
-    // 用一个 put 成功但 get 返回 None 的 store 触发 Corrupt 分支。
+    // Use a store whose put succeeds but get returns None to trigger the Corrupt branch.
     struct VanishStore {
         inner: Arc<MemoryStore>,
         puts: std::sync::atomic::AtomicU64,
@@ -1604,7 +1604,7 @@ fn self_check_corrupt_failure_never_retries() {
     assert!(err.to_string().contains("vanished"), "{err}");
 }
 
-/// 错误净化：内嵌 http(s) URL（含 query/签名参数）整体剥离。
+/// Error sanitization: embedded http(s) URLs (including query/signature parameters) are stripped entirely.
 #[test]
 fn self_check_error_sanitizes_urls() {
     use vrt_sql::persist::sanitize_self_check_error;
@@ -1615,7 +1615,7 @@ fn self_check_error_sanitizes_urls() {
     assert!(!out.contains("X-Amz-Signature"), "{out}");
     assert!(!out.contains("AKID"), "{out}");
     assert!(out.contains("connection refused"), "{out}");
-    // 多 URL + 无 URL 情形。
+    // Multiple URLs + the no-URL case.
     assert_eq!(
         sanitize_self_check_error("a http://x/1 b https://y/2 c"),
         "a <url> b <url> c"

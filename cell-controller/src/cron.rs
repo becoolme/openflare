@@ -64,7 +64,7 @@ impl TriggerKey {
     /// the pod-side scheduled-event path can drop a redelivery the
     /// controller could not observe (e.g. response lost in failover).
     /// Passthrough through vrt-host into the workerd `scheduled()`
-    /// event payload is 未证实 — the key is defined now so any
+    /// event payload is unverified -- the key is defined now so any
     /// conforming transport can carry it.
     pub fn idempotency_key(&self) -> String {
         format!(
@@ -209,7 +209,7 @@ impl TriggerLog for MemoryTriggerLog {
     }
 }
 
-/// Per-pod trigger delivery boundary (production transport: 未证实 —
+/// Per-pod trigger delivery boundary (production transport: unverified --
 /// pod-local scheduled-event invocation; memory impl records).
 #[async_trait::async_trait]
 pub trait CronInvoker: Send + Sync {

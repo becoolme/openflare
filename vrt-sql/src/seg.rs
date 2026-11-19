@@ -1,28 +1,28 @@
-//! `vrt-seg v1` 段格式（T36 / §4.2 方案 1）。
+//! `vrt-seg v1` segment format (T36 / section 4.2 option 1).
 //!
-//! **自定义格式，不冒称 LTX 兼容**。每次本地提交后，本次事务产生
-//! 的 WAL 帧被解析、打包为段上传；恢复时把页帧直接应用到快照之上
-//! （等效 WAL replay，但不依赖 WAL 文件头/盐值语义）。
+//! **Custom format, not claimed to be LTX-compatible**. After each local commit, the WAL frames
+//! produced by that transaction are parsed and packed into a segment for upload; on restore the page frames are applied directly on top of the snapshot
+//! (equivalent to WAL replay, but without depending on WAL header/salt semantics).
 //!
-//! 布局（全部大端）：
+//! Layout (all big-endian):
 //! ```text
 //! magic      8B   "VRTSEG01"
 //! version    u32  = 1
 //! flags      u32  reserved = 0
-//! databaseId 32B  ASCII，右补 \0
+//! databaseId 32B  ASCII, right-padded with \0
 //! epoch      u64
 //! lsn        u64
-//! prev_lsn   u64  前一已提交段 lsn（链校验；首段为 0 或快照基线）
+//! prev_lsn   u64  lsn of the previous committed segment (chain check; 0 or the snapshot baseline for the first segment)
 //! page_size  u32
 //! frame_cnt  u32
-//! wal_begin  u64  本段首帧在 WAL 中的帧下标（调试用，可为 0）
+//! wal_begin  u64  frame index of this segment's first frame within the WAL (for debugging, may be 0)
 //! frames     frame_cnt × { page_no u32, commit_db_size u32, data[page_size] }
-//! sha256     32B  对以上全部字节的校验
+//! sha256     32B  checksum over all of the above bytes
 //! ```
 //!
-//! `commit_db_size != 0` 的帧是提交记录：恢复时应用后把 db 截断到
-//! 该页数。WAL 帧头里的 salt/checksum 不存储——段级 sha256 是唯一
-//! 完整性来源。
+//! A frame with `commit_db_size != 0` is a commit record: after applying it on restore, truncate the db to
+//! that page count. The salt/checksum in the WAL frame header are not stored -- the segment-level sha256 is the sole
+//! integrity source.
 
 use sha2::{Digest, Sha256};
 
@@ -30,10 +30,10 @@ const MAGIC: &[u8; 8] = b"VRTSEG01";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 8 + 4 + 4 + 32 + 8 + 8 + 8 + 4 + 4 + 8;
 const SHA_LEN: usize = 32;
-/// 单段上限（帧数据）：64 MiB——超出即分段缺失前的防御闸。
+/// Per-segment cap (frame data): 64 MiB -- a defensive gate before segmentation gaps appear.
 pub const SEG_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-/// 一帧：页号 + 提交后 db 页数（非提交帧为 0）+ 页镜像。
+/// One frame: page number + db page count after commit (0 for non-commit frames) + page image.
 #[derive(Debug, Clone)]
 pub struct SegFrame {
     pub page_no: u32,
@@ -41,7 +41,7 @@ pub struct SegFrame {
     pub data: Vec<u8>,
 }
 
-/// 段内容。
+/// Segment content.
 #[derive(Debug, Clone)]
 pub struct Segment {
     pub database_id: String,
@@ -53,7 +53,7 @@ pub struct Segment {
     pub frames: Vec<SegFrame>,
 }
 
-/// 段错误（fail closed 信号）。
+/// Segment error (fail-closed signal).
 #[derive(Debug, thiserror::Error)]
 pub enum SegError {
     #[error("segment too short")]
@@ -75,7 +75,7 @@ fn put_u64(b: &mut Vec<u8>, v: u64) {
     b.extend_from_slice(&v.to_be_bytes());
 }
 
-/// 编码段（含尾部 sha256）。
+/// Encode a segment (including the trailing sha256).
 pub fn encode(seg: &Segment) -> Vec<u8> {
     let mut b =
         Vec::with_capacity(HEADER_LEN + seg.frames.len() * (8 + seg.page_size as usize) + SHA_LEN);
@@ -103,7 +103,7 @@ pub fn encode(seg: &Segment) -> Vec<u8> {
     b
 }
 
-/// 解码 + 校验 sha256。任何不符 → 明确错误（fail closed）。
+/// Decode + verify sha256. Any mismatch -> explicit error (fail closed).
 pub fn decode(buf: &[u8]) -> Result<Segment, SegError> {
     if buf.len() < HEADER_LEN + SHA_LEN {
         return Err(SegError::Truncated);
@@ -187,8 +187,8 @@ pub fn decode(buf: &[u8]) -> Result<Segment, SegError> {
     })
 }
 
-/// 把段帧应用到 db 镜像文件（pwrite 页 + 提交帧截断）。
-/// 调用方保证按 lsn 顺序、基线一致。
+/// Apply segment frames to the db image file (pwrite pages + commit-frame truncation).
+/// The caller guarantees lsn order and a consistent baseline.
 pub fn apply_frames(file: &mut std::fs::File, seg: &Segment) -> Result<(), SegError> {
     use std::io::{Seek, SeekFrom, Write};
     let ps = seg.page_size as u64;
@@ -209,8 +209,8 @@ pub fn apply_frames(file: &mut std::fs::File, seg: &Segment) -> Result<(), SegEr
     Ok(())
 }
 
-/// 段对象 key：`{kind.prefix}/{id}/{epoch:016x}/{lsn:016x}.seg`
-/// （T37r：D1 `db/…` 布局不变，Queue `q/…`）。
+/// Segment object key: `{kind.prefix}/{id}/{epoch:016x}/{lsn:016x}.seg`
+/// (T37r: D1 `db/...` layout unchanged, Queue `q/...`).
 pub fn seg_key(
     kind: crate::paths::ResourceKind,
     database_id: &str,
@@ -223,7 +223,7 @@ pub fn seg_key(
     )
 }
 
-/// 快照对象 key：`{kind.prefix}/{id}/{epoch:016x}/snap-{lsn:016x}.snap`。
+/// Snapshot object key: `{kind.prefix}/{id}/{epoch:016x}/snap-{lsn:016x}.snap`.
 pub fn snap_key(
     kind: crate::paths::ResourceKind,
     database_id: &str,
@@ -236,7 +236,7 @@ pub fn snap_key(
     )
 }
 
-/// manifest 对象 key。
+/// Manifest object key.
 pub fn manifest_key(kind: crate::paths::ResourceKind, database_id: &str) -> String {
     format!("{}/{database_id}/manifest", kind.object_prefix())
 }

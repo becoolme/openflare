@@ -1,5 +1,5 @@
-//! vrt-sql Prometheus 指标（T34）。label 只用固定枚举与
-//! [`crate::service::DbLabels`] 有界 databaseId——绝不放 SQL/错误文本。
+//! vrt-sql Prometheus metrics (T34). Labels use only fixed enums and
+//! the bounded databaseId from [`crate::service::DbLabels`] -- never SQL/error text.
 
 use std::sync::OnceLock;
 use vrt_metrics::Registry;
@@ -67,8 +67,8 @@ pub fn registry() -> &'static Registry {
     reg()
 }
 
-/// `endpoint` ∈ `query|execute`；`outcome` ∈
-/// `ok|sql_error|protocol_error|unauthorized|rate_limited|unavailable`。
+/// `endpoint` ∈ `query|execute`; `outcome` ∈
+/// `ok|sql_error|protocol_error|unauthorized|rate_limited|unavailable`.
 pub fn query(endpoint: &'static str, outcome: &'static str, seconds: f64) {
     let r = reg();
     r.inc(
@@ -83,7 +83,7 @@ pub fn query(endpoint: &'static str, outcome: &'static str, seconds: f64) {
     );
 }
 
-/// `db` 必须是 DbLabels::label 的产物（有界）。
+/// `db` must be a product of DbLabels::label (bounded).
 pub fn rows(db: &str, read: u64, written: u64) {
     let r = reg();
     if read > 0 {
@@ -106,7 +106,7 @@ pub fn set_open_databases(n: usize) {
     reg().set("vrt_sql_open_databases", &[], n as f64);
 }
 
-/// `reason` ∈ `publish|checkpoint|claim|restore|tombstone|gc`。
+/// `reason` ∈ `publish|checkpoint|claim|restore|tombstone|gc`.
 pub fn persistence_failure(reason: &'static str) {
     reg().inc(
         "vrt_sql_persistence_failures_total",
@@ -115,17 +115,17 @@ pub fn persistence_failure(reason: &'static str) {
     );
 }
 
-/// 恢复因损坏/sha 不符 fail closed 并进入退避。
+/// Restore failed closed on corruption/sha mismatch and entered backoff.
 pub fn restore_corrupt_backoff() {
     reg().inc("vrt_sql_restore_corrupt_backoff_total", &[], 1.0);
 }
 
-/// degraded 读（lease 有效但续租失败）。
+/// degraded read (lease valid but renewal failed).
 pub fn degraded_read() {
     reg().inc("vrt_sql_degraded_reads_total", &[], 1.0);
 }
 
-/// `stage` ∈ `store|expired`（续租失败的两种语境）。
+/// `stage` ∈ `store|expired` (the two contexts of a renewal failure).
 /// RV-R53.3: one bounded tombstone-GC round's counters.
 pub fn tombstone_gc_round(reclaimed: usize, objects_freed: u64, failures: usize) {
     let r = reg();
@@ -157,14 +157,14 @@ pub fn lease_renew_failure(stage: &'static str) {
     );
 }
 
-/// fenced 库计数增减（fence +1，恢复/摘除 -1 由调用方补）。
+/// Fenced-db counter inc/dec (fence +1; the caller adds -1 on recovery/removal).
 pub fn set_fenced_dbs_delta(d: i64) {
     static N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
     let v = N.fetch_add(d, std::sync::atomic::Ordering::Relaxed) + d;
     reg().set("vrt_sql_fenced_dbs", &[], v.max(0) as f64);
 }
 
-/// `GET /metrics` handler。
+/// `GET /metrics` handler.
 pub async fn metrics_handler() -> axum::response::Response {
     axum::response::IntoResponse::into_response((
         [(
@@ -175,7 +175,7 @@ pub async fn metrics_handler() -> axum::response::Response {
     ))
 }
 
-/// metrics listener router（内部端口，不公开）。
+/// metrics listener router (internal port, not public).
 pub fn router() -> axum::Router {
     axum::Router::new().route("/metrics", axum::routing::get(metrics_handler))
 }

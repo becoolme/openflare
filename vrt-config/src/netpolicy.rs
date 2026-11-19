@@ -12,8 +12,8 @@
 //! are charset-validated then quoted). Nothing here touches a cluster:
 //! the T8 controller applies the manifest.
 //!
-//! 未证实: CNI `except` 支持与 IPv6 NetworkPolicy 支持取决于部署的
-//! CNI（Cilium/Calico 支持，部分轻量 CNI 不实现）— 见 egress 文档。
+//! Unverified: CNI `except` support and IPv6 NetworkPolicy support depend on the deployed
+//! CNI (supported by Cilium/Calico, not implemented by some lightweight CNIs) -- see the egress doc.
 
 use crate::error::ConfigError;
 use std::collections::BTreeMap;
@@ -213,7 +213,7 @@ pub struct RuntimeNetPolicy {
     /// 6443, kubelet 10250, Traefik, public DB ports) — public-shaped
     /// addresses that must never be reachable from tenant pods. An
     /// operator-supplied REQUIRED list; auto-collecting from Node
-    /// objects is a follow-up (未证实).
+    /// objects is a follow-up (unverified).
     pub node_excepts: Vec<Cidr>,
     /// Additional operator CIDRs to except (e.g. a platform LAN that is
     /// public-shaped but must not be reachable).
@@ -400,7 +400,7 @@ fn validate(input: &RuntimeNetPolicy) -> Result<(), ConfigError> {
     }
     // Node/platform public addresses are REQUIRED excepts — the
     // operator must declare them explicitly (auto-discovery is a
-    // follow-up; see the egress doc's 未证实 notes).
+    // follow-up; see the egress doc's unverified notes).
     if input.node_excepts.is_empty() {
         return Err(ConfigError::Identifier("netpolicy.nodeExcepts"));
     }

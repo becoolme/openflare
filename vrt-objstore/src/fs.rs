@@ -1,14 +1,14 @@
-//! 文件系统对象存储（standalone 默认）。
+//! Filesystem object store (the standalone default).
 //!
-//! 布局：`{root}/{key}` 直接映射为文件。条件写是**真 CAS**：
-//! 1. 进程内 `cas_lock` Mutex 互斥（**必须**——macOS/BSD flock 锁按
-//!    进程合并，同进程多 fd 的 LOCK_EX 不互斥；Linux per-fd 才互斥）。
-//! 2. 打开 `{key}.lock` 锁文件 → `flock(LOCK_EX)` 跨进程互斥。
-//! 2. 锁内读当前内容 → 比 etag（sha256）→ 写 `{key}.tmp-{nonce}`
-//!    → fsync → atomic rename → fsync 目录。
-//! 3. flock 在 fd 关闭时自动释放。
+//! Layout: `{root}/{key}` maps directly to a file. Conditional writes are a **real CAS**:
+//! 1. In-process `cas_lock` Mutex exclusion (**required** -- macOS/BSD flock locks are merged
+//!    per process, so LOCK_EX on multiple fds in one process does not exclude; on Linux only per-fd does).
+//! 2. Open the `{key}.lock` lock file -> `flock(LOCK_EX)` for cross-process exclusion.
+//! 2. Under the lock read the current content -> compare etag (sha256) -> write `{key}.tmp-{nonce}`
+//!    -> fsync -> atomic rename -> fsync the directory.
+//! 3. flock is released automatically when the fd closes.
 //!
-//! 不是"先读后写"——校验与提交全程在排他锁内。
+//! Not "read then write" -- check and commit both happen entirely inside the exclusive lock.
 
 use super::{
     FileGetOutcome, FilePutOutcome, ListEntry, ListPage, ObjectMeta, ObjectStore, StoreError,
@@ -25,10 +25,10 @@ fn etag_of(body: &[u8]) -> String {
     hex::encode(Sha256::digest(body))
 }
 
-/// 文件系统 store。单节点 standalone 默认后端。
+/// Filesystem store. The default backend for single-node standalone.
 pub struct FsStore {
     root: PathBuf,
-    /// 进程内 CAS 互斥：flock 在 macOS 下同进程不互斥（见文件头注）。
+    /// In-process CAS exclusion: flock does not exclude within one process on macOS (see the file header).
     cas_lock: std::sync::Mutex<()>,
 }
 
@@ -39,7 +39,7 @@ impl std::fmt::Debug for FsStore {
 }
 
 impl FsStore {
-    /// 打开（不存在则创建 root）。
+    /// Open (creates root if missing).
     pub fn new(root: PathBuf) -> std::io::Result<Self> {
         std::fs::create_dir_all(&root)?;
         Ok(Self {
@@ -58,7 +58,7 @@ impl FsStore {
         Ok(self.root.join(format!("{key}.lock")))
     }
 
-    /// 排他锁 guard：flock 文件 + fd 关闭即释放。
+    /// Exclusive-lock guard: the flock file + released when the fd closes.
     fn lock_key(&self, key: &str) -> Result<std::fs::File, StoreError> {
         let lp = self.lock_path_of(key)?;
         if let Some(d) = lp.parent() {
@@ -89,7 +89,7 @@ impl FsStore {
         }
     }
 
-    /// tmp 写入 + fsync + rename + 目录 fsync（锁内调用）。
+    /// tmp write + fsync + rename + directory fsync (called under the lock).
     fn atomic_commit(&self, path: &Path, body: &[u8]) -> Result<String, StoreError> {
         let dir = path
             .parent()
@@ -111,7 +111,7 @@ impl FsStore {
                 .map_err(|e| StoreError::unavailable(true, format!("tmp fsync: {e}")))?;
             std::fs::rename(&tmp, path)
                 .map_err(|e| StoreError::unavailable(true, format!("rename: {e}")))?;
-            // 目录 fsync：rename 持久化。
+            // directory fsync: persists the rename.
             let d = std::fs::File::open(dir)
                 .map_err(|e| StoreError::unavailable(true, format!("dir open: {e}")))?;
             d.sync_all()
@@ -124,8 +124,8 @@ impl FsStore {
         res.map(|_| etag_of(body))
     }
 
-    /// 同步 CAS：锁内 read-verify-write（ObjectStore async 方法内部直接
-    /// 调它——文件 I/O 就绪即返回，无需 reactor）。
+    /// Synchronous CAS: read-verify-write under the lock (the ObjectStore async methods call
+    /// it directly -- file I/O returns as soon as ready, no reactor needed).
     pub fn put_cas_sync(
         &self,
         key: &str,
@@ -139,7 +139,7 @@ impl FsStore {
         match (expected, &cur) {
             (Some(exp), Some(bytes)) if etag_of(bytes) == exp => {}
             (None, None) => {}
-            // expected=Some + 缺失 / etag 不符 / expected=None + 已存在
+            // expected=Some + missing / etag mismatch / expected=None + already exists
             _ => return Err(StoreError::PreconditionFailed),
         }
         self.atomic_commit(&path, body)
@@ -166,8 +166,8 @@ impl ObjectStore for FsStore {
         Ok(self.get(key).await?.map(|o| o.meta))
     }
 
-    /// RV-R31 #5：流式下载——打开的 fd 读到的是 rename 提交的完整
-    /// 快照（对象写入本身走 tmp→rename），边拷边算 sha256。
+    /// RV-R31 #5: streaming download -- the open fd reads the full snapshot committed by
+    /// rename (object writes themselves go through tmp->rename), computing sha256 while copying.
     async fn get_to_file(
         &self,
         key: &str,
@@ -199,7 +199,7 @@ impl ObjectStore for FsStore {
                 .map_err(|e| StoreError::unavailable(true, format!("get_to_file write: {e}")))?;
             len += n as u64;
         }
-        // fs 后端 etag 即内容 sha256（与 etag_of/put_file 同口径）。
+        // The fs backend's etag is the content sha256 (same convention as etag_of/put_file).
         let sha256 = hex::encode(hasher.finalize());
         Ok(Some(FileGetOutcome {
             etag: sha256.clone(),
@@ -228,10 +228,10 @@ impl ObjectStore for FsStore {
         self.atomic_commit(&path, body)
     }
 
-    /// T36b：流式快照写入——不整读源文件进内存。
-    /// 两阶段：无锁流拷 src→tmp（含流式 sha256+fsync）→ CAS 锁内
-    /// 校验前置条件 + rename + 目录 fsync（锁只持快速段，不阻塞
-    /// 其它 key 的 CAS）。
+    /// T36b: streaming snapshot write -- does not read the whole source file into memory.
+    /// Two phases: lock-free stream copy src->tmp (with streaming sha256+fsync) -> under the CAS lock
+    /// verify the precondition + rename + directory fsync (the lock is held only for the fast part and does not block
+    /// CAS on other keys).
     async fn put_file(
         &self,
         key: &str,
@@ -250,7 +250,7 @@ impl ObjectStore for FsStore {
             path.file_name().unwrap_or_default().to_string_lossy(),
             std::process::id()
         ));
-        // Phase 1（无锁）：流式拷贝 + sha256 + fsync。
+        // Phase 1 (lock-free): streaming copy + sha256 + fsync.
         let streamed = (|| -> Result<(String, u64), StoreError> {
             use sha2::{Digest, Sha256};
             use std::io::{Read, Write};
@@ -284,7 +284,7 @@ impl ObjectStore for FsStore {
                 return Err(e);
             }
         };
-        // Phase 2（锁内）：前置条件 + rename + 目录 fsync。
+        // Phase 2 (under the lock): precondition + rename + directory fsync.
         let _guard = self.cas_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lock = self.lock_key(key)?;
         if if_none_match && path.exists() {
@@ -295,12 +295,12 @@ impl ObjectStore for FsStore {
             let _ = std::fs::remove_file(&tmp);
             return Err(StoreError::unavailable(true, format!("rename: {e}")));
         }
-        // 目录 fsync：rename 持久化（与 atomic_commit 同口径）。
+        // directory fsync: persists the rename (same convention as atomic_commit).
         let d = std::fs::File::open(dir)
             .map_err(|e| StoreError::unavailable(true, format!("dir open: {e}")))?;
         d.sync_all()
             .map_err(|e| StoreError::unavailable(true, format!("dir fsync: {e}")))?;
-        // fs 后端 etag = 内容 sha256（与 etag_of 同口径）。
+        // fs backend etag = content sha256 (same convention as etag_of).
         Ok(FilePutOutcome {
             etag: sha256.clone(),
             sha256,
@@ -309,9 +309,9 @@ impl ObjectStore for FsStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<ListPage, StoreError> {
-        // T36b：从最长目录前缀开始遍历（O(匹配子树) 而非 O(全树)）。
-        // "prefix 可落目录边界中间"（`db/ab` 须匹配 `db/abc/x`）→
-        // 遍历锚点是最后一个 '/' 之前部分；无 '/' → 全树。
+        // T36b: start walking from the longest directory prefix (O(matching subtree) rather than O(whole tree)).
+        // "the prefix may land in the middle of a directory boundary" (`db/ab` must match `db/abc/x`) ->
+        // the walk anchor is the part before the last '/'; no '/' -> whole tree.
         if prefix.starts_with('/')
             || prefix.split('/').any(|seg| seg == "..")
             || prefix.contains('\0')
@@ -355,7 +355,7 @@ impl ObjectStore for FsStore {
             }
         }
         out.sort_by(|a, b| a.key.cmp(&b.key));
-        // fs 遍历一次走完整棵子树——无分页界，truncated 恒假。
+        // an fs walk covers the whole subtree in one pass -- no pagination bound, truncated is always false.
         Ok(ListPage {
             entries: out,
             truncated: false,

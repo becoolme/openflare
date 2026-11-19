@@ -874,7 +874,7 @@ mod normalize_tests {
         );
         assert_eq!(
             normalize_asset_path("/%E4%B8%AD%E6%96%87%20page.html").unwrap(),
-            "/中文 page.html"
+            "/\u{4e2d}\u{6587} page.html"
         );
         // Malformed escape keeps raw — never panics, never matches.
         assert_eq!(normalize_asset_path("/bad%zzfile").unwrap(), "/bad%zzfile");

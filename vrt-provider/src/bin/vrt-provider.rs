@@ -183,7 +183,7 @@ async fn run() -> ExitCode {
             )
             .map_err(|_| ())
             .and_then(|d1| {
-                // T37: queue 与 d1 共用同一 vrt-sql 下游/secret。
+                // T37: queue and d1 share the same vrt-sql downstream/secret.
                 vrt_provider::queue::QueueClient::new(
                     sql.addr.clone(),
                     secret,

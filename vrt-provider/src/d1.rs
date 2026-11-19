@@ -1,11 +1,11 @@
-//! D1 数据面（T34）：facade-d1 → provider → vrt-sql。
+//! D1 data plane (T34): facade-d1 -> provider -> vrt-sql.
 //!
-//! provider 的职责：鉴权（签名 props→Authorizer）→ 按快照把
-//! `bindingId` 映射到 `databaseId`（Worker 不可指定）→ 有界限流
-//! → 限额预检 → 分配 seq（全局单调，按 databaseId 子序列亦单调）→
-//! 向 vrt-sql 发签名请求。**结果不确定的写绝不重试**（§3 R4）。
-//! vrt-sql 不可用时返回 D1 错误面 `{success:false,error:"D1_ERROR: …"}`，
-//! 写结构化日志与指标，绝不挂起。
+//! The provider's responsibilities: authenticate (signed props -> Authorizer) -> map
+//! `bindingId` to `databaseId` from the snapshot (the Worker cannot choose) -> bounded rate limiting
+//! -> quota pre-check -> allocate seq (globally monotonic, hence monotonic per databaseId subsequence) ->
+//! send a signed request to vrt-sql. **A write with an uncertain outcome is never retried** (section 3 R4).
+//! When vrt-sql is unavailable, returns the D1 error surface `{success:false,error:"D1_ERROR: ..."}`,
+//! writes structured logs and metrics, and never hangs.
 
 use crate::context::{BindingContext, BindingResource};
 use crate::error::ProviderError;
@@ -15,22 +15,22 @@ use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// 与 vrt-sql::service 同款的认证头（共享 wire 格式，见 service.rs）。
+/// Same auth headers as vrt-sql::service (shared wire format, see service.rs).
 pub const SQL_AUTH_HEADER: &str = "x-vrt-sql-auth";
 pub const SQL_EPOCH_HEADER: &str = "x-vrt-epoch";
 pub const SQL_SEQ_HEADER: &str = "x-vrt-seq";
 /// RV-R71: remaining request budget in ms (shrink-only on the vrt-sql side).
 pub const SQL_DEADLINE_MS_HEADER: &str = "x-vrt-deadline-ms";
-/// bookmark/session 头（透传给调用方）。
+/// bookmark/session headers (passed through to the caller).
 pub const BOOKMARK_HEADER: &str = "x-cf-d1-session-commit-token";
 
-/// 预检上限：与 vrt-sql::security 的 limit 口径一致（引擎仍是权威）。
+/// Pre-check limits: consistent with vrt-sql::security's limits (the engine remains authoritative).
 pub const D1_MAX_SQL_BYTES: usize = 100 * 1024;
 pub const D1_MAX_PARAMS: usize = 100;
-/// 单请求体上限（先于读 body 校验）。
+/// Per-request body cap (checked before reading the body).
 pub const D1_MAX_BODY_BYTES: usize = 1024 * 1024;
-/// 上游响应上限（RV-R8 #8）：与 vrt-sql 自身 `body_max_bytes` 上界
-/// （64MiB）一致——vrt-sql 不可能产生更大的合法响应。
+/// Upstream response cap (RV-R8 #8): consistent with vrt-sql's own `body_max_bytes` upper bound
+/// (64MiB) -- vrt-sql cannot produce a larger legal response.
 pub const D1_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -42,9 +42,9 @@ fn unix_nanos() -> u64 {
         .as_nanos() as u64
 }
 
-/// provider→vrt-sql 签名器（与 vrt-sql::service::ServiceAuth 同一 wire
-/// 格式：`v1:<ts>:<hmac(ts|method|path?query|sha256(body)|epoch|seq)>`）。
-/// 有意不复用 vrt-sql crate —— 保持服务边界，格式注释双侧同步。
+/// provider->vrt-sql signer (same wire format as vrt-sql::service::ServiceAuth:
+/// `v1:<ts>:<hmac(ts|method|path?query|sha256(body)|epoch|seq)>`).
+/// Deliberately does not reuse the vrt-sql crate -- keeps the service boundary; the format comments are synced on both sides.
 pub struct SqlAuthSigner {
     secret: Vec<u8>,
 }
@@ -60,7 +60,7 @@ impl SqlAuthSigner {
         Self { secret }
     }
 
-    /// `epoch`/`seq` 与实际上送的头值一致（签名覆盖它们）。
+    /// `epoch`/`seq` match the header values actually sent (the signature covers them).
     pub fn sign(
         &self,
         method: &str,
@@ -84,18 +84,18 @@ impl SqlAuthSigner {
     }
 }
 
-/// vrt-sql 下游客户端。
+/// vrt-sql downstream client.
 pub struct D1Client {
     http: reqwest::Client,
-    /// 例 `http://127.0.0.1:8090`（无尾斜杠）。
+    /// e.g. `http://127.0.0.1:8090` (no trailing slash).
     addr: String,
     signer: SqlAuthSigner,
     timeout: Duration,
-    /// 全局单调 seq（跨 databaseId 单调 ⇒ 按库子序列也单调）。
-    /// 种子取 unix-nanos：provider 重启后 seq 继续走高而非回绕到 1
-    /// ——epoch 固定为 1 的本轮里，回绕会让**新写**撞上 `_vrt_dedup`
-    /// 旧行（引擎现亦校验负载，双保险）。假设：墙钟不回退到历史
-    /// 高水位以下（与 ±30s 认证窗口同一时钟信任基）。
+    /// Globally monotonic seq (monotonic across databaseIds => the per-database subsequence is monotonic too).
+    /// Seeded from unix-nanos: after a provider restart seq keeps climbing instead of wrapping back to 1
+    /// -- in this round where epoch is fixed at 1, wrapping back would let a **new write** collide with an old `_vrt_dedup`
+    /// row (the engine now also checks the payload, a double safeguard). Assumption: the wall clock does not move back below a historical
+    /// high-water mark (the same clock trust base as the +-30s auth window).
     seq: AtomicU64,
 }
 
@@ -130,10 +130,10 @@ impl D1Client {
         })
     }
 
-    /// 分配下一个 seq（公开供计量/测试；内部由 forward 调用）。
+    /// Allocate the next seq (public for metering/tests; called internally by forward).
     pub fn next_seq(&self) -> u64 {
-        // CAS-max(cur+1, now+1)：进程内严格递增，且计数器随墙钟
-        // 抬升（重启种子必高于上一轮已发出的 seq）。
+        // CAS-max(cur+1, now+1): strictly increasing within the process, and the counter rises
+        // with the wall clock (a restart seed is always higher than the seq issued in the previous run).
         let now = unix_nanos();
         let mut cur = self.seq.load(Ordering::Relaxed);
         loop {
@@ -148,7 +148,7 @@ impl D1Client {
         }
     }
 
-    /// 限额预检：sql 长度与参数数（权威限额仍在引擎侧）。
+    /// Quota pre-check: sql length and parameter count (the authoritative limits remain on the engine side).
     pub fn precheck(body: &[u8]) -> Result<(), &'static str> {
         let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| "body json")?;
         let stmts: &[serde_json::Value] = match &v {
@@ -170,8 +170,8 @@ impl D1Client {
         Ok(())
     }
 
-    /// 转发一次 D1 请求。返回（status, bookmark, body 字节）。
-    /// **绝不重试**：单次发送，任何失败（连接/超时/5xx）返回 Err。
+    /// Forward one D1 request. Returns (status, bookmark, body bytes).
+    /// **Never retries**: a single send, any failure (connect/timeout/5xx) returns Err.
     pub async fn forward(
         &self,
         ctx: &BindingContext,

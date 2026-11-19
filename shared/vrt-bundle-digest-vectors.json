@@ -55,19 +55,19 @@
     {
       "name": "unicode-module-name-json",
       "pack": {
-        "mainModule": "中/main.js",
+        "mainModule": "\u4e2d/main.js",
         "modules": {
-          "中/main.js": "export default {}",
-          "data/表.json": {
+          "\u4e2d/main.js": "export default {}",
+          "data/\u8868.json": {
             "json": {
-              "深": {
+              "\u6df1": {
                 "nested": [
                   -1,
                   0,
                   1
                 ]
               },
-              "s": "值"
+              "s": "\u503c"
             }
           }
         },

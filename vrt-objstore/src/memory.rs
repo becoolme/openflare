@@ -1,5 +1,5 @@
-//! 内存对象存储（测试/离线）。真 CAS：全局锁内 compare+swap。
-//! 附带失败注入钩子（`fail_next_*`）供对抗测试。
+//! In-memory object store (tests/offline). Real CAS: compare+swap under a global lock.
+//! Comes with failure-injection hooks (`fail_next_*`) for adversarial tests.
 
 use super::{ListEntry, ListPage, ObjectMeta, ObjectStore, StoreError, StoredObject};
 use std::collections::BTreeMap;
@@ -8,11 +8,11 @@ use std::sync::Mutex;
 #[derive(Clone)]
 struct Entry {
     body: Vec<u8>,
-    /// etag = sha256(body) hex —— CAS 以内容哈希为版本。
+    /// etag = sha256(body) hex -- CAS uses the content hash as the version.
     etag: String,
 }
 
-/// 内存 store。`Clone` 共享同一张表（两 registry 共享场景）。
+/// In-memory store. `Clone` shares the same table (the two-registry sharing scenario).
 #[derive(Default)]
 pub struct MemoryStore {
     inner: std::sync::Arc<Mutex<MemInner>>,
@@ -21,11 +21,11 @@ pub struct MemoryStore {
 #[derive(Default)]
 struct MemInner {
     objs: BTreeMap<String, Entry>,
-    /// 失败注入：下一次匹配操作返回该错误一次。
+    /// Failure injection: the next matching operation returns this error once.
     inject_get: Vec<StoreError>,
     inject_put: Vec<StoreError>,
     inject_list: Vec<StoreError>,
-    /// T36b：put* 调用计数（退避/节流测试观察口）。
+    /// T36b: put* call counter (observation port for backoff/throttle tests).
     put_calls: usize,
 }
 
@@ -39,33 +39,33 @@ impl MemoryStore {
         Self::default()
     }
 
-    /// 注入：接下来 `n` 次 put* 调用返回该错误。
+    /// Inject: the next `n` put* calls return this error.
     pub fn inject_put_failures(&self, errs: Vec<StoreError>) {
         self.inner.lock().unwrap().inject_put = errs;
     }
-    /// 注入：接下来 `n` 次 get 调用返回该错误。
+    /// Inject: the next `n` get calls return this error.
     pub fn inject_get_failures(&self, errs: Vec<StoreError>) {
         self.inner.lock().unwrap().inject_get = errs;
     }
-    /// 注入：接下来 `n` 次 list 调用返回该错误。
+    /// Inject: the next `n` list calls return this error.
     pub fn inject_list_failures(&self, errs: Vec<StoreError>) {
         self.inner.lock().unwrap().inject_list = errs;
     }
 
-    /// 测试观察口：put* 累计调用数（含注入失败）。
+    /// Test observation port: cumulative put* call count (including injected failures).
     pub fn put_calls(&self) -> usize {
         self.inner.lock().unwrap().put_calls
     }
 
-    /// 测试观察口：对象数。
+    /// Test observation port: object count.
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().objs.len()
     }
-    /// 测试观察口：所有 key。
+    /// Test observation port: all keys.
     pub fn keys(&self) -> Vec<String> {
         self.inner.lock().unwrap().objs.keys().cloned().collect()
     }
-    /// 测试篡改口：直接覆盖对象内容（绕过 CAS，制造坏段）。
+    /// Test tampering port: directly overwrite object content (bypasses CAS, to manufacture a bad segment).
     pub fn corrupt(&self, key: &str, body: Vec<u8>) {
         let etag = etag_of(&body);
         self.inner

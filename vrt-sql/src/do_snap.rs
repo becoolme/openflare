@@ -265,8 +265,8 @@ pub fn verify_snapshot_files(meta: &SnapshotMeta, files_dir: &Path) -> Result<()
 /// write to a sibling tmp then rename. If `dst_dir` exists it is NOT
 /// overwritten — callers keep local data on failure (fail closed).
 /// Returns Err when dst exists (restore into a FRESH dir only).
-/// RV-R31 #4：tmp 内逐文件 fsync → 各级 tmp 目录 fsync → rename →
-/// 父目录 fsync——全部完成后才算落盘，掉电不会留下缺页的目录。
+/// RV-R31 #4: per-file fsync inside tmp -> fsync every tmp directory level -> rename ->
+/// parent directory fsync -- only after all of it completes is the result on disk; power loss never leaves a directory with missing pages.
 pub fn place_verified(files_dir: &Path, dst_dir: &Path) -> Result<(), SnapError> {
     if dst_dir.exists() {
         return Err(SnapError::Unsafe(format!(
@@ -294,13 +294,13 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<(), SnapError> {
         if entry.file_type()?.is_dir() {
             copy_tree(&entry.path(), &d)?;
         } else {
-            // 逐文件 fsync——校验过的内容必须先耐久，rename 才有意义。
+            // Per-file fsync -- verified content must be durable first, otherwise the rename is meaningless.
             std::fs::copy(entry.path(), &d)?;
             std::fs::File::open(&d)?.sync_all()?;
         }
     }
-    // 目录项 fsync：本层所有新建名字持久化（父目录项由调用方/
-    // 上层递归的目录 fsync 覆盖）。
+    // Directory-entry fsync: all new names at this level are persisted (the parent entry is covered by
+    // the caller / the directory fsync of the enclosing recursion).
     std::fs::File::open(dst)?.sync_all()?;
     Ok(())
 }

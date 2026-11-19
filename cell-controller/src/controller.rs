@@ -54,7 +54,7 @@ pub struct CellControllerDeps {
     /// one `report` call; this plan paces re-delivery BETWEEN ticks.
     pub ack_retry: RetryPlan,
     /// NetworkPolicy manifest sink — the T6 `render_network_policy`
-    /// output reaches the cluster through this boundary ("由 T8 下发").
+    /// output reaches the cluster through this boundary ("delivered by T8").
     /// `None` for deployments without a cluster writer (MVP tests);
     /// a configured-but-failing applier degrades `readyz`.
     pub manifests: Option<Arc<dyn ManifestApplier>>,

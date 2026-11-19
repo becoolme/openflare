@@ -350,7 +350,7 @@ test("same cfg string compiles once across requests", async () => {
 
 test("percent-encoded paths decode before manifest match", async () => {
   const a = [];
-  const idx = { ...INDEX, paths: ["/my file.txt", "/中文 page.html"] };
+  const idx = { ...INDEX, paths: ["/my file.txt", "/\u4e2d\u6587 page.html"] };
   const r = new AssetsRouter();
   const space = await hit(env({}, userWorker([]), assetsWorker(a, idx)),req("/my%20file.txt"));
   assert.equal(space.headers.get(HDR), "assets");
@@ -371,7 +371,7 @@ test("malformed percent escape keeps raw segment (no crash, no match)", async ()
 // percent_decode_before_normalize — decodeURIComponent parity.
 const DECODE_TABLE = [
   ["/my%20file.txt", "/my file.txt"],
-  ["/%E4%B8%AD%E6%96%87%20page.html", "/中文 page.html"],
+  ["/%E4%B8%AD%E6%96%87%20page.html", "/\u4e2d\u6587 page.html"],
   ["/bad%zzfile", "/bad%zzfile"], // bad escape → whole segment raw
   ["/a%zz%20b", "/a%zz%20b"], // mixed: one bad escape → NOTHING decodes
   ["/truncated%2", "/truncated%2"], // `%` + <2 hex → raw

@@ -1,20 +1,20 @@
-# VRT 平台模式 —— vrt-host 示例配置（pod 模式：cell-controller 经
-# FileEnvelopePodChannel 投递 envelope+assignment）。
-# 部署时替换 __VRT_*__ 占位符；不含真实密钥。键名为 serde camelCase。
+# VRT platform mode -- vrt-host example config (pod mode: cell-controller delivers
+# envelope+assignment through FileEnvelopePodChannel).
+# Replace the __VRT_*__ placeholders at deploy time; contains no real secrets. Key names are serde camelCase.
 cellId = "cell-mvp-1"
-workerdBinary = "__WORKERD__"                           # 固定版本 workerd 绝对路径
+workerdBinary = "__WORKERD__"                           # absolute path of the pinned-version workerd
 workDir = "__VRT_ROOT__/pods/pod-0/work"                # 0700
 cacheDir = "__VRT_ROOT__/pods/pod-0/cache"              # 0700
 listenAddr = "127.0.0.1:8080"
-controlListen = "127.0.0.1:9091"                        # readyz/healthz（loopback 强制）
-# P3c-1: DO storage root — K8s 下必须挂持久卷（pod 重建后数据仍在；
-# 跨 cell 的 placement/fencing 为 P3c-2，未接入前 DO 仅本 pod 可用）。
+controlListen = "127.0.0.1:9091"                        # readyz/healthz (loopback enforced)
+# P3c-1: DO storage root -- on K8s this must be a persistent volume (data survives pod recreation;
+# cross-cell placement/fencing is P3c-2; until that lands, DO is usable on this pod only).
 doStorageDir = "__VRT_ROOT__/pods/pod-0/do"
 allowLocalDurability = true # RV-R66: dev example, single-copy DO state
 
 [desired]
-path = "__VRT_ROOT__/pods/pod-0/envelope.json"          # FileEnvelopePodChannel 写入
-podId = "pod-0"                                         # 与 assignment.podId 绑定
+path = "__VRT_ROOT__/pods/pod-0/envelope.json"          # written by FileEnvelopePodChannel
+podId = "pod-0"                                         # bound to assignment.podId
 assignmentFile = "__VRT_ROOT__/pods/pod-0/assignment.json"
 trustedKeys = [
   { keyId = "bf29c9743adb0a97f43ae4bc", publicKey = "MCowBQYDK2VwAyEAO4cbNjsO7FQzisOvZshKKMa67lIim3ikig7RdntOAZM=" },
@@ -24,21 +24,21 @@ graceVersions = 1
 
 [render]
 mode = "capnp"
-# T16/B3：params 由 facade manifest 启动时推导（与 paramsFile 互斥，
-# 两者同时配置 = 两份真相，validate 拒绝启动）
+# T16/B3: params are derived from the facade manifest at startup (mutually exclusive with paramsFile;
+# configuring both = two sources of truth, validate refuses to start)
 facadeManifest = "__VRT_ROOT__/facade/manifest.json"
-# H5-r1: binding-backend 按租户派生 —— 指向 provider 的
-# listenerDir（每个租户渲染为 <dir>/<seg(tenant)>.sock，与 provider
-# 绑定路径逐字节一致）。assignmentFile 模式下禁止 verbatim
-# bindingBackendSocket（静态 socket 会让全部租户共用同一个租户
-# 监听器 —— 跨租户越权）。
+# H5-r1: binding-backend is derived per tenant -- points at the provider's
+# listenerDir (each tenant renders to <dir>/<seg(tenant)>.sock, byte-for-byte identical to the
+# provider's bind path). In assignmentFile mode a verbatim
+# bindingBackendSocket is forbidden (a static socket would make all tenants share one tenant
+# listener -- cross-tenant privilege escalation).
 bindingBackendDir = "__VRT_ROOT__/provider/listeners"
 systemCompatDate = "2024-09-25"
 systemCompatFlags = []
-secretsFile = "__VRT_ROOT__/secrets/render-secrets.json"  # 0600，{tenantId:{ref:value}}
+secretsFile = "__VRT_ROOT__/secrets/render-secrets.json"  # 0600, {tenantId:{ref:value}}
 extraArgs = []
 
-[bundles]                                                # T15/B2 控制面 bundle 拉取
+[bundles]                                                # T15/B2 control-plane bundle fetch
 baseUrl = "https://cp.internal/api/internal/clusters/cl_mvp_1"
 tokenFile = "__VRT_ROOT__/secrets/cell-token"              # 0600
 requestTimeoutMs = 10000

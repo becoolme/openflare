@@ -81,19 +81,19 @@ pub struct WorkerToml {
     pub(crate) hostnames: Vec<String>,
     #[serde(default)]
     pub(crate) crons: Vec<CronDesired>,
-    /// T37b：`[[queueConsumers]]` —— 本 worker 消费的队列（queue
-    /// 为显示名，queueId 打包期按 `vrt-q:{tenant}:{name}` 派生）。
+    /// T37b: `[[queueConsumers]]` -- the queues this worker consumes (queue
+    /// is a display name, queueId is derived at pack time as `vrt-q:{tenant}:{name}`).
     #[serde(default)]
     pub(crate) queue_consumers: Vec<QueueConsumerToml>,
-    /// P3c-1：`durableObjectBindings` —— DO namespace bindings
-    /// （wrangler `durable_objects.bindings[]` 归一后同一形状）。
+    /// P3c-1: `durableObjectBindings` -- DO namespace bindings
+    /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
     pub(crate) durable_object_bindings: Vec<DoBindingToml>,
-    /// P3c-1：`durableObjectMigrations` —— wrangler `[[migrations]]`
-    /// 归一后的 shape；deploy 时按序求值为最终 class 集合。
+    /// P3c-1: `durableObjectMigrations` -- the shape after normalizing wrangler `[[migrations]]`
+    /// ; at deploy time evaluated in order into the final class set.
     #[serde(default)]
     pub(crate) durable_object_migrations: Vec<DoMigrationToml>,
-    /// W1：`[[workflows]]` 归一后同一形状。
+    /// W1: `[[workflows]]` -- same shape after normalization.
     #[serde(default)]
     pub(crate) workflows: Vec<WorkflowToml>,
     #[serde(default)]
@@ -110,11 +110,11 @@ pub(crate) struct BindingsToml {
     pub(crate) kv: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) r2: BTreeMap<String, String>,
-    /// `name → 用户侧 database_id`（服务端在打包期派生真实 id）。
+    /// `name -> user-side database_id` (the server derives the real id at pack time).
     #[serde(default)]
     pub(crate) d1: BTreeMap<String, String>,
-    /// T37: `name → 用户侧队列名`（queueId 在打包期由
-    /// `vrt-q:{tenant}:{name}` 派生——standalone 无控制面 provision）。
+    /// T37: `name -> user-side queue name` (queueId is derived at pack time from
+    /// `vrt-q:{tenant}:{name}` -- standalone has no control-plane provisioning).
     #[serde(default)]
     pub(crate) queue: BTreeMap<String, String>,
     #[serde(default)]
@@ -125,92 +125,92 @@ pub(crate) struct BindingsToml {
     pub(crate) assets: BTreeMap<String, String>,
 }
 
-/// T37b `[[queueConsumers]]`：字段与 wrangler `queues.consumers[]`
-/// 对齐（snake→camel 由 project_cfg 归一；数值边界在 pack 时查，
-/// 与 [`QueueConsumerDesired`] 校验一致）。
+/// T37b `[[queueConsumers]]`: fields aligned with wrangler `queues.consumers[]`
+/// (snake->camel is normalized by project_cfg; numeric bounds are checked at pack time,
+/// consistent with [`QueueConsumerDesired`] validation).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QueueConsumerToml {
-    /// 队列显示名（id 打包期派生）。
+    /// Queue display name (id derived at pack time).
     pub(crate) queue: String,
-    /// 死信队列显示名。
+    /// Dead-letter queue display name.
     pub(crate) dead_letter_queue: Option<String>,
-    /// 1..=100。
+    /// 1..=100.
     pub(crate) max_batch_size: Option<u32>,
-    /// 毫秒，0..=60_000（归一化 schema `maxBatchTimeoutMs`）。
+    /// Milliseconds, 0..=60_000 (normalized schema `maxBatchTimeoutMs`).
     pub(crate) max_batch_timeout_ms: Option<u32>,
-    /// 0..=100。
+    /// 0..=100.
     pub(crate) max_retries: Option<u32>,
-    /// 秒，0..=86_400（归一化 `retryDelaySeconds`）。
+    /// Seconds, 0..=86_400 (normalized `retryDelaySeconds`).
     pub(crate) retry_delay_seconds: Option<u32>,
-    /// 1..=1000（平台派发并发上限）。
+    /// 1..=1000 (platform dispatch concurrency cap).
     pub(crate) max_concurrency: Option<u32>,
 }
 
-/// P3c-1 `durableObjectBindings[]` —— 字段与 wrangler
-/// `durable_objects.bindings[]` 对齐（`script_name` → `scriptName`
-/// 归一由 project_cfg 完成；vrt.toml 原生直接用 camelCase）。
+/// P3c-1 `durableObjectBindings[]` -- fields aligned with wrangler
+/// `durable_objects.bindings[]` (`script_name` -> `scriptName`
+/// normalization is done by project_cfg; the native vrt.toml uses camelCase directly).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoBindingToml {
-    /// `env.<name>` 上的 namespace stub 句柄。
+    /// The namespace stub handle on `env.<name>`.
     pub(crate) name: String,
-    /// 目标 worker 导出的 JS class 名。
+    /// The JS class name exported by the target worker.
     pub(crate) class_name: String,
-    /// wrangler `script_name` —— 同租户内另一 worker 名；省略 = 本
-    /// worker 声明该类。
+    /// wrangler `script_name` -- another worker name within the same tenant; omitted = this
+    /// worker declares the class.
     pub(crate) script_name: Option<String>,
 }
 
-/// P3c-1 `durableObjectMigrations[]` —— wrangler `[[migrations]]` 的
-/// 归一 shape。按数组序求值：`newClasses`/`newSqliteClasses` 声明、
-/// `renamedClasses` 继承存储身份、`deletedClasses` 移除。
+/// P3c-1 `durableObjectMigrations[]` -- the normalized shape of wrangler `[[migrations]]`.
+/// Evaluated in array order: `newClasses`/`newSqliteClasses` declare,
+/// `renamedClasses` inherit storage identity, `deletedClasses` remove.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoMigrationToml {
-    /// 人类可读 tag（CF 语义——仅标识用途，不参与求值）。
+    /// Human-readable tag (CF semantics -- identification only, not part of evaluation).
     pub(crate) tag: Option<String>,
-    /// KV 后端 class —— localDisk 下与 SQLite 同一存储，`enableSql=false`。
+    /// KV-backend class -- under localDisk the same storage as SQLite, `enableSql=false`.
     #[serde(default)]
     pub(crate) new_classes: Vec<String>,
-    /// SQLite 后端 class —— `enableSql=true`，暴露 `storage.sql`。
+    /// SQLite-backend class -- `enableSql=true`, exposes `storage.sql`.
     #[serde(default)]
     pub(crate) new_sqlite_classes: Vec<String>,
-    /// `{from,to}` —— `to` 继承 `from` 的 uniqueKey（数据保留）。
+    /// `{from,to}` -- `to` inherits `from`'s uniqueKey (data retained).
     #[serde(default)]
     pub(crate) renamed_classes: Vec<DoRenameToml>,
-    /// 移除 class 声明；数据目录在 generation 切换完成后清理。
+    /// Remove the class declaration; the data directory is cleaned after the generation switch completes.
     #[serde(default)]
     pub(crate) deleted_classes: Vec<String>,
 }
 
-/// P3c-1 `renamedClasses[]` 的 `{from,to}` 形状。
+/// The `{from,to}` shape of P3c-1 `renamedClasses[]`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoRenameToml {
-    /// 既有 class 名（当前版本或本 deploy 先前 migration step 声明）。
+    /// Existing class name (declared by the current version or by an earlier migration step in this deploy).
     pub(crate) from: String,
-    /// 新 class 名——继承 `from` 的 uniqueKey 与 enableSql。
+    /// New class name -- inherits `from`'s uniqueKey and enableSql.
     pub(crate) to: String,
 }
 
-/// W1 `[[workflows]]` —— 字段与 wrangler 对齐（`class_name` →
-/// `className`、`script_name` → `scriptName` 归一由 project_cfg 完
-/// 成）。MVP：只允许同 worker 的 class；`script_name` 指向其他
-/// worker 时 pack fail closed。
+/// W1 `[[workflows]]` -- fields aligned with wrangler (`class_name` ->
+/// `className`, `script_name` -> `scriptName` normalization is done by
+/// project_cfg). MVP: only classes of the same worker are allowed; when `script_name` points to another
+/// worker, pack fails closed.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkflowToml {
-    /// 工作流名（`^[A-Za-z0-9_-]{1,64}$`），worker 内唯一。
+    /// Workflow name (`^[A-Za-z0-9_-]{1,64}$`), unique within the worker.
     pub(crate) name: String,
-    /// `env.<binding>` 绑定名（JS identifier）。
+    /// `env.<binding>` binding name (JS identifier).
     pub(crate) binding: String,
-    /// 同 worker 导出的 `WorkflowEntrypoint` class 名。
+    /// The `WorkflowEntrypoint` class name exported by the same worker.
     pub(crate) class_name: String,
-    /// wrangler `script_name` —— 仅允许等于本 worker 名（same-
-    /// worker）；指向其他 worker 在 pack 拒绝（W1 范围限制）。
+    /// wrangler `script_name` -- only allowed to equal this worker's name (same-
+    /// worker); pointing at another worker is rejected at pack (W1 scope restriction).
     pub(crate) script_name: Option<String>,
-    /// `limits.steps`（1..=100_000）。
+    /// `limits.steps` (1..=100_000).
     pub(crate) limits_steps: Option<u32>,
 }
 
@@ -265,15 +265,15 @@ pub(crate) struct QuotasToml {
     pub(crate) outbound_connections: u32,
 }
 
-/// P3c-1：DO 打包上下文——部署密钥（uniqueKey HMAC 派生）与
-/// 当前激活版本的 class 集合（`renamed_classes` lineage 来源）。
-/// `None` ⇒ 任何 DO 声明都拒绝（`pack`/`pack_with_resolver` 无
-/// 密钥/状态上下文，产出的 uniqueKey 无法证明由服务端派生）。
+/// P3c-1: DO packing context -- the deploy key (uniqueKey HMAC derivation) and
+/// the class set of the currently active version (source of the `renamed_classes` lineage).
+/// `None` => any DO declaration is rejected (`pack`/`pack_with_resolver` have no
+/// key/state context, so the produced uniqueKey cannot be proven server-derived).
 pub struct DoPackCtx<'a> {
-    /// uniqueKey 派生密钥（standalone：signing seed；控制面：快照
-    /// 签名密钥材料）。只作 HMAC key，不持久化、不外发。
+    /// uniqueKey derivation key (standalone: the signing seed; control plane: the snapshot
+    /// signing key material). Used only as an HMAC key, never persisted or sent out.
     pub pepper: [u8; 32],
-    /// 当前激活版本声明的 class 集合（rename `from` 解析源）。
+    /// The class set declared by the currently active version (source for resolving rename `from`).
     pub prior_classes: &'a [DoClassDesired],
 }
 
@@ -309,13 +309,13 @@ pub struct PackedWorker {
     pub var_values: BTreeMap<String, String>,
     /// Desired crons.
     pub crons: Vec<CronDesired>,
-    /// T37b: desired queue consumers（queueId 已解析）。
+    /// T37b: desired queue consumers (queueId already resolved).
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
-    /// P3c-1: DO class 声明——migrations 求值结果，`uniqueKey`
-    /// 已由部署密钥 HMAC 派生，rename lineage 已解析。
+    /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
+    /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
-    /// W1: workflow 声明——`uniqueKey` 已由部署密钥 HMAC 派生
-    /// （`vrt-wf:` 域），same-worker 限制与名称/绑定校验已过。
+    /// W1: workflow declarations -- `uniqueKey` already derived by HMAC with the deploy key
+    /// (`vrt-wf:` domain), the same-worker restriction and name/binding validation have passed.
     pub workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired>,
     /// Declared hostnames (replaces state list when non-empty).
     pub hostnames: Vec<String>,
@@ -510,8 +510,8 @@ pub fn pack_with_resolver(
     pack_inner(worker_dir, overrides, tenant_id, resolve_worker, None)
 }
 
-/// [`pack_with_resolver`] + DO 上下文——deploy 入口（唯一能给
-/// uniqueKey 派生与 rename lineage 提供密钥/状态的调用方）。
+/// [`pack_with_resolver`] + DO context -- the deploy entry point (the only caller that can supply
+/// keys/state for uniqueKey derivation and rename lineage).
 pub fn pack_with_ctx(
     worker_dir: &Path,
     overrides: &DeployOverrides,
@@ -680,11 +680,11 @@ fn pack_inner(
             }));
         }
         for (binding, user_id) in &b.d1 {
-            // databaseId 由服务端派生（T34c/F2：含 tenant_id ——
-            // T35 多租户控制面接入时无需格式迁移；standalone 单租户
-            // 时等价 CF 账号级 database_id 语义）。同一实例内相同
-            // databaseId 的多个 Worker 共享同一数据库（D1 语义）；
-            // Worker 永远拿不到任意 id——签名快照覆盖派生值。
+            // databaseId is derived server-side (T34c/F2: includes tenant_id --
+            // no format migration is needed when the T35 multi-tenant control plane comes in; for standalone single-tenant
+            // it is equivalent to CF account-level database_id semantics). Multiple Workers in the same instance with the same
+            // databaseId share the same database (D1 semantics);
+            // a Worker never gets an arbitrary id -- the signed snapshot covers the derived value.
             if user_id.is_empty()
                 || user_id.len() > 64
                 || !user_id
@@ -709,10 +709,10 @@ fn pack_inner(
             ));
         }
         for (binding, queue_name) in &b.queue {
-            // T37: queueId 派生——sha256("vrt-q:{tenant}:{name}") 的
-            // 前 26 hex 字符（hex ⊂ [a-z0-9]，与 database_id 同一规则）。
-            // 同实例同名的多个 producer 共享同一队列（CF 语义）；
-            // worker 永远拿不到任意 id——签名快照覆盖派生值。
+            // T37: queueId derivation -- the first 26 hex chars of sha256("vrt-q:{tenant}:{name}")
+            // (hex is a subset of [a-z0-9], same rule as database_id).
+            // Multiple producers with the same name in the same instance share the same queue (CF semantics);
+            // a worker never gets an arbitrary id -- the signed snapshot covers the derived value.
             let digest = derive_queue_id(tenant_id, queue_name)?;
             bindings.push(BindingDesired::Queue(
                 snapshot_protocol::compute_desired::QueueBinding {
@@ -767,9 +767,9 @@ fn pack_inner(
     }
     bindings.extend(overrides.bindings.iter().cloned());
 
-    // T37b: `[[queueConsumers]]` —— 队列名 → queueId 派生（与
-    // producer 同一哈希规则）；DLQ 名同样派生，自指被拒；
-    // 数值边界与 snapshot-protocol 校验一致（双层 fail closed）。
+    // T37b: `[[queueConsumers]]` -- queue name -> queueId derivation (same hash rule as
+    // the producer); the DLQ name is derived likewise, self-reference rejected;
+    // numeric bounds match the snapshot-protocol validation (two-layer fail closed).
     let mut queue_consumers = Vec::with_capacity(meta.queue_consumers.len());
     for c in &meta.queue_consumers {
         let queue_id = derive_queue_id(tenant_id, &c.queue)?;
@@ -797,13 +797,13 @@ fn pack_inner(
 
     // Deterministic worker-id material: hash the worker name so a
     // re-deployed directory keeps its identity without stored state.
-    // （DO uniqueKey 派生也需要 —— 提到 assets 之前。）
+    // (DO uniqueKey derivation needs it too -- hoisted before assets.)
     let id_material = hex::encode(sha2::Sha256::digest(name.as_bytes()));
 
-    // P3c-1: Durable Objects —— migrations 按序求值为最终 class
-    // 集合；uniqueKey = HMAC(pepper, "vrt-do:{tenant}:{worker}:{class}")
-    // （ring hmac；pepper = 部署签名密钥材料 —— worker 无法预测，
-    // 服务端稳定；rename 继承 `from` 的 key 使目录跨改名存活）。
+    // P3c-1: Durable Objects -- migrations are evaluated in order into the final class
+    // set; uniqueKey = HMAC(pepper, "vrt-do:{tenant}:{worker}:{class}")
+    // (ring hmac; pepper = deploy signing key material -- unpredictable to the worker,
+    // stable server-side; rename inherits `from`'s key so the directory survives renames).
     let worker_id = format!("w_{}", &id_material[..16]);
     let mut durable_object_classes: Vec<DoClassDesired> = Vec::new();
     let has_do_cfg =
@@ -846,9 +846,9 @@ fn pack_inner(
                 if declared.contains_key(&rename.to) {
                     return Err(LocalError::Worker("do rename target declared"));
                 }
-                // `from` 的存储身份 = 本 deploy 已声明值，否则查当前
-                // 激活版本；两者都没有 → rename 指向不存在的 class，
-                // 静默丢弃数据的风险 → fail closed。
+                // `from`'s storage identity = the value already declared in this deploy, otherwise look up the current
+                // active version; if neither has it -> the rename points at a nonexistent class,
+                // risking silent data loss -> fail closed.
                 let entry = declared.remove(&rename.from).or_else(|| {
                     ctx.prior_classes
                         .iter()
@@ -878,8 +878,8 @@ fn pack_inner(
             }
         }
         durable_object_classes = declared.into_values().collect();
-        // 声明了 bindings 但无 class 声明：本 worker 至少有一个
-        // 非 script_name 绑定 → fail closed（与快照校验同向）。
+        // bindings declared but no class declaration: this worker has at least one
+        // non-script_name binding -> fail closed (same direction as snapshot validation).
         for b in &meta.durable_object_bindings {
             valid_do_name(&b.name)?;
             valid_do_name(&b.class_name)?;
@@ -906,12 +906,12 @@ fn pack_inner(
         }
     }
 
-    // W1 `[[workflows]]`；W7 起 `script_name` 可指向同租户另一
+    // W1 `[[workflows]]`; since W7 `script_name` may point to another worker in the same tenant
     // worker —— uniqueKey = HMAC(pepper,
-    // "vrt-wf:{tenant}:{definingWorker}:{wfName}")（与 DO class 同一
-    // 身份域不同前缀；定义者归属 → 存储/op 都在目标 worker 名下，
-    // 与 CF 一致）。目标必须是已部署 worker（resolve_worker 404
-    // → fail closed，与 DO script_name 相同）。
+    // "vrt-wf:{tenant}:{definingWorker}:{wfName}") (same
+    // identity domain as DO classes with a different prefix; ownership by the defining worker -> both storage and op are under the target worker name,
+    // consistent with CF). The target must be a deployed worker (resolve_worker 404
+    // -> fail closed, same as DO script_name).
     let mut workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired> = Vec::new();
     if !meta.workflows.is_empty() {
         let ctx = do_ctx.ok_or(LocalError::Worker("workflows require deploy context"))?;
@@ -943,8 +943,8 @@ fn pack_inner(
                     return Err(LocalError::Worker("workflow limits.steps bounds"));
                 }
             }
-            // uniqueKey 派生域含 DEFINING worker —— 引擎存储归属
-            // script_name 目标；目标侧字段在 desired 层另行校验。
+            // the uniqueKey derivation domain includes the DEFINING worker -- engine storage belongs to
+            // the script_name target; target-side fields are validated separately at the desired layer.
             let defining = service_worker_id.clone().unwrap_or(worker_id.clone());
             // W7 deploy-gate: same-worker class_name must be a named
             // export AND a WorkflowEntrypoint subclass — missing
@@ -1097,9 +1097,9 @@ fn scan_dir(
     Ok(())
 }
 
-/// P3c-1：JS 标识符检查（class 名与 binding 名同规则——
-/// `^[A-Za-z_$][A-Za-z0-9_$]{0,63}$`，与 binding name 校验一致；
-/// class 名上限放宽到 128 与 CF 一致）。
+/// P3c-1: JS identifier check (class names and binding names follow the same rule --
+/// `^[A-Za-z_$][A-Za-z0-9_$]{0,63}$`, consistent with binding name validation;
+/// the class name cap is relaxed to 128, consistent with CF).
 fn valid_do_name(value: &str) -> Result<(), LocalError> {
     let ok = !value.is_empty()
         && value.len() <= 128
@@ -1119,13 +1119,13 @@ fn valid_do_name(value: &str) -> Result<(), LocalError> {
     }
 }
 
-/// P3c-1：`uniqueKey = HMAC-SHA256(pepper,
-/// "vrt-do:{tenant}:{worker}:{class}")` —— 64 hex。派生输入不含
-/// 用户可控的存储身份：tenant/worker/class 是部署身份，pepper 是
-/// 部署密钥（standalone signing seed / 控制面快照密钥）——worker
-/// 既无法预测也无法伪造另一个 class 的存储目录。
-/// W1：`vrt-wf:{tenant}:{worker}:{wfName}` → 64-hex 存储身份，
-/// 与 DO uniqueKey 同域不同前缀（engine class 目录独立于用户类）。
+/// P3c-1: `uniqueKey = HMAC-SHA256(pepper,
+/// "vrt-do:{tenant}:{worker}:{class}")` -- 64 hex. The derivation input contains no
+/// user-controllable storage identity: tenant/worker/class are deploy identities, the pepper is
+/// the deploy key (standalone signing seed / control-plane snapshot key) -- a worker
+/// can neither predict nor forge another class's storage directory.
+/// W1: `vrt-wf:{tenant}:{worker}:{wfName}` -> 64-hex storage identity,
+/// same domain as DO uniqueKey with a different prefix (the engine class directory is independent of user classes).
 pub fn derive_wf_unique_key(
     pepper: &[u8; 32],
     tenant_id: &str,
@@ -1140,7 +1140,7 @@ pub fn derive_wf_unique_key(
     hex::encode(tag.as_ref())
 }
 
-/// W1：workflow name 校验（`^[A-Za-z0-9_-]{1,64}$`）。
+/// W1: workflow name validation (`^[A-Za-z0-9_-]{1,64}$`).
 fn valid_workflow_name(name: &str) -> Result<(), LocalError> {
     if name.is_empty()
         || name.len() > 64
@@ -1169,9 +1169,9 @@ pub fn derive_do_unique_key(
     hex::encode(tag.as_ref())
 }
 
-/// T37/T37b：`vrt-q:{tenant}:{name}` → sha256 前 26 hex 字符
-/// （hex ⊂ `[a-z0-9]{26}`，vrt-sql 路径规则）。standalone 无控制面
-/// provision——同名队列在实例内唯一。
+/// T37/T37b: `vrt-q:{tenant}:{name}` -> first 26 hex chars of sha256
+/// (hex is a subset of `[a-z0-9]{26}`, vrt-sql path rules). standalone has no control-plane
+/// provisioning -- queue names with the same name are unique within the instance.
 pub fn derive_queue_id(tenant_id: &str, queue_name: &str) -> Result<String, LocalError> {
     if queue_name.is_empty()
         || queue_name.len() > 64

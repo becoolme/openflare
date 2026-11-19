@@ -17,7 +17,7 @@
 //!
 //! The token file carries the scoped cluster ingest token
 //! (`vrt.cell-controller` scope — `deriveClusterEventIngestScopedToken`).
-//! Production pod transport + k8s Lease are 未证实 here — the binary uses
+//! Production pod transport + k8s Lease are unverified here -- the binary uses
 //! `UnavailablePodChannel` (fails loud → PARTIAL, never fake APPLIED) and
 //! an in-memory lease (single replica).
 
@@ -114,7 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         source,
         channel,
         ack,
-        // 未证实: production NetworkPolicy applier (k8s client) — not
+        // Unverified: production NetworkPolicy applier (k8s client) -- not
         // wired. With `egress_required` (default true) this fails
         // closed: PARTIAL `egress-policy-unavailable` acks and
         // /healthz degradation until a real applier lands.
@@ -462,8 +462,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
     {
         tracing::info!("queue dispatcher enabled");
-        // 独立 1s 任务：consumer maxBatchTimeout ≥1s 的语义要求
-        // 亚 reconcile 周期的 claim 节拍（T37b §8）。
+        // Independent 1s task: the semantics of consumer maxBatchTimeout >=1s require
+        // a claim cadence finer than the reconcile period (T37b section 8).
         let ctl = controller.dispatch_handle();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));

@@ -1,15 +1,15 @@
-//! 可注入时钟（T36）：lease 到期/续租/边界判定全部走 `Clock`，
-//! 测试可确定性推进。
+//! Injectable clock (T36): lease expiry/renewal/boundary decisions all go through `Clock`,
+//! so tests can advance time deterministically.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 毫秒级墙钟。
+/// Millisecond wall clock.
 pub trait Clock: Send + Sync + std::fmt::Debug {
-    /// unix epoch 毫秒。
+    /// Unix epoch milliseconds.
     fn now_ms(&self) -> u64;
 }
 
-/// 系统时钟。
+/// System clock.
 #[derive(Debug)]
 pub struct SystemClock;
 
@@ -22,7 +22,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// 测试时钟：手动推进，确定性边界测试。
+/// Test clock: manually advanced, for deterministic boundary tests.
 #[derive(Debug)]
 pub struct TestClock {
     t: AtomicU64,

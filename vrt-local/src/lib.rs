@@ -299,11 +299,11 @@ impl VrtLocal {
         let _lock = lock::StateLock::acquire(&self.root)?;
         let key = keys::load_signing_key(&self.root)?;
         let st_probe = state::read(&self.root)?;
-        // P3c-1：DO uniqueKey 的 HMAC pepper = signing seed（部署
-        // 密钥）；rename lineage 源 = 该 worker 当前激活版本的
-        // class 集合（首次部署为空——`renamed_classes`/`deleted_
-        // classes` 指向不存在的 class → fail closed）。worker name
-        // 先经同一 meta 加载路径解析（与 pack 内的决定一致）。
+        // P3c-1: the HMAC pepper for DO uniqueKey = signing seed (deploy
+        // key); the rename lineage source = the class set of the worker's currently
+        // active version (empty on first deploy -- `renamed_classes`/`deleted_
+        // classes` pointing at a nonexistent class -> fail closed). The worker name
+        // is first resolved through the same meta load path (consistent with the decision inside pack).
         let do_ctx = {
             let pepper = keys::load_signing_seed(&self.root)?;
             let (meta, _src) = crate::project_cfg::load_worker_meta(worker_dir)?;

@@ -1,10 +1,10 @@
-# VRT 独立模式 —— vrt-sql 示例配置（T34→T36）。
-# 持久化（T36 §4）：对象存储 fs 后端，manifest CAS lease + ack 前段
-# 上传；backend=none 仅测试/dev（启动 WARN，生产拒绝缺省）。键名 camelCase。
+# VRT standalone mode -- vrt-sql example config (T34->T36).
+# Persistence (T36 section 4): object-store fs backend, manifest CAS lease + segments uploaded
+# before ack; backend=none is for test/dev only (WARN at startup, production rejects the default). Key names are camelCase.
 dbRoot = "__VRT_ROOT__/sql/data"
-listenTcp = "__VRT_SQL_LISTEN__"      # 内部网络；与 unixDir 恰设其一
-# unixDir = "__VRT_ROOT__/sql"       # 或 UDS：{unixDir}/vrt-sql.sock
-metricsListen = "__VRT_SQL_METRICS__" # 仅 /metrics（内部，不公开）
+listenTcp = "__VRT_SQL_LISTEN__"      # internal network; exactly one of this and unixDir
+# unixDir = "__VRT_ROOT__/sql"       # or UDS: {unixDir}/vrt-sql.sock
+metricsListen = "__VRT_SQL_METRICS__" # /metrics only (internal, not public)
 bookmarkSecretFile = "__VRT_ROOT__/keys/sql-bookmark.secret"
 authSecretFile = "__VRT_ROOT__/keys/sql-auth.secret"
 globalConcurrency = 64
@@ -19,5 +19,5 @@ clockSkewMarginMs = 500
 checkpointEveryCommits = 64
 retentionMs = 86400000
 [persistence.fs]
-# 独立对象卷目录（standalone compose: 独立卷挂在 /data/objstore）。
+# Separate object volume directory (standalone compose: a separate volume mounted at /data/objstore).
 root = "__VRT_ROOT__/objstore"

@@ -677,7 +677,7 @@
     {
       "name": "workflow-name-unicode",
       "field": "workflowName",
-      "value": "流程",
+      "value": "\u6d41\u7a0b",
       "expect": "reject"
     },
     {
@@ -731,7 +731,7 @@
     {
       "name": "r69-cron-u3000",
       "field": "cron",
-      "value": "0　 0 * * *",
+      "value": "0\u3000 0 * * *",
       "expect": "reject"
     },
     {

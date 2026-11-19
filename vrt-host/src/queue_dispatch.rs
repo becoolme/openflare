@@ -63,8 +63,8 @@ pub struct QueueDispatchState {
     /// MIG-11: bounded serialized-switch hold ceilings — shared with
     /// ingress/cron/wfops via [`SwitchHoldParams`].
     pub hold: SwitchHoldParams,
-    /// T37b-r5：dispatch 日志限流（每 key 每 10s 至多一条）——
-    /// dispatcher 轮询路径，无界 info 会刷屏；拒绝路径单独计数。
+    /// T37b-r5: dispatch log rate limiting (at most one per key per 10s) --
+    /// the dispatcher polling path would be flooded by unbounded info; rejection paths are counted separately.
     log_throttle: std::sync::Mutex<std::collections::BTreeMap<String, std::time::Instant>>,
 }
 
@@ -121,9 +121,9 @@ struct DispatchBody {
     dispatch: serde_json::Value,
 }
 
-/// T37b-r6：上游响应体诊断片段 —— ≤256B 可打印 ASCII（其余 '.'）。
-/// facade/上游错误体不含消息 body；仍按不信任输入脱敏，与
-/// dispatcher 侧 `snippet()` 同规则。
+/// T37b-r6: upstream response body diagnostic snippet -- <=256B printable ASCII (others '.').
+/// The facade/upstream error body does not contain the message body; still sanitized as untrusted input, with
+/// the same rule as the dispatcher-side `snippet()`.
 fn snippet(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -168,8 +168,8 @@ fn wake_reject(state: &QueueDispatchState, code: &'static str, msg: &'static str
 
 async fn dispatch(State(state): State<Arc<QueueDispatchState>>, request: Request) -> Response {
     let t0 = std::time::Instant::now();
-    // T37b-r5：每次拒绝打一条限流 warn——typed code 直接可诊断；
-    // 拒绝可能发生在 body 解析前（tenant 未知）→ 分开打。
+    // T37b-r5: log a rate-limited warn on every rejection -- the typed code is directly diagnosable;
+    // a rejection may happen before body parsing (unknown tenant) -> logged separately.
     macro_rules! reject {
         ($status:expr, $code:expr, $msg:expr) => {{
             if state.log_allow(&format!("reject:{}", $code)) {
@@ -374,10 +374,10 @@ async fn dispatch(State(state): State<Arc<QueueDispatchState>>, request: Request
     };
     let endpoint = slot.endpoint().clone();
     let payload = body.dispatch.to_string();
-    // T37b-r6：必须 origin-form + Host —— ingress 的 upstream 约定
-    // （ingress.rs 同构）。此前 absolute-form URI 且无 Host：
-    // workerd socket 服务无法构造 request.url → 裸文本 "Bad
-    // Request" 400（dispatcher 侧报 malformed）。
+    // T37b-r6: must be origin-form + Host -- the ingress upstream convention
+    // (same shape as ingress.rs). Previously an absolute-form URI with no Host:
+    // the workerd socket service could not construct request.url -> bare-text "Bad
+    // Request" 400 (the dispatcher side reported malformed).
     let req = match hyper::Request::builder()
         .method(hyper::http::Method::POST)
         .uri("/vrt/queue-dispatch")
@@ -460,8 +460,8 @@ async fn dispatch(State(state): State<Arc<QueueDispatchState>>, request: Request
                 &[("worker_id", &body.worker_id), ("outcome", "delivered")],
                 1.0,
             );
-            // T37b-r5：每次派发一条限流 info —— tenant/worker/queue/
-            // 条数/状态码/耗时，让投递链可观测。
+            // T37b-r5: one rate-limited info per dispatch -- tenant/worker/queue/
+            // message count/status code/duration, making the delivery chain observable.
             if state.log_allow(&format!("ok:{}:{}", body.tenant_id, body.worker_id)) {
                 tracing::info!(
                     tenant = %body.tenant_id,

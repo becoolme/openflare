@@ -9,7 +9,7 @@
 //!
 //! Probes hit the pod's `GET /readyz` over loopback HTTP — bounded
 //! body, hard timeout, typed JSON. Unix-socket probing is a follow-up
-//! (reqwest lacks the transport here; 未证实 noted in the doc).
+//! (reqwest lacks the transport here; noted as unverified in the doc).
 
 use crate::assign::PodAssignment;
 use crate::pod::{PodApplyResult, PodChannel, PodError, PodProbeResult, TenantFailure};

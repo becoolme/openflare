@@ -832,11 +832,11 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
             }
             "queues" => {
                 // T37: `queues.producers[]` → queue bindings.
-                // T37b: `queues.consumers[]` → `queueConsumers`（归一化
-                // camelCase，字段白名单与 CF wrangler schema 对齐；
-                // `queue`/`dead_letter_queue` 为显示名，queueId 在
-                // 打包期由 vrt-q:{tenant}:{name} 派生）。其余键 fail
-                // closed。
+                // T37b: `queues.consumers[]` -> `queueConsumers` (normalized
+                // camelCase, field allowlist aligned with the CF wrangler schema;
+                // `queue`/`dead_letter_queue` are display names, queueId is
+                // derived at pack time from vrt-q:{tenant}:{name}). Other keys fail
+                // closed.
                 let q = value
                     .as_object()
                     .ok_or_else(|| invalid("queues", "must be a table"))?;
@@ -920,8 +920,8 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                             c.insert(camel.into(), Value::from(n));
                         }
                     }
-                    // 秒→毫秒/同名字段——归一化 schema 与 TS 一致
-                    // （maxBatchTimeoutMs / retryDelaySeconds）。
+                    // seconds -> milliseconds / same-name field -- the normalized schema matches TS
+                    // (maxBatchTimeoutMs / retryDelaySeconds).
                     if let Some(n) = opt_u64(
                         e.get("max_batch_timeout"),
                         &format!("queues.consumers[{i}].max_batch_timeout"),
@@ -960,9 +960,9 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
             }
             "durable_objects" => {
                 // P3c-1: `durable_objects.bindings[]` →
-                // `durableObjectBindings`（camelCase 归一；白名单与
-                // CF wrangler schema 对齐——`environment`/`experimental_
-                // version` 等字段不在本轮范围 → unsupported）。
+                // `durableObjectBindings` (camelCase normalization; allowlist aligned with
+                // the CF wrangler schema -- fields such as `environment`/`experimental_
+                // version` are out of scope this round -> unsupported).
                 let d = value
                     .as_object()
                     .ok_or_else(|| invalid("durable_objects", "must be a table"))?;
@@ -1018,8 +1018,8 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 }
             }
             "migrations" => {
-                // P3c-1: `[[migrations]]` → `durableObjectMigrations`。
-                // CF 的 cumulative migration 语义在 pack 求值。
+                // P3c-1: `[[migrations]]` -> `durableObjectMigrations`.
+                // CF's cumulative migration semantics are evaluated in pack.
                 // DO1 standalone decision: `transferred_classes` stays
                 // REJECTED here — standalone mints uniqueKey as
                 // HMAC(tenant:worker:class), so a transfer would
@@ -1028,7 +1028,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 // platform runtime carries `transferFromWorkerId`
                 // lineage in the signed desired; standalone has no
                 // control plane to mint it → explicit unsupported,
-                // never a silent wrong key.其余键 fail closed。
+                // never a silent wrong key. Other keys fail closed.
                 let arr = value
                     .as_array()
                     .ok_or_else(|| invalid("migrations", "must be an array of tables"))?;
@@ -1590,8 +1590,8 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     r2.insert(name.into(), Value::from(bucket));
                 }
                 "d1" => {
-                    // 用户侧标识（database_id 或 binding 名）；真实的
-                    // databaseId 在打包期由服务端派生。
+                    // User-side identifier (database_id or binding name); the real
+                    // databaseId is derived server-side at pack time.
                     let id = b.get("databaseId").and_then(|i| i.as_str()).unwrap_or(name);
                     d1.insert(name.into(), Value::from(id));
                 }
@@ -1609,8 +1609,8 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     service.insert(name.into(), Value::from(target));
                 }
                 "queue" => {
-                    // 用户侧队列名（wrangler `queue`）；真实 queueId
-                    // 在打包期由 vrt-q:{tenant}:{name} 派生。
+                    // User-side queue name (wrangler `queue`); the real queueId
+                    // is derived at pack time from vrt-q:{tenant}:{name}.
                     let qn = b.get("queue").and_then(|i| i.as_str()).unwrap_or(name);
                     queue.insert(name.into(), Value::from(qn));
                 }
@@ -1694,8 +1694,8 @@ mod tests {
         #[serde(rename = "configFile")]
         config_file: Option<String>,
         expect: Expectation,
-        /// T34: 平台 TS 归一化层暂拒 d1（资源 API 属 T35），standalone
-        /// Rust 侧接受——向量可携带 `rustExpect` 覆盖 `expect`。
+        /// T34: the platform TS normalization layer temporarily rejects d1 (the resource API belongs to T35); standalone
+        /// Rust side accepts it -- a vector may carry `rustExpect` to override `expect`.
         #[serde(rename = "rustExpect", default)]
         rust_expect: Option<Expectation>,
     }

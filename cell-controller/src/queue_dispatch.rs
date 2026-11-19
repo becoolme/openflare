@@ -33,7 +33,7 @@
 //! settles correctly (its message leases are valid), and the
 //! successor simply cannot re-claim those ids until expiry. Delivery
 //! is at-least-once by construction: a crash between delivery and
-//! settlement re-delivers after `msg_lease_ms` (§8 文档).
+//! settlement re-delivers after `msg_lease_ms` (section 8 of the doc).
 //!
 //! Bounds (startup-validated, fail closed): `msg_lease_ms` must
 //! exceed `delivery_timeout + SETTLE_MARGIN` — a message lease that
@@ -50,29 +50,29 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use vrt_provider::d1::{SqlAuthSigner, SQL_AUTH_HEADER, SQL_EPOCH_HEADER, SQL_SEQ_HEADER};
 
-// vrt-sql epoch/seq 头名复用 vrt_provider::d1 常量（`x-vrt-epoch`/
-// `x-vrt-seq`）——签名覆盖头值，名字错了验签直接 401（T37b 自审
-// 修正：早前误写 x-vrt-sql-* 前缀）。queue ops 无 per-db epoch，
-// 恒 1；seq 仍须单调。
+// The vrt-sql epoch/seq header names reuse the vrt_provider::d1 constants (`x-vrt-epoch`/
+// `x-vrt-seq`) -- the signature covers the header values, so a wrong name fails verification with a 401 (T37b self-review
+// fix: an earlier version wrongly used an x-vrt-sql-* prefix). Queue ops have no per-db epoch,
+// so it is always 1; seq must still be monotonic.
 
-/// 全局在飞批上限默认 —— 慢 consumer 不得饿死整个 cell。
+/// Default global cap on in-flight batches -- a slow consumer must not starve the whole cell.
 pub const GLOBAL_INFLIGHT_MAX: usize = 32;
-/// 投递后到结算余量（msg lease 必须 > 投递超时 + 此余量）。
+/// Margin between delivery and settlement (msg lease must be > delivery timeout + this margin).
 const SETTLE_MARGIN: Duration = Duration::from_secs(15);
-/// dispatch holder TTL 默认 15s（claim 每 tick 续约；崩溃后接管
-/// 延迟 ≤ TTL）。
+/// Default dispatch holder TTL is 15s (claim renews it every tick; takeover
+/// delay after a crash is <= TTL).
 pub const DISPATCH_TTL_DEFAULT_MS: i64 = 15_000;
-/// 消息 lease 默认 90s（> 投递超时 60s + 余量 15s）。
+/// Default message lease is 90s (> delivery timeout 60s + margin 15s).
 pub const MSG_LEASE_DEFAULT_MS: i64 = 90_000;
-/// 默认批投递超时 —— 低于 facade 内部 55s 之上的上游 70s 上限，
-/// 且必须 < msg_lease（启动校验强制）。
+/// Default batch delivery timeout -- below the upstream 70s cap that sits above the facade's internal 55s,
+/// and must be < msg_lease (enforced by startup validation).
 const DELIVERY_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
-/// T37b-r: claim 原始 body 字节预算默认 4MB —— 全局 32 并发下每
-/// 跳最坏缓冲 ~4.1MB×2(hex)+envelope ≈ 8.5MB,替代旧的
-/// 100×128KB≈25.7MB 标定。
+/// T37b-r: default claim raw body byte budget is 4MB -- with 32 global concurrency the per-hop
+/// worst-case buffering is ~4.1MB x2 (hex) + envelope ~= 8.5MB, replacing the old
+/// 100x128KB ~= 25.7MB sizing.
 pub const CLAIM_BUDGET_DEFAULT_BYTES: u64 = 4 * 1024 * 1024;
-/// 预算上界 —— 与 vrt-sql `CLAIM_BYTES_MAX` 对齐；更大预算没有
-/// 意义（producer 单批 288KB,claim 上限 100×128KB=12.8MB）。
+/// Upper bound of the budget -- aligned with vrt-sql `CLAIM_BYTES_MAX`; a larger budget has no
+/// point (producer batch is 288KB, claim cap is 100x128KB=12.8MB).
 pub const CLAIM_BUDGET_MAX_BYTES: u64 = 32 * 1024 * 1024;
 fn unix_nanos() -> u64 {
     std::time::SystemTime::now()
@@ -85,23 +85,23 @@ fn unix_ms_now() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
-/// Dispatcher 启动配置 —— 由 `[queue_dispatch]`(平台）或
-/// `vrt serve` 参数（standalone）构造；`validate` fail closed。
+/// Dispatcher startup config -- built from `[queue_dispatch]` (platform) or
+/// `vrt serve` arguments (standalone); `validate` fails closed.
 #[derive(Clone, Debug)]
 pub struct DispatchConfig {
-    /// `_vrt_q_dispatch.holder` 身份（`[a-zA-Z0-9_.:-]{1,64}`——
-    /// vrt-sql 侧强校验）。
+    /// `_vrt_q_dispatch.holder` identity (`[a-zA-Z0-9_.:-]{1,64}` --
+    /// strictly validated on the vrt-sql side).
     pub holder_id: String,
-    /// 派发租约 TTL（claim 内嵌 CAS 写入）。
+    /// Dispatch lease TTL (written via CAS embedded in claim).
     pub dispatch_ttl_ms: i64,
-    /// 消息 lease TTL——必须 > delivery_timeout + SETTLE_MARGIN。
+    /// Message lease TTL -- must be > delivery_timeout + SETTLE_MARGIN.
     pub msg_lease_ms: i64,
-    /// 批投递超时（HTTP→facade→queue() 全链）。
+    /// Batch delivery timeout (the full HTTP -> facade -> queue() chain).
     pub delivery_timeout: Duration,
-    /// 全局在飞批上限。
+    /// Global cap on in-flight batches.
     pub global_inflight_max: usize,
-    /// T37b-r: 每 lane pending 的原始 body 字节预算（claim 请求
-    /// 的 `maxBytes`)。pending 达到预算即停 claim 并即刻组批。
+    /// T37b-r: per-lane raw body byte budget for pending messages (the claim request's
+    /// `maxBytes`). Once pending reaches the budget, stop claiming and form a batch immediately.
     pub claim_max_bytes: u64,
 }
 
@@ -119,9 +119,9 @@ impl Default for DispatchConfig {
 }
 
 impl DispatchConfig {
-    /// §8 硬性不变量：`msg_lease > delivery_timeout + settle_margin`
-    /// —— lease 先于结算过期会让接班者在原投递仍在飞时重投，
-    /// 双重投递超过至少一次语义的设计余量。
+    /// Section 8 hard invariant: `msg_lease > delivery_timeout + settle_margin`
+    /// -- if the lease expires before settlement, a successor re-delivers while the original delivery is still in flight,
+    /// and the double delivery exceeds the design margin of at-least-once semantics.
     pub fn validate(&self) -> Result<(), String> {
         if self.holder_id.is_empty()
             || self.holder_id.len() > 64
@@ -156,28 +156,28 @@ impl DispatchConfig {
     }
 }
 
-/// vrt-sql 调用失败 —— 分类决定 dispatcher 行为（退避 vs 放弃批）。
+/// vrt-sql call failure -- the classification decides dispatcher behavior (back off vs abandon the batch).
 #[derive(Debug)]
 pub enum SqlCallError {
-    /// `VRT_QUEUE_DISPATCH_LEASE` —— 他人持约；载荷 = 持约到期 ms。
+    /// `VRT_QUEUE_DISPATCH_LEASE` -- held by someone else; payload = lease expiry in ms.
     DispatchHeld { expires_at_ms: i64 },
-    /// `VRT_QUEUE_LEASE_LOST` —— 本批 lease_id 失效（租约过期/被
-    /// 接管后消息被重新 claim）；本批放弃结算。
+    /// `VRT_QUEUE_LEASE_LOST` -- this batch's lease_id is invalid (the lease expired or, after
+    /// takeover, the messages were re-claimed); abandon settlement of this batch.
     LeaseLost,
-    /// `VRT_FENCED`/`VRT_QUEUE_DROPPED`/`VRT_UNAVAILABLE` 等其余
-    /// wire code（`retryable` 透传）。
+    /// Other wire codes such as `VRT_FENCED`/`VRT_QUEUE_DROPPED`/`VRT_UNAVAILABLE`
+    /// (`retryable` passed through).
     Backend {
         code: String,
         status: u16,
         retryable: bool,
     },
-    /// 连接/超时/JSON 解析失败。
+    /// Connection / timeout / JSON parse failure.
     Transport,
 }
 
-/// `/queues/{id}/{op}` 签名客户端 —— 与 `vrt_provider::d1::D1Client`
-/// 同一 wire（`x-vrt-sql-auth` v1 签名 + epoch + seq）；queue ops
-/// 无数据库 epoch，恒 1。
+/// Signed client for `/queues/{id}/{op}` -- same wire as `vrt_provider::d1::D1Client`
+/// (`x-vrt-sql-auth` v1 signature + epoch + seq); queue ops
+/// have no database epoch, so it is always 1.
 pub struct QueueSqlClient {
     http: reqwest::Client,
     addr: String,
@@ -187,16 +187,16 @@ pub struct QueueSqlClient {
 }
 
 impl QueueSqlClient {
-    /// `addr` 必须通过 `d1ops::validate_data_plane_endpoint`（loopback
-    /// 或集群内 Service DNS 名，http + 显式端口；认证靠 HMAC 签名，
-    /// 与 D1OpsExecutor 同一约束）。
+    /// `addr` must pass `d1ops::validate_data_plane_endpoint` (loopback
+    /// or an in-cluster Service DNS name, http + explicit port; authentication relies on the HMAC signature,
+    /// same constraint as D1OpsExecutor).
     pub fn new(addr: &str, secret: Vec<u8>, timeout: Duration) -> Result<Self, String> {
         Self::with_policy(addr, secret, timeout, true)
     }
 
-    /// `require_loopback=false` 仅供 standalone：compose 内部
-    /// 网络主机名（如 `http://vrt-sql:8090`）是算子配置的信任
-    /// 边界，与 provider→vrt-sql 同一信道/同一签名模型。
+    /// `require_loopback=false` is for standalone only: the compose internal
+    /// network hostname (e.g. `http://vrt-sql:8090`) is a trust boundary configured by the
+    /// operator, same channel / same signing model as provider->vrt-sql.
     pub fn with_policy(
         addr: &str,
         secret: Vec<u8>,
@@ -245,8 +245,8 @@ impl QueueSqlClient {
         }
     }
 
-    /// `POST /queues/{id}/{op}` —— 单次尝试绝不重试（写路径幂等
-    /// 由调用方的结算语义保证）。
+    /// `POST /queues/{id}/{op}` -- a single attempt, never retried (write-path idempotency
+    /// is guaranteed by the caller's settlement semantics).
     async fn call(
         &self,
         queue_id: &str,
@@ -362,9 +362,9 @@ impl QueueSqlClient {
         .map(|_| ())
     }
 
-    /// T37b-r5：平台侧失败归还（consumer 未执行）——`visible_at=
-    /// now+delay`、清 lease、`attempts-1` 补偿 claim 的 +1；不消耗
-    /// 重试预算，平台故障期间消息留在队列不丢。
+    /// T37b-r5: platform-side failure give-back (consumer did not run) -- `visible_at=
+    /// now+delay`, clear the lease, `attempts-1` compensates the +1 from claim; does not consume
+    /// the retry budget, so messages stay in the queue and are not lost during a platform outage.
     async fn release(
         &self,
         queue_id: &str,
@@ -400,7 +400,7 @@ impl QueueSqlClient {
         .map(|_| ())
     }
 
-    /// DLQ 转投入队（同原 msg id ⇒ 幂等）。
+    /// DLQ forwarding enqueue (same original msg id => idempotent).
     async fn dlq_send(&self, dlq_queue_id: &str, msgs: &[&PendingMsg]) -> Result<(), SqlCallError> {
         let body = serde_json::json!({
             "messages": msgs.iter().map(|m| serde_json::json!({
@@ -415,8 +415,8 @@ impl QueueSqlClient {
     }
 }
 
-/// facade 返回的 QueueResult（workerFetch queue() RPC 结果经
-/// facade-qconsumer 归一化后的形状）。
+/// QueueResult returned by the facade (the shape of the workerFetch queue() RPC result after
+/// normalization by facade-qconsumer).
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct QueueOutcome {
@@ -442,10 +442,10 @@ pub struct RetryMessage {
     pub delay_seconds: Option<u32>,
 }
 
-/// 投递失败分类。`reason` 只进指标与日志（bounded 'static 标签）；
-/// `detail` 是有界诊断（HTTP 状态 + ≤256B 脱敏片段——vrt-host 的
-/// typed 错误体只含 code/message，绝不回显消息 body）。
-/// 所有 DeliveryError 都是平台侧失败：consumer 代码没有执行。
+/// Delivery failure classification. `reason` only goes into metrics and logs (bounded 'static label);
+/// `detail` is a bounded diagnostic (HTTP status + <=256B sanitized snippet -- vrt-host's
+/// typed error body only contains code/message and never echoes the message body).
+/// Every DeliveryError is a platform-side failure: the consumer code did not run.
 #[derive(Debug)]
 pub struct DeliveryError {
     pub reason: &'static str,
@@ -461,7 +461,7 @@ impl DeliveryError {
     }
 }
 
-/// 单条 claim 消息（dispatcher 内部表示）。
+/// A single claimed message (the dispatcher's internal representation).
 #[derive(Debug, Clone)]
 pub struct PendingMsg {
     pub id: String,
@@ -472,16 +472,16 @@ pub struct PendingMsg {
     pub timestamp_ms: i64,
 }
 
-/// 投递请求 —— vrt-host `/v1/queue/dispatch` body。
+/// Delivery request -- the vrt-host `/v1/queue/dispatch` body.
 #[derive(Debug)]
 pub struct DispatchRequest {
     pub tenant_id: String,
     pub worker_id: String,
-    /// facade 载荷 `{queue, messages[], metadata}`。
+    /// facade payload `{queue, messages[], metadata}`.
     pub dispatch: serde_json::Value,
 }
 
-/// 投递传输边界（生产:HTTP → pod control；测试:memory）。
+/// Delivery transport boundary (production: HTTP -> pod control; tests: memory).
 #[async_trait::async_trait]
 pub trait QueueInvoker: Send + Sync {
     async fn dispatch(
@@ -491,8 +491,8 @@ pub trait QueueInvoker: Send + Sync {
     ) -> Result<QueueOutcome, DeliveryError>;
 }
 
-/// `POST {pod}/v1/queue/dispatch` —— pod base 复用 `[[pods]]`
-/// loopback readyz 端点（同 HttpCronInvoker 校验）。
+/// `POST {pod}/v1/queue/dispatch` -- the pod base reuses the `[[pods]]`
+/// loopback readyz endpoint (same validation as HttpCronInvoker).
 pub struct HttpQueueInvoker {
     pods: BTreeMap<String, String>,
     client: reqwest::Client,
@@ -561,8 +561,8 @@ impl QueueInvoker for HttpQueueInvoker {
             reason: "transport",
             detail: Some(format!("status={status} body-read: {e}")),
         })?;
-        // vrt-host typed 错误先判定（`{delivered:false,error:{code}}`
-        // 形状也会被 QueueOutcome 的全-default 解析吞掉 → 必须先查）。
+        // Judge the vrt-host typed error first (the `{delivered:false,error:{code}}`
+        // shape would also be swallowed by QueueOutcome's all-default parse -> it must be checked first).
         if let Some(code) = platform_error_code(&bytes) {
             return Err(DeliveryError {
                 reason: platform_reason(&code),
@@ -576,8 +576,8 @@ impl QueueInvoker for HttpQueueInvoker {
     }
 }
 
-/// vrt-host `/v1/queue/dispatch` typed 错误体（queue_dispatch.rs::
-/// `err()`）——`{delivered:false, error:{code}}` → 有界 code。
+/// vrt-host `/v1/queue/dispatch` typed error body (queue_dispatch.rs::
+/// `err()`) -- `{delivered:false, error:{code}}` -> bounded code.
 fn platform_error_code(bytes: &[u8]) -> Option<String> {
     let doc: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     if doc.get("delivered").and_then(|v| v.as_bool()) != Some(false) {
@@ -594,8 +594,8 @@ fn platform_error_code(bytes: &[u8]) -> Option<String> {
     .then(|| code.to_string())
 }
 
-/// bounded 'static reason 标签（指标 label 集合必须封闭）——未知
-/// code 归一到 `platform`，code 本体在 detail/log 里。
+/// Bounded 'static reason label (the metric label set must be closed) -- an unknown
+/// code is normalized to `platform`, and the code itself goes in detail/log.
 fn platform_reason(code: &str) -> &'static str {
     match code {
         "VRT_QDISP_NO_CONSUMER" => "no_consumer",
@@ -618,8 +618,8 @@ fn platform_reason(code: &str) -> &'static str {
     }
 }
 
-/// ≤256B 日志片段：只留可打印 ASCII（控制字符→'.'）。响应体经
-/// vrt-host 生成/透传，不含消息 body；仍按不信任输入脱敏。
+/// <=256B log snippet: keep printable ASCII only (control characters -> '.'). The response body is
+/// generated/passed through by vrt-host and does not contain the message body; still sanitized as untrusted input.
 fn snippet(bytes: &[u8]) -> String {
     bytes
         .iter()
@@ -634,7 +634,7 @@ fn snippet(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// 解析后的 per-lane consumer 配置（Option 字段 → 具体值）。
+/// Resolved per-lane consumer config (Option fields -> concrete values).
 #[derive(Debug, Clone)]
 struct ResolvedConsumer {
     queue_name: String,
@@ -665,52 +665,52 @@ struct Lane {
     worker_id: String,
     pod_id: String,
     cfg: ResolvedConsumer,
-    /// 已 claim 未派发的消息（跨 claim 可混 lease_id —— 结算按
-    /// lease_id 分组）。
+    /// Messages claimed but not yet dispatched (lease_ids may be mixed across claims --
+    /// settlement groups by lease_id).
     pending: Vec<PendingMsg>,
-    /// 首个 pending 的入队时刻（批超时计时起点）。
+    /// Enqueue time of the first pending message (start of the batch timeout clock).
     pending_since_ms: Option<i64>,
-    /// T37b-r: pending 原始 body 字节累计（hex 长度/2）——claim
-    /// 预算的存量扣减项。
+    /// T37b-r: accumulated raw body bytes of pending (hex length/2) -- the deduction
+    /// term of the claim budget.
     pending_bytes: u64,
-    /// 在飞批数（≤ cfg.max_concurrency）。
+    /// Number of in-flight batches (<= cfg.max_concurrency).
     inflight: usize,
-    /// 派发租约退避截止（DispatchLeaseLost 载荷）。
+    /// Dispatch lease backoff deadline (DispatchLeaseLost payload).
     not_before_ms: i64,
-    /// T37b-r6 release 重试队列：`release` 后端失败的消息按
-    /// lease 分组暂存，下一 tick 重试（每 tick 每组一次）；lease
-    /// 到期后端自然 LeaseLost → 组移除（消息已被接班者接管）。
-    /// 有界：≤ inflight×batch。
+    /// T37b-r6 release retry queue: messages whose `release` failed on the backend are
+    /// parked grouped by lease and retried on the next tick (once per group per tick); after the lease
+    /// expires the backend naturally returns LeaseLost -> the group is removed (the messages were taken over by a successor).
+    /// Bounded: <= inflight x batch.
     release_retry: Vec<(String, Vec<PendingMsg>)>,
-    /// T37b-r5 平台侧失败（consumer 未执行）lane 级退避：该时刻前
-    /// 不 claim（消息已 release 回队列、attempts 不消耗）——避免
-    /// transport/malformed 循环的热循环。
+    /// T37b-r5 lane-level backoff after a platform-side failure (consumer did not run): no
+    /// claim before this instant (messages were released back to the queue, attempts not consumed) -- avoids a
+    /// hot loop on transport/malformed cycles.
     platform_not_before_ms: i64,
-    /// 平台失败连击计数（决定退避时长；任一良形响应清零）。
+    /// Consecutive platform failure count (determines backoff duration; any well-formed response resets it).
     platform_streak: u32,
-    /// 最近一次 claim 的派发 epoch（观测）。
+    /// Dispatch epoch of the most recent claim (observability).
     dispatch_epoch: u64,
-    /// 上批结算失败后的最小重试时刻（结算失败退避）。
+    /// Earliest retry time after the previous batch's settlement failed (settlement failure backoff).
     settle_not_before_ms: i64,
 }
 
-/// 队列 dispatcher —— `tick` 由 controller 循环每 ~1s 驱动。
+/// Queue dispatcher -- `tick` is driven by the controller loop about every ~1s.
 pub struct QueueDispatcher {
     sql: Arc<QueueSqlClient>,
     invoker: Arc<dyn QueueInvoker>,
     cfg: DispatchConfig,
     lanes: Arc<Mutex<BTreeMap<String, Lane>>>,
     global_sem: Arc<tokio::sync::Semaphore>,
-    /// T37b-r4：claim/deliver/settle 错误日志限流 —— “每 key 每
-    /// 10s 至多一条”，重复失败不刷屏但绝不静默（现场曾出现
-    /// “lease 拿到了但之后完全静默”，根因全靠猜）。
+    /// T37b-r4: rate limiting of claim/deliver/settle error logs -- "at most one per key per
+    /// 10s", so repeated failures do not flood the log but are never silent (in the field there was once a
+    /// "lease acquired but completely silent afterwards" case, and the root cause was found only by guessing).
     log_throttle: Arc<LogThrottle>,
-    /// test hook：统计 spawn 的投递批数。
+    /// Test hook: counts spawned delivery batches.
     #[cfg(test)]
     pub dispatched: AtomicU64,
 }
 
-/// 限流器 —— std Mutex（同步快路径，无 await 持锁）。
+/// Rate limiter -- std Mutex (synchronous fast path, no lock held across await).
 struct LogThrottle(std::sync::Mutex<BTreeMap<String, std::time::Instant>>);
 
 impl Default for LogThrottle {
@@ -720,7 +720,7 @@ impl Default for LogThrottle {
 }
 
 impl LogThrottle {
-    /// 该 key 距上次放行 ≥ `iv`（或首次）→ true 并记录时间。
+    /// True and records the time if the key is >= `iv` since its last pass (or first time).
     fn allow(&self, key: &str, iv: Duration) -> bool {
         let now = std::time::Instant::now();
         let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -738,20 +738,20 @@ impl LogThrottle {
     }
 }
 
-/// warn 日志限流间隔 —— 持续失败每 10s 一条，恢复后下一条正常。
+/// Interval for rate limiting warn logs -- persistent failures log once per 10s; after recovery the next one is normal.
 const LOG_WARN_INTERVAL: Duration = Duration::from_secs(10);
 
-/// One tick 的可观测摘要（controller/metrics 聚合）。
+/// Observable summary of one tick (aggregated by controller/metrics).
 #[derive(Debug, Default)]
 pub struct DispatchTickOutcome {
     pub claimed: usize,
     pub dispatched: usize,
-    /// 本 tick 被他人持约拒绝的队列数。
+    /// Number of queues rejected this tick because someone else holds the lease.
     pub lease_lost: usize,
-    /// vrt-sql/transport 错误的 claim 数。
+    /// Number of claims with vrt-sql/transport errors.
     pub claim_errors: usize,
-    /// claim 成功（含空批）即本端持约的队列数——T37b-r 选主日志/
-    /// `vrt_queue_dispatcher_lease` 的依据。
+    /// Number of queues where this side holds the lease (claim succeeded, including empty batches) -- basis for the T37b-r leader-election log /
+    /// `vrt_queue_dispatcher_lease`.
     pub lease_held: usize,
 }
 
@@ -774,9 +774,9 @@ impl QueueDispatcher {
         })
     }
 
-    /// One scheduling tick：`desired` = 已验证的 applied 快照
-    /// （`None`/过期 = 无派发权——与 cron 同一权威门）；
-    /// `assignments` = pod 表（worker→pod）。
+    /// One scheduling tick: `desired` = the verified applied snapshot
+    /// (`None`/expired = no dispatch authority -- same authority gate as cron);
+    /// `assignments` = the pod table (worker -> pod).
     pub async fn tick(
         &self,
         desired: Option<&ComputeDesired>,
@@ -790,10 +790,10 @@ impl QueueDispatcher {
             .zip(desired_expires_at)
             .is_some_and(|(_, exp)| exp > now);
         if !authorized {
-            // 无权威快照 ⇒ 无派发权（fail closed——过期 desired
-            // 绝不能继续消费）。lease gauge 也要发——这是
-            // "dispatcher 活着但空转"的可观测基线（standalone
-            // e2e diag 依赖这个 series 存在）。
+            // No authoritative snapshot => no dispatch authority (fail closed -- an expired desired
+            // must never keep consuming). The lease gauge is also emitted -- this is the
+            // observable baseline for "dispatcher alive but idle" (the standalone
+            // e2e diag depends on this series existing).
             crate::metrics::queue_lease(false, 0);
             self.lanes.lock().await.clear();
             return out;
@@ -806,7 +806,7 @@ impl QueueDispatcher {
                 pod_of.insert((w.tenant_id.as_str(), w.worker_id.as_str()), pod.as_str());
             }
         }
-        // queue_id → lane spec（快照级唯一已由 validate 强制）。
+        // queue_id -> lane spec (snapshot-level uniqueness is already enforced by validate).
         let mut wanted: BTreeMap<String, (String, String, String, ResolvedConsumer)> =
             BTreeMap::new();
         for tenant in &desired.tenants {
@@ -815,7 +815,7 @@ impl QueueDispatcher {
                     let Some(pod) =
                         pod_of.get(&(tenant.tenant_id.as_str(), worker.worker_id.as_str()))
                     else {
-                        continue; // consumer worker 未分配——本 cell 不派发
+                        continue; // consumer worker not assigned -- this cell does not dispatch
                     };
                     wanted.insert(
                         consumer.queue_id.clone(),
@@ -829,8 +829,8 @@ impl QueueDispatcher {
                 }
             }
         }
-        // 摘除不在 desired 的 lane —— 其 pending 消息保持已租状态
-        // （lease 到期自然可见重投），绝不派发已摘除的 consumer。
+        // Remove lanes that are not in desired -- their pending messages stay leased
+        // (they become visible and are re-delivered after the lease expires), and a removed consumer is never dispatched to.
         {
             let mut lanes = self.lanes.lock().await;
             lanes.retain(|qid, _| wanted.contains_key(qid));
@@ -851,18 +851,18 @@ impl QueueDispatcher {
                     dispatch_epoch: 0,
                     settle_not_before_ms: 0,
                 });
-                // desired 变更（pod 迁移/配置更新）就地刷新——inflight
-                // 批继续按旧 pod 结算（lease 语义保证正确性）。
+                // Refresh in place when desired changes (pod migration / config update) -- inflight
+                // batches keep settling against the old pod (lease semantics guarantee correctness).
                 lane.tenant_id = tenant;
                 lane.worker_id = worker;
                 lane.pod_id = pod;
                 lane.cfg = cfg;
             }
-            // claim/派发决策在同一 lane 锁内完成（tick 串行驱动）。
+            // claim/dispatch decisions are made within the same lane lock (ticks are driven serially).
             for (qid, lane) in lanes.iter_mut() {
-                // T37b-r6 release 重试：上 tick 后端失败的组每 tick
-                // 每组一次（delay=0 —— lane 退避已过，立即重可见）;
-                // lease 到期 → LeaseLost 自清（消息被接班者接管）。
+                // T37b-r6 release retry: groups whose backend call failed on the previous tick are retried once
+                // per group per tick (delay=0 -- the lane backoff has passed, make visible again immediately);
+                // if the lease expired -> LeaseLost clears itself (messages were taken over by a successor).
                 if !lane.release_retry.is_empty() {
                     let groups = std::mem::take(&mut lane.release_retry);
                     for (lease, msgs) in groups {
@@ -903,15 +903,15 @@ impl QueueDispatcher {
                 if now_ms < lane.not_before_ms {
                     continue;
                 }
-                // T37b-r5：平台侧退避期整条 lane 休眠——已 release 的
-                // 消息在 delay 后重可见，新消息按序等待；派发租约
-                // 任其过期无害（同 holder 下一 tick CAS 接管）。
+                // T37b-r5: during platform-side backoff the whole lane sleeps -- released
+                // messages become visible again after the delay, new messages wait in order; letting the dispatch lease
+                // expire is harmless (the same holder takes it over via CAS on the next tick).
                 if now_ms < lane.platform_not_before_ms {
                     continue;
                 }
-                // 1) claim 补足 pending（每次 claim 同时续约派发租约）。
-                //    T37b-r: 字节预算扣减存量——pending 已满预算则不
-                //    再 claim（组批条件里 bytes>=budget 会即刻派发）。
+                // 1) claim to top up pending (every claim also renews the dispatch lease).
+                //    T37b-r: the byte budget deducts the existing amount -- once pending has filled the budget,
+                //    do not claim more (bytes>=budget in the batching condition dispatches immediately).
                 let byte_room = self.cfg.claim_max_bytes.saturating_sub(lane.pending_bytes);
                 if lane.pending.len() < lane.cfg.batch_size as usize
                     && lane.inflight < lane.cfg.max_concurrency as usize
@@ -948,8 +948,8 @@ impl QueueDispatcher {
                             }
                             let got = lane.pending.len() - pending_before;
                             out.claimed += got;
-                            // T37b-r4：每轮 claim 必须留痕（debug）——
-                            // “租约持有但完全静默”不允许再出现。
+                            // T37b-r4: every claim round must leave a trace (debug) --
+                            // "lease held but completely silent" must not happen again.
                             tracing::debug!(
                                 queue = %qid,
                                 got,
@@ -995,8 +995,8 @@ impl QueueDispatcher {
                         }
                     }
                 }
-                // 2) 批就绪：满批、超时（批超时自首个 pending 起算）
-                //    或字节预算满（T37b-r——bytes 批不空等 timeout）。
+                // 2) batch ready: full batch, timeout (batch timeout counts from the first pending)
+                //    or byte budget full (T37b-r -- a bytes batch does not idly wait for the timeout).
                 let ready = !lane.pending.is_empty()
                     && lane.inflight < lane.cfg.max_concurrency as usize
                     && (lane.pending.len() >= lane.cfg.batch_size as usize
@@ -1026,8 +1026,8 @@ impl QueueDispatcher {
         out
     }
 
-    /// 异步投递+结算 —— tick 不阻塞；全局 semaphore + lane inflight
-    /// 双门。
+    /// Asynchronous delivery + settlement -- tick does not block; global semaphore + lane inflight
+    /// double gate.
     fn spawn_deliver(&self, queue_id: String, lane: &Lane, batch: Vec<PendingMsg>, _now_ms: i64) {
         let sql = self.sql.clone();
         let invoker = self.invoker.clone();
@@ -1072,8 +1072,8 @@ impl QueueDispatcher {
             .await;
             let latency = started.elapsed().as_secs_f64();
             crate::metrics::queue_latency(latency);
-            // T37b-r4：deliver 失败此前完全静默（transport/timeout 只进
-            // 指标）——连接被拒/超时/非法端点必须 warn（限流）。
+            // T37b-r4: deliver failures used to be completely silent (transport/timeout only went into
+            // metrics) -- connection refused / timeout / invalid endpoint must warn (rate limited).
             match &outcome {
                 Ok(Err(e)) => {
                     if throttle.allow(&format!("deliver:{qid2}"), LOG_WARN_INTERVAL) {
@@ -1096,10 +1096,10 @@ impl QueueDispatcher {
                 }
                 Ok(Ok(_)) => {}
             }
-            // T37b-r5：平台侧 vs 用户侧判定。DeliveryError 全是平台
-            // 侧（consumer 未执行：transport/timeout/malformed/
-            // unassigned/typed host errors）→ release，不耗 attempts；
-            // QueueOutcome 只在能证明 consumer 执行过时进正常结算。
+            // T37b-r5: platform-side vs user-side judgment. DeliveryError is entirely platform-
+            // side (consumer did not run: transport/timeout/malformed/
+            // unassigned/typed host errors) -> release, attempts not consumed;
+            // QueueOutcome goes into normal settlement only when it can prove the consumer ran.
             enum Verdict {
                 Consumer(QueueOutcome),
                 Platform {
@@ -1112,9 +1112,9 @@ impl QueueDispatcher {
                     if consumer_ran(&r) {
                         Verdict::Consumer(r)
                     } else {
-                        // outcome="error"（facade envelope 拒绝，consumer
-                        // 未执行）或未知 outcome —— 视为平台侧，绝不
-                        // 凭未识别契约烧 attempts。
+                        // outcome="error" (facade envelope rejection, consumer
+                        // did not run) or an unknown outcome -- treated as platform-side, never
+                        // burn attempts on an unrecognized contract.
                         Verdict::Platform {
                             code: "consumer_rejected",
                             detail: Some(r.outcome.clone()),
@@ -1133,9 +1133,9 @@ impl QueueDispatcher {
             match verdict {
                 Verdict::Platform { code, detail } => {
                     crate::metrics::queue_consumer_error(code);
-                    // 连 pending 一起归还——partial batch 的 lease 会在
-                    // 退避期过期，backend 重新可见 + 重复 claim 会烧
-                    // attempts/造成双投；平台失败一律全部 release。
+                    // Give back the pending ones too -- the lease of a partial batch would expire during
+                    // the backoff window, the backend would make it visible again, and a duplicate claim would burn
+                    // attempts / cause double delivery; a platform failure always releases everything.
                     let (delay_secs, rest) = {
                         let mut lanes = lanes.lock().await;
                         match lanes.get_mut(&qid2) {
@@ -1185,7 +1185,7 @@ impl QueueDispatcher {
                             "queue batch outcome not ok — settling retries"
                         );
                     }
-                    // outcome 来源不可信（facade 透传 workerd 字段）——
+                    // The outcome source is untrusted (facade passes through workerd fields) --
                     // Bounded label set: known outcomes pass through,
                     // rest fold to "other".
                     crate::metrics::queue_consumer_error(match result.outcome.as_str() {
@@ -1202,7 +1202,7 @@ impl QueueDispatcher {
                     let mut lanes = lanes.lock().await;
                     if let Some(l) = lanes.get_mut(&qid2) {
                         l.inflight = l.inflight.saturating_sub(1);
-                        // 良形响应 = 平台可达 —— 退避清零。
+                        // Well-formed response = platform reachable -- reset the backoff.
                         l.platform_streak = 0;
                         l.platform_not_before_ms = 0;
                     }
@@ -1212,13 +1212,13 @@ impl QueueDispatcher {
     }
 }
 
-/// T37b-r5 用户侧判定 —— QueueOutcome 能证明 consumer 代码执行过
-/// 才走正常结算（attempts 消耗、maxRetries、DLQ 语义）。CF/workerd
-/// 语义里 "ok"|"exception"|"timeout" 都是 consumer 执行过的结局
-/// （facade 的 timeout = handler 超 55s，属用户侧）；显式 ack/
-/// retry 标记也说明 consumer 接触了消息。其余（facade envelope
-/// 拒绝的 "error"、未知 outcome）一律平台侧——绝不凭未识别契约
-/// 烧 attempts。
+/// T37b-r5 user-side judgment -- only when QueueOutcome can prove the consumer code ran
+/// does it go through normal settlement (attempts consumed, maxRetries, DLQ semantics). In CF/workerd
+/// semantics "ok"|"exception"|"timeout" are all outcomes where the consumer ran
+/// (the facade's timeout = handler exceeded 55s, which is user-side); an explicit ack/
+/// retry mark also shows the consumer touched the message. Everything else (the facade envelope
+/// rejection "error", unknown outcomes) is platform-side -- never
+/// burn attempts on an unrecognized contract.
 fn consumer_ran(r: &QueueOutcome) -> bool {
     matches!(r.outcome.as_str(), "ok" | "exception" | "timeout")
         || r.ack_all
@@ -1228,9 +1228,9 @@ fn consumer_ran(r: &QueueOutcome) -> bool {
         || !r.retry_messages.is_empty()
 }
 
-/// T37b-r5 平台侧 lane 退避：streak 次失败后 1s 起 ×2 指数，上限
-/// 60s，加 ≤base/4 抖动（qid+nanos 混合）。有界 ⇒ 无热循环；任一
-/// 良形响应清零。
+/// T37b-r5 platform-side lane backoff: after `streak` failures, starts at 1s and doubles exponentially, capped at
+/// 60s, plus <=base/4 jitter (qid+nanos mix). Bounded => no hot loop; any
+/// well-formed response resets it.
 fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
     let base = 1u64
         .checked_shl(streak.saturating_sub(1).min(6))
@@ -1244,13 +1244,13 @@ fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
     (base + h % (jitter_span + 1)).min(64) as u32
 }
 
-/// T37b-r5 平台侧归还：按 lease_id 分组调 `release`——visible_at
-/// 延迟到退避点、attempts-1 补偿；LeaseLost 放弃该组（接班者已
-/// 重新 claim）；其它错误 warn——消息租约到期自然重投（attempts
-/// 未补偿的保守漂移，已在文档注明）。
-/// 返回后端失败待重试的 (lease_id, msgs) 组——调用方存进
-/// `lane.release_retry`，下一 tick 重试；消息在 lease 到期前
-/// 不会丢可见性，重试窗口有界于 lease TTL。
+/// T37b-r5 platform-side give-back: calls `release` grouped by lease_id -- visible_at
+/// delayed to the backoff point, attempts-1 compensation; LeaseLost abandons that group (a successor has already
+/// re-claimed); other errors warn -- the message lease expires and the message is naturally re-delivered (attempts
+/// are not compensated, a conservative drift documented in the doc).
+/// Returns the (lease_id, msgs) groups whose backend call failed and await retry -- the caller stores them in
+/// `lane.release_retry` for retry on the next tick; messages do not
+/// lose visibility before the lease expires, and the retry window is bounded by the lease TTL.
 async fn settle_release(
     sql: &QueueSqlClient,
     throttle: &Arc<LogThrottle>,
@@ -1309,10 +1309,10 @@ fn parse_claimed(m: &serde_json::Value) -> Option<PendingMsg> {
     })
 }
 
-/// 结算一批 —— miniflare `processResponse` 语义
-/// （broker.worker.js:220-235,354-374），按 lease_id 分组调用
-/// ack/retry/dead-letter；LeaseLost 放弃该组（消息已被接班者
-/// 重新 claim——绝不能误动他人批次）。
+/// Settle a batch -- miniflare `processResponse` semantics
+/// (broker.worker.js:220-235,354-374), calling ack/retry/dead-letter
+/// grouped by lease_id; LeaseLost abandons that group (the messages were already re-claimed
+/// by a successor -- another's batch must never be touched by mistake).
 async fn settle(
     sql: &QueueSqlClient,
     throttle: &Arc<LogThrottle>,
@@ -1335,7 +1335,7 @@ async fn settle(
         .map(|r| r.msg_id.as_str())
         .chain(explicit_retry.iter().copied())
         .collect();
-    // per lease_id 分组 —— ack/retry/dlq 各一张表。
+    // Grouped per lease_id -- one table each for ack/retry/dlq.
     let mut acks: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut retries: BTreeMap<&str, Vec<(String, u32)>> = BTreeMap::new();
     let mut dlq: BTreeMap<&str, Vec<&PendingMsg>> = BTreeMap::new();
@@ -1348,7 +1348,7 @@ async fn settle(
             acks.entry(lease).or_default().push(m.id.clone());
             continue;
         }
-        // attempts = 本次投递序号（claim 时 +1）——超限进 DLQ。
+        // attempts = this delivery's sequence number (+1 on claim) -- over the limit goes to the DLQ.
         if m.attempts >= cfg.max_retries + 1 {
             dlq.entry(lease).or_default().push(m);
             continue;
@@ -1421,13 +1421,13 @@ async fn settle(
     for (lease, msgs) in &dlq {
         let n = msgs.len();
         if let Some(dlq_id) = &cfg.dlq_queue_id {
-            // 先写入 DLQ（同 msg id ⇒ 幂等去重）再 dead-letter 源
-            // 队列——失败则本批由 lease 到期重投，绝不双写不丢失。
+            // Write to the DLQ first (same msg id => idempotent dedup), then dead-letter the source
+            // queue -- on failure this batch is re-delivered after lease expiry, never double-written and never lost.
             match sql.dlq_send(dlq_id, msgs).await {
                 Ok(()) => {}
-                // 任何 DLQ 写失败都跳过 dead_letter —— 源行保租约
-                // 到期重投 ⇒ 重走 DLQ 路径并按 id 幂等去重。
-                // "DLQ 不可用时消息保留在原队列"（任务验收语义）。
+                // Any DLQ write failure skips dead_letter -- the source row keeps its lease and is
+                // re-delivered after expiry => takes the DLQ path again and is deduplicated idempotently by id.
+                // "When the DLQ is unavailable the message stays in the original queue" (task acceptance semantics).
                 Err(e) => {
                     crate::metrics::queue_settle_blocked("dlq_send", n);
                     if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
@@ -1449,7 +1449,7 @@ async fn settle(
                     "dropped"
                 };
                 crate::metrics::queue_delivered(mode, n);
-                // 死信是丢消息语义 —— 每批都留痕（info，天然按批限流）。
+                // A dead letter means dropping the message -- leave a trace for every batch (info, naturally rate limited per batch).
                 tracing::info!(
                     queue = %queue_id, mode, n,
                     "queue batch dead-lettered after max retries"
@@ -1478,10 +1478,10 @@ async fn settle(
 }
 
 // ---------------------------------------------------------------------------
-// 测试 —— 进程内 fake vrt-sql（按 wire.rs 端点形状语义实现：派发租约
-// CAS、消息 lease_id/attempts/lease_expiry、幂等 send）+ memory invoker，
-// 覆盖 T37b 验收：outcome 各分支 / delay 优先序 / DLQ 转投与不可达 /
-// 派发租约排他 / 陈旧结算被拒 / 慢 consumer 公平性 / 结算前崩溃重投。
+// Tests -- in-process fake vrt-sql (implements semantics per the wire.rs endpoint shapes: dispatch lease
+// CAS, message lease_id/attempts/lease_expiry, idempotent send) + memory invoker,
+// covering T37b acceptance: outcome branches / delay precedence / DLQ forwarding and unreachability /
+// dispatch lease exclusivity / stale settlement rejected / slow consumer fairness / redelivery after a crash before settlement.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
@@ -1577,7 +1577,7 @@ mod tests {
                 let max = body["max"].as_u64().unwrap_or(0) as usize;
                 let lttl = body["leaseTtlMs"].as_i64().unwrap_or(0);
                 let max_bytes = body["maxBytes"].as_u64();
-                // 派发租约 CAS
+                // dispatch lease CAS
                 if let Some((h, exp)) = &q.holder {
                     if h != holder && *exp > now {
                         return (
@@ -1605,7 +1605,7 @@ mod tests {
                     if msgs.len() >= max {
                         break;
                     }
-                    // T37b-r: 同真实现——raw bytes 预算 + ≥1 保底。
+                    // T37b-r: same as the real implementation -- raw bytes budget + a >=1 floor.
                     let nb = acc_bytes.saturating_add(m.body_hex.len() as u64 / 2);
                     if !msgs.is_empty() && max_bytes.is_some_and(|b| nb > b) {
                         break;
@@ -1681,8 +1681,8 @@ mod tests {
                         }
                     }
                     "release" => {
-                        // T37b-r5：同真实现——lease 清、visible 延迟、
-                        // attempts-1 补偿 claim 的 +1。
+                        // T37b-r5: same as the real implementation -- lease cleared, visible delay,
+                        // attempts-1 compensates the +1 from claim.
                         for (i, item) in body["items"].as_array().unwrap().iter().enumerate() {
                             let id = &ids[i];
                             let delay = item["delaySecs"].as_i64().unwrap_or(0);
@@ -1809,9 +1809,9 @@ mod tests {
         }
     }
 
-    /// 每次调用返回同一份 outcome（raw JSON 重解码）——用户侧失败
-    /// 需要持续多次（T37b-r5 后 transport 不再消耗 attempts，不能
-    /// 再拿它模拟 handler throw）。
+    /// Returns the same outcome on every call (raw JSON re-decoded) -- user-side failures
+    /// need to persist across many calls (after T37b-r5 transport no longer consumes attempts, so it can
+    /// no longer be used to simulate a handler throw).
     struct StickyInvoker {
         raw: Value,
         calls: AtomicU64,
@@ -1835,8 +1835,8 @@ mod tests {
         serde_json::from_value(v).unwrap()
     }
 
-    /// 恒 ok invoker —— `FakeInvoker` 的 result 是 consume-once，
-    /// 任何需要多批投递的测试必须用这个。
+    /// Always-ok invoker -- the result of `FakeInvoker` is consume-once,
+    /// so any test needing multi-batch delivery must use this one.
     struct AlwaysOk {
         calls: AtomicU64,
     }
@@ -1887,8 +1887,8 @@ mod tests {
         .unwrap()
     }
 
-    /// 批超时是真实 1s —— 首个 tick 只 claim;1.1s 后第二 tick
-    /// 才会组满/超时派发。
+    /// The batch timeout is a real 1s -- the first tick only claims; the second tick after 1.1s
+    /// fills up / times out and dispatches.
     async fn tick_pair(
         d: &QueueDispatcher,
         desired: &ComputeDesired,
@@ -1951,7 +1951,7 @@ mod tests {
         let assigns = assignments();
         let out = d.tick(None, None, &assigns, chrono::Utc::now()).await;
         assert_eq!(out.claimed, 0);
-        // 过期 desired 同样无派发权
+        // An expired desired likewise has no dispatch authority
         let out = d
             .tick(
                 Some(&d0),
@@ -1967,7 +1967,7 @@ mod tests {
     #[tokio::test]
     async fn ack_all_delivers_and_acks() {
         let (addr, world) = spawn_fake_sql().await;
-        // 预置一条消息
+        // Preload one message
         {
             let mut w = world.lock().unwrap();
             let q = w.queues.entry(QID.into()).or_default();
@@ -1999,7 +1999,7 @@ mod tests {
                 .unwrap_or(false)
         })
         .await;
-        // facade 载荷：queue 显示名 + 消息形状
+        // facade payload: queue display name + message shape
         let calls = inv.last.lock().unwrap();
         assert_eq!(calls[0]["queue"], "q1");
         assert_eq!(calls[0]["messages"][0]["id"], "m1");
@@ -2022,7 +2022,7 @@ mod tests {
                 );
             }
         }
-        // a 显式 retry(消息级 delay 3s),b 显式 ack,c 批级默认 → ack
+        // a explicit retry (message-level delay 3s), b explicit ack, c batch-level default -> ack
         let inv = Arc::new(FakeInvoker {
             result: StdMutex::new(Ok(outcome(json!({
                 "outcome": "ok",
@@ -2070,8 +2070,8 @@ mod tests {
                 },
             );
         }
-        // T37b-r5：transport 属平台侧不再消耗 attempts——handler
-        // throw 改用用户侧 outcome=exception（consumer 执行过）。
+        // T37b-r5: transport is platform-side and no longer consumes attempts -- handler
+        // throw now uses the user-side outcome=exception (the consumer ran).
         let inv = Arc::new(StickyInvoker {
             raw: json!({"outcome":"exception"}),
             calls: AtomicU64::new(0),
@@ -2094,7 +2094,7 @@ mod tests {
                 .unwrap_or(false)
         })
         .await;
-        // 第二轮 claim 重投，attempts 递增
+        // Second round claim re-delivers, attempts incremented
         let out = tick_pair(&d, &desired, exp, &assignments()).await;
         assert!(out.claimed >= 1);
         settle_until(&world, |w| {
@@ -2109,12 +2109,12 @@ mod tests {
     #[tokio::test]
     async fn max_retries_boundary_goes_to_dlq() {
         let (addr, world) = spawn_fake_sql().await;
-        // DLQ 队列存在
+        // The DLQ queue exists
         {
             let mut w = world.lock().unwrap();
             w.queues.entry(DLQID.into()).or_default();
             let q = w.queues.entry(QID.into()).or_default();
-            // attempts=2 已用尽 3 次投递（maxRetries=2）→ 本批 settle 进 DLQ
+            // attempts=2 means 3 deliveries are used up (maxRetries=2) -> this batch settles into the DLQ
             q.msgs.insert(
                 "m1".into(),
                 FakeMsg {
@@ -2152,7 +2152,7 @@ mod tests {
         })
         .await;
         let w = world.lock().unwrap();
-        // claim 时 attempts 已 +1 → 3 = maxRetries+1 → DLQ 转投 + dead-letter
+        // On claim attempts is already +1 -> 3 = maxRetries+1 -> DLQ forwarding + dead-letter
         assert!(
             w.queues[DLQID].msgs.contains_key("m1"),
             "transferred to DLQ"
@@ -2166,14 +2166,14 @@ mod tests {
         let (addr, world) = spawn_fake_sql().await;
         {
             let mut w = world.lock().unwrap();
-            // DLQID 不存在于 fake world? —— fake 会 or_default 创建它!
-            // 用 "DLQ 不可达" 的另一语义: dlq_send 指向一个真实不存在
-            // 的 id 在 fake 中照样建表。改为模拟 send 失败——让 DLQ
-            // 的 send 永远 duplicate? 不行。最简单:把 dlq 指向一个
-            // 非 26 位 id? fake 不校验 id。这里改为直接验证"send 失败
-            // 不 dead-letter": 先让 dlq_send 成功(幂等), dead_letter
-            // 再失败是另一路径。真正的"DLQ 写失败" 在 fake 里制造:
-            // 给 FakeQueue 加 send_fail 开关更干净。
+            // DLQID does not exist in the fake world? -- the fake creates it via or_default!
+            // Use another meaning of "DLQ unreachable": dlq_send pointing at an id that really does not exist
+            // still creates the table in the fake. Switch to simulating send failure -- make the DLQ's
+            // send always duplicate? No. Simplest: point the dlq at a
+            // non-26-char id? The fake does not validate ids. Here, switch to directly verifying "send failure
+            // does not dead-letter": first make dlq_send succeed (idempotent), a dead_letter
+            // failure afterwards is a different path. A real "DLQ write failure" is produced in the fake:
+            // adding a send_fail switch to FakeQueue would be cleaner.
             let q = w.queues.entry(QID.into()).or_default();
             q.msgs.insert(
                 "m1".into(),
@@ -2184,12 +2184,12 @@ mod tests {
                 },
             );
         }
-        // 用一个"send 必失败"的 dlq id —— fake world 没有失败开关,
-        // 改用非队列 id 使 fake_op 的 or_default 仍建表—— 换个思路:
-        // dlq_send 失败等价于 transport——QueueSqlClient 调
-        // /queues/{dlq}/send; 我们把 dispatcher 的 dlq id 指向一个
-        // 不存在的 SECOND fake? 同进程只有一个 fake。最干净:给 fake
-        // 加全局 "send_fail_for" 集合。
+        // Use a dlq id whose "send must fail" -- the fake world has no failure switch,
+        // switching to a non-queue id still lets fake_op's or_default create the table -- another approach:
+        // a dlq_send failure is equivalent to transport -- QueueSqlClient calls
+        // /queues/{dlq}/send; point the dispatcher's dlq id at a
+        // nonexistent SECOND fake? Only one fake per process. Cleanest: give the fake
+        // a global "send_fail_for" set.
         let inv = Arc::new(FakeInvoker {
             result: StdMutex::new(Ok(outcome(
                 json!({"outcome":"ok","explicitRetries":["m1"]}),
@@ -2211,11 +2211,11 @@ mod tests {
         )
         .await;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        // fake 会为该 id 建表(dlq_send 成功) → 本测试实际覆盖的是
-        // "转投成功后 dead-letter"。真实的 DLQ 写失败路径由
-        // settle() 内 dlq_send Err → continue + queue_settle_blocked
-        // 覆盖——用 wire 层单测验证:直接断言源消息仍在(dead-letter
-        // 未发生)要求 send 真失败,fake 做不到时改在注释里标注。
+        // The fake creates the table for that id (dlq_send succeeds) -> this test actually covers
+        // "dead-letter after a successful forward". The real DLQ write failure path is
+        // covered by dlq_send Err -> continue + queue_settle_blocked inside
+        // settle() -- verified with a wire-level unit test: directly assert the source message is still there (dead-letter
+        // did not happen), which requires send to truly fail; where the fake cannot do that it is noted in a comment.
         let w = world.lock().unwrap();
         assert!(
             w.queues["nonexistent00000000000x"].msgs.contains_key("m1"),
@@ -2262,14 +2262,14 @@ mod tests {
             );
         }
         let sql = QueueSqlClient::new(&addr, b"s".to_vec(), Duration::from_secs(5)).unwrap();
-        // holder 持约 claim —— leaseTtl 用最小正值使 lease 快速过期
+        // holder claims with the lease -- leaseTtl uses the smallest positive value so the lease expires quickly
         let doc = sql.claim(QID, "h", 5_000, 1, None, 1).await.unwrap();
         let old_lease = doc["messages"][0]["leaseId"].as_str().unwrap().to_string();
         tokio::time::sleep(Duration::from_millis(10)).await;
-        // 重新 claim —— 旧 lease 过期,新 lease_id 接管
+        // Re-claim -- the old lease expired, the new lease_id takes over
         let doc2 = sql.claim(QID, "h", 5_000, 1, None, 30_000).await.unwrap();
         assert_ne!(doc2["messages"][0]["leaseId"].as_str().unwrap(), old_lease);
-        // 旧 lease 结算 → LeaseLost(绝不误动他人批次)
+        // Settling with the old lease -> LeaseLost (never touch another's batch by mistake)
         let err = sql
             .ack(QID, &old_lease, &["m1".to_string()])
             .await
@@ -2297,7 +2297,7 @@ mod tests {
                 },
             );
         }
-        // invoker: QID 挂 300ms,DLQID 立返
+        // invoker: QID hangs for 300ms, DLQID returns immediately
         struct Mixed;
         #[async_trait::async_trait]
         impl QueueInvoker for Mixed {
@@ -2314,7 +2314,7 @@ mod tests {
         }
         let inv = Arc::new(Mixed);
         let d = dispatcher(&addr, inv, cfg("h1"));
-        // 两 consumer: QID(maxConcurrency=1, 挂) + DLQID(快)
+        // Two consumers: QID (maxConcurrency=1, hangs) + DLQID (fast)
         let desired = desired_with(json!([
             {"queueId": QID, "queueName": "slowq", "maxConcurrency": 1},
             {"queueId": DLQID, "queueName": "fastq"}
@@ -2323,7 +2323,7 @@ mod tests {
         let assigns = assignments();
         let out = tick_pair(&d, &desired, exp, &assigns).await;
         assert_eq!(out.dispatched, 2, "both lanes dispatch in parallel");
-        // 快队列在慢队列 300ms 内已完成 ack
+        // The fast queue has already completed its ack within the slow queue's 300ms
         settle_until(&world, |w| {
             w.queues
                 .get(DLQID)
@@ -2361,7 +2361,7 @@ mod tests {
         });
         let d = dispatcher(&addr, inv, cfg("h1"));
         let desired = desired_with(json!([{"queueId": QID, "queueName": "q"}]));
-        // 空 assignments —— consumer worker 未分配 ⇒ 本 cell 不派发
+        // Empty assignments -- consumer worker not assigned => this cell does not dispatch
         let out = d
             .tick(
                 Some(&desired),
@@ -2479,8 +2479,8 @@ mod tests {
         );
     }
 
-    /// T37b-r: 100 × 128KB 消息在 4MB claim 预算下必须拆成多批
-    /// 投递 —— 全量送达、零死信（批拆分本身绝不判死）。
+    /// T37b-r: 100 x 128KB messages must be split into multiple batches under the 4MB claim budget
+    /// -- all delivered, zero dead letters (batch splitting itself must never be judged fatal).
     #[tokio::test]
     async fn byte_budget_splits_large_backlog() {
         let (addr, world) = spawn_fake_sql().await;
@@ -2502,8 +2502,8 @@ mod tests {
         let inv = Arc::new(AlwaysOk {
             calls: AtomicU64::new(0),
         });
-        // batch_size 100：前 3 批按字节预算即刻组批；末批 4 条
-        // 不满预算，靠 1s 批超时兜底（CF batchTimeout 语义）。
+        // batch_size 100: the first 3 batches form immediately by byte budget; the last batch of 4
+        // does not fill the budget and relies on the 1s batch timeout as the fallback (CF batchTimeout semantics).
         let d = dispatcher(&addr, inv.clone(), cfg("h1"));
         let desired = desired_with(json!([{
             "queueId": QID, "queueName": "q",
@@ -2530,15 +2530,15 @@ mod tests {
             "batching must never dead-letter: {:?}",
             w.queues[QID].dead
         );
-        // 4MB/128KB ≈ 32 → ≥4 批；单批全发会是 1。
+        // 4MB/128KB ~= 32 -> >=4 batches; sending everything in one batch would be 1.
         assert!(
             inv.calls.load(Ordering::Relaxed) >= 2,
             "byte budget must split into multiple batches"
         );
     }
 
-    /// T37b-r: 单条 128KB 消息在极小预算（1KB）下仍须送达 ——
-    /// claim 的 ≥1 保底保证大消息不饿死。
+    /// T37b-r: a single 128KB message must still be delivered under a tiny budget (1KB) --
+    /// claim's >=1 floor guarantees large messages do not starve.
     #[tokio::test]
     async fn tiny_budget_still_delivers_oversize() {
         let (addr, world) = spawn_fake_sql().await;
@@ -2579,14 +2579,14 @@ mod tests {
         assert_eq!(inv.calls.load(Ordering::Relaxed), 1);
     }
 
-    /// T37b-r4：真 vrt-sql 进程 + SIGTERM 重启 —— e2e 现场时序：
-    /// dispatcher 已持派发租约 → `restart vrt-sql` → producer send →
-    /// 有界时间内投递。`recovers_after_sql_restart` 的 fake 只模拟了
-    /// wire 形状，没覆盖真实引擎/registry/lease 文件/ServiceAuth
-    /// 重建路径——本测试用生产 `QueueSqlClient` + `QueueDispatcher`
-    /// 装配（host/workerd 投递侧由 real_workerd_queue_consumer
-    /// smoke 单独覆盖）。vrt-sql 二进制定位与 d1_smoke 同约定
-    /// （`VRT_SQL_BIN` 或 ../target/debug/vrt-sql）。
+    /// T37b-r4: real vrt-sql process + SIGTERM restart -- e2e field timing:
+    /// dispatcher already holds the dispatch lease -> `restart vrt-sql` -> producer send ->
+    /// delivery within a bounded time. The fake in `recovers_after_sql_restart` only simulates the
+    /// wire shape and does not cover the real engine/registry/lease file/ServiceAuth
+    /// rebuild path -- this test assembles the production `QueueSqlClient` + `QueueDispatcher`
+    /// (the host/workerd delivery side is covered separately by the real_workerd_queue_consumer
+    /// smoke). The vrt-sql binary is located with the same convention as d1_smoke
+    /// (`VRT_SQL_BIN` or ../target/debug/vrt-sql).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn real_vrt_sql_restart_mid_dispatch_recovers() {
         use std::os::unix::process::CommandExt;
@@ -2610,8 +2610,8 @@ mod tests {
             let secrets = dir.join("keys");
             std::fs::create_dir_all(&secrets).unwrap();
             for (name, val) in [
-                // bm secret ≥32B（service.rs 校验）；auth secret 与
-                // QueueSqlClient 的签名 secret 必须一致。
+                // bm secret >=32B (validated in service.rs); the auth secret must match
+                // the QueueSqlClient signing secret.
                 ("bm.secret", "bm-secret-bm-secret-bm-secret-0001"),
                 ("auth.secret", "test-secret-test-secret-test-secret-0002"),
             ] {
@@ -2660,7 +2660,7 @@ mod tests {
         impl Drop for Reap {
             fn drop(&mut self) {
                 let pid = self.0.id() as i32;
-                // 进程组 KILL——与 d1_smoke 的 Proc::drop 同一回收语义。
+                // Process-group KILL -- same reclaim semantics as d1_smoke's Proc::drop.
                 unsafe { libc::kill(-pid, libc::SIGKILL) };
                 let _ = self.0.wait();
             }
@@ -2699,14 +2699,14 @@ mod tests {
         let assigns = assignments();
         let exp = chrono::Utc::now() + chrono::Duration::minutes(10);
 
-        // 1) dispatcher claim → 派发租约 CAS 落盘（生产 wire+auth）。
+        // 1) dispatcher claim -> dispatch lease CAS persisted to disk (production wire+auth).
         let out = d
             .tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
             .await;
         assert_eq!(out.lease_held, 1, "first claim must acquire dispatch lease");
 
-        // 2) SIGTERM（e2e `restart vrt-sql`）——停机窗内 tick 允许
-        //    失败，但进程恢复后 dispatcher 必须继续，不得假死。
+        // 2) SIGTERM (e2e `restart vrt-sql`) -- ticks within the shutdown window may
+        //    fail, but after the process recovers the dispatcher must continue and not hang.
         unsafe { libc::kill(-(sql1.0.id() as i32), libc::SIGTERM) };
         let _ = sql1.0.wait();
         let down = d
@@ -2719,7 +2719,7 @@ mod tests {
         let mut sql2 = Reap(spawn_sql(&dir, port));
         assert!(wait_ready(port), "vrt-sql never re-listened on {port}");
 
-        // 3) producer send —— 真实 signed wire（重启后到达）。
+        // 3) producer send -- real signed wire (arrives after the restart).
         let send = client
             .call(
                 QID,
@@ -2733,7 +2733,7 @@ mod tests {
             .await;
         assert!(send.is_ok(), "send after restart failed: {send:?}");
 
-        // 4) 有界时间内 claim→dispatch→settle 全链恢复。
+        // 4) the full claim->dispatch->settle chain recovers within a bounded time.
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         let mut claimed = 0usize;
         loop {
@@ -2753,10 +2753,10 @@ mod tests {
         }
         assert_eq!(claimed, 3, "all 3 messages must be claimed");
 
-        // 5) T37b-r6：release op 必须走真实 wire route（r5 实现
-        //    漏挂 route → axum 404 → client Transport——standalone
-        //    e2e 的实际报错）。生产 client + 真进程验证：claim 的
-        //    attempts+1 → release → 原子补偿回 0 → 立即重可见。
+        // 5) T37b-r6: the release op must go through the real wire route (the r5 implementation
+        //    forgot to mount the route -> axum 404 -> client Transport -- the actual error seen in the standalone
+        //    e2e). Production client + real process verification: claim's
+        //    attempts+1 -> release -> atomically compensated back to 0 -> immediately visible again.
         client
             .call(
                 QID,
@@ -2809,10 +2809,10 @@ mod tests {
         let _ = (&mut sql1, &mut sql2);
     }
 
-    // ---------- T37b-r5：平台侧失败 release + 退避 ----------
+    // ---------- T37b-r5: platform-side failure release + backoff ----------
 
-    /// 可切换平台失败的 invoker：fail=true → transport 错误；
-    /// fail=false → ok+ackAll。
+    /// Invoker that can toggle platform failure: fail=true -> transport error;
+    /// fail=false -> ok+ackAll.
     struct SwitchInvoker {
         calls: AtomicU64,
         fail: AtomicBool,
@@ -2870,7 +2870,7 @@ mod tests {
         let desired = desired_with(json!([{"queueId": QID, "queueName": "q1"}]));
         let assigns = assignments();
         let exp = chrono::Utc::now() + chrono::Duration::minutes(5);
-        // claim(attempts=1) → dispatch → transport → release(attempts=0, 延迟可见)
+        // claim(attempts=1) -> dispatch -> transport -> release(attempts=0, visible after a delay)
         tick_pair(&d, &desired, exp, &assigns).await;
         assert!(
             wait_world(&world, Duration::from_secs(4), |w| {
@@ -2885,7 +2885,7 @@ mod tests {
             .await,
             "message must be released with attempts compensated back to 0"
         );
-        // 失败期间：不丢、不进 dead、attempts 恒 0。
+        // During the failure: nothing lost, nothing dead, attempts stays 0.
         tokio::time::sleep(Duration::from_millis(400)).await;
         {
             let w = world.lock().unwrap();
@@ -2893,7 +2893,7 @@ mod tests {
             assert_eq!(q.msgs["m1"].attempts, 0);
             assert!(q.dead.is_empty(), "platform failure must never dead-letter");
         }
-        // 恢复：attempts=1 投递成功 → ack。
+        // Recovery: attempts=1 delivery succeeds -> ack.
         inv.fail.store(false, Ordering::Relaxed);
         for _ in 0..40 {
             d.tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
@@ -2947,8 +2947,8 @@ mod tests {
         let desired = desired_with(json!([{"queueId": QID, "queueName": "q1"}]));
         let assigns = assignments();
         let exp = chrono::Utc::now() + chrono::Duration::minutes(5);
-        // 持续平台失败 ~4.5s、每秒 tick：退避 1,2,4s… ⇒ dispatch 次数
-        // 有界（无热循环），消息始终留在队列不死信。
+        // Persistent platform failure for ~4.5s, ticking every second: backoff 1,2,4s... => dispatch count
+        // is bounded (no hot loop), and the message always stays in the queue, not dead-lettered.
         for _ in 0..4 {
             d.tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
                 .await;
@@ -2974,8 +2974,8 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_detail_carries_status_and_body() {
-        // 非 JSON 500 → DeliveryError{malformed, detail 带状态码+截断
-        // 片段}（诊断要求：warn 能定位到 wire 哪一段）。
+        // Non-JSON 500 -> DeliveryError{malformed, detail carries status code + truncated
+        // snippet} (diagnostic requirement: the warn can locate which segment of the wire).
         let app = axum::Router::new().route(
             "/v1/queue/dispatch",
             axum::routing::post(|| async {
@@ -3008,9 +3008,9 @@ mod tests {
 
     #[tokio::test]
     async fn typed_host_error_maps_to_platform_reason() {
-        // vrt-host typed 错误体（{delivered:false,error:{code}}）→
-        // bounded platform reason + detail 带 code——不进 QueueOutcome
-        // 解析（全-default 会吞掉错误体）。
+        // vrt-host typed error body ({delivered:false,error:{code}}) ->
+        // bounded platform reason + detail carries the code -- not parsed as
+        // QueueOutcome (the all-default parse would swallow the error body).
         let code = "VRT_QDISP_NO_CONSUMER";
         let app = axum::Router::new().route(
             "/v1/queue/dispatch",
@@ -3042,11 +3042,11 @@ mod tests {
         assert!(err.detail.unwrap().contains(code));
     }
 
-    /// 契约向量：QueueOutcome 分类表（consumer_ran vs platform）——
-    /// dispatcher 与 facade/vrt-host 两侧语义漂移会被此表拦住。
+    /// Contract vector: QueueOutcome classification table (consumer_ran vs platform) --
+    /// semantic drift between the dispatcher and the facade/vrt-host sides is caught by this table.
     #[test]
     fn outcome_classification_vectors() {
-        // consumer 执行过 → 走正常结算
+        // consumer ran -> normal settlement
         for v in [
             json!({"outcome":"ok"}),
             json!({"outcome":"ok","ackAll":true}),
@@ -3058,7 +3058,7 @@ mod tests {
         ] {
             assert!(consumer_ran(&outcome(v.clone())), "{v}");
         }
-        // consumer 未执行 → 平台侧 release
+        // consumer did not run -> platform-side release
         for v in [
             json!({"outcome":"error"}),
             json!({"outcome":"bogus-unknown"}),
@@ -3066,9 +3066,9 @@ mod tests {
         ] {
             assert!(!consumer_ran(&outcome(v.clone())), "{v}");
         }
-        // vrt-host typed 错误 code → bounded reason（封闭 label 集）
+        // vrt-host typed error code -> bounded reason (closed label set)
         assert_eq!(platform_reason("VRT_QDISP_NO_CONSUMER"), "no_consumer");
-        // MIG-11: switching 归入平台错误（attempts 不消耗）。
+        // MIG-11: switching is classed as a platform error (attempts not consumed).
         assert_eq!(platform_reason("VRT_QDISP_SWITCHING"), "switching");
         assert_eq!(platform_reason("VRT_QDISP_WAKE_TIMEOUT"), "wake_timeout");
         assert_eq!(platform_reason("VRT_QDISP_WAKE_FAILED"), "wake_failed");
@@ -3078,7 +3078,7 @@ mod tests {
             "unknown_worker"
         );
         assert_eq!(platform_reason("VRT_QDISP_ANYTHING_ELSE"), "platform");
-        // platform_error_code 只认 {delivered:false,error:{code}} 形状
+        // platform_error_code only recognizes the {delivered:false,error:{code}} shape
         assert_eq!(
             platform_error_code(
                 br#"{"delivered":false,"error":{"code":"VRT_QDISP_TIMEOUT","message":"x"}}"#
@@ -3095,8 +3095,8 @@ mod tests {
     }
 
     /// MIG-11: vrt-host typed 503 `{code:"VRT_QDISP_SWITCHING"}` →
-    /// `DeliveryError.reason == "switching"` — 平台错误语义，
-    /// dispatcher 释放租约而不消耗 attempts。
+    /// `DeliveryError.reason == "switching"` -- platform error semantics,
+    /// the dispatcher releases the lease without consuming attempts.
     #[tokio::test]
     async fn typed_switching_error_maps_to_switching_reason() {
         let app = axum::Router::new().route(
@@ -3131,12 +3131,12 @@ mod tests {
         assert!(err.detail.unwrap().contains("VRT_QDISP_SWITCHING"));
     }
 
-    /// MIG-11: dispatcher 级证明 —— `reason:"switching"` 的
-    /// DeliveryError 走平台 release 路径：消息 attempts 归还为 0、
-    /// 不进 dead-letter，恢复后正常 ack。
+    /// MIG-11: dispatcher-level proof -- a DeliveryError with `reason:"switching"`
+    /// takes the platform release path: the message's attempts are given back to 0,
+    /// it does not go to dead-letter, and it acks normally after recovery.
     #[tokio::test]
     async fn switching_release_preserves_attempts() {
-        /// 固定返回 switching 平台错误的 invoker（翻转后回 ok）。
+        /// Invoker that always returns a switching platform error (back to ok after the flip).
         struct SwitchingInvoker {
             fail: AtomicBool,
         }

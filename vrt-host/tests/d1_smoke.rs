@@ -59,10 +59,10 @@ fn vrt_sql_bin() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/vrt-sql")
 }
 
-/// T37r2：所有 smoke socket 都有 connect/read/write 硬超时——real_*
-/// 测试绝不能再把一个挂起的 workerd/vrt-sql 拖成整个 workspace
-/// 超时（上一轮队列 smoke 曾挂死 2400s）。超时即 panic（Proc::drop
-/// 在 panic 时附带 workerd.log 尾部）。
+/// T37r2: all smoke sockets have hard connect/read/write timeouts -- real_*
+/// tests must never again let a hung workerd/vrt-sql drag the whole workspace into a
+/// timeout (the previous round's queue smoke once hung for 2400s). A timeout panics (Proc::drop
+/// attaches the tail of workerd.log on panic).
 const SMOKE_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const SMOKE_CONN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -120,10 +120,10 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
 /// leader), so TERM/KILL go to the whole group — grandchildren can
 /// never be orphaned.
 ///
-/// T37r2：另起一个 DETACHED babysitter 盯住本测试进程——若测试进程
-/// 本身被杀（harness 超时 SIGKILL 不会跑 Drop），babysitter 在 ~1s
-/// 内 KILL 子进程整个组：子进程绝不可能比测试进程活得更久。
-/// babysitter 在自身独立进程组中，不被随测试组一起 kill。
+/// T37r2: spawn a separate DETACHED babysitter to watch this test process -- if the test process
+/// itself is killed (a harness-timeout SIGKILL does not run Drop), the babysitter KILLs the child's whole group
+/// within ~1s: a child can never outlive the test process.
+/// The babysitter is in its own independent process group and is not killed along with the test group.
 struct Proc {
     child: Child,
     babysitter: Option<Child>,
@@ -149,8 +149,8 @@ impl Proc {
     }
 }
 
-/// 自终止 watcher：轮询测试进程 pid；一旦消失（正常退出或被杀——
-/// SIGKILL 下 Drop 不跑，只有它能兜住），KILL 子进程整组后退出。
+/// Self-terminating watcher: polls the test process pid; once it disappears (normal exit or killed --
+/// Drop does not run under SIGKILL and only this can catch it), KILLs the child's whole group and exits.
 fn spawn_babysitter(child_pid: u32) -> Child {
     Command::new("sh")
         .arg("-c")
@@ -159,7 +159,7 @@ fn spawn_babysitter(child_pid: u32) -> Child {
             parent = std::process::id(),
             pid = child_pid,
         ))
-        // 独立进程组——测试组的批量 kill 波及不到它；它只等测试进程死。
+        // Independent process group -- the test group's bulk kill cannot reach it; it only waits for the test process to die.
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -178,8 +178,8 @@ impl Drop for Proc {
         // vrt-sql/vrt-provider install no TERM handler → the default
         // disposition ends them immediately, so the shared window
         // costs nothing for them.
-        // T37r2：信号发给整个进程组（spawn 时 process_group(0) 使子
-        // 进程是组长，-pid = 其 pgid）——覆盖组内一切后代。
+        // T37r2: the signal goes to the whole process group (process_group(0) at spawn makes the child
+        // process the group leader, -pid = its pgid) -- covering every descendant in the group.
         let pid = self.child.id() as i32;
         let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -210,9 +210,9 @@ impl Drop for Proc {
 }
 
 /// Root-dir guard: declare FIRST so it drops LAST — always removes the
-/// dir (T37r2：失败时保留曾让挂死/崩溃测试在 target/tmp 泄漏几十个
-/// 目录；forensics 已由 Proc::drop 在 panic 时把日志尾部打进
-/// stderr)。`VRT_SMOKE_KEEP` 仍可选保留。
+/// dir (T37r2: on failure keep -- previously hung/crashed tests leaked dozens of
+/// directories in target/tmp; forensics are already printed by Proc::drop on panic, with the log tail, into
+/// stderr). `VRT_SMOKE_KEEP` can still optionally keep them.
 struct SmokeDir(PathBuf);
 
 impl Drop for SmokeDir {
@@ -478,8 +478,8 @@ fn render_cfg(dir: &Path, port: u16, sql_port: u16, db_id: &str) -> (PathBuf, Ve
     )
 }
 
-/// 测试临时根：`target/tmp/vrt-d1-smoke-<port>`（仓库约定，
-/// 不落 /tmp/claude——T34c/F1）。
+/// Test temp root: `target/tmp/vrt-d1-smoke-<port>` (repository convention,
+/// not under /tmp/claude -- T34c/F1).
 fn smoke_dir(suffix: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../target/tmp")
@@ -517,8 +517,8 @@ fn spawn_vrt_sql(dir: &Path, port: u16) -> Child {
         "operationTimeoutMs": 5000,
         "drainTimeoutMs": 5000,
         "bodyMaxBytes": 1048576,
-        // T36b/P0-A: `[persistence]` 必填——fs 后端 root 在测试
-        // 临时目录内（非 `none`，端到端覆盖持久化路径）。
+        // T36b/P0-A: `[persistence]` is required -- the fs backend root is inside the test
+        // temp directory (not `none`, covering the persistence path end to end).
         "persistence": {
             "backend": "fs",
             // RV-R66: objstore and dbRoot share the test tmp device by
@@ -532,8 +532,8 @@ fn spawn_vrt_sql(dir: &Path, port: u16) -> Child {
     Command::new(vrt_sql_bin())
         .args(["serve", "--config"])
         .arg(&cfg_path)
-        // T37r2：独立进程组——Proc 的 group TERM/KILL 与 babysitter
-        // group-kill 覆盖它可能派生的任何子进程。
+        // T37r2: independent process group -- Proc's group TERM/KILL and the babysitter's
+        // group-kill cover any child process it may spawn.
         .process_group(0)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -557,7 +557,7 @@ fn real_workerd_d1_end_to_end() {
     let dir = smoke_dir("stub");
     let _dir_guard = SmokeDir(dir.clone());
     let sql_port = free_port();
-    // vrt-sql 同样进 Proc guard——任一 assert/panic 都会 Drop 回收。
+    // vrt-sql also goes into a Proc guard -- any assert/panic triggers a Drop that reclaims it.
     let _sql = Proc::new(spawn_vrt_sql(&dir, sql_port));
     assert!(wait_ready(sql_port), "vrt-sql never listened on {sql_port}");
     let db_id = "d1smoke00000000000000000aa";
@@ -624,11 +624,11 @@ fn real_workerd_d1_end_to_end() {
         "batch must roll back atomically: {body}"
     );
     assert_eq!(v["session"], json!([{"one":1}]), "{body}");
-    // sql/wd 的 Proc guard 在作用域末自动 kill+wait+清目录。
+    // The sql/wd Proc guards automatically kill+wait+clean the directory at scope end.
 }
 
-/// T34c/F1 回归：guard 在 panic 展开时也必须 kill+wait 子进程。
-/// 用 `/bin/kill -0 <pid>` 探测（ESRCH ⇒ 已被回收，无新依赖）。
+/// T34c/F1 regression: the guard must also kill+wait the child during panic unwinding.
+/// Probe with `/bin/kill -0 <pid>` (ESRCH => already reaped, no new dependency).
 #[test]
 fn proc_guard_reaps_child_on_panic() {
     let dir = smoke_dir("stub");
@@ -951,9 +951,9 @@ fn real_provider_d1_end_to_end() {
         "second hit: {body2}{}",
         dump()
     );
-    // T36b: 重启 vrt-sql——fs 持久化 + 重启 claim/lease 释放路径
-    // 必须让 counter 延续（hits:3 而非重置回 1）。SIGTERM 下优雅
-    // 释放 lease，新进程无需等满 15s。
+    // T36b: restart vrt-sql -- fs persistence + the restart claim/lease release path
+    // must keep the counter going (hits:3 rather than reset back to 1). On SIGTERM the lease is
+    // released gracefully, and the new process need not wait the full 15s.
     drop(sql);
     sql = Proc::logged(
         spawn_logged(&debug.join("vrt-sql"), &sql_args, &sql_log),
@@ -1017,10 +1017,10 @@ fn real_provider_d1_end_to_end() {
 // ENV-gated like the D1 test (VRT_WORKERD_BIN); sandbox CI skips.
 // ---------------------------------------------------------------------------
 
-const QUEUE_USER_MODULE: &str = r#"// T37r2：workerd 对 send 响应里的 metadata.metrics.oldestMessageTimestamp
-// 按 `date` 解析——stub 返回入队前 metrics，第一次 send 正好覆盖
-// "空队列 oldest=0" 规范化路径；该字段为 null/字符串会让 send()
-// 直接 TypeError 而不是 QueueOperationError（沙箱外实测）。
+const QUEUE_USER_MODULE: &str = r#"// T37r2: workerd parses metadata.metrics.oldestMessageTimestamp in the send response
+// as a `date` -- the stub returns the pre-enqueue metrics, and the first send exactly covers
+// the "empty queue oldest=0" normalization path; if the field is null/a string, send()
+// throws a TypeError directly instead of QueueOperationError (measured outside the sandbox).
 export default {
   async fetch(req, env) {
     const out = {};
@@ -1107,11 +1107,11 @@ export default {
     if (!p.startsWith("/internal/bindings/v1/queue/")) {
       return new Response("unknown", { status: 404 });
     }
-    // T37r2：wrapBindingBackend 合法注入的 props 身份头（provider 的
-    // 授权面靠它们）必须放行——T37 旧检查把它们误判成 props 泄漏，
-    // 在读 body 前返回 500，实测让 workerd 的 send 永久挂起。规则与
-    // facade 的剥离面一致：x-vrt-* 一律拒；x-open-compute-* 只允许
-    // 身份头全集 + facade mint 的 request-id，其余拒。
+    // T37r2: the props identity headers legitimately injected by wrapBindingBackend (the provider's
+    // authorization surface relies on them) must be allowed through -- the old T37 check misjudged them as props leaks,
+    // returning 500 before reading the body, which was measured to make workerd's send hang forever. The rule matches
+    // the facade's stripping surface: x-vrt-* always rejected; x-open-compute-* only allowed for the
+    // full identity header set + the request-id minted by the facade, everything else rejected.
     const IDENTITY_HEADERS = new Set([
       "x-open-compute-binding-id",
       "x-open-compute-version-id",
@@ -1134,10 +1134,10 @@ export default {
     }
     const leaf = p.split("/").pop();
     const qid = "<QID>";
-    // workerd 按 `date` 解析 oldestMessageTimestamp——必须是 epoch-ms
-    // 数字，空队列 0，绝不能 null/字符串（T37r2；miniflare broker
-    // `.getTime() ?? 0` 同口径）。vrt-sql 内部字段是
-    // `oldestMessageTimestampMs`。
+    // workerd parses oldestMessageTimestamp as a `date` -- it must be an epoch-ms
+    // number, 0 for an empty queue, never null/a string (T37r2; the same convention as the miniflare broker's
+    // `.getTime() ?? 0`). The vrt-sql internal field is
+    // `oldestMessageTimestampMs`.
     const metricsOf = (m) => ({
       backlogCount: m.backlogCount ?? 0,
       backlogBytes: m.backlogBytes ?? 0,
@@ -1170,10 +1170,10 @@ export default {
     } else {
       return new Response("bad op", { status: 400 });
     }
-    // broker 语义（miniflare message/batch 响应的 metrics 在 enqueue
-    // 前计算——broker.worker.js:345-377）：取入队前 metrics。这也让
-    // smoke 的第一次 send 精确覆盖"空队列 oldestMessageTimestamp=0"
-    // 的规范化路径（T37r2）。
+    // broker semantics (miniflare computes the metrics in message/batch responses before enqueue --
+    // broker.worker.js:345-377): take the pre-enqueue metrics. This also lets the
+    // smoke's first send exactly cover the normalization path of "empty queue oldestMessageTimestamp=0"
+    // (T37r2).
     const pre = await sql(env, "GET", `/queues/${qid}/metrics`);
     const preV = await pre.json();
     const r = await sql(env, "POST", `/queues/${qid}/send`, enc.encode(JSON.stringify({ messages })));
@@ -1412,9 +1412,9 @@ fn real_workerd_queue_producer() {
     let sql_port = free_port();
     let _sql = Proc::new(spawn_vrt_sql(&dir, sql_port));
     assert!(wait_ready(sql_port), "vrt-sql never listened on {sql_port}");
-    // queueId 按 mint 规则（vrt-q:{tenant}:{name} 的 sha256 前 26 hex）
-    // 派生——hex ⊂ [a-z0-9]{26}，构造上不可能非法（T37 硬编码 25 位
-    // 在 vrt-sql 入口被 VRT_QUEUE_INVALID 拒）。
+    // queueId is derived by the mint rule (the first 26 hex of the sha256 of vrt-q:{tenant}:{name})
+    // -- hex is a subset of [a-z0-9]{26}, so it cannot be invalid by construction (T37's hard-coded 25 chars
+    // were rejected at the vrt-sql entry with VRT_QUEUE_INVALID).
     let queue_id_s = format!("{:x}", Sha256::digest(b"vrt-q:team-q:q-smoke"))[..26].to_string();
     let queue_id: &str = &queue_id_s;
     assert_eq!(queue_id.len(), 26);
@@ -1465,9 +1465,9 @@ fn real_workerd_queue_producer() {
         "101-message batch must reject: {body}"
     );
 
-    // backlog 直查 vrt-sql metrics（手工 ServiceAuth sign —
-    // vrt-host 不依赖 vrt-sql crate；签名格式 v1:<ts>:<hmac-sha256>
-    // 与 service.rs::message 逐字节一致）。
+    // Query the backlog directly from vrt-sql metrics (manual ServiceAuth sign --
+    // vrt-host does not depend on the vrt-sql crate; the signature format v1:<ts>:<hmac-sha256>
+    // is byte-for-byte identical to service.rs::message).
     let pq = format!("/queues/{queue_id}/metrics");
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1490,17 +1490,17 @@ fn real_workerd_queue_producer() {
     let metrics_body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
     let m: serde_json::Value = serde_json::from_str(&metrics_body)
         .unwrap_or_else(|_| panic!("bad metrics json: {metrics_body}"));
-    // wire 形状 `{success, metrics:{backlogCount, backlogBytes,
-    // oldestMessageTimestampMs}}`（vrt-sql wire.rs:825 同 send 响应）。
+    // wire shape `{success, metrics:{backlogCount, backlogBytes,
+    // oldestMessageTimestampMs}}` (vrt-sql wire.rs:825, same as the send response).
     assert_eq!(m["success"].as_bool(), Some(true), "{metrics_body}");
     let wm = &m["metrics"];
-    // send(1) + batch(2) = 3；101-条被拒的不入队。
+    // send(1) + batch(2) = 3; the rejected 101-item batch is not enqueued.
     assert_eq!(wm["backlogCount"].as_i64(), Some(3), "{metrics_body}");
     assert!(
         wm["backlogBytes"].as_i64().unwrap_or(0) > 0,
         "{metrics_body}"
     );
-    // oldest 为服务端时钟 epoch-ms：正整数且不晚于 now+5s 容差。
+    // oldest is the server clock in epoch-ms: a positive integer and no later than now+5s tolerance.
     let oldest = wm["oldestMessageTimestampMs"]
         .as_i64()
         .unwrap_or_else(|| panic!("oldestMessageTimestampMs not int: {metrics_body}"));
@@ -1514,8 +1514,8 @@ fn real_workerd_queue_producer() {
     );
 }
 
-/// ServiceAuth 等价签名（vrt-host 不依赖 vrt-sql 且不加 hmac 依赖）：
-/// RFC2104 HMAC-SHA256 — 两个 64B 分组 sha256。
+/// ServiceAuth-equivalent signing (vrt-host does not depend on vrt-sql and adds no hmac dependency):
+/// RFC2104 HMAC-SHA256 -- sha256 over two 64B blocks.
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     let mut k = [0u8; 64];
     if key.len() > 64 {
@@ -1720,9 +1720,9 @@ fn real_workerd_queue_consumer() {
         }
     }
 
-    // T37b-r6：dispatch 必须走 vrt-host `/v1/queue/dispatch` 生产
-    // 路由（真实 router/handler/响应编码 + 上游请求形状），不再
-    // 直连 facade socket——上一跳正是 r6 缺陷藏身处。
+    // T37b-r6: dispatch must go through vrt-host's `/v1/queue/dispatch` production
+    // route (real router/handler/response encoding + upstream request shape), no longer
+    // connecting directly to the facade socket -- that previous hop is exactly where the r6 defect hid.
     let disp_port = free_port();
     {
         let rt = vrt_host::supervisor::TenantRuntime::new("team-q");
@@ -1780,8 +1780,8 @@ fn real_workerd_queue_consumer() {
     assert_eq!(m["contentType"], json!("text"), "{claim}");
     assert_eq!(m["attempts"].as_i64(), Some(1), "{claim}");
     let dispatch_msg = |attempts: i64| {
-        // vrt-host `/v1/queue/dispatch` envelope（tenantId/workerId +
-        // opaque dispatch 载荷）——经生产路由转发到 facade。
+        // vrt-host `/v1/queue/dispatch` envelope (tenantId/workerId +
+        // opaque dispatch payload) -- forwarded to the facade via the production route.
         serde_json::json!({
             "tenantId": "team-q",
             "workerId": "wq",

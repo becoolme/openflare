@@ -22,7 +22,7 @@
 //!   these services directly** (only facade system workers hold
 //!   `BINDING_BACKEND`); see the service-scope invariant below;
 //! - one `unix:` socket per worker (`<socketDir>/<workerId>.sock`):
-//!   vrt-host's local ingress maps `Host → workerId → socket` (主设计
+//!   vrt-host's local ingress maps `Host → workerId → socket` (main design
 //!   §5.1), so the capnp exposes one socket per worker, not per process.
 //!
 //! Determinism: services, sockets, bindings and module lists are emitted
@@ -231,7 +231,7 @@ pub struct RuntimeParams {
     /// talk to `binding-backend`, so their outbound must be a worker
     /// that always denies. workerd defaults `globalOutbound` to
     /// `internet`, so an explicit deny designator is mandatory — a
-    /// network-service `allow = []` alternative is 未证实.
+    /// network-service `allow = []` alternative is unverified.
     pub deny_outbound: ServiceEndpoint,
     /// Facade service endpoints for `kv` / `r2` / `assets` bindings.
     pub facades: FacadeRefs,
@@ -995,8 +995,8 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
             worker_service_name(&worker.worker_id)
         }),
     ));
-    // T37b：consumer 派发端点 socket —— vrt-host `/v1/queue/dispatch`
-    // 代理到此；`*.qconsumer.sock` 与 `*.sock` 并列同目录。
+    // T37b: consumer dispatch endpoint socket -- vrt-host `/v1/queue/dispatch`
+    // proxies to it; `*.qconsumer.sock` sits alongside `*.sock` in the same directory.
     if !worker.queue_consumers.is_empty() {
         out.push_str(&format!(
             "    (name = {}, address = {}, http = (), service = {}),\n",
@@ -1302,7 +1302,7 @@ fn emit_binding(
             )?;
             // Secrets never enter the config text/digest: the binding is
             // `fromEnvironment` and vrt-host injects `env` into the
-            // child process (主文档 §2.3/§3).
+            // child process (main doc §2.3/§3).
             let env_name = secret_env_name(&worker.worker_id, &secret.name);
             if env.insert(env_name.clone(), value.clone()).is_some() {
                 return Err(ConfigError::Identifier("secretEnv"));

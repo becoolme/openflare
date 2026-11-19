@@ -87,18 +87,18 @@ pub struct VersionRecord {
     pub var_values: BTreeMap<String, String>,
     #[serde(default)]
     pub crons: Vec<CronDesired>,
-    /// T37b：该版本激活时 worker 消费的队列集合（CF 语义——
-    /// consumer 关系随版本走，回滚恢复原消费关系）。
+    /// T37b: the set of queues the worker consumes when this version is activated (CF semantics --
+    /// consumer relations follow the version, and rollback restores the original consumption relations).
     #[serde(default)]
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
-    /// P3c-1：该版本声明的 DO class 集合（migrations 已在 pack 时
-    /// 解析为最终集合，`uniqueKey` 已定；回滚恢复原声明——
-    /// `renamed_classes` lineage 的存储身份随版本走）。
+    /// P3c-1: the DO class set declared by this version (migrations were already
+    /// resolved to the final set at pack time, `uniqueKey` is fixed; rollback restores the original declaration --
+    /// the storage identity of the `renamed_classes` lineage follows the version).
     #[serde(default)]
     pub durable_object_classes: Vec<snapshot_protocol::compute_desired::DoClassDesired>,
-    /// W1：该版本声明的 workflow 集合（`uniqueKey` 已在 pack 时
-    /// 派生；same-worker 限制已过）。skip-if-empty 保持旧版本记录
-    /// 字节兼容。
+    /// W1: the workflow set declared by this version (`uniqueKey` was already
+    /// derived at pack time; the same-worker restriction has passed). skip-if-empty keeps old version records
+    /// byte compatible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired>,
     pub quotas: WorkerQuotas,
