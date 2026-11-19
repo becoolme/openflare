@@ -1,0 +1,74 @@
+<section style="border-bottom: 1px solid #E6E7EB; background: #FFFFFF">
+<div style="max-width: 1240px; margin: 0 auto; padding: clamp(64px, 9vw, 120px) clamp(16px, 4vw, 32px); display: flex; flex-direction: column; gap: 40px">
+<div style="display: flex; flex-direction: column; gap: 14px; max-width: 760px">
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; letter-spacing: 0.12em; color: #2450E6">05 · DEVELOPER EXPERIENCE</div>
+<h2 style="margin: 0; font-weight: 600; font-size: clamp(34px, 4.4vw, 56px); line-height: 1.02; letter-spacing: -0.04em; color: #0F1A2E">Keep your wrangler file. Change where it lands.</h2>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: stretch">
+
+<div style="flex: 1 1 520px; min-width: 0; border: 1px solid #D5DAE3; border-radius: 14px; background: #FFFFFF; overflow: hidden; display: flex; flex-direction: column">
+<div style="display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid #EDEFF3; background: #FCFCFA; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #5B6678">
+<svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#8C96A8" stroke-width="1"><path d="M3 1.5h5.5L11 4v8.5H3z"></path><path d="M8.5 1.5V4H11"></path></svg>
+<span>examples/standalone-wrangler/wrangler.jsonc</span>
+</div>
+<div style="display: flex; flex: 1">
+<pre aria-hidden="true" style="margin: 0; padding: 18px 10px 18px 16px; font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.75; color: #AEB6C4; text-align: right; border-right: 1px solid #EDEFF3; user-select: none">1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11</pre>
+<pre style="flex: 1; margin: 0; padding: 18px 18px; overflow-x: auto; font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.75; color: #0F1A2E">{'{'}
+  <span style="color: #2450E6">"name"</span>: <span style="color: #0B7466">"wrangler-demo"</span>,
+  <span style="color: #2450E6">"main"</span>: <span style="color: #0B7466">"main.js"</span>,
+  <span style="color: #2450E6">"compatibility_date"</span>: <span style="color: #0B7466">"2024-09-25"</span>,
+  <span style="color: #2450E6">"routes"</span>: [<span style="color: #0B7466">"wrangler.vrt.local/*"</span>],   <span style="display: inline-block; padding: 0 7px; border-radius: 999px; border: 1px solid #2450E6; color: #2450E6; font-size: 11px">A</span>
+  <span style="color: #2450E6">"kv_namespaces"</span>: [
+    {'{'} <span style="color: #2450E6">"binding"</span>: <span style="color: #0B7466">"CACHE"</span> {'}'}             <span style="display: inline-block; padding: 0 7px; border-radius: 999px; border: 1px solid #2450E6; color: #2450E6; font-size: 11px">B</span>
+  ],
+  <span style="color: #2450E6">"assets"</span>: {'{'} <span style="color: #2450E6">"directory"</span>: <span style="color: #0B7466">"public"</span>,
+              <span style="color: #2450E6">"binding"</span>: <span style="color: #0B7466">"ASSETS"</span> {'}'} <span style="display: inline-block; padding: 0 7px; border-radius: 999px; border: 1px solid #2450E6; color: #2450E6; font-size: 11px">C</span>
+{'}'}</pre>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); border-top: 1px solid #EDEFF3">
+<div style="padding: 14px 16px; border-right: 1px solid #EDEFF3; font-size: 13.5px; color: #4B5568"><b style="color: #2450E6; font-family: 'JetBrains Mono', monospace; font-weight: 500">A</b>&nbsp; Routes become Host rules on the ingress.</div>
+<div style="padding: 14px 16px; border-right: 1px solid #EDEFF3; font-size: 13.5px; color: #4B5568"><b style="color: #2450E6; font-family: 'JetBrains Mono', monospace; font-weight: 500">B</b>&nbsp; No namespace ID: the binding resolves locally.</div>
+<div style="padding: 14px 16px; font-size: 13.5px; color: #4B5568"><b style="color: #2450E6; font-family: 'JetBrains Mono', monospace; font-weight: 500">C</b>&nbsp; Static assets ship inside the version bundle.</div>
+</div>
+</div>
+
+<div style="flex: 1 1 420px; min-width: 0; border: 1px solid #D5DAE3; border-radius: 14px; background: #F6F8FC; overflow: hidden; display: flex; flex-direction: column">
+<div style="display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid #E1E6F0">
+<span style="width: 10px; height: 10px; border-radius: 50%; border: 1px solid #B4BCC9"></span><span style="width: 10px; height: 10px; border-radius: 50%; border: 1px solid #B4BCC9"></span><span style="width: 10px; height: 10px; border-radius: 50%; border: 1px solid #B4BCC9"></span>
+<span style="margin-left: auto; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #5B6678">vrt — standalone</span>
+</div>
+<div style="padding: 18px 18px 22px; font-family: 'JetBrains Mono', monospace; font-size: 13px; line-height: 1.85; color: #0F1A2E; overflow-x: auto; white-space: pre">
+<div style="animation: of-line 14s linear infinite both; animation-delay: 0s"><span style="color: #2450E6">$</span> vrt secret put --root /data greeting-secret</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 0.8s; color: #5B6678"># value read from stdin, stored outside config</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 1.8s"><span style="color: #2450E6">$</span> vrt deploy --root /data ./standalone-hello</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 2.6s; color: #5B6678"># bundle → sign → publish new revision</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 3.6s"><span style="color: #2450E6">$</span> curl -H 'Host: hello.vrt.local' \</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 3.6s">    http://127.0.0.1:8080/</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 4.6s; color: #5B6678"># served by workerd, routed by Host</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 5.6s"><span style="color: #2450E6">$</span> vrt rollback …</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 6.4s; color: #5B6678"># re-point to an earlier signed version</div>
+<div style="animation: of-line 14s linear infinite both; animation-delay: 7.4s"><span style="color: #2450E6">$</span> <span style="display: inline-block; width: 8px; height: 15px; vertical-align: -2px; background: #2450E6; animation: of-blink 1s step-end infinite"></span></div>
+</div>
+<div style="margin-top: auto; display: flex; flex-wrap: wrap; gap: 8px; padding: 14px 16px; border-top: 1px solid #E1E6F0">
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border: 1px solid #C9CFDA; border-radius: 999px; background: #FFFFFF; color: #334055">init</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border: 1px solid #C9CFDA; border-radius: 999px; background: #FFFFFF; color: #334055">deploy</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border: 1px solid #C9CFDA; border-radius: 999px; background: #FFFFFF; color: #334055">rollback</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border: 1px solid #C9CFDA; border-radius: 999px; background: #FFFFFF; color: #334055">versions</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border: 1px solid #C9CFDA; border-radius: 999px; background: #FFFFFF; color: #334055">secrets</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border: 1px solid #C9CFDA; border-radius: 999px; background: #FFFFFF; color: #334055">hostnames</span>
+<span style="font-family: 'JetBrains Mono', monospace; font-size: 12px; padding: 4px 10px; border: 1px solid #C9CFDA; border-radius: 999px; background: #FFFFFF; color: #334055">status</span>
+</div>
+</div>
+</div>
+</div>
+</section>
