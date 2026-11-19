@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Fail if any tracked file (outside third_party/) contains CJK characters.
+"""Fail if any tracked file contains CJK characters.
+
+Vendored upstream code under third_party/ is exempt, but our own provenance
+notes there (UPSTREAM.md) are checked.
 
 Policy: code, comments, test data and config are English/ASCII. Test input that
 needs non-ASCII must be written as escapes (Rust "\\u{4e2d}", JS/JSON "\\u4e2d").
@@ -33,7 +36,7 @@ def main():
     os.chdir(repo_root())
     hits = 0
     for path in tracked_files():
-        if path.startswith(SKIP_PREFIXES):
+        if path.startswith(SKIP_PREFIXES) and not path.endswith("/UPSTREAM.md"):
             continue
         try:
             with open(path, "rb") as fh:
