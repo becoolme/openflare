@@ -1,0 +1,56 @@
+---
+interface Props {
+  title: string;
+  description: string;
+}
+const { title, description } = Astro.props;
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#FAFAF7" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" />
+  </head>
+  <body>
+    <div style="background: #FAFAF7; color: #0F1A2E; font-family: Geist, Inter, system-ui, sans-serif; font-size: 16px; line-height: 1.6">
+      <slot />
+    </div>
+  </body>
+</html>
+
+<style is:global>
+  html { scroll-behavior: smooth; }
+  body { margin: 0; background: #FAFAF7; }
+  section[id] { scroll-margin-top: 72px; }
+  a { color: #334055; text-decoration: none; }
+  a:hover { color: #0F1A2E; }
+  a:focus-visible, summary:focus-visible { outline: 2px solid #2450E6; outline-offset: 3px; border-radius: 4px; }
+  @keyframes of-flow { to { stroke-dashoffset: -34; } }
+  @keyframes of-flow-r { to { stroke-dashoffset: 34; } }
+  @keyframes of-spin { to { transform: rotate(360deg); } }
+  @keyframes of-pulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+  @keyframes of-move { from { offset-distance: 0%; } to { offset-distance: 100%; } }
+  @keyframes of-float { 0%, 100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+  @keyframes of-trace { 0% { stroke-dashoffset: 24; } 40%, 100% { stroke-dashoffset: 0; } }
+  @keyframes of-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+  @keyframes of-line { 0% { opacity: 0; transform: translateY(3px); } 5%, 90% { opacity: 1; transform: none; } 97%, 100% { opacity: 0; } }
+  @keyframes of-scan { 0% { transform: translateY(-10px); opacity: 0; } 10%, 80% { opacity: .9; } 100% { transform: translateY(250px); opacity: 0; } }
+  @media (max-width: 760px) { .of-navlinks, .of-navgh { display: none !important; } }
+  details > summary { list-style: none; cursor: pointer; }
+  details > summary::-webkit-details-marker { display: none; }
+  details[open] .of-plus { transform: rotate(45deg); }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    * { animation: none !important; }
+  }
+</style>

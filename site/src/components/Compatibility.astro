@@ -1,0 +1,46 @@
+---
+import { content } from '../data/content';
+const { binds, limits } = content;
+---
+<section id="bindings" style="border-bottom: 1px solid #E6E7EB">
+<div style="max-width: 1240px; margin: 0 auto; padding: clamp(64px, 9vw, 120px) clamp(16px, 4vw, 32px); display: flex; flex-direction: column; gap: 40px">
+<div style="display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 20px 48px">
+<div style="flex: 1 1 520px; display: flex; flex-direction: column; gap: 14px">
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; letter-spacing: 0.12em; color: #2450E6">04 · COMPATIBILITY</div>
+<h2 style="margin: 0; font-weight: 600; font-size: clamp(34px, 4.4vw, 56px); line-height: 1.02; letter-spacing: -0.04em; color: #0F1A2E">The Workers API, resolved locally.</h2>
+</div>
+<p style="flex: 1 1 380px; margin: 0; max-width: 460px; font-size: 17px; color: #334055">Your code calls the same runtime APIs. Bindings resolve to services in your deployment. A config field OpenFlare can’t honour fails the deploy with a typed error instead of disappearing.</p>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 12px">
+{binds.map((b) => (<Fragment>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 18px 20px; border: 1px solid #D5DAE3; border-radius: 12px; background: #FFFFFF">
+<div style="display: flex; align-items: center; justify-content: space-between; gap: 10px">
+<span style="font-weight: 600; font-size: 16px; color: #0F1A2E">{b.k}</span>
+{b.ok && (<Fragment><span style="display: inline-flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #0B7466"><span style="width: 6px; height: 6px; border-radius: 50%; background: #0E8A7A"></span>SUPPORTED</span></Fragment>)}
+{b.lim && (<Fragment><span style="display: inline-flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #8A5000"><span style="width: 6px; height: 6px; border-radius: 50%; border: 1.5px solid #B26A00; box-sizing: border-box"></span>WITH LIMITS</span></Fragment>)}
+</div>
+<span style="font-size: 14px; line-height: 1.5; color: #4B5568">{b.note}</span>
+</div>
+</Fragment>))}
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 20px">
+<div style="flex: 1 1 520px; min-width: 0; border: 1px solid #D5DAE3; border-radius: 14px; background: #FFFFFF; overflow-x: auto">
+<table style="width: 100%; min-width: 520px; border-collapse: collapse; font-size: 14.5px">
+<caption style="text-align: left; padding: 16px 22px 6px; font-weight: 600; font-size: 16px; color: #0F1A2E">Honest limits</caption>
+<thead><tr style="text-align: left; font-family: 'JetBrains Mono', monospace; font-size: 11px; letter-spacing: 0.1em; color: #5B6678"><th scope="col" style="padding: 10px 22px; font-weight: 500; border-bottom: 1px solid #D5DAE3">AREA</th><th scope="col" style="padding: 10px 22px; font-weight: 500; border-bottom: 1px solid #D5DAE3">BEHAVIOUR</th></tr></thead>
+<tbody>
+{limits.map((l) => (<Fragment>
+<tr><td style="padding: 11px 22px; border-bottom: 1px solid #EDEFF3; color: #0F1A2E; white-space: nowrap">{l.k}</td><td style="padding: 11px 22px; border-bottom: 1px solid #EDEFF3; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #334055">{l.v}</td></tr>
+</Fragment>))}
+</tbody>
+</table>
+</div>
+<div style="flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 12px; padding: 22px; border: 1px dashed #B4BCC9; border-radius: 14px; background: #FCFCFA">
+<div style="font-weight: 600; font-size: 16px; color: #0F1A2E">Not built yet</div>
+<p style="margin: 0; font-size: 14.5px; color: #4B5568">Workers AI, Vectorize and other unrecognised wrangler keys fail the deploy with a typed error that names the key.</p>
+<div style="font-weight: 600; font-size: 16px; color: #0F1A2E; padding-top: 6px">Accepted, ignored</div>
+<p style="margin: 0; font-size: 14.5px; color: #4B5568"><code style="font-family: 'JetBrains Mono', monospace; font-size: 13px">account_id</code>, <code style="font-family: 'JetBrains Mono', monospace; font-size: 13px">placement</code> and hosted resource IDs. Bindings resolve inside your deployment instead.</p>
+</div>
+</div>
+</div>
+</section>

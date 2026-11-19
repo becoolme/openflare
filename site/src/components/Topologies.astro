@@ -1,0 +1,66 @@
+<section style="border-bottom: 1px solid #E6E7EB">
+<div style="max-width: 1240px; margin: 0 auto; padding: clamp(64px, 9vw, 120px) clamp(16px, 4vw, 32px); display: flex; flex-direction: column; gap: 40px">
+<div style="display: flex; flex-direction: column; gap: 14px; max-width: 720px">
+<div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; letter-spacing: 0.12em; color: #2450E6">02 · TOPOLOGIES</div>
+<h2 style="margin: 0; font-weight: 600; font-size: clamp(34px, 4.4vw, 56px); line-height: 1.02; letter-spacing: -0.04em; color: #0F1A2E">One box, many boxes, or none yet.</h2>
+<p style="margin: 0; font-size: 17px; color: #334055">The same services scale from a single Compose file to a multi-host cell. The state model doesn’t change: hosts only ever apply signed desired state.</p>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px">
+
+<article style="display: flex; flex-direction: column; border: 1px solid #D5DAE3; border-radius: 16px; background: #FFFFFF; overflow: hidden">
+<div style="padding: 20px; border-bottom: 1px solid #EDEFF3; background: #FCFCFA">
+<svg aria-hidden="true" viewBox="0 0 320 160" style="display: block; width: 100%; height: auto" fill="none" stroke-linecap="round" stroke-linejoin="round" font-family="JetBrains Mono, monospace">
+<rect x="40" y="16" width="240" height="128" rx="10" stroke="#0F1A2E" stroke-width="1"></rect>
+<text x="54" y="36" fill="#5B6678" font-size="8.5" letter-spacing="1" stroke="none">ONE HOST · COMPOSE</text>
+<rect x="56" y="48" width="96" height="34" rx="5" stroke="#8C96A8" stroke-width="0.75"></rect><text x="104" y="69" fill="#334055" font-size="9" text-anchor="middle" stroke="none">vrt-local</text>
+<rect x="168" y="48" width="96" height="34" rx="5" stroke="#2450E6" stroke-width="1"></rect><text x="216" y="69" fill="#334055" font-size="9" text-anchor="middle" stroke="none">vrt-host</text>
+<rect x="56" y="96" width="96" height="34" rx="5" stroke="#0E8A7A" stroke-width="0.75"></rect><text x="104" y="117" fill="#334055" font-size="9" text-anchor="middle" stroke="none">vrt-provider</text>
+<rect x="168" y="96" width="96" height="34" rx="5" stroke="#0E8A7A" stroke-width="0.75"></rect><text x="216" y="117" fill="#334055" font-size="9" text-anchor="middle" stroke="none">vrt-sql</text>
+<path d="M152 65H168" stroke="#2450E6" stroke-width="1" stroke-dasharray="3 5" style="animation: of-flow 1.2s linear infinite"></path>
+<path d="M216 82V96" stroke="#0E8A7A" stroke-width="1" stroke-dasharray="3 5" style="animation: of-flow 1.2s linear infinite"></path>
+</svg>
+</div>
+<div style="padding: 22px 24px 26px; display: flex; flex-direction: column; gap: 8px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: #0F1A2E">Standalone</h3>
+<p style="margin: 0; font-size: 15px; color: #4B5568"><code style="font-family: 'JetBrains Mono', monospace; font-size: 13.5px">docker compose up</code> runs the whole stack on one machine. <code style="font-family: 'JetBrains Mono', monospace; font-size: 13.5px">vrt-local</code> is the management plane; the <code style="font-family: 'JetBrains Mono', monospace; font-size: 13.5px">vrt</code> CLI deploys, rolls back and manages secrets.</p>
+</div>
+</article>
+
+<article style="display: flex; flex-direction: column; border: 1px solid #D5DAE3; border-radius: 16px; background: #FFFFFF; overflow: hidden">
+<div style="padding: 20px; border-bottom: 1px solid #EDEFF3; background: #FCFCFA">
+<svg aria-hidden="true" viewBox="0 0 320 160" style="display: block; width: 100%; height: auto" fill="none" stroke-linecap="round" stroke-linejoin="round" font-family="JetBrains Mono, monospace">
+<rect x="104" y="12" width="112" height="34" rx="5" stroke="#0F1A2E" stroke-width="1"></rect><text x="160" y="33" fill="#334055" font-size="9" text-anchor="middle" stroke="none">cell-controller</text>
+<path d="M160 46V70M48 70H272M48 70V96M160 70V96M272 70V96" stroke="#C9CFDA" stroke-width="1"></path>
+<path d="M160 46V70H48V96M160 70V96M160 70H272V96" stroke="#2450E6" stroke-width="1" stroke-dasharray="3 9" style="animation: of-flow 1.8s linear infinite"></path>
+<rect x="12" y="96" width="72" height="48" rx="5" stroke="#2450E6" stroke-width="1"></rect><text x="48" y="117" fill="#334055" font-size="8.5" text-anchor="middle" stroke="none">vrt-host</text><text x="48" y="131" fill="#5B6678" font-size="7.5" text-anchor="middle" stroke="none">host-a</text>
+<rect x="124" y="96" width="72" height="48" rx="5" stroke="#2450E6" stroke-width="1"></rect><text x="160" y="117" fill="#334055" font-size="8.5" text-anchor="middle" stroke="none">vrt-host</text><text x="160" y="131" fill="#5B6678" font-size="7.5" text-anchor="middle" stroke="none">host-b</text>
+<rect x="236" y="96" width="72" height="48" rx="5" stroke="#2450E6" stroke-width="1"></rect><text x="272" y="117" fill="#334055" font-size="8.5" text-anchor="middle" stroke="none">vrt-host</text><text x="272" y="131" fill="#5B6678" font-size="7.5" text-anchor="middle" stroke="none">host-c</text>
+<circle cx="76" cy="104" r="2" fill="#0E8A7A" style="animation: of-pulse 1.6s ease-in-out infinite"></circle><circle cx="188" cy="104" r="2" fill="#0E8A7A" style="animation: of-pulse 2s ease-in-out infinite"></circle><circle cx="300" cy="104" r="2" fill="#0E8A7A" style="animation: of-pulse 1.3s ease-in-out infinite"></circle>
+</svg>
+</div>
+<div style="padding: 22px 24px 26px; display: flex; flex-direction: column; gap: 8px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: #0F1A2E">Multi-host cell</h3>
+<p style="margin: 0; font-size: 15px; color: #4B5568"><code style="font-family: 'JetBrains Mono', monospace; font-size: 13.5px">cell-controller</code> owns cron, queues, leases and tenant assignment across many <code style="font-family: 'JetBrains Mono', monospace; font-size: 13.5px">vrt-host</code> machines, and publishes signed desired state to each.</p>
+</div>
+</article>
+
+<article style="display: flex; flex-direction: column; border: 1px solid #D5DAE3; border-radius: 16px; background: #FFFFFF; overflow: hidden">
+<div style="padding: 20px; border-bottom: 1px solid #EDEFF3; background: #FCFCFA">
+<svg aria-hidden="true" viewBox="0 0 320 160" style="display: block; width: 100%; height: auto" fill="none" stroke-linecap="round" stroke-linejoin="round" font-family="JetBrains Mono, monospace">
+<rect x="40" y="16" width="240" height="128" rx="10" stroke="#0F1A2E" stroke-width="1" stroke-dasharray="5 4"></rect>
+<text x="54" y="36" fill="#5B6678" font-size="8.5" letter-spacing="1" stroke="none">CI · SMOKE TEST</text>
+<rect x="72" y="52" width="176" height="38" rx="5" stroke="#8C96A8" stroke-width="0.75" stroke-dasharray="3 3"></rect>
+<text x="160" y="75" fill="#334055" font-size="9" text-anchor="middle" stroke="none">WORKERD_SOURCE=stub</text>
+<path d="M90 112l6 6 12-13" stroke="#0E8A7A" stroke-width="1.5" stroke-dasharray="24" style="animation: of-trace 2.6s ease-in-out infinite"></path>
+<text x="118" y="119" fill="#334055" font-size="9" stroke="none">stack healthy</text>
+<rect x="240" y="108" width="6" height="12" fill="#2450E6" style="animation: of-blink 1s step-end infinite"></rect>
+</svg>
+</div>
+<div style="padding: 22px 24px 26px; display: flex; flex-direction: column; gap: 8px">
+<h3 style="margin: 0; font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: #0F1A2E">No workerd yet</h3>
+<p style="margin: 0; font-size: 15px; color: #4B5568">A stub runtime brings the full stack up without a workerd binary, so CI and first-time readers can smoke-test the platform before supplying one.</p>
+</div>
+</article>
+</div>
+</div>
+</section>

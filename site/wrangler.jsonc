@@ -1,0 +1,11 @@
+{
+  // Static-assets-only Worker: no `main`, Cloudflare serves dist/ directly.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "openflare-site",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist",
+    "not_found_handling": "404-page",
+    "html_handling": "auto-trailing-slash"
+  }
+}

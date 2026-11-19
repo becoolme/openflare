@@ -1,0 +1,15 @@
+---
+import Base from '../layouts/Base.astro';
+import Nav from '../components/Nav.astro';
+import Footer from '../components/Footer.astro';
+---
+<Base title="Not found — OpenFlare" description="This page does not exist.">
+  <Nav />
+  <main style="max-width: 1240px; margin: 0 auto; padding: clamp(80px, 12vw, 160px) clamp(16px, 4vw, 32px); display: flex; flex-direction: column; gap: 20px">
+    <div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; letter-spacing: 0.12em; color: #2450E6">404 · NO ROUTE MATCHED</div>
+    <h1 style="margin: 0; font-weight: 600; font-size: clamp(40px, 6vw, 72px); line-height: 1; letter-spacing: -0.045em">Nothing is deployed here.</h1>
+    <p style="margin: 0; font-size: 18px; color: #334055">The page you asked for doesn’t exist.</p>
+    <a href="/" style="align-self: flex-start; display: inline-flex; align-items: center; min-height: 50px; padding: 0 24px; border-radius: 999px; background: #2450E6; color: #FFFFFF; font-weight: 500">Back to the home page</a>
+  </main>
+  <Footer />
+</Base>
