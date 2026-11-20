@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "vars-basic",
   "binding": "vars",
-  "title": "Wrangler vars are visible to the Worker without leaking config",
+  "title": "Wrangler vars are visible to the Worker",
   "requiresWorkerd": true,
   "evidence": [
     "https://developers.cloudflare.com/workers/configuration/environment-variables/",

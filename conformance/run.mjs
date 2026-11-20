@@ -455,6 +455,8 @@ function stageCaseDir(entry) {
     const src = path.join(entry.dir, f);
     const st = fs.statSync(src);
     if (st.isFile()) fs.copyFileSync(src, path.join(tmp, f));
+    // Subdirectories (e.g. an assets `public/` dir) are copied whole.
+    else if (st.isDirectory()) fs.cpSync(src, path.join(tmp, f), { recursive: true });
   }
   return tmp;
 }
