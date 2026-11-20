@@ -692,6 +692,10 @@ struct Lane {
     dispatch_epoch: u64,
     /// Earliest retry time after the previous batch's settlement failed (settlement failure backoff).
     settle_not_before_ms: i64,
+    /// Consecutive backend settlement failures; advances the bounded claim backoff.
+    settle_streak: u32,
+    /// Fences concurrent completions from resetting a newer settlement failure backoff.
+    settle_generation: u64,
 }
 
 /// Queue dispatcher -- `tick` is driven by the controller loop about every ~1s.
@@ -850,6 +854,8 @@ impl QueueDispatcher {
                     release_retry: Vec::new(),
                     dispatch_epoch: 0,
                     settle_not_before_ms: 0,
+                    settle_streak: 0,
+                    settle_generation: 0,
                 });
                 // Refresh in place when desired changes (pod migration / config update) -- inflight
                 // batches keep settling against the old pod (lease semantics guarantee correctness).
@@ -1037,6 +1043,7 @@ impl QueueDispatcher {
         let tenant = lane.tenant_id.clone();
         let worker = lane.worker_id.clone();
         let cfg = lane.cfg.clone();
+        let settle_generation = lane.settle_generation;
         let delivery_timeout = self.cfg.delivery_timeout;
         let throttle = self.log_throttle.clone();
         #[cfg(test)]
@@ -1198,10 +1205,20 @@ impl QueueDispatcher {
                         "error" => "error",
                         _ => "other",
                     });
-                    settle(&sql, &throttle, &queue_id, &cfg, &batch, &result).await;
+                    let settle_failed =
+                        settle(&sql, &throttle, &queue_id, &cfg, &batch, &result).await;
                     let mut lanes = lanes.lock().await;
                     if let Some(l) = lanes.get_mut(&qid2) {
                         l.inflight = l.inflight.saturating_sub(1);
+                        if settle_failed {
+                            l.settle_generation = l.settle_generation.wrapping_add(1);
+                            l.settle_streak = l.settle_streak.saturating_add(1);
+                            let delay_secs = settlement_backoff_secs(l.settle_streak, &qid2);
+                            l.settle_not_before_ms = unix_ms_now() + i64::from(delay_secs) * 1000;
+                        } else if l.settle_generation == settle_generation {
+                            l.settle_streak = 0;
+                            l.settle_not_before_ms = 0;
+                        }
                         // Well-formed response = platform reachable -- reset the backoff.
                         l.platform_streak = 0;
                         l.platform_not_before_ms = 0;
@@ -1228,10 +1245,9 @@ fn consumer_ran(r: &QueueOutcome) -> bool {
         || !r.retry_messages.is_empty()
 }
 
-/// T37b-r5 platform-side lane backoff: after `streak` failures, starts at 1s and doubles exponentially, capped at
-/// 60s, plus <=base/4 jitter (qid+nanos mix). Bounded => no hot loop; any
-/// well-formed response resets it.
-fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
+/// Bounded exponential backoff: starts at 1s, doubles to a 60s base, then
+/// adds <=base/4 jitter (seed+nanos mix). The final cap is 64s.
+fn bounded_backoff_secs(streak: u32, seed: &str) -> u32 {
     let base = 1u64
         .checked_shl(streak.saturating_sub(1).min(6))
         .map(|v| v.min(60))
@@ -1242,6 +1258,17 @@ fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
         h = h.wrapping_mul(31).wrapping_add(u64::from(b));
     }
     (base + h % (jitter_span + 1)).min(64) as u32
+}
+
+/// T37b-r5 platform-side lane backoff. Any well-formed response resets it.
+fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
+    bounded_backoff_secs(streak, seed)
+}
+
+/// Settlement errors leave claimed rows leased until expiry. Pause new
+/// claims briefly so a failing backend does not receive a hot loop of writes.
+fn settlement_backoff_secs(streak: u32, seed: &str) -> u32 {
+    bounded_backoff_secs(streak, seed)
 }
 
 /// T37b-r5 platform-side give-back: calls `release` grouped by lease_id -- visible_at
@@ -1320,7 +1347,7 @@ async fn settle(
     cfg: &ResolvedConsumer,
     batch: &[PendingMsg],
     result: &QueueOutcome,
-) {
+) -> bool {
     let retry_all = result.outcome != "ok" || result.retry_batch.retry;
     let explicit_retry: BTreeSet<&str> =
         result.explicit_retries.iter().map(|s| s.as_str()).collect();
@@ -1339,6 +1366,7 @@ async fn settle(
     let mut acks: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut retries: BTreeMap<&str, Vec<(String, u32)>> = BTreeMap::new();
     let mut dlq: BTreeMap<&str, Vec<&PendingMsg>> = BTreeMap::new();
+    let mut failed = false;
     for m in batch {
         let lease = m.lease_id.as_str();
         let retry_this = retry_all
@@ -1381,6 +1409,7 @@ async fn settle(
                 }
             }
             Err(e) => {
+                failed = true;
                 crate::metrics::queue_settle_blocked("backend", n);
                 if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                     tracing::warn!(
@@ -1408,6 +1437,7 @@ async fn settle(
                 }
             }
             Err(e) => {
+                failed = true;
                 crate::metrics::queue_settle_blocked("backend", n);
                 if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                     tracing::warn!(
@@ -1429,6 +1459,7 @@ async fn settle(
                 // re-delivered after expiry => takes the DLQ path again and is deduplicated idempotently by id.
                 // "When the DLQ is unavailable the message stays in the original queue" (task acceptance semantics).
                 Err(e) => {
+                    failed = true;
                     crate::metrics::queue_settle_blocked("dlq_send", n);
                     if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                         tracing::warn!(
@@ -1465,6 +1496,7 @@ async fn settle(
                 }
             }
             Err(e) => {
+                failed = true;
                 crate::metrics::queue_settle_blocked("backend", n);
                 if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                     tracing::warn!(
@@ -1475,6 +1507,7 @@ async fn settle(
             }
         }
     }
+    failed
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,6 +1559,7 @@ mod tests {
     struct FakeWorld {
         queues: HashMap<String, FakeQueue>,
         sent: Vec<(String, String)>, // (queue_id, msg_id) audit
+        fail_ack: bool,
     }
 
     type Shared = Arc<StdMutex<FakeWorld>>;
@@ -1537,6 +1571,16 @@ mod tests {
     ) -> (axum::http::StatusCode, Json<Value>) {
         let mut world = w.lock().unwrap();
         let now = now_ms();
+        if op == "ack" && world.fail_ack {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "success": false,
+                    "code": "VRT_UNAVAILABLE",
+                    "retryable": true
+                })),
+            );
+        }
         let q = world.queues.entry(qid.clone()).or_default();
         match op.as_str() {
             "send" => {
@@ -2004,6 +2048,68 @@ mod tests {
         assert_eq!(calls[0]["queue"], "q1");
         assert_eq!(calls[0]["messages"][0]["id"], "m1");
         assert_eq!(calls[0]["messages"][0]["attempts"], 1);
+    }
+
+    #[tokio::test]
+    async fn settlement_backend_failure_backs_off_new_claims() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            w.fail_ack = true;
+            let q = w.queues.entry(QID.into()).or_default();
+            q.msgs.insert(
+                "m1".into(),
+                FakeMsg {
+                    body_hex: "aa".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let inv = Arc::new(FakeInvoker {
+            result: StdMutex::new(Ok(outcome(json!({"outcome":"ok"})))),
+            calls: AtomicU64::new(0),
+            delay: None,
+            last: StdMutex::new(vec![]),
+        });
+        let d = dispatcher(&addr, inv, cfg("h1"));
+        let desired = desired_with(json!([{"queueId": QID, "queueName": "q1"}]));
+        let exp = chrono::Utc::now() + chrono::Duration::minutes(5);
+        tick_pair(&d, &desired, exp, &assignments()).await;
+
+        let deadline = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                {
+                    let lanes = d.lanes.lock().await;
+                    if let Some(lane) = lanes.get(QID) {
+                        if lane.inflight == 0 && lane.settle_streak == 1 {
+                            return lane.settle_not_before_ms;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("settlement failure should update the lane backoff");
+        let remaining_ms = deadline - now_ms();
+        assert!(remaining_ms > 0, "backoff deadline must be in the future");
+        assert!(remaining_ms <= 64_000, "backoff must remain bounded");
+        assert!(world.lock().unwrap().queues[QID].msgs.contains_key("m1"));
+
+        let seq_before = world.lock().unwrap().queues[QID].seq;
+        let out = d
+            .tick(
+                Some(&desired),
+                Some(exp),
+                &assignments(),
+                chrono::Utc::now(),
+            )
+            .await;
+        assert_eq!(
+            out.claimed, 0,
+            "the lane must wait through settlement backoff"
+        );
+        assert_eq!(world.lock().unwrap().queues[QID].seq, seq_before);
     }
 
     #[tokio::test]
