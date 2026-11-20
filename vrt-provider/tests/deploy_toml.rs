@@ -36,6 +36,11 @@ fn provider_text(raw: &str, root: &Path) -> String {
         .replace("REPLACE_ME_S3_ENDPOINT", "s3.example.com")
         .replace("REPLACE_ME_S3_REGION", "auto")
         .replace("REPLACE_ME_S3_BUCKET", "vrt-deploy-test")
+        // R2 binding store placeholders (a deploy overlay fills a full URL,
+        // so the stand-in carries its own scheme).
+        .replace("REPLACE_ME_R2_BINDING_ENDPOINT", "https://r2.example.com")
+        .replace("REPLACE_ME_R2_BINDING_REGION", "auto")
+        .replace("REPLACE_ME_R2_BINDING_BUCKET", "vrt-r2-deploy-test")
 }
 
 #[test]

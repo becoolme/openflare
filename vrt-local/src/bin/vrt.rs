@@ -19,7 +19,15 @@ USAGE:
   vrt init --root <dir> --cell <id> --tenant <id> [--mode capnp|stub]
            [--facade-dist <dir>] [--workerd <path>] [--ingress-listen <addr>]
   vrt serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
-  vrt deploy --root <dir> <worker_dir>
+           [--vrt-sql-bin <p>] [--mgmt-tcp-listen <addr> --mgmt-tcp-token-file <p>]
+  vrt dev [<worker_dir>] [--listen <addr>] [--no-watch] [--no-color] [--no-logs]
+           [--workerd <p>] [--stub] [--allow-unpinned-workerd]
+           [--vrt-host-bin <p>] [--vrt-provider-bin <p>] [--vrt-sql-bin <p>]
+           [--facade-dist <dir>]
+  vrt deploy --root <dir> [--secrets-file <f|->] [--var K:V]… [--name <n>] [--dry-run] <worker_dir>
+  vrt deploy --url <http://host:port> --token-file <p> [same options] <worker_dir>
+  vrt logs --root <dir> <worker> [--follow] [--since <dur>] [--level <lvl>] [--json]
+  vrt doctor [--root <dir>] [--json] [--strict]
   vrt rollback --root <dir> <worker> <version_id>
   vrt hostnames add --root <dir> <worker> <hostname>
   vrt hostnames rm  --root <dir> <worker> <hostname>
@@ -71,11 +79,31 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-/// Positional args (everything not consumed as a `--flag value` pair).
+/// Flags that take NO value — `positional` must not consume the arg
+/// after one (a `--no-watch dir` bug would silently drop `dir`).
+const BARE_FLAGS: &[&str] = &[
+    "--supervise",
+    "--no-watch",
+    "--no-color",
+    "--no-logs",
+    "--stub",
+    "--allow-unpinned-workerd",
+    "--dry-run",
+    "--json",
+    "--follow",
+    "--strict",
+];
+
+/// Positional args (everything not consumed as a `--flag value` pair
+/// or listed as a bare flag).
 fn positional(args: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        if BARE_FLAGS.contains(&args[i].as_str()) {
+            i += 1;
+            continue;
+        }
         if args[i].starts_with("--") {
             i += 2;
             continue;
@@ -100,22 +128,10 @@ async fn run(args: Vec<String>) -> Result<(), String> {
     match cmd {
         "init" => cmd_init(&args[1..]),
         "serve" => cmd_serve(&args[1..]).await,
-        "deploy" => {
-            let root = root_of(&args[1..])?;
-            let pos = positional(&args[1..]);
-            let dir = pos.first().ok_or("worker_dir required")?.clone();
-            let r = direct(&root, |l| {
-                l.deploy(
-                    Path::new(&dir),
-                    &vrt_local::worker_pkg::DeployOverrides::default(),
-                )
-                .map(|r| {
-                    serde_json::json!({"versionId": r.version_id, "artifactDigest": r.artifact_digest, "revision": r.revision})
-                })
-            })?;
-            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
-            Ok(())
-        }
+        "dev" => cmd_dev(&args[1..]).await,
+        "deploy" => cmd_deploy(&args[1..]),
+        "logs" => cmd_logs(&args[1..]),
+        "doctor" => cmd_doctor(&args[1..]),
         "rollback" => {
             let root = root_of(&args[1..])?;
             let pos = positional(&args[1..]);
@@ -350,7 +366,7 @@ fn cmd_queue_metrics(root: &Path, queue_id: &str) -> Result<(), String> {
         .unwrap_or_default()
         .as_nanos() as u64;
     let auth = signer.sign("GET", &path_query, b"", 1, seq);
-    // Bounded I/O — DNS resolve + 5s connect + 10s r/w (诊断绝不挂死).
+    // Bounded I/O — DNS resolve + 5s connect + 10s r/w (diagnostics must never hang).
     let sock_addr = std::net::ToSocketAddrs::to_socket_addrs(&authority)
         .map_err(|e| format!("resolve {authority}: {e}"))?
         .next()
@@ -934,17 +950,352 @@ fn write_configs(
     Ok(())
 }
 
+/// `--mgmt-tcp-listen <addr> --mgmt-tcp-token-file <path>` → the
+/// optional TCP management listener (A2). The token file is REQUIRED
+/// when the listener is enabled — there is no default credential.
+fn mgmt_tcp(args: &[String]) -> Result<Option<vrt_local::serve::MgmtTcpOptions>, String> {
+    let Some(listen) = arg(args, "--mgmt-tcp-listen") else {
+        return Ok(None);
+    };
+    let addr: std::net::SocketAddr = listen
+        .parse()
+        .map_err(|_| "--mgmt-tcp-listen must be host:port".to_string())?;
+    let token_file = arg(args, "--mgmt-tcp-token-file")
+        .ok_or("--mgmt-tcp-listen requires --mgmt-tcp-token-file <path>")?;
+    Ok(Some(vrt_local::serve::MgmtTcpOptions {
+        listen: addr,
+        token_file: PathBuf::from(token_file),
+    }))
+}
+
+/// `vrt doctor` — diagnostics. Human output prints one line per
+/// check (`[status] id — detail` + hint); `--json` emits the stable
+/// `{root, ok, checks[]}` report. Exit non-zero on any fail, and on
+/// any action under --strict.
+fn cmd_doctor(args: &[String]) -> Result<(), String> {
+    let root_s = arg(args, "--root").unwrap_or(".vrt");
+    let root = std::path::Path::new(root_s);
+    let project_dir = std::env::current_dir().map_err(|e| e.to_string())?;
+    let report = vrt_local::doctor::run(root, &project_dir);
+    let strict = args.iter().any(|a| a == "--strict");
+    let ok = report.passing(strict);
+    if args.iter().any(|a| a == "--json") {
+        let mut out = serde_json::to_value(&report).unwrap_or_default();
+        out["ok"] = serde_json::Value::Bool(ok);
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        for c in &report.checks {
+            println!("[{}] {} — {}", c.status, c.id, c.detail);
+            if let Some(h) = &c.hint {
+                println!("        hint: {h}");
+            }
+            if let Some(d) = &c.docs {
+                println!("        docs: {d}");
+            }
+        }
+    }
+    if ok {
+        Ok(())
+    } else {
+        Err("doctor: one or more checks failed".into())
+    }
+}
+
+/// `vrt logs` — read-only tail of the host log hub for ONE worker
+/// (name or workerId). The cursor lives on the wire as
+/// `(bootId, nextSeq)`; `--follow` polls until Ctrl+C.
+fn cmd_logs(args: &[String]) -> Result<(), String> {
+    let root_s = arg(args, "--root").ok_or("--root required")?;
+    let root = std::path::Path::new(root_s);
+    let pos = positional(args);
+    let worker = pos.first().ok_or("worker name|workerId required")?;
+    let level = arg(args, "--level").map(String::from);
+    if let Some(l) = &level {
+        if !matches!(
+            l.as_str(),
+            "debug" | "info" | "log" | "warn" | "error" | "platform"
+        ) {
+            return Err("--level must be debug|info|log|warn|error|platform".into());
+        }
+    }
+    let cutoff = arg(args, "--since")
+        .map(|s| {
+            let ms = vrt_local::logtail::parse_since(s).map_err(|e| e.to_string())?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            Ok::<i64, String>(now - ms)
+        })
+        .transpose()?
+        .unwrap_or(i64::MIN);
+    let worker_id = direct(root, |l| l.resolve_worker_id(worker))?;
+    let base = vrt_local::logtail::control_listen_addr(root)
+        .map_err(|_| "vrt-host.toml has no controlListen".to_string())?;
+    let opts = vrt_local::logtail::LogsOpts {
+        follow: args.iter().any(|a| a == "--follow"),
+        json: args.iter().any(|a| a == "--json"),
+        level,
+        since_ms: cutoff,
+        color: false,
+        ..Default::default()
+    };
+    let mut out = std::io::stdout().lock();
+    vrt_local::logtail::logs_run(&mut out, &base, &worker_id, &opts).map_err(|e| e.to_string())
+}
+
+/// `vrt deploy` — two modes:
+///   local   `vrt deploy --root <dir> <worker_dir>` (unchanged)
+///   remote  `vrt deploy --url <http://host:port> --token-file <p>
+///            [--secrets-file <path|->] [--var KEY:VALUE]…
+///            [--name <n>] [--dry-run] <worker_dir>`
+/// Secrets never appear in argv, logs, or error text.
+fn cmd_deploy(args: &[String]) -> Result<(), String> {
+    use vrt_local::worker_pkg::{DeployOverrides, DeployUpload, UploadAssets};
+    let pos = positional(args);
+    let dir = pos.first().ok_or("worker_dir required")?.clone();
+    let overrides = DeployOverrides {
+        name: arg(args, "--name").map(String::from),
+        vars: collect_vars(args)?,
+        ..Default::default()
+    };
+    let secrets = collect_secrets(args)?;
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    if arg(args, "--url").is_some() && arg(args, "--root").is_some() {
+        return Err("--url and --root are mutually exclusive".into());
+    }
+
+    if let Some(url) = arg(args, "--url") {
+        // ---- remote mode: pack client-side, upload, server verifies
+        let token_path =
+            arg(args, "--token-file").ok_or("--url requires --token-file <path> (0600, 64-hex)")?;
+        let token = vrt_local::keys::load_token_file(Path::new(token_path))
+            .map_err(|e| format!("token file: {e}"))?;
+        let g = vrt_local::worker_pkg::gather_dir(Path::new(&dir)).map_err(|e| e.to_string())?;
+        if dry_run {
+            let s = vrt_local::worker_pkg::summarize(&g, &overrides).map_err(|e| e.to_string())?;
+            println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
+            return Ok(());
+        }
+        let body = DeployUpload {
+            modules: g
+                .files
+                .iter()
+                .map(|(k, v)| {
+                    use base64::Engine;
+                    (
+                        k.clone(),
+                        base64::engine::general_purpose::STANDARD.encode(v),
+                    )
+                })
+                .collect(),
+            assets: g.pending_assets.as_ref().map(|p| {
+                use base64::Engine;
+                UploadAssets {
+                    manifest: base64::engine::general_purpose::STANDARD.encode(&p.manifest_bytes),
+                    objects: p
+                        .objects
+                        .iter()
+                        .map(|(d, b)| {
+                            (
+                                d.clone(),
+                                base64::engine::general_purpose::STANDARD.encode(b),
+                            )
+                        })
+                        .collect(),
+                }
+            }),
+            vars: overrides.vars.clone(),
+            secrets,
+            name: overrides.name.clone(),
+            meta: g.meta.clone(),
+        };
+        let wire = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+        let (status, text) = http_post_json(url, "/v1/deploy/upload", &token, &wire)?;
+        if status != 200 {
+            return Err(format!("deploy rejected ({status}): {text}"));
+        }
+        println!("{text}");
+        return Ok(());
+    }
+
+    // ---- local mode (unchanged semantics + the new options)
+    let root = root_of(args)?;
+    let g = if dry_run {
+        Some(vrt_local::worker_pkg::gather_dir(Path::new(&dir)).map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    if let Some(g) = g {
+        let s = vrt_local::worker_pkg::summarize(&g, &overrides).map_err(|e| e.to_string())?;
+        println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
+        return Ok(());
+    }
+    let r = direct(&root, |l| {
+        if !secrets.is_empty() {
+            let tenant = l.status()?.tenant_id.to_string();
+            for (sref, value) in &secrets {
+                l.put_secret(&tenant, sref, value)?;
+            }
+        }
+        l.deploy(Path::new(&dir), &overrides).map(|r| {
+            serde_json::json!({"versionId": r.version_id, "artifactDigest": r.artifact_digest, "revision": r.revision})
+        })
+    })?;
+    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+    Ok(())
+}
+
+/// Repeated `--var KEY:VALUE` — non-secret vars only; values MAY
+/// contain `:` (first colon splits). Secret values must never travel
+/// argv — they come via `--secrets-file` or stdin.
+fn collect_vars(args: &[String]) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--var" {
+            let kv = args.get(i + 1).ok_or("--var requires KEY:VALUE")?;
+            let Some((k, v)) = kv.split_once(':') else {
+                return Err("--var requires KEY:VALUE".into());
+            };
+            if k.is_empty() {
+                return Err("--var key must not be empty".into());
+            }
+            out.insert(k.to_string(), v.to_string());
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// `--secrets-file <path>` (`-` = stdin), `.dev.vars` format —
+/// `KEY=VALUE` lines, `#` comments. Secret VALUES are read from the
+/// file/stream only and flow into the upload body or `put_secret`;
+/// they never appear in errors, logs, or argv.
+fn collect_secrets(args: &[String]) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let Some(path) = arg(args, "--secrets-file") else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let text = if path == "-" {
+        let mut s = String::new();
+        std::io::stdin()
+            .read_to_string(&mut s)
+            .map_err(|e| format!("read secrets stdin: {e}"))?;
+        s
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("read secrets file: {e}"))?
+    };
+    vrt_local::devvars::parse(&text).map_err(|e| e.to_string())
+}
+
+/// Minimal sync HTTP POST (JSON) for the remote mgmt API — mirrors
+/// `unix_http`: bounded connect/rw timeouts, one request, one
+/// response. `http://` only — remote deployments should reach the
+/// listener over an SSH tunnel or TLS-terminating proxy.
+fn http_post_json(
+    base_url: &str,
+    path: &str,
+    token: &[u8],
+    body: &[u8],
+) -> Result<(u16, String), String> {
+    use std::io::{Read, Write};
+    let authority = base_url
+        .strip_prefix("http://")
+        .ok_or("deploy --url supports http:// only (use an SSH tunnel or TLS proxy for remote targets)")?
+        .trim_end_matches('/');
+    let authority = authority.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("--url must be http://host:port".into());
+    }
+    let sock_addr = std::net::ToSocketAddrs::to_socket_addrs(authority)
+        .map_err(|e| format!("resolve {authority}: {e}"))?
+        .next()
+        .ok_or("url resolves to nothing")?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_secs(10))
+            .map_err(|e| format!("connect {authority}: {e}"))?;
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .and_then(|_| stream.set_write_timeout(Some(std::time::Duration::from_secs(60))))
+        .map_err(|e| e.to_string())?;
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nhost: {authority}\r\nauthorization: Bearer {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        String::from_utf8_lossy(token),
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .and_then(|_| stream.write_all(body))
+        .map_err(|e| format!("send: {e}"))?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    let (head, body_out) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status: u16 = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Ok((status, body_out.to_string()))
+}
+
 async fn cmd_serve(args: &[String]) -> Result<(), String> {
     let root = root_of(args)?;
     let opts = vrt_local::serve::ServeOptions {
+        mgmt_tcp: mgmt_tcp(args)?,
         supervise: args.iter().any(|a| a == "--supervise"),
         vrt_host_bin: arg(args, "--vrt-host-bin").map(PathBuf::from),
         vrt_provider_bin: arg(args, "--vrt-provider-bin").map(PathBuf::from),
+        vrt_sql_bin: arg(args, "--vrt-sql-bin").map(PathBuf::from),
         extra_args: Vec::new(),
+        stop: None,
     };
     vrt_local::serve::run(&root, &opts)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// `vrt dev` — one-command local development: init `.vrt/`, supervise
+/// host/provider/sql, deploy, watch, redeploy. See `vrt_local::dev`.
+async fn cmd_dev(args: &[String]) -> Result<(), String> {
+    let pos = positional(args);
+    let worker_dir = pos
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let opts = vrt_local::dev::DevOptions {
+        worker_dir,
+        listen: arg(args, "--listen").map(String::from),
+        no_watch: args.iter().any(|a| a == "--no-watch"),
+        workerd: arg(args, "--workerd").map(PathBuf::from),
+        stub: args.iter().any(|a| a == "--stub"),
+        allow_unpinned_workerd: args.iter().any(|a| a == "--allow-unpinned-workerd"),
+        vrt_host_bin: arg(args, "--vrt-host-bin").map(PathBuf::from),
+        vrt_provider_bin: arg(args, "--vrt-provider-bin").map(PathBuf::from),
+        vrt_sql_bin: arg(args, "--vrt-sql-bin").map(PathBuf::from),
+        facade_dist: arg(args, "--facade-dist").map(PathBuf::from),
+        stop: None,
+        print_logs: !args.iter().any(|a| a == "--no-logs"),
+        no_color: args.iter().any(|a| a == "--no-color"),
+    };
+    let session = vrt_local::dev::run(opts).await.map_err(|e| e.to_string())?;
+    let s = &session.summary;
+    println!("dev server ready in {:?}", s.ready_after);
+    println!("  url:    {}", s.url);
+    println!("  worker: {}", s.worker_name);
+    println!("  runtime: {}", s.runtime);
+    if !s.bindings.is_empty() {
+        println!("bindings:");
+        for line in &s.bindings {
+            println!("  {line}");
+        }
+    }
+    println!("control: {}", s.control_base);
+    println!("tip: add `.vrt/` to .gitignore");
+    session.wait().await.map_err(|e| e.to_string())
 }
 
 async fn cmd_hostnames(args: &[String]) -> Result<(), String> {

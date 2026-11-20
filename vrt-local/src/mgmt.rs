@@ -2,6 +2,12 @@
 //! token-authenticated). Every handler is a thin adapter onto the
 //! typed [`VrtLocal`] ops; input validation lives in the library, the
 //! wire layer only enforces shape, body cap, token and timeout.
+//!
+//! An OPTIONAL TCP listener (`--mgmt-tcp-listen`) shares the same
+//! router under a SEPARATE bearer token and a per-source-IP rate
+//! limit — it exists for remote `vrt deploy --url` and is off by
+//! default. The unix socket's security level is never lowered to
+//! accommodate it.
 
 use crate::layout::mgmt_dir;
 use crate::{keys, worker_pkg, LocalError, VrtLocal};
@@ -24,9 +30,11 @@ const MAX_BODY: usize = 64 * 1024;
 const REQ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Shared API state — `renewal` is what `serve` reports on /healthz.
+/// The bearer token is NOT here: it lives in the auth middleware
+/// state so the unix and TCP listeners can hold different tokens on
+/// the same routes.
 pub struct Api {
     root: PathBuf,
-    token: Vec<u8>,
     renewal: std::sync::RwLock<RenewalView>,
 }
 
@@ -47,41 +55,73 @@ pub fn socket_path(root: &std::path::Path) -> PathBuf {
     mgmt_dir(root).join("vrt.sock")
 }
 
-/// Build the router (bind/listen lives in `serve` so tests can attach
-/// their own listener).
+/// Max body on `/v1/deploy/upload` — the wire cap, not a content
+/// cap: module bytes (96MB) + assets (8MB) base64-inflate ~4/3, and
+/// `assemble` re-applies the real content caps after decode.
+const UPLOAD_MAX_BODY: usize = 200 * 1024 * 1024;
+
+/// Build the unix-socket router (bind/listen lives in `serve` so
+/// tests can attach their own listener).
 /// Returns the router plus the shared [`Api`] so `serve`'s renewal
 /// loop can record outcomes onto the same /healthz view.
 pub fn router(root: PathBuf) -> Result<(Router, Arc<Api>), LocalError> {
     let token = keys::load_mgmt_token(&root)?;
     let api = Arc::new(Api {
         root,
-        token,
         renewal: std::sync::RwLock::new(RenewalView::default()),
     });
     Ok((
-        Router::new()
-            .route("/v1/status", get(status))
-            .route("/v1/versions", get(versions))
-            .route("/v1/deploy", post(deploy))
-            .route("/v1/rollback", post(rollback))
-            .route("/v1/hostnames", get(hostnames_list).post(hostname_set))
-            .route("/v1/secrets", get(secrets_list).put(secret_put))
-            .route("/v1/secrets/{secret_ref}", delete(secret_rm))
-            .route("/v1/renew", post(renew))
-            .route("/healthz", get(healthz))
-            // T37b-r: dispatcher metrics live in THIS process's
-            // cell-controller registry (standalone runs the
-            // dispatcher in-process) — host /metrics can't see them.
-            .route("/v1/metrics", get(metrics_text))
-            .layer(DefaultBodyLimit::max(MAX_BODY))
-            .layer(middleware::from_fn_with_state(api.clone(), auth))
-            .with_state(api.clone()),
+        routes(api.clone()).layer(middleware::from_fn_with_state(token, auth)),
         api,
     ))
 }
 
+/// The TCP management listener's router — the same routes on the
+/// SHARED [`Api`] (so /healthz reports the real renewal view), under
+/// a different bearer token plus a per-source-IP rate limit. Never
+/// mounted unless `serve` was explicitly told to listen on TCP.
+pub fn tcp_router(api: Arc<Api>, token: Vec<u8>, limiter: Arc<RateLimit>) -> Router {
+    routes(api)
+        .layer(middleware::from_fn_with_state(token, auth))
+        .layer(middleware::from_fn_with_state(limiter, rate_limit))
+}
+
+/// Route table shared by both listeners — body caps included.
+fn routes(api: Arc<Api>) -> Router {
+    Router::new()
+        .route("/v1/status", get(status))
+        .route("/v1/versions", get(versions))
+        .route("/v1/deploy", post(deploy))
+        // A2: remote deploy — the packed bundle + meta + secrets
+        // travel in one body; the route-level body limit overrides
+        // the global 64KiB below (innermost DefaultBodyLimit wins).
+        .route(
+            "/v1/deploy/upload",
+            post(deploy_upload)
+                .layer(DefaultBodyLimit::max(UPLOAD_MAX_BODY))
+                // Declared-oversize bodies die before a byte is read —
+                // DefaultBodyLimit alone still buffers up to the cap.
+                .route_layer(middleware::from_fn(content_length_gate)),
+        )
+        .route("/v1/rollback", post(rollback))
+        .route("/v1/hostnames", get(hostnames_list).post(hostname_set))
+        .route("/v1/secrets", get(secrets_list).put(secret_put))
+        .route("/v1/secrets/{secret_ref}", delete(secret_rm))
+        .route("/v1/renew", post(renew))
+        .route("/healthz", get(healthz))
+        // T37b-r: dispatcher metrics live in THIS process's
+        // cell-controller registry (standalone runs the
+        // dispatcher in-process) — host /metrics can't see them.
+        .route("/v1/metrics", get(metrics_text))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .with_state(api)
+}
+
+/// Bearer check — constant-time, the token arrives as middleware
+/// state so the same `auth` serves both listeners under different
+/// credentials.
 async fn auth(
-    State(api): State<Arc<Api>>,
+    State(token): State<Vec<u8>>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
@@ -91,11 +131,72 @@ async fn auth(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     let ok = bearer.is_some_and(|t| {
-        t.len() == api.token.len()
-            && subtle::ConstantTimeEq::ct_eq(t.as_bytes(), api.token.as_slice()).into()
+        t.len() == token.len()
+            && subtle::ConstantTimeEq::ct_eq(t.as_bytes(), token.as_slice()).into()
     });
     if !ok {
         return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Early reject for declared-oversize uploads (Content-Length >
+/// UPLOAD_MAX_BODY → 413 without reading the body).
+async fn content_length_gate(req: Request, next: Next) -> Result<Response, StatusCode> {
+    let declared = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n as usize > UPLOAD_MAX_BODY) {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    Ok(next.run(req).await)
+}
+
+/// Per-source-IP rate limiting for the TCP listener only — a fixed
+/// 60s window; the unix socket is owner-only and needs none.
+pub struct RateLimit {
+    inner:
+        std::sync::Mutex<std::collections::BTreeMap<std::net::IpAddr, (std::time::Instant, u32)>>,
+}
+
+impl RateLimit {
+    /// Requests per source IP per 60s window.
+    pub const MAX_PER_MIN: u32 = 60;
+    /// New empty limiter.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        })
+    }
+    fn check(&self, ip: std::net::IpAddr) -> bool {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        let entry = g.entry(ip).or_insert((now, 0));
+        if now.duration_since(entry.0) >= std::time::Duration::from_secs(60) {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= Self::MAX_PER_MIN
+    }
+}
+
+async fn rate_limit(
+    State(limiter): State<Arc<RateLimit>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // ConnectInfo is guaranteed by `into_make_service_with_connect_info`
+    // on the TCP listener; absent it (tests calling the router
+    // directly) the limiter simply does not engage.
+    if let Some(axum::extract::ConnectInfo(addr)) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        if !limiter.check(addr.ip()) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
     }
     Ok(next.run(req).await)
 }
@@ -222,6 +323,24 @@ async fn deploy(
     })
     .await
     .map_err(fail)?;
+    serde_json::to_value(&r)
+        .map(Json)
+        .map_err(|_| err_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", None))
+}
+
+/// A2: remote deploy — one JSON body carries meta + module bytes +
+/// `[assets]` objects + secret values. The rejection status is kept
+/// (413 for over-cap bodies) but its detail is NOT: secrets ride in
+/// the body and error text never echoes it.
+async fn deploy_upload(
+    State(api): State<Arc<Api>>,
+    body: Result<Json<worker_pkg::DeployUpload>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let Json(b) = body.map_err(|r| err_body(r.status(), "body", None))?;
+    let root = api.root.clone();
+    let r = op(move || local(&root)?.deploy_upload(&b))
+        .await
+        .map_err(fail)?;
     serde_json::to_value(&r)
         .map(Json)
         .map_err(|_| err_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", None))

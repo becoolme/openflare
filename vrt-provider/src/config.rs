@@ -323,9 +323,9 @@ pub struct FsAssetsConfig {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VrtSqlConfig {
-    /// Base URL (`http://host:port`, no trailing slash). 内部网络。
+    /// Base URL (`http://host:port`, no trailing slash). Internal network.
     pub addr: String,
-    /// 服务间认证 secret 文件（0600，与 vrt-sql 同一份）。
+    /// Inter-service auth secret file (0600, the same one as vrt-sql).
     pub auth_secret_file: PathBuf,
     /// Per-request timeout (bounded; no retry).
     #[serde(default = "default_vrt_sql_timeout_ms")]

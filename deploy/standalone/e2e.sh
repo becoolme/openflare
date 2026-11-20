@@ -245,8 +245,8 @@ dn1="${d1##*:}"; dn1="${dn1%\}*}"; dn2="${d2##*:}"; dn2="${dn2%\}*}"
        curl -sS --max-time 5 -H "Host: d1.vrt.local" "$BASE_URL/api/hits" >&2 || true
        FAILED=1; exit 1; }
 
-# T36b: restart ONLY vrt-sql — fs 持久化 + 优雅 lease 释放应让
-# counter 即时延续（SIGTERM 释放 lease；新 holder 不必等满 15s）。
+# T36b: restart ONLY vrt-sql -- fs persistence + graceful lease release should let
+# the counter continue immediately (SIGTERM releases the lease; a new holder need not wait the full 15s).
 step "restart vrt-sql only (persistence + lease release)"
 "${DC[@]}" restart vrt-sql
 wait_ready d1.vrt.local /api/hits \

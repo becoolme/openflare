@@ -1,11 +1,11 @@
-//! async ObjectStore → 同步调用方的桥接（vrt-sql 单写者锁内使用）。
+//! Bridge from the async ObjectStore to synchronous callers (used inside the vrt-sql single-writer lock).
 //!
-//! 专用 runtime（lazy 全局）驱动 store future：
-//! - 调用线程在 runtime 内（async ctx）→ 把 future 交给一个临时
-//!   std 线程跑 `rt.block_on`（`Runtime::block_on` 不能嵌套在
-//!   runtime 线程里）；本线程 join 等待。等价于把 I/O 卸载到专用
-//!   reactor，不依赖 `block_in_place`（单线程 runtime 会 panic）。
-//! - 调用线程不在 runtime → 直接 `rt.block_on`。
+//! A dedicated runtime (lazy global) drives the store future:
+//! - calling thread is inside a runtime (async ctx) -> hand the future to a temporary
+//!   std thread that runs `rt.block_on` (`Runtime::block_on` cannot nest inside a
+//!   runtime thread); this thread joins and waits. Equivalent to offloading I/O to a dedicated
+//!   reactor, and does not depend on `block_in_place` (which panics on a single-thread runtime).
+//! - calling thread is not in a runtime -> call `rt.block_on` directly.
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -13,7 +13,7 @@ use tokio::runtime::{Builder, Runtime};
 
 static STORE_RT: OnceLock<Runtime> = OnceLock::new();
 
-/// 对象存储专用 runtime（2 线程足够：调用方本身串行化）。
+/// Dedicated object-store runtime (2 threads are enough: callers are serialized themselves).
 pub fn store_runtime() -> &'static Runtime {
     STORE_RT.get_or_init(|| {
         Builder::new_multi_thread()
@@ -25,10 +25,10 @@ pub fn store_runtime() -> &'static Runtime {
     })
 }
 
-/// 同步等待一个 store future 完成。
+/// Synchronously wait for a store future to complete.
 ///
 /// # Panics
-/// store future panic 会传播（`join` unwrap）——视为 bug。
+/// A store future panic propagates (`join` unwrap) -- treated as a bug.
 pub fn block_on_store<F>(fut: F) -> F::Output
 where
     F: Future + Send,
@@ -36,7 +36,7 @@ where
 {
     let rt = store_runtime();
     if tokio::runtime::Handle::try_current().is_ok() {
-        // 已在某 runtime 线程：绝不能 block_on 嵌套 → 卸载到普通线程。
+        // Already on some runtime thread: must not nest block_on -> offload to a plain thread.
         std::thread::scope(|s| {
             s.spawn(|| rt.block_on(fut))
                 .join()

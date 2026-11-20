@@ -22,9 +22,9 @@ const DIRS: [&str; 8] = [
 /// Extra dirs created by init (T25): host/provider runtime state and
 /// the seeded facade manifest. Validated by [`check`] only when the
 /// `.vrt-init` marker exists — roots created before T25 simply lack
-/// them and keep passing. `objstore` (T36b): vrt-sql fs 持久化根——
-/// bind-mount/host-dir 变体下卷内目录由 init 建（命名卷属主则来自
-/// 镜像 /data/objstore，Dockerfile.vrt-local 同步维护）。
+/// them and keep passing. `objstore` (T36b): vrt-sql fs persistence root --
+/// under the bind-mount/host-dir variant the in-volume directory is created by init (for a named volume the owner comes from
+/// the image's /data/objstore, maintained in sync with Dockerfile.vrt-local).
 const INIT_DIRS: [&str; 5] = ["facade", "provider", "work", "cache", "objstore"];
 
 /// Commit marker — written LAST by [`init_commit`]. `open`/`check`

@@ -102,19 +102,19 @@ pub struct QueueDispatchToml {
     /// `_vrt_q_dispatch.holder` — defaults to `cron_holder`.
     #[serde(default)]
     pub holder_id: Option<String>,
-    /// 派发租约 TTL ms（5s..300s）。
+    /// Dispatch lease TTL in ms (5s..300s).
     #[serde(default)]
     pub dispatch_ttl_ms: Option<i64>,
-    /// 消息 lease TTL ms——必须 > delivery_timeout_secs+15s。
+    /// Message lease TTL in ms -- must be > delivery_timeout_secs+15s.
     #[serde(default)]
     pub msg_lease_ms: Option<i64>,
-    /// 批投递超时秒（< msg_lease-15s）。
+    /// Batch delivery timeout in seconds (< msg_lease-15s).
     #[serde(default)]
     pub delivery_timeout_secs: Option<u64>,
-    /// 全局在飞批上限 1..=1024。
+    /// Global cap on in-flight batches, 1..=1024.
     #[serde(default)]
     pub global_inflight_max: Option<usize>,
-    /// T37b-r: claim 原始 body 字节预算（默认 4MB,上限 32MB）。
+    /// T37b-r: claim raw body byte budget (default 4MB, max 32MB).
     #[serde(default)]
     pub claim_max_bytes: Option<u64>,
 }
@@ -457,7 +457,7 @@ pub fn cron_deps(
     Ok((log, Box::new(invoker), lease, lease_ttl, true))
 }
 
-/// 未证实-free fail-closed invoker for configurations that cannot
+/// Unverified-free fail-closed invoker for configurations that cannot
 /// honestly deliver (multi-replica without distributed lease, no pods).
 /// Delivery always errors → the slot is claimed but never claimed as
 /// fired — visible in the tick outcome, never a fake success.

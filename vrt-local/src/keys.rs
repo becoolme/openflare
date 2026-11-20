@@ -56,10 +56,10 @@ pub fn load_signing_key(root: &Path) -> Result<SigningKey, LocalError> {
     Ok(SigningKey::from_seed(seed)?)
 }
 
-/// P3c-1：raw 32-byte signing seed — DO `uniqueKey` 的 HMAC pepper
-/// （seed 即密钥材料，权限/归属检查与 [`load_signing_key`] 同路）。
+/// P3c-1: raw 32-byte signing seed -- the HMAC pepper for DO `uniqueKey`
+/// (the seed is key material; permission/ownership checks follow the same path as [`load_signing_key`]).
 pub fn load_signing_seed(root: &Path) -> Result<[u8; 32], LocalError> {
-    // 复用 SigningKey 加载的全部权限/归属/长度检查，然后直接读 seed。
+    // Reuse all the permission/ownership/length checks of SigningKey loading, then read the seed directly.
     load_signing_key(root)?;
     let bytes = std::fs::read(key_path(root)).map_err(|_| LocalError::Layout("key read"))?;
     bytes
@@ -107,8 +107,17 @@ pub fn write_mgmt_token(root: &std::path::Path) -> Result<(), LocalError> {
 
 /// Load the management token; missing/insecure/malformed → fail closed.
 pub fn load_mgmt_token(root: &std::path::Path) -> Result<Vec<u8>, LocalError> {
-    let path = mgmt_token_path(root);
-    let meta = std::fs::metadata(&path).map_err(|_| LocalError::Layout("token missing"))?;
+    load_token_file(&mgmt_token_path(root))
+}
+
+/// Load a bearer-token file at an arbitrary path — the TCP
+/// management listener uses a SEPARATE token (`--token-file`) from
+/// the unix socket's `mgmt/token` so an exposed TCP credential never
+/// doubles as the local one. Same rules either way: `0600`,
+/// owner-only, exactly 64 lowercase-or-uppercase hex chars —
+/// anything else fails closed.
+pub fn load_token_file(path: &std::path::Path) -> Result<Vec<u8>, LocalError> {
+    let meta = std::fs::metadata(path).map_err(|_| LocalError::Layout("token missing"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -116,7 +125,7 @@ pub fn load_mgmt_token(root: &std::path::Path) -> Result<Vec<u8>, LocalError> {
             return Err(LocalError::Layout("token mode"));
         }
     }
-    let raw = std::fs::read(&path)?;
+    let raw = std::fs::read(path)?;
     if raw.len() != 64 || !raw.iter().all(|b| b.is_ascii_hexdigit()) {
         return Err(LocalError::Layout("token malformed"));
     }
@@ -146,13 +155,13 @@ pub fn write_cursor_secret(root: &std::path::Path) -> Result<(), LocalError> {
     .map_err(|_| LocalError::Layout("cursor write"))
 }
 
-/// provider↔vrt-sql 服务间认证 secret（`keys/sql-auth.secret`, 0600）—
-/// T34。两端共享同一份；非 0600 时两侧均 fail closed。
+/// Provider<->vrt-sql service-to-service auth secret (`keys/sql-auth.secret`, 0600) --
+/// T34. Both ends share the same file; if it is not 0600 both sides fail closed.
 pub fn sql_auth_secret_path(root: &std::path::Path) -> std::path::PathBuf {
     crate::layout::keys_dir(root).join("sql-auth.secret")
 }
 
-/// vrt-sql bookmark HMAC key（`keys/sql-bookmark.secret`, 0600）。
+/// vrt-sql bookmark HMAC key (`keys/sql-bookmark.secret`, 0600).
 pub fn sql_bookmark_secret_path(root: &std::path::Path) -> std::path::PathBuf {
     crate::layout::keys_dir(root).join("sql-bookmark.secret")
 }

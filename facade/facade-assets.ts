@@ -129,8 +129,8 @@ export class AssetTransport extends WorkerEntrypoint {
     }
     const headers = new Headers(request.headers);
     for (const name of INTERNAL_HEADERS) headers.delete(name);
-    // INTERNAL_HEADERS 是上游维护的命名清单；兜底再剔除任何
-    // x-open-compute-* 前缀头，保证身份面完全由 props 覆写。
+    // INTERNAL_HEADERS is an upstream-maintained named list; as a safety net also strip any
+    // x-open-compute-* prefixed header, so the identity surface is fully overwritten by props.
     for (const name of [...headers.keys()]) {
       if (name.toLowerCase().startsWith("x-open-compute-")) headers.delete(name);
     }

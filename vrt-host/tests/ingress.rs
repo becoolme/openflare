@@ -1701,3 +1701,85 @@ async fn ws_per_tenant_cap_rejects_with_503_and_frees_on_close() {
     assert!(head3.starts_with("HTTP/1.1 101"), "head3: {head3}");
     ig.stop().await;
 }
+
+/// `vrt dev` only: `ingress.devCatchAll` routes ANY unmatched Host to
+/// the desired doc's single worker. Production strictness holds in
+/// both directions — flag off → `unknown_host`, flag on with >1
+/// worker → still `unknown_host` (never a guess between workers).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dev_catch_all_routes_only_single_worker_desired() {
+    let registry = TenantRegistry::new();
+    let rt = TenantRuntime::new("t1");
+    registry.insert("t1".to_string(), rt.clone());
+    let mut fx = Fixture::new();
+    let spec = fx.stub_spec("t1", &["w1"], &[]);
+    let handle = spawn(&rt, spec);
+    wait_state(&rt, TenantState::Ready, Duration::from_secs(8)).await;
+
+    let single = snapshot_protocol::compute_desired::ComputeDesired {
+        schema_version: 1,
+        cell_id: "cell".into(),
+        revision: 1,
+        tenants: vec![tenant("t1", vec![worker("w1", "app.example.com", "d1")])],
+        deletions: vec![],
+    };
+
+    // Flag OFF (production default): unmatched Host is a typed 404 —
+    // proves the catch-all never engages without the dev switch.
+    let state = IngressState::new(
+        registry.clone(),
+        Duration::from_secs(5),
+        Duration::from_millis(500),
+        1024,
+    );
+    state.set_routes(RouteTable::from_desired(&single));
+    let ig = start_ingress(&state).await;
+    let (status, _, body) = http_get(ig.addr, "localhost", "/", &[]).await;
+    assert_eq!(status, 404);
+    assert!(body.contains("unknown_host"), "strict routing: {body}");
+    ig.stop().await;
+
+    // Flag ON (dev): every Host — including an unmatched one — lands
+    // on the single worker.
+    let state = IngressState::new(
+        registry.clone(),
+        Duration::from_secs(5),
+        Duration::from_millis(500),
+        1024,
+    );
+    state.set_dev_catch_all(true);
+    state.set_routes(RouteTable::from_desired(&single));
+    let ig = start_ingress(&state).await;
+    for host in ["localhost", "anything.example.com", "unmatched.test"] {
+        let (status, _, body) = http_get(ig.addr, host, "/", &[]).await;
+        assert_eq!(status, 200, "{host} must catch-all to the worker: {body}");
+        assert!(body.contains("stub ok"), "{host}: {body}");
+    }
+    ig.stop().await;
+
+    // Flag ON but TWO workers in the desired doc: no guess — the
+    // unmatched Host still fails closed with unknown_host. Exact
+    // matches keep working.
+    let state = IngressState::new(
+        registry.clone(),
+        Duration::from_secs(5),
+        Duration::from_millis(500),
+        1024,
+    );
+    state.set_dev_catch_all(true);
+    state.set_routes(RouteTable::from_desired(&desired_with_routes()));
+    let ig = start_ingress(&state).await;
+    let (status, _, body) = http_get(ig.addr, "localhost", "/", &[]).await;
+    assert_eq!(status, 404);
+    assert!(
+        body.contains("unknown_host"),
+        "two-worker doc must not guess: {body}"
+    );
+    let (status, _, _) = http_get(ig.addr, "app.example.com", "/", &[]).await;
+    assert_eq!(status, 200, "exact route unaffected");
+    ig.stop().await;
+
+    handle.send(SupervisorCmd::Stop).await;
+    wait_state(&rt, TenantState::Stopped, Duration::from_secs(8)).await;
+    handle.join().await;
+}

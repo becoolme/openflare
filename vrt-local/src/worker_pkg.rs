@@ -47,7 +47,7 @@
 //! `node_modules/` are skipped; symlinks are rejected.
 
 use crate::LocalError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use snapshot_protocol::compute_desired::{
     AssetsBinding, BindingDesired, BindingPermissions, CronDesired, DoBindingDesired,
@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 /// vrt.toml document (deny_unknown_fields — a typo must fail closed).
 /// pub(crate) — `project_cfg` synthesizes this shape from wrangler
 /// sources through the identical deserialize path.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerToml {
     pub(crate) name: String,
@@ -81,19 +81,19 @@ pub struct WorkerToml {
     pub(crate) hostnames: Vec<String>,
     #[serde(default)]
     pub(crate) crons: Vec<CronDesired>,
-    /// T37b：`[[queueConsumers]]` —— 本 worker 消费的队列（queue
-    /// 为显示名，queueId 打包期按 `vrt-q:{tenant}:{name}` 派生）。
+    /// T37b: `[[queueConsumers]]` -- the queues this worker consumes (queue
+    /// is a display name, queueId is derived at pack time as `vrt-q:{tenant}:{name}`).
     #[serde(default)]
     pub(crate) queue_consumers: Vec<QueueConsumerToml>,
-    /// P3c-1：`durableObjectBindings` —— DO namespace bindings
-    /// （wrangler `durable_objects.bindings[]` 归一后同一形状）。
+    /// P3c-1: `durableObjectBindings` -- DO namespace bindings
+    /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
     pub(crate) durable_object_bindings: Vec<DoBindingToml>,
-    /// P3c-1：`durableObjectMigrations` —— wrangler `[[migrations]]`
-    /// 归一后的 shape；deploy 时按序求值为最终 class 集合。
+    /// P3c-1: `durableObjectMigrations` -- the shape after normalizing wrangler `[[migrations]]`
+    /// ; at deploy time evaluated in order into the final class set.
     #[serde(default)]
     pub(crate) durable_object_migrations: Vec<DoMigrationToml>,
-    /// W1：`[[workflows]]` 归一后同一形状。
+    /// W1: `[[workflows]]` -- same shape after normalization.
     #[serde(default)]
     pub(crate) workflows: Vec<WorkflowToml>,
     #[serde(default)]
@@ -103,18 +103,18 @@ pub struct WorkerToml {
     pub(crate) assets: Option<AssetsToml>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct BindingsToml {
     #[serde(default)]
     pub(crate) kv: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) r2: BTreeMap<String, String>,
-    /// `name → 用户侧 database_id`（服务端在打包期派生真实 id）。
+    /// `name -> user-side database_id` (the server derives the real id at pack time).
     #[serde(default)]
     pub(crate) d1: BTreeMap<String, String>,
-    /// T37: `name → 用户侧队列名`（queueId 在打包期由
-    /// `vrt-q:{tenant}:{name}` 派生——standalone 无控制面 provision）。
+    /// T37: `name -> user-side queue name` (queueId is derived at pack time from
+    /// `vrt-q:{tenant}:{name}` -- standalone has no control-plane provisioning).
     #[serde(default)]
     pub(crate) queue: BTreeMap<String, String>,
     #[serde(default)]
@@ -125,97 +125,97 @@ pub(crate) struct BindingsToml {
     pub(crate) assets: BTreeMap<String, String>,
 }
 
-/// T37b `[[queueConsumers]]`：字段与 wrangler `queues.consumers[]`
-/// 对齐（snake→camel 由 project_cfg 归一；数值边界在 pack 时查，
-/// 与 [`QueueConsumerDesired`] 校验一致）。
-#[derive(Debug, Deserialize)]
+/// T37b `[[queueConsumers]]`: fields aligned with wrangler `queues.consumers[]`
+/// (snake->camel is normalized by project_cfg; numeric bounds are checked at pack time,
+/// consistent with [`QueueConsumerDesired`] validation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QueueConsumerToml {
-    /// 队列显示名（id 打包期派生）。
+    /// Queue display name (id derived at pack time).
     pub(crate) queue: String,
-    /// 死信队列显示名。
+    /// Dead-letter queue display name.
     pub(crate) dead_letter_queue: Option<String>,
-    /// 1..=100。
+    /// 1..=100.
     pub(crate) max_batch_size: Option<u32>,
-    /// 毫秒，0..=60_000（归一化 schema `maxBatchTimeoutMs`）。
+    /// Milliseconds, 0..=60_000 (normalized schema `maxBatchTimeoutMs`).
     pub(crate) max_batch_timeout_ms: Option<u32>,
-    /// 0..=100。
+    /// 0..=100.
     pub(crate) max_retries: Option<u32>,
-    /// 秒，0..=86_400（归一化 `retryDelaySeconds`）。
+    /// Seconds, 0..=86_400 (normalized `retryDelaySeconds`).
     pub(crate) retry_delay_seconds: Option<u32>,
-    /// 1..=1000（平台派发并发上限）。
+    /// 1..=1000 (platform dispatch concurrency cap).
     pub(crate) max_concurrency: Option<u32>,
 }
 
-/// P3c-1 `durableObjectBindings[]` —— 字段与 wrangler
-/// `durable_objects.bindings[]` 对齐（`script_name` → `scriptName`
-/// 归一由 project_cfg 完成；vrt.toml 原生直接用 camelCase）。
-#[derive(Debug, Deserialize)]
+/// P3c-1 `durableObjectBindings[]` -- fields aligned with wrangler
+/// `durable_objects.bindings[]` (`script_name` -> `scriptName`
+/// normalization is done by project_cfg; the native vrt.toml uses camelCase directly).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoBindingToml {
-    /// `env.<name>` 上的 namespace stub 句柄。
+    /// The namespace stub handle on `env.<name>`.
     pub(crate) name: String,
-    /// 目标 worker 导出的 JS class 名。
+    /// The JS class name exported by the target worker.
     pub(crate) class_name: String,
-    /// wrangler `script_name` —— 同租户内另一 worker 名；省略 = 本
-    /// worker 声明该类。
+    /// wrangler `script_name` -- another worker name within the same tenant; omitted = this
+    /// worker declares the class.
     pub(crate) script_name: Option<String>,
 }
 
-/// P3c-1 `durableObjectMigrations[]` —— wrangler `[[migrations]]` 的
-/// 归一 shape。按数组序求值：`newClasses`/`newSqliteClasses` 声明、
-/// `renamedClasses` 继承存储身份、`deletedClasses` 移除。
-#[derive(Debug, Deserialize)]
+/// P3c-1 `durableObjectMigrations[]` -- the normalized shape of wrangler `[[migrations]]`.
+/// Evaluated in array order: `newClasses`/`newSqliteClasses` declare,
+/// `renamedClasses` inherit storage identity, `deletedClasses` remove.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoMigrationToml {
-    /// 人类可读 tag（CF 语义——仅标识用途，不参与求值）。
+    /// Human-readable tag (CF semantics -- identification only, not part of evaluation).
     pub(crate) tag: Option<String>,
-    /// KV 后端 class —— localDisk 下与 SQLite 同一存储，`enableSql=false`。
+    /// KV-backend class -- under localDisk the same storage as SQLite, `enableSql=false`.
     #[serde(default)]
     pub(crate) new_classes: Vec<String>,
-    /// SQLite 后端 class —— `enableSql=true`，暴露 `storage.sql`。
+    /// SQLite-backend class -- `enableSql=true`, exposes `storage.sql`.
     #[serde(default)]
     pub(crate) new_sqlite_classes: Vec<String>,
-    /// `{from,to}` —— `to` 继承 `from` 的 uniqueKey（数据保留）。
+    /// `{from,to}` -- `to` inherits `from`'s uniqueKey (data retained).
     #[serde(default)]
     pub(crate) renamed_classes: Vec<DoRenameToml>,
-    /// 移除 class 声明；数据目录在 generation 切换完成后清理。
+    /// Remove the class declaration; the data directory is cleaned after the generation switch completes.
     #[serde(default)]
     pub(crate) deleted_classes: Vec<String>,
 }
 
-/// P3c-1 `renamedClasses[]` 的 `{from,to}` 形状。
-#[derive(Debug, Deserialize)]
+/// The `{from,to}` shape of P3c-1 `renamedClasses[]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DoRenameToml {
-    /// 既有 class 名（当前版本或本 deploy 先前 migration step 声明）。
+    /// Existing class name (declared by the current version or by an earlier migration step in this deploy).
     pub(crate) from: String,
-    /// 新 class 名——继承 `from` 的 uniqueKey 与 enableSql。
+    /// New class name -- inherits `from`'s uniqueKey and enableSql.
     pub(crate) to: String,
 }
 
-/// W1 `[[workflows]]` —— 字段与 wrangler 对齐（`class_name` →
-/// `className`、`script_name` → `scriptName` 归一由 project_cfg 完
-/// 成）。MVP：只允许同 worker 的 class；`script_name` 指向其他
-/// worker 时 pack fail closed。
-#[derive(Debug, Deserialize)]
+/// W1 `[[workflows]]` -- fields aligned with wrangler (`class_name` ->
+/// `className`, `script_name` -> `scriptName` normalization is done by
+/// project_cfg). MVP: only classes of the same worker are allowed; when `script_name` points to another
+/// worker, pack fails closed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct WorkflowToml {
-    /// 工作流名（`^[A-Za-z0-9_-]{1,64}$`），worker 内唯一。
+    /// Workflow name (`^[A-Za-z0-9_-]{1,64}$`), unique within the worker.
     pub(crate) name: String,
-    /// `env.<binding>` 绑定名（JS identifier）。
+    /// `env.<binding>` binding name (JS identifier).
     pub(crate) binding: String,
-    /// 同 worker 导出的 `WorkflowEntrypoint` class 名。
+    /// The `WorkflowEntrypoint` class name exported by the same worker.
     pub(crate) class_name: String,
-    /// wrangler `script_name` —— 仅允许等于本 worker 名（same-
-    /// worker）；指向其他 worker 在 pack 拒绝（W1 范围限制）。
+    /// wrangler `script_name` -- only allowed to equal this worker's name (same-
+    /// worker); pointing at another worker is rejected at pack (W1 scope restriction).
     pub(crate) script_name: Option<String>,
-    /// `limits.steps`（1..=100_000）。
+    /// `limits.steps` (1..=100_000).
     pub(crate) limits_steps: Option<u32>,
 }
 
 /// T21: `[assets]` — static-assets directory packed at deploy.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct AssetsToml {
     /// Directory relative to the worker dir (canonicalized inside).
@@ -243,7 +243,7 @@ pub(crate) struct AssetsToml {
 }
 
 /// T31c: `runWorkerFirst` value on `[assets]` — Wrangler wire shape.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum RunWorkerFirstToml {
     /// `runWorkerFirst = <bool>`.
@@ -256,7 +256,7 @@ fn default_assets_binding() -> String {
     "ASSETS".into()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QuotasToml {
     pub(crate) cpu_ms: u32,
@@ -265,15 +265,15 @@ pub(crate) struct QuotasToml {
     pub(crate) outbound_connections: u32,
 }
 
-/// P3c-1：DO 打包上下文——部署密钥（uniqueKey HMAC 派生）与
-/// 当前激活版本的 class 集合（`renamed_classes` lineage 来源）。
-/// `None` ⇒ 任何 DO 声明都拒绝（`pack`/`pack_with_resolver` 无
-/// 密钥/状态上下文，产出的 uniqueKey 无法证明由服务端派生）。
+/// P3c-1: DO packing context -- the deploy key (uniqueKey HMAC derivation) and
+/// the class set of the currently active version (source of the `renamed_classes` lineage).
+/// `None` => any DO declaration is rejected (`pack`/`pack_with_resolver` have no
+/// key/state context, so the produced uniqueKey cannot be proven server-derived).
 pub struct DoPackCtx<'a> {
-    /// uniqueKey 派生密钥（standalone：signing seed；控制面：快照
-    /// 签名密钥材料）。只作 HMAC key，不持久化、不外发。
+    /// uniqueKey derivation key (standalone: the signing seed; control plane: the snapshot
+    /// signing key material). Used only as an HMAC key, never persisted or sent out.
     pub pepper: [u8; 32],
-    /// 当前激活版本声明的 class 集合（rename `from` 解析源）。
+    /// The class set declared by the currently active version (source for resolving rename `from`).
     pub prior_classes: &'a [DoClassDesired],
 }
 
@@ -287,6 +287,11 @@ pub struct DeployOverrides {
     pub bindings: Vec<BindingDesired>,
     /// Extra hostnames.
     pub hostnames: Vec<String>,
+    /// Non-secret var overrides merged into `[vars]` (`--var`,
+    /// `.dev.vars` undeclared keys) — same-name config entries lose.
+    /// Secret values must NEVER be passed here; they go through
+    /// `put_secret` + `[secrets]` refs.
+    pub vars: BTreeMap<String, String>,
 }
 
 /// Fully packed worker ready for state application.
@@ -309,13 +314,13 @@ pub struct PackedWorker {
     pub var_values: BTreeMap<String, String>,
     /// Desired crons.
     pub crons: Vec<CronDesired>,
-    /// T37b: desired queue consumers（queueId 已解析）。
+    /// T37b: desired queue consumers (queueId already resolved).
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
-    /// P3c-1: DO class 声明——migrations 求值结果，`uniqueKey`
-    /// 已由部署密钥 HMAC 派生，rename lineage 已解析。
+    /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
+    /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
-    /// W1: workflow 声明——`uniqueKey` 已由部署密钥 HMAC 派生
-    /// （`vrt-wf:` 域），same-worker 限制与名称/绑定校验已过。
+    /// W1: workflow declarations -- `uniqueKey` already derived by HMAC with the deploy key
+    /// (`vrt-wf:` domain), the same-worker restriction and name/binding validation have passed.
     pub workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired>,
     /// Declared hostnames (replaces state list when non-empty).
     pub hostnames: Vec<String>,
@@ -379,10 +384,11 @@ pub fn mime_for_path(path: &str) -> &'static str {
     }
 }
 
-/// Scan `assets_dir` → canonical manifest + objects. Paths are
+/// Scan `assets_dir` → `(request path, bytes)` entries. Paths are
 /// forward-slash `/`-prefixed request paths; `..`/absolute/backslash/
 /// NUL names are impossible under `read_dir`, but symlinks and
-/// over-cap inputs are still rejected.
+/// over-cap inputs are still rejected. Manifest construction lives
+/// in [`assets_from_entries`] so the upload path shares it.
 fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAssets, LocalError> {
     let dir = worker_dir
         .join(&assets.dir)
@@ -406,8 +412,7 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
         &assets.not_found_handling,
         &["none", "404-page", "single-page-application"],
     )?;
-    let mut files: Vec<(String, String, u64, String, Vec<u8>)> = Vec::new();
-    let mut total: u64 = 0;
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     let mut stack = vec![dir.clone()];
     while let Some(d) = stack.pop() {
         for entry in std::fs::read_dir(&d).map_err(|_| LocalError::Worker("assets read"))? {
@@ -438,21 +443,38 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
             let req_path = format!("/{rel_str}");
             let bytes =
                 std::fs::read(&entry_path).map_err(|_| LocalError::Worker("assets read"))?;
-            let size = bytes.len() as u64;
-            if size > MAX_ASSET_FILE_BYTES {
-                return Err(LocalError::Worker("asset file too large"));
-            }
-            total += size;
-            if total > MAX_ASSET_TOTAL_BYTES {
-                return Err(LocalError::Worker("assets total too large"));
-            }
-            if files.len() >= MAX_ASSET_FILES {
-                return Err(LocalError::Worker("too many asset files"));
-            }
-            let digest = hex::encode(sha2::Sha256::digest(&bytes));
-            let mime = mime_for_path(&rel_str).to_string();
-            files.push((req_path, digest, size, mime, bytes));
+            entries.push((req_path, bytes));
         }
+    }
+    assets_from_entries(entries, &html_handling, &not_found)
+}
+
+/// Build the canonical manifest + digest-keyed objects from
+/// `(request path, bytes)` entries — shared by the directory scan
+/// and any future in-memory source. All caps apply here.
+fn assets_from_entries(
+    entries: Vec<(String, Vec<u8>)>,
+    html_handling: &str,
+    not_found: &str,
+) -> Result<PendingAssets, LocalError> {
+    let mut files: Vec<(String, String, u64, String, Vec<u8>)> = Vec::new();
+    let mut total: u64 = 0;
+    for (req_path, bytes) in entries {
+        let size = bytes.len() as u64;
+        if size > MAX_ASSET_FILE_BYTES {
+            return Err(LocalError::Worker("asset file too large"));
+        }
+        total += size;
+        if total > MAX_ASSET_TOTAL_BYTES {
+            return Err(LocalError::Worker("assets total too large"));
+        }
+        if files.len() >= MAX_ASSET_FILES {
+            return Err(LocalError::Worker("too many asset files"));
+        }
+        let digest = hex::encode(sha2::Sha256::digest(&bytes));
+        let rel_str = req_path.trim_start_matches('/');
+        let mime = mime_for_path(rel_str).to_string();
+        files.push((req_path, digest, size, mime, bytes));
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     let file_entries: Vec<serde_json::Value> = files
@@ -510,8 +532,8 @@ pub fn pack_with_resolver(
     pack_inner(worker_dir, overrides, tenant_id, resolve_worker, None)
 }
 
-/// [`pack_with_resolver`] + DO 上下文——deploy 入口（唯一能给
-/// uniqueKey 派生与 rename lineage 提供密钥/状态的调用方）。
+/// [`pack_with_resolver`] + DO context -- the deploy entry point (the only caller that can supply
+/// keys/state for uniqueKey derivation and rename lineage).
 pub fn pack_with_ctx(
     worker_dir: &Path,
     overrides: &DeployOverrides,
@@ -529,15 +551,46 @@ fn pack_inner(
     resolve_worker: &dyn Fn(&str) -> Option<String>,
     do_ctx: Option<&DoPackCtx<'_>>,
 ) -> Result<PackedWorker, LocalError> {
+    assemble(
+        gather_dir(worker_dir)?,
+        overrides,
+        tenant_id,
+        resolve_worker,
+        do_ctx,
+    )
+}
+
+/// The content a pack consumes — collected from a local worker
+/// directory or decoded from a remote-deploy upload. `assemble` runs
+/// the identical validation either way: a remote deploy cannot
+/// smuggle module bytes, asset digests, or meta fields that a local
+/// one could not produce.
+pub struct Gathered {
+    /// Worker meta (vrt.toml shape — `project_cfg` normalizes the
+    /// wrangler family into this same structure client-side).
+    pub meta: WorkerToml,
+    /// `/`-separated rel path → file bytes for module candidates.
+    /// `[assets] dir` contents and scan exclusions (dotfiles,
+    /// `node_modules`, config basenames) are never here.
+    pub files: BTreeMap<String, Vec<u8>>,
+    /// Paths the directory scan skipped — informational (the
+    /// `--dry-run` summary); always empty for uploads.
+    pub skipped: Vec<String>,
+    /// `[assets] dir` packed content (None when undeclared).
+    pub pending_assets: Option<PendingAssets>,
+}
+
+/// Collect `worker_dir` into a [`Gathered`]: meta normalization,
+/// self-contained-file scan (symlinks rejected), module-byte cap
+/// (pre-read), and the `[assets] dir` scan. Type assignment and
+/// everything downstream live in [`assemble`] — the single
+/// validation path shared by `vrt deploy --root` and remote uploads.
+pub fn gather_dir(worker_dir: &Path) -> Result<Gathered, LocalError> {
     // T31/C4: `vrt.toml` keeps precedence; otherwise the wrangler family
     // (json > jsonc > toml) normalizes into the same meta shape.
-    let (meta, meta_source) = crate::project_cfg::load_worker_meta(worker_dir)?;
-    let _ = meta_source;
-    let name = overrides.name.clone().unwrap_or_else(|| meta.name.clone());
-
-    // --- module scan ---
-    let mut modules: BTreeMap<String, String> = BTreeMap::new();
-    let mut declared = meta.modules;
+    let (meta, _meta_source) = crate::project_cfg::load_worker_meta(worker_dir)?;
+    let mut files = BTreeMap::new();
+    let mut skipped = Vec::new();
     let mut total: u64 = 0;
     // `[assets] dir` is content-addressed asset data, not worker
     // modules — exclude it from the module scan (an .html file there
@@ -559,75 +612,66 @@ fn pack_inner(
                 .filter(|p| p.starts_with(&worker_canonical))
         })
         .flatten();
-    scan_dir(worker_dir, worker_dir, &mut |rel, path| {
-        if let Some(root) = &assets_rel {
-            let canon = path
-                .canonicalize()
-                .unwrap_or_else(|_| worker_canonical.join(rel));
-            if canon.starts_with(root) {
-                return Ok(());
+    scan_dir(
+        worker_dir,
+        worker_dir,
+        &mut |rel, path| {
+            if let Some(root) = &assets_rel {
+                let canon = path
+                    .canonicalize()
+                    .unwrap_or_else(|_| worker_canonical.join(rel));
+                if canon.starts_with(root) {
+                    return Ok(());
+                }
             }
-        }
-        total += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        if total > MAX_WORKER_DIR_BYTES {
-            return Err(LocalError::Worker("dir size"));
-        }
-        if let Some(ty) = declared.remove(rel) {
-            modules.insert(rel.to_string(), ty);
-        } else if let Some(ty) = type_for_extension(path) {
-            modules.insert(rel.to_string(), ty.to_string());
-        } else {
-            return Err(LocalError::Worker("module type"));
-        }
-        Ok(())
-    })?;
-    // Declared modules that are NOT files on disk fail closed.
-    if !declared.is_empty() {
-        return Err(LocalError::Worker("modules missing"));
-    }
+            total += std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if total > MAX_WORKER_DIR_BYTES {
+                return Err(LocalError::Worker("dir size"));
+            }
+            let bytes = std::fs::read(path).map_err(|_| LocalError::Worker("read"))?;
+            files.insert(rel.to_string(), bytes);
+            Ok(())
+        },
+        &mut |rel| skipped.push(rel.to_string()),
+    )?;
+    let pending_assets = match &meta.assets {
+        Some(decl) => Some(scan_assets_dir(worker_dir, decl)?),
+        None => None,
+    };
+    Ok(Gathered {
+        meta,
+        files,
+        skipped,
+        pending_assets,
+    })
+}
 
-    // --- pack-format JSON (same wire forms the TS builder emits) ---
-    let mut pack_modules = serde_json::Map::new();
-    // W7: esModule sources for the workflow class scan below.
-    let mut esm_sources: Vec<String> = Vec::new();
-    for (rel, ty) in &modules {
-        let path = worker_dir.join(rel);
-        let wire = match ty.as_str() {
-            "esModule" | "commonJs" | "text" | "json" => {
-                let text =
-                    std::fs::read_to_string(&path).map_err(|_| LocalError::Worker("utf8"))?;
-                if ty == "esModule" {
-                    esm_sources.push(text.clone());
-                }
-                match ty.as_str() {
-                    "esModule" => serde_json::Value::String(text),
-                    "commonJs" => serde_json::json!({"cjs": text}),
-                    "text" => serde_json::json!({"text": text}),
-                    _ => {
-                        serde_json::json!({"json": serde_json::from_str::<serde_json::Value>(&text).map_err(|_| LocalError::Worker("json module"))?})
-                    }
-                }
-            }
-            "wasm" | "data" => {
-                use base64::Engine;
-                let bytes = std::fs::read(&path).map_err(|_| LocalError::Worker("read"))?;
-                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-                if ty == "wasm" {
-                    serde_json::json!({"wasm_b64": b64})
-                } else {
-                    serde_json::json!({"data_b64": b64})
-                }
-            }
-            _ => return Err(LocalError::Worker("module type")),
-        };
-        pack_modules.insert(rel.clone(), wire);
+/// Validate a [`Gathered`] into a [`PackedWorker`]. Everything the
+/// signed desired doc depends on is computed HERE — tenant id,
+/// worker-name resolution, and DO/workflow unique-key derivation are
+/// server-side inputs the upload body never carries.
+pub fn assemble(
+    g: Gathered,
+    overrides: &DeployOverrides,
+    tenant_id: &str,
+    resolve_worker: &dyn Fn(&str) -> Option<String>,
+    do_ctx: Option<&DoPackCtx<'_>>,
+) -> Result<PackedWorker, LocalError> {
+    let Gathered {
+        mut meta,
+        files,
+        pending_assets: gathered_assets,
+        ..
+    } = g;
+    // Caller-side non-secret var overrides (`--var`, `.dev.vars`).
+    for (k, v) in &overrides.vars {
+        meta.vars.insert(k.clone(), v.clone());
     }
-    let pack = serde_json::json!({
-        "mainModule": meta.main_module,
-        "modules": pack_modules,
-        "compatibilityDate": meta.compatibility_date,
-        "compatibilityFlags": meta.compatibility_flags,
-    });
+    let name = overrides.name.clone().unwrap_or_else(|| meta.name.clone());
+
+    // --- modules → pack JSON: typing, caps, and the wire forms the
+    // TS builder emits — one shared path for local and remote. ---
+    let (pack, esm_sources) = build_pack_json(&meta, &files)?;
     // The shared validator/digester — identical code to the platform.
     let bundle = vrt_config::VersionBundle::from_pack(&pack)?;
 
@@ -680,11 +724,11 @@ fn pack_inner(
             }));
         }
         for (binding, user_id) in &b.d1 {
-            // databaseId 由服务端派生（T34c/F2：含 tenant_id ——
-            // T35 多租户控制面接入时无需格式迁移；standalone 单租户
-            // 时等价 CF 账号级 database_id 语义）。同一实例内相同
-            // databaseId 的多个 Worker 共享同一数据库（D1 语义）；
-            // Worker 永远拿不到任意 id——签名快照覆盖派生值。
+            // databaseId is derived server-side (T34c/F2: includes tenant_id --
+            // no format migration is needed when the T35 multi-tenant control plane comes in; for standalone single-tenant
+            // it is equivalent to CF account-level database_id semantics). Multiple Workers in the same instance with the same
+            // databaseId share the same database (D1 semantics);
+            // a Worker never gets an arbitrary id -- the signed snapshot covers the derived value.
             if user_id.is_empty()
                 || user_id.len() > 64
                 || !user_id
@@ -709,10 +753,10 @@ fn pack_inner(
             ));
         }
         for (binding, queue_name) in &b.queue {
-            // T37: queueId 派生——sha256("vrt-q:{tenant}:{name}") 的
-            // 前 26 hex 字符（hex ⊂ [a-z0-9]，与 database_id 同一规则）。
-            // 同实例同名的多个 producer 共享同一队列（CF 语义）；
-            // worker 永远拿不到任意 id——签名快照覆盖派生值。
+            // T37: queueId derivation -- the first 26 hex chars of sha256("vrt-q:{tenant}:{name}")
+            // (hex is a subset of [a-z0-9], same rule as database_id).
+            // Multiple producers with the same name in the same instance share the same queue (CF semantics);
+            // a worker never gets an arbitrary id -- the signed snapshot covers the derived value.
             let digest = derive_queue_id(tenant_id, queue_name)?;
             bindings.push(BindingDesired::Queue(
                 snapshot_protocol::compute_desired::QueueBinding {
@@ -767,9 +811,9 @@ fn pack_inner(
     }
     bindings.extend(overrides.bindings.iter().cloned());
 
-    // T37b: `[[queueConsumers]]` —— 队列名 → queueId 派生（与
-    // producer 同一哈希规则）；DLQ 名同样派生，自指被拒；
-    // 数值边界与 snapshot-protocol 校验一致（双层 fail closed）。
+    // T37b: `[[queueConsumers]]` -- queue name -> queueId derivation (same hash rule as
+    // the producer); the DLQ name is derived likewise, self-reference rejected;
+    // numeric bounds match the snapshot-protocol validation (two-layer fail closed).
     let mut queue_consumers = Vec::with_capacity(meta.queue_consumers.len());
     for c in &meta.queue_consumers {
         let queue_id = derive_queue_id(tenant_id, &c.queue)?;
@@ -797,13 +841,13 @@ fn pack_inner(
 
     // Deterministic worker-id material: hash the worker name so a
     // re-deployed directory keeps its identity without stored state.
-    // （DO uniqueKey 派生也需要 —— 提到 assets 之前。）
+    // (DO uniqueKey derivation needs it too -- hoisted before assets.)
     let id_material = hex::encode(sha2::Sha256::digest(name.as_bytes()));
 
-    // P3c-1: Durable Objects —— migrations 按序求值为最终 class
-    // 集合；uniqueKey = HMAC(pepper, "vrt-do:{tenant}:{worker}:{class}")
-    // （ring hmac；pepper = 部署签名密钥材料 —— worker 无法预测，
-    // 服务端稳定；rename 继承 `from` 的 key 使目录跨改名存活）。
+    // P3c-1: Durable Objects -- migrations are evaluated in order into the final class
+    // set; uniqueKey = HMAC(pepper, "vrt-do:{tenant}:{worker}:{class}")
+    // (ring hmac; pepper = deploy signing key material -- unpredictable to the worker,
+    // stable server-side; rename inherits `from`'s key so the directory survives renames).
     let worker_id = format!("w_{}", &id_material[..16]);
     let mut durable_object_classes: Vec<DoClassDesired> = Vec::new();
     let has_do_cfg =
@@ -846,9 +890,9 @@ fn pack_inner(
                 if declared.contains_key(&rename.to) {
                     return Err(LocalError::Worker("do rename target declared"));
                 }
-                // `from` 的存储身份 = 本 deploy 已声明值，否则查当前
-                // 激活版本；两者都没有 → rename 指向不存在的 class，
-                // 静默丢弃数据的风险 → fail closed。
+                // `from`'s storage identity = the value already declared in this deploy, otherwise look up the current
+                // active version; if neither has it -> the rename points at a nonexistent class,
+                // risking silent data loss -> fail closed.
                 let entry = declared.remove(&rename.from).or_else(|| {
                     ctx.prior_classes
                         .iter()
@@ -878,8 +922,8 @@ fn pack_inner(
             }
         }
         durable_object_classes = declared.into_values().collect();
-        // 声明了 bindings 但无 class 声明：本 worker 至少有一个
-        // 非 script_name 绑定 → fail closed（与快照校验同向）。
+        // bindings declared but no class declaration: this worker has at least one
+        // non-script_name binding -> fail closed (same direction as snapshot validation).
         for b in &meta.durable_object_bindings {
             valid_do_name(&b.name)?;
             valid_do_name(&b.class_name)?;
@@ -906,12 +950,12 @@ fn pack_inner(
         }
     }
 
-    // W1 `[[workflows]]`；W7 起 `script_name` 可指向同租户另一
+    // W1 `[[workflows]]`; since W7 `script_name` may point to another worker in the same tenant
     // worker —— uniqueKey = HMAC(pepper,
-    // "vrt-wf:{tenant}:{definingWorker}:{wfName}")（与 DO class 同一
-    // 身份域不同前缀；定义者归属 → 存储/op 都在目标 worker 名下，
-    // 与 CF 一致）。目标必须是已部署 worker（resolve_worker 404
-    // → fail closed，与 DO script_name 相同）。
+    // "vrt-wf:{tenant}:{definingWorker}:{wfName}") (same
+    // identity domain as DO classes with a different prefix; ownership by the defining worker -> both storage and op are under the target worker name,
+    // consistent with CF). The target must be a deployed worker (resolve_worker 404
+    // -> fail closed, same as DO script_name).
     let mut workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired> = Vec::new();
     if !meta.workflows.is_empty() {
         let ctx = do_ctx.ok_or(LocalError::Worker("workflows require deploy context"))?;
@@ -943,8 +987,8 @@ fn pack_inner(
                     return Err(LocalError::Worker("workflow limits.steps bounds"));
                 }
             }
-            // uniqueKey 派生域含 DEFINING worker —— 引擎存储归属
-            // script_name 目标；目标侧字段在 desired 层另行校验。
+            // the uniqueKey derivation domain includes the DEFINING worker -- engine storage belongs to
+            // the script_name target; target-side fields are validated separately at the desired layer.
             let defining = service_worker_id.clone().unwrap_or(worker_id.clone());
             // W7 deploy-gate: same-worker class_name must be a named
             // export AND a WorkflowEntrypoint subclass — missing
@@ -994,7 +1038,10 @@ fn pack_inner(
     // binding references the manifest digest it produced).
     let pending_assets = match &meta.assets {
         Some(decl) => {
-            let pending = scan_assets_dir(worker_dir, decl)?;
+            // `[assets]` declared but no content gathered — on the
+            // upload path the client simply did not ship it (a local
+            // gather fails earlier at `scan_assets_dir`). Fail closed.
+            let pending = gathered_assets.ok_or(LocalError::Worker("assets missing"))?;
             bindings.push(BindingDesired::Assets(AssetsBinding {
                 name: decl.binding.clone(),
                 manifest_digest: pending.manifest_digest.clone(),
@@ -1059,13 +1106,21 @@ fn type_for_extension(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`.
+/// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`
+/// (reported via `skipped` so `--dry-run` can list them).
 /// Symlinks are rejected — a worker dir must be self-contained.
 fn scan_dir(
     root: &Path,
     dir: &Path,
     emit: &mut dyn FnMut(&str, &Path) -> Result<(), LocalError>,
+    skipped: &mut dyn FnMut(&str),
 ) -> Result<(), LocalError> {
+    let rel_of = |path: &Path| {
+        path.strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    };
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|_| LocalError::Worker("dir read"))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -1077,6 +1132,7 @@ fn scan_dir(
             || file_name == "node_modules"
             || crate::project_cfg::is_config_basename(file_name)
         {
+            skipped(&rel_of(&path));
             continue;
         }
         let meta = std::fs::symlink_metadata(&path).map_err(|_| LocalError::Worker("stat"))?;
@@ -1084,22 +1140,17 @@ fn scan_dir(
             return Err(LocalError::Worker("symlink"));
         }
         if meta.is_dir() {
-            scan_dir(root, &path, emit)?;
+            scan_dir(root, &path, emit, skipped)?;
         } else if meta.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .map_err(|_| LocalError::Worker("path"))?
-                .to_string_lossy()
-                .replace('\\', "/");
-            emit(&rel, &path)?;
+            emit(&rel_of(&path), &path)?;
         }
     }
     Ok(())
 }
 
-/// P3c-1：JS 标识符检查（class 名与 binding 名同规则——
-/// `^[A-Za-z_$][A-Za-z0-9_$]{0,63}$`，与 binding name 校验一致；
-/// class 名上限放宽到 128 与 CF 一致）。
+/// P3c-1: JS identifier check (class names and binding names follow the same rule --
+/// `^[A-Za-z_$][A-Za-z0-9_$]{0,63}$`, consistent with binding name validation;
+/// the class name cap is relaxed to 128, consistent with CF).
 fn valid_do_name(value: &str) -> Result<(), LocalError> {
     let ok = !value.is_empty()
         && value.len() <= 128
@@ -1119,13 +1170,13 @@ fn valid_do_name(value: &str) -> Result<(), LocalError> {
     }
 }
 
-/// P3c-1：`uniqueKey = HMAC-SHA256(pepper,
-/// "vrt-do:{tenant}:{worker}:{class}")` —— 64 hex。派生输入不含
-/// 用户可控的存储身份：tenant/worker/class 是部署身份，pepper 是
-/// 部署密钥（standalone signing seed / 控制面快照密钥）——worker
-/// 既无法预测也无法伪造另一个 class 的存储目录。
-/// W1：`vrt-wf:{tenant}:{worker}:{wfName}` → 64-hex 存储身份，
-/// 与 DO uniqueKey 同域不同前缀（engine class 目录独立于用户类）。
+/// P3c-1: `uniqueKey = HMAC-SHA256(pepper,
+/// "vrt-do:{tenant}:{worker}:{class}")` -- 64 hex. The derivation input contains no
+/// user-controllable storage identity: tenant/worker/class are deploy identities, the pepper is
+/// the deploy key (standalone signing seed / control-plane snapshot key) -- a worker
+/// can neither predict nor forge another class's storage directory.
+/// W1: `vrt-wf:{tenant}:{worker}:{wfName}` -> 64-hex storage identity,
+/// same domain as DO uniqueKey with a different prefix (the engine class directory is independent of user classes).
 pub fn derive_wf_unique_key(
     pepper: &[u8; 32],
     tenant_id: &str,
@@ -1140,7 +1191,7 @@ pub fn derive_wf_unique_key(
     hex::encode(tag.as_ref())
 }
 
-/// W1：workflow name 校验（`^[A-Za-z0-9_-]{1,64}$`）。
+/// W1: workflow name validation (`^[A-Za-z0-9_-]{1,64}$`).
 fn valid_workflow_name(name: &str) -> Result<(), LocalError> {
     if name.is_empty()
         || name.len() > 64
@@ -1169,9 +1220,9 @@ pub fn derive_do_unique_key(
     hex::encode(tag.as_ref())
 }
 
-/// T37/T37b：`vrt-q:{tenant}:{name}` → sha256 前 26 hex 字符
-/// （hex ⊂ `[a-z0-9]{26}`，vrt-sql 路径规则）。standalone 无控制面
-/// provision——同名队列在实例内唯一。
+/// T37/T37b: `vrt-q:{tenant}:{name}` -> first 26 hex chars of sha256
+/// (hex is a subset of `[a-z0-9]{26}`, vrt-sql path rules). standalone has no control-plane
+/// provisioning -- queue names with the same name are unique within the instance.
 pub fn derive_queue_id(tenant_id: &str, queue_name: &str) -> Result<String, LocalError> {
     if queue_name.is_empty()
         || queue_name.len() > 64
@@ -1187,4 +1238,355 @@ pub fn derive_queue_id(tenant_id: &str, queue_name: &str) -> Result<String, Loca
         format!("vrt-q:{tenant_id}:{queue_name}").as_bytes(),
     ));
     Ok(digest[..26].to_string())
+}
+
+/// Modules → pack-format JSON: explicit `[modules]` type override
+/// wins, else the extension rule; unknown extensions, absent
+/// declared files, over-cap totals, non-UTF8 text, and bad JSON all
+/// fail closed. Returns the pack doc + the esModule sources (the
+/// workflow class scan needs them).
+fn build_pack_json(
+    meta: &WorkerToml,
+    files: &BTreeMap<String, Vec<u8>>,
+) -> Result<(serde_json::Value, Vec<String>), LocalError> {
+    let mut declared = meta.modules.clone();
+    let mut typed: BTreeMap<String, String> = BTreeMap::new();
+    let mut total: u64 = 0;
+    for (rel, bytes) in files {
+        total += bytes.len() as u64;
+        if total > MAX_WORKER_DIR_BYTES {
+            return Err(LocalError::Worker("dir size"));
+        }
+        let ty = declared
+            .remove(rel)
+            .or_else(|| type_for_extension(Path::new(rel)).map(str::to_string))
+            .ok_or(LocalError::Worker("module type"))?;
+        typed.insert(rel.clone(), ty);
+    }
+    // Declared modules that are NOT in the gathered files fail closed.
+    if !declared.is_empty() {
+        return Err(LocalError::Worker("modules missing"));
+    }
+    let mut pack_modules = serde_json::Map::new();
+    let mut esm_sources: Vec<String> = Vec::new();
+    for (rel, ty) in &typed {
+        let bytes = &files[rel];
+        let wire = match ty.as_str() {
+            "esModule" | "commonJs" | "text" | "json" => {
+                let text = std::str::from_utf8(bytes)
+                    .map_err(|_| LocalError::Worker("utf8"))?
+                    .to_string();
+                if ty == "esModule" {
+                    esm_sources.push(text.clone());
+                }
+                match ty.as_str() {
+                    "esModule" => serde_json::Value::String(text),
+                    "commonJs" => serde_json::json!({"cjs": text}),
+                    "text" => serde_json::json!({"text": text}),
+                    _ => {
+                        serde_json::json!({"json": serde_json::from_str::<serde_json::Value>(&text).map_err(|_| LocalError::Worker("json module"))?})
+                    }
+                }
+            }
+            "wasm" | "data" => {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+                if ty == "wasm" {
+                    serde_json::json!({"wasm_b64": b64})
+                } else {
+                    serde_json::json!({"data_b64": b64})
+                }
+            }
+            _ => return Err(LocalError::Worker("module type")),
+        };
+        pack_modules.insert(rel.clone(), wire);
+    }
+    Ok((
+        serde_json::json!({
+            "mainModule": meta.main_module,
+            "modules": pack_modules,
+            "compatibilityDate": meta.compatibility_date,
+            "compatibilityFlags": meta.compatibility_flags,
+        }),
+        esm_sources,
+    ))
+}
+
+/// `vrt deploy --dry-run` output — pack-side facts only: worker name,
+/// module count, bundle bytes, declared bindings, scan-skipped paths.
+/// Server-side derivations (service target ids, DO/workflow unique
+/// keys) are listed as declared, never resolved — the dry run proves
+/// the pack is valid and shows what WOULD deploy.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeploySummary {
+    /// Worker name (after overrides).
+    pub name: String,
+    /// Module count in the bundle.
+    pub module_count: usize,
+    /// Stored bundle document bytes.
+    pub bundle_bytes: usize,
+    /// Bundle digest (the version's content identity).
+    pub bundle_digest: String,
+    /// `kind:bindingName` per declared binding.
+    pub bindings: Vec<String>,
+    /// Secret binding names (names only — refs/values never print).
+    pub secret_bindings: Vec<String>,
+    /// Paths the scan ignored (dotfiles, `node_modules`, configs).
+    pub ignored: Vec<String>,
+}
+
+/// Build the [`DeploySummary`] — runs the full module validation so
+/// a dry run fails on exactly what a real deploy would.
+pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySummary, LocalError> {
+    let mut meta = g.meta.clone();
+    for (k, v) in &overrides.vars {
+        meta.vars.insert(k.clone(), v.clone());
+    }
+    let (pack, _esm) = build_pack_json(&meta, &g.files)?;
+    let bundle = vrt_config::VersionBundle::from_pack(&pack)?;
+    let mut bindings: Vec<String> = Vec::new();
+    for name in meta.vars.keys() {
+        bindings.push(format!("var:{name}"));
+    }
+    let mut secret_bindings: Vec<String> = meta.secrets.keys().cloned().collect();
+    for name in &secret_bindings {
+        bindings.push(format!("secret:{name}"));
+    }
+    if let Some(b) = &meta.bindings {
+        for name in b.kv.keys() {
+            bindings.push(format!("kv:{name}"));
+        }
+        for name in b.r2.keys() {
+            bindings.push(format!("r2:{name}"));
+        }
+        for name in b.d1.keys() {
+            bindings.push(format!("d1:{name}"));
+        }
+        for name in b.queue.keys() {
+            bindings.push(format!("queue:{name}"));
+        }
+        for name in b.pg.keys() {
+            bindings.push(format!("pg:{name}"));
+        }
+        for name in b.service.keys() {
+            bindings.push(format!("service:{name}"));
+        }
+        for name in b.assets.keys() {
+            bindings.push(format!("assets:{name}"));
+        }
+    }
+    if let Some(a) = &meta.assets {
+        bindings.push(format!("assets:{}", a.binding));
+    }
+    for b in &meta.durable_object_bindings {
+        bindings.push(format!("durableObject:{}", b.name));
+    }
+    for w in &meta.workflows {
+        bindings.push(format!("workflow:{}({})", w.name, w.binding));
+    }
+    for c in &meta.queue_consumers {
+        bindings.push(format!("queueConsumer:{}", c.queue));
+    }
+    bindings.sort();
+    secret_bindings.sort();
+    Ok(DeploySummary {
+        name: overrides.name.clone().unwrap_or_else(|| meta.name.clone()),
+        module_count: g.files.len(),
+        bundle_bytes: bundle.stored_document().len(),
+        bundle_digest: bundle.digest().to_string(),
+        bindings,
+        secret_bindings,
+        ignored: g.skipped.clone(),
+    })
+}
+
+/// Remote-upload wire body (`vrt deploy --url`): the client
+/// materializes meta + module bytes + `[assets]` content locally and
+/// the server re-validates everything through [`assemble`]. Secret
+/// values travel only inside this body — never in argv, logs, or
+/// error text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeployUpload {
+    /// Worker meta as normalized by `project_cfg` client-side.
+    pub meta: WorkerToml,
+    /// `/`-separated rel path → base64 file bytes (module candidates
+    /// only; `[assets] dir` content belongs in `assets`).
+    #[serde(default)]
+    pub modules: BTreeMap<String, String>,
+    /// `[assets] dir` content (manifest + digest-keyed objects).
+    #[serde(default)]
+    pub assets: Option<UploadAssets>,
+    /// Non-secret var overrides (`--var KEY:VALUE`) — merged into
+    /// `[vars]` by `assemble`, identical to a local deploy.
+    #[serde(default)]
+    pub vars: BTreeMap<String, String>,
+    /// secretRef → value (`--secrets-file`, `.dev.vars` format) —
+    /// written to the tenant secret store before the deploy commits.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
+    /// Worker name override (`vrt.toml` name otherwise).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Uploaded `[assets]` payload — canonical manifest + objects keyed
+/// by their sha256 (each re-hashed server-side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UploadAssets {
+    /// Canonical manifest JSON, base64.
+    pub manifest: String,
+    /// sha256 hex → base64 file bytes.
+    #[serde(default)]
+    pub objects: BTreeMap<String, String>,
+}
+
+/// Decode + sanity-check a [`DeployUpload`] into a [`Gathered`].
+/// A malformed path, an over-cap body, a digest that does not match
+/// its bytes, or a manifest that does not enumerate exactly the
+/// shipped objects fails closed here, before `assemble` runs.
+pub fn gathered_from_upload(body: &DeployUpload) -> Result<Gathered, LocalError> {
+    use base64::Engine;
+    let mut files = BTreeMap::new();
+    let mut total: u64 = 0;
+    for (rel, b64) in &body.modules {
+        if !valid_module_rel(rel) {
+            return Err(LocalError::Worker("module path"));
+        }
+        // Reject absurd payloads before decode — b64 inflates ~4/3,
+        // so anything beyond 2x the cap can never fit.
+        if b64.len() as u64 > MAX_WORKER_DIR_BYTES * 2 {
+            return Err(LocalError::Worker("dir size"));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| LocalError::Worker("module encoding"))?;
+        total += bytes.len() as u64;
+        if total > MAX_WORKER_DIR_BYTES {
+            return Err(LocalError::Worker("dir size"));
+        }
+        files.insert(rel.clone(), bytes);
+    }
+    let pending_assets = match &body.assets {
+        Some(a) => Some(upload_assets_verified(a)?),
+        None => None,
+    };
+    Ok(Gathered {
+        meta: body.meta.clone(),
+        files,
+        skipped: Vec::new(),
+        pending_assets,
+    })
+}
+
+/// Upload-path shape check — mirrors `scan_dir`'s exclusions so a
+/// remote body cannot place bytes where a local scan never would:
+/// no `.`-prefixed components, no `node_modules`, no config
+/// basenames at the leaf, no traversal or separators.
+fn valid_module_rel(rel: &str) -> bool {
+    if rel.is_empty() || rel.len() > 1024 || rel.contains('\\') || rel.contains('\0') {
+        return false;
+    }
+    let comps: Vec<&str> = rel.split('/').collect();
+    if comps
+        .iter()
+        .any(|c| c.is_empty() || *c == "." || *c == "..")
+    {
+        return false;
+    }
+    if comps
+        .iter()
+        .any(|c| c.starts_with('.') || *c == "node_modules")
+    {
+        return false;
+    }
+    if crate::project_cfg::is_config_basename(comps[comps.len() - 1]) {
+        return false;
+    }
+    true
+}
+
+/// `/`-prefixed request path in an assets manifest — same rules the
+/// scan produces: clean components, no traversal, no separators.
+fn valid_asset_req_path(path: &str) -> bool {
+    let Some(rel) = path.strip_prefix('/') else {
+        return false;
+    };
+    !rel.is_empty()
+        && rel.len() <= 1024
+        && !rel.contains('\\')
+        && !rel.contains('\0')
+        && rel
+            .split('/')
+            .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// Verify an uploaded `[assets]` payload into [`PendingAssets`] —
+/// every object digest must match its bytes, the manifest file
+/// table must enumerate EXACTLY the shipped objects, and the same
+/// file/total caps apply as the directory scan.
+fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError> {
+    use base64::Engine;
+    let manifest_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&a.manifest)
+        .map_err(|_| LocalError::Worker("assets encoding"))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| LocalError::Worker("assets manifest"))?;
+    let files = manifest["files"]
+        .as_array()
+        .ok_or(LocalError::Worker("assets manifest"))?;
+    if files.len() > MAX_ASSET_FILES {
+        return Err(LocalError::Worker("too many asset files"));
+    }
+    let mut declared = std::collections::BTreeSet::new();
+    let mut objects = Vec::with_capacity(files.len());
+    let mut total: u64 = 0;
+    for f in files {
+        let path = f["path"]
+            .as_str()
+            .ok_or(LocalError::Worker("assets manifest"))?;
+        let sha = f["sha256"]
+            .as_str()
+            .ok_or(LocalError::Worker("assets manifest"))?;
+        let size = f["size"]
+            .as_u64()
+            .ok_or(LocalError::Worker("assets manifest"))?;
+        if !valid_asset_req_path(path) {
+            return Err(LocalError::Worker("assets path"));
+        }
+        let Some(b64) = a.objects.get(sha) else {
+            return Err(LocalError::Worker("assets object missing"));
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|_| LocalError::Worker("assets encoding"))?;
+        if bytes.len() as u64 != size {
+            return Err(LocalError::Worker("assets size"));
+        }
+        if hex::encode(sha2::Sha256::digest(&bytes)) != sha {
+            return Err(LocalError::Worker("assets digest"));
+        }
+        if size > MAX_ASSET_FILE_BYTES {
+            return Err(LocalError::Worker("asset file too large"));
+        }
+        total += size;
+        if total > MAX_ASSET_TOTAL_BYTES {
+            return Err(LocalError::Worker("assets total too large"));
+        }
+        declared.insert(sha.to_string());
+        objects.push((sha.to_string(), bytes));
+    }
+    // Exact match both directions — a hand-crafted upload that ships
+    // objects the manifest never names is rejected, not ignored.
+    if a.objects.keys().any(|k| !declared.contains(k)) {
+        return Err(LocalError::Worker("assets object extra"));
+    }
+    let manifest_digest = hex::encode(sha2::Sha256::digest(&manifest_bytes));
+    Ok(PendingAssets {
+        manifest_bytes,
+        manifest_digest,
+        objects,
+    })
 }

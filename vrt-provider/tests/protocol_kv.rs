@@ -230,7 +230,7 @@ fn list_response_shape() {
             expires_at_ms: None,
         },
         KvListRow {
-            key: "键".as_bytes().to_vec(),
+            key: "\u{952e}".as_bytes().to_vec(),
             metadata_json: Some(b"{\"x\":1}".to_vec()),
             expires_at_ms: Some(2_000_000_000_000),
         },
@@ -241,7 +241,7 @@ fn list_response_shape() {
     assert_eq!(value["keys"][0]["name"], "a");
     assert!(value["keys"][0]["metadata"].is_null());
     assert!(value["keys"][0]["expiration"].is_null());
-    assert_eq!(value["keys"][1]["name"], "键");
+    assert_eq!(value["keys"][1]["name"], "\u{952e}");
     assert_eq!(value["keys"][1]["expiration"], 2_000_000_000);
     assert_eq!(value["list_complete"], false);
     assert_eq!(value["cursor"], "cursor-token");

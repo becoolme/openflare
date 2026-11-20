@@ -37,7 +37,7 @@ fn scope(dir: PathBuf) -> PlacementScope {
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
-    // 仓库约定：target/tmp-p3c2r1/（任务约束，收尾统一清理）。
+    // Repository convention: target/tmp-p3c2r1/ (task constraint, cleaned up together at the end).
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../target/tmp-p3c2r1")
         .join(format!("{}-{}", tag, std::process::id()));

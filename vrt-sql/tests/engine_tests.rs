@@ -1,4 +1,4 @@
-//! 引擎行为测试（§3）：事务/meta/格式/BLOB/authorizer/限额/超时/路径/单写者/dedup。
+//! Engine behavior tests (section 3): transaction/meta/format/BLOB/authorizer/limits/timeout/path/single-writer/dedup.
 
 use std::time::{Duration, Instant};
 use vrt_sql::paths::ResourceKind::D1;
@@ -37,7 +37,7 @@ fn batch(
 fn single_txn_rolls_back_whole_batch() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
-    // 第二条失败 → 整批回滚：CREATE 也应不存在
+    // Second statement fails -> whole batch rolls back: CREATE should not exist either
     let r = batch(
         &e,
         &[
@@ -47,7 +47,7 @@ fn single_txn_rolls_back_whole_batch() {
         ],
     );
     assert!(r.is_err());
-    // 表不存在 = 回滚生效
+    // Table does not exist = rollback took effect
     let r2 = batch(&e, &["SELECT * FROM t"]);
     assert!(r2.is_err());
     assert!(r2.unwrap_err().wire_message().contains("t"));
@@ -78,7 +78,7 @@ fn meta_fields() {
     assert!(ins.size_after > 0);
     let sel = &r[1].meta;
     assert_eq!(sel.rows_read, 1);
-    assert_eq!(sel.rows_written, 0); // SELECT 不写
+    assert_eq!(sel.rows_written, 0); // SELECT does not write
     assert!(!sel.changed_db);
 }
 
@@ -99,7 +99,7 @@ fn results_format_variants() {
         .query_batch_sync(&stmts, &c, ResultsFormat::ArrayOfObjects)
         .unwrap();
     assert_eq!(r[0].results, serde_json::json!([{ "a": 1, "b": "x" }]));
-    // NONE：与 miniflare 一致仍按对象数组返回
+    // NONE: same as miniflare, still returned as an array of objects
     let r = e.query_batch_sync(&stmts, &c, ResultsFormat::None).unwrap();
     assert!(r[0].results.is_array());
 }
@@ -121,7 +121,7 @@ fn results_format_invalid_falls_back() {
 fn empty_and_comment_only_batches_rejected() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
-    // miniflare 过滤 `^\s+--`：缩进/换行后的行注释剥掉 → 无语句错
+    // miniflare filters `^\s+--`: line comments after indentation/newline are stripped -> no "no statement" error
     for sql in ["", "   ", "  -- c", "  -- c\n   -- d"] {
         let r = batch(&e, &[sql]);
         assert!(
@@ -132,7 +132,7 @@ fn empty_and_comment_only_batches_rejected() {
             "{sql}"
         );
     }
-    // 串首即 `--`（无前置空白）不剥 → 到达 SQLite 报"无语句"类错误
+    // `--` at the very start of the string (no leading whitespace) is not stripped -> reaches SQLite, which reports a "no statement"-class error
     assert!(batch(&e, &["-- comment"]).is_err());
     assert!(batch(&e, &["-- a\n-- b"]).is_err());
 }
@@ -169,7 +169,7 @@ fn big_int_and_float() {
     assert!(r[0].results[0]["f"].as_f64().unwrap() > 1e299);
 }
 
-// ---------- authorizer 禁项 ----------
+// ---------- authorizer deny items ----------
 
 #[test]
 fn attach_and_variants_denied() {
@@ -191,10 +191,10 @@ fn attach_and_variants_denied() {
 fn pragma_restrictions() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
-    // 读白名单放行
+    // read allowlist passes
     assert!(batch(&e, &["PRAGMA table_info(t)"]).is_ok());
     assert!(batch(&e, &["PRAGMA integrity_check"]).is_ok());
-    // 写与引擎托管项拒
+    // writes and engine-managed items rejected
     for sql in [
         "PRAGMA journal_mode=WAL",
         "PRAGMA synchronous=OFF",
@@ -205,7 +205,7 @@ fn pragma_restrictions() {
     ] {
         assert!(batch(&e, &[sql]).is_err(), "should deny: {sql}");
     }
-    // foreign_keys 读放行
+    // foreign_keys read allowed
     assert!(batch(&e, &["PRAGMA foreign_keys"]).is_ok());
 }
 
@@ -217,7 +217,7 @@ fn function_denylist() {
         "SELECT load_extension('/tmp/evil')",
         "SELECT fts3_tokenizer('simple')",
         "SELECT sqlite_dbpage(1)",
-        "SELECT pragma_table_info('t')", // pragma_*() 函数形态
+        "SELECT pragma_table_info('t')", // pragma_*() function form
         "SELECT pragma_journal_mode()",
     ] {
         assert!(batch(&e, &[sql]).is_err(), "should deny: {sql}");
@@ -228,7 +228,7 @@ fn function_denylist() {
 fn sqlite_master_write_denied() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
-    // authorizer 不拦 sqlite_master（内部 DDL 依赖）；由 SQLite 自身拒
+    // the authorizer does not block sqlite_master (internal DDL depends on it); rejected by SQLite itself
     assert!(batch(&e, &["INSERT INTO sqlite_master VALUES('x','y','z',1,'s')"]).is_err());
     assert!(batch(&e, &["SELECT name FROM sqlite_master"]).is_ok());
 }
@@ -246,13 +246,13 @@ fn dedup_table_invisible_to_users() {
 fn vacuum_all_forms_denied() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
-    // T33：VACUUM 全禁（内部 Attach{''} 与用户 ATTACH 不可分）
+    // T33: VACUUM entirely banned (internal Attach{''} is indistinguishable from the user's ATTACH)
     assert!(batch(&e, &["VACUUM INTO '/tmp/escape.db'"]).is_err());
     assert!(batch(&e, &["VACUUM"]).is_err());
     assert!(batch(&e, &["vacuum main"]).is_err());
 }
 
-// ---------- 限额与超时 ----------
+// ---------- limits and timeout ----------
 
 #[test]
 fn oversized_sql_rejected() {
@@ -295,7 +295,7 @@ fn infinite_cte_interrupted() {
     );
 }
 
-// ---------- 路径/单写者 ----------
+// ---------- path/single-writer ----------
 
 #[test]
 fn invalid_db_id_rejected() {
@@ -332,16 +332,16 @@ fn dedup_replay_returns_stored_result() {
     let r1 = e
         .query_batch_sync(&stmts, &c, ResultsFormat::ArrayOfObjects)
         .unwrap();
-    // 同 (epoch,seq) 重放：不重复执行（行数应仍 1），返回原结果
+    // Replay with the same (epoch,seq): not executed again (row count should still be 1), original result returned
     let r2 = e
         .query_batch_sync(&stmts, &c, ResultsFormat::ArrayOfObjects)
         .unwrap();
-    // 重放返回存储的原始结果负载（meta 中的 duration 等动态字段除外）
+    // The replay returns the stored original result payload (except dynamic fields such as duration in meta)
     assert_eq!(r1[0].results, r2[0].results);
     assert_eq!(r1.len(), r2.len());
     let cnt = batch(&e, &["SELECT COUNT(*) c FROM t"]).unwrap();
     assert_eq!(cnt[0].results[0]["c"], serde_json::json!(1));
-    // 不同 seq → 真执行
+    // Different seq -> really executes
     let c2 = TxnCtx {
         dedup: Some((1, 43)),
         ..c
@@ -354,8 +354,8 @@ fn dedup_replay_returns_stored_result() {
 
 #[test]
 fn dedup_collision_different_payload_rejected() {
-    // T34b: 同 (epoch,seq) 不同负载 ⇒ seq 分配撞键（如 provider 重启
-    // 回绕）——fail closed，绝不回放旧结果。
+    // T34b: same (epoch,seq) with a different payload => seq allocation collision (e.g. provider restart
+    // wraparound) -- fail closed, never replay the old result.
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
     batch(&e, &["CREATE TABLE t(a)"]).unwrap();
@@ -378,10 +378,10 @@ fn dedup_collision_different_payload_rejected() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("dedup key collision"), "{err}");
-    // 冲突写未执行：表里仍只有第一行。
+    // The conflicting write was not executed: the table still has only the first row.
     let cnt = batch(&e, &["SELECT COUNT(*) c FROM t"]).unwrap();
     assert_eq!(cnt[0].results[0]["c"], serde_json::json!(1));
-    // 同 (epoch,seq) 同负载 ⇒ 仍是合法重放（不报错、不重复执行）。
+    // Same (epoch,seq) with the same payload => still a legitimate replay (no error, no re-execution).
     e.query_batch_sync(
         &[stmt("INSERT INTO t VALUES(9)")],
         &c,
@@ -398,7 +398,7 @@ fn dedup_not_committed_on_business_failure() {
     let e = open(&tmp);
     batch(&e, &["CREATE TABLE t(a UNIQUE)"]).unwrap();
     batch(&e, &["INSERT INTO t VALUES(1)"]).unwrap();
-    // 业务失败（唯一约束）→ dedup 不应落账，同 seq 重试应重放执行再失败
+    // Business failure (unique constraint) -> dedup must not be recorded; retrying the same seq should re-execute and fail again
     let stmts = vec![stmt("INSERT INTO t VALUES(1)")];
     let c = TxnCtx {
         epoch: 1,
@@ -427,7 +427,7 @@ fn commit_lsn_advances() {
     assert_eq!(e.commit_lsn(), l0 + 2);
 }
 
-// ---------- T33b S1：保留名 DDL / trigger 绕过 ----------
+// ---------- T33b S1: reserved-name DDL / trigger bypass ----------
 
 #[test]
 fn reserved_ddl_on_vrt_objects_denied() {
@@ -435,7 +435,7 @@ fn reserved_ddl_on_vrt_objects_denied() {
     let e = open(&tmp);
     batch(&e, &["CREATE TABLE t(a)"]).unwrap();
     for sql in [
-        // trigger 体在 internal 窗口执行的绕过路径——建都不让建
+        // bypass path where the trigger body runs inside the internal window -- refuse to even create it
         "CREATE TRIGGER evil AFTER INSERT ON _vrt_dedup BEGIN UPDATE t SET a=0; END",
         "CREATE TRIGGER evil2 AFTER INSERT ON _vrt_dedup BEGIN SELECT 1; END",
         "CREATE INDEX i ON _vrt_dedup(seq)",
@@ -446,13 +446,13 @@ fn reserved_ddl_on_vrt_objects_denied() {
     ] {
         assert!(batch(&e, &[sql]).is_err(), "should deny: {sql}");
     }
-    // sqlite_ 前缀（SQLite 自身也拒，叠防御纵深）
+    // sqlite_ prefix (SQLite itself also rejects, stacking defense in depth)
     assert!(batch(&e, &["CREATE TABLE sqlite_evil(a)"]).is_err());
-    // CREATE VIEW 不解析 SELECT 体（SQLite 惰性授权）——视图可建
-    // 但透读 _vrt_dedup 在 SELECT 时被 Read 拒（真正的安全边界）
+    // CREATE VIEW does not parse the SELECT body (SQLite lazy authorization) -- the view can be created
+    // but reading through to _vrt_dedup is rejected with Read at SELECT time (the real security boundary)
     assert!(batch(&e, &["CREATE VIEW v AS SELECT * FROM _vrt_dedup"]).is_ok());
     assert!(batch(&e, &["SELECT * FROM v"]).is_err());
-    // 正常 DDL 不受影响
+    // normal DDL is unaffected
     assert!(batch(&e, &["CREATE TABLE u2(a UNIQUE)"]).is_ok()); // autoindex
     assert!(batch(&e, &["CREATE INDEX iu ON t(a)"]).is_ok());
     assert!(batch(
@@ -467,7 +467,7 @@ fn dedup_write_safe_against_trigger_bypass() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
     batch(&e, &["CREATE TABLE t(a)"]).unwrap();
-    // 挂不上 trigger → dedup 写入路径没有可劫持点
+    // no trigger can be attached -> the dedup write path has no hijack point
     assert!(batch(
         &e,
         &["CREATE TRIGGER e AFTER INSERT ON _vrt_dedup BEGIN INSERT INTO t VALUES(999); END"]
@@ -485,14 +485,14 @@ fn dedup_write_safe_against_trigger_bypass() {
     )
     .unwrap();
     let r = batch(&e, &["SELECT COUNT(*) c FROM t"]).unwrap();
-    assert_eq!(r[0].results[0]["c"], serde_json::json!(1)); // 无 999
+    assert_eq!(r[0].results[0]["c"], serde_json::json!(1)); // no 999
 }
 
-// ---------- T33b S2：函数白名单 ----------
+// ---------- T33b S2: function allowlist ----------
 
 #[test]
 fn function_whitelist_matches_bundled_universe() {
-    // 每个白名单函数都真实存在于 bundled 3.53.2
+    // every allowlisted function really exists in bundled 3.53.2
     let c = rusqlite::Connection::open_in_memory().unwrap();
     let mut st = c
         .prepare("SELECT DISTINCT name FROM pragma_function_list")
@@ -502,7 +502,7 @@ fn function_whitelist_matches_bundled_universe() {
         .unwrap()
         .flatten()
         .collect();
-    // 表值函数不出现在 function_list；白名单元素不应缺失
+    // table-valued functions do not appear in function_list; no allowlist element should be missing
     let allow = FUNCTION_ALLOW_FOR_TEST;
     for f in allow {
         assert!(
@@ -510,7 +510,7 @@ fn function_whitelist_matches_bundled_universe() {
             "whitelist fn missing from bundled: {f}"
         );
     }
-    // 全集中每个函数要么在白名单，要么在显式拒名单——无未评估函数
+    // every function in the full set is either on the allowlist or on the explicit deny list -- no unevaluated functions
     for f in &universe {
         let allowed = allow.iter().any(|a| a.eq_ignore_ascii_case(f));
         let known_denied = vrt_sql::security::FUNCTION_KNOWN_DENY
@@ -523,7 +523,7 @@ fn function_whitelist_matches_bundled_universe() {
     }
 }
 
-// 与 security.rs 的白名单保持同步（测试侧显式重列，防止误改漏检）
+// Kept in sync with the allowlist in security.rs (re-listed explicitly on the test side to prevent mistaken edits going unnoticed)
 const FUNCTION_ALLOW_FOR_TEST: &[&str] = &[
     "abs",
     "changes",
@@ -637,7 +637,7 @@ const FUNCTION_ALLOW_FOR_TEST: &[&str] = &[
 fn function_whitelist_smoke() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
-    // 白名单函数正常可用
+    // allowlisted functions work normally
     assert!(batch(
         &e,
         &["SELECT typeof(1), upper('a'), json_extract('{\"x\":1}','$.x'), strftime('%Y','now')"]
@@ -648,7 +648,7 @@ fn function_whitelist_smoke() {
         &["SELECT unistr('a'), concat('a','b'), octet_length('x')"]
     )
     .is_ok());
-    // 非白名单（含 bundled 中不存在的）一律拒
+    // non-allowlisted ones (including those absent from bundled) are always rejected
     for sql in [
         "SELECT load_extension('/x')",
         "SELECT fts3_tokenizer('simple')",
@@ -673,25 +673,25 @@ fn oversized_value_hit_length_limit() {
     assert!(batch(&e, &["SELECT randomblob(64*1024*1024)"]).is_err());
 }
 
-// ---------- T33b S3：信息泄漏 ----------
+// ---------- T33b S3: information leak ----------
 
 #[test]
 fn info_leak_pragmas_denied() {
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
     for sql in [
-        "PRAGMA database_list",   // 绝对路径
-        "PRAGMA compile_options", // 构建细节
-        "PRAGMA function_list",   // 构建细节
+        "PRAGMA database_list",   // absolute path
+        "PRAGMA compile_options", // build details
+        "PRAGMA function_list",   // build details
     ] {
         assert!(batch(&e, &[sql]).is_err(), "should deny: {sql}");
     }
-    // sqlite_version() 放行：仅版本号、无路径/密钥，兼容探测常用
+    // sqlite_version() allowed: version number only, no paths/keys, commonly used for compatibility probes
     assert!(batch(&e, &["SELECT sqlite_version()"]).is_ok());
     assert!(batch(&e, &["PRAGMA table_info(t)"]).is_ok());
 }
 
-// ---------- T33b S4：dedup epoch 一致 ----------
+// ---------- T33b S4: dedup epoch consistency ----------
 
 #[test]
 fn dedup_epoch_mismatch_rejected() {
@@ -711,10 +711,10 @@ fn dedup_epoch_mismatch_rejected() {
     );
     assert!(r.is_err());
     let cnt = batch(&e, &["SELECT COUNT(*) c FROM t"]).unwrap();
-    assert_eq!(cnt[0].results[0]["c"], serde_json::json!(0)); // 未执行
+    assert_eq!(cnt[0].results[0]["c"], serde_json::json!(0)); // not executed
 }
 
-// ---------- T35b：受限 DROP（数据面删除） ----------
+// ---------- T35b: restricted DROP (data-plane delete) ----------
 
 #[test]
 fn registry_drop_removes_db_dir_idempotent() {
@@ -724,19 +724,19 @@ fn registry_drop_removes_db_dir_idempotent() {
     std::fs::create_dir(&root).unwrap();
     let reg = EngineRegistry::new(root.clone());
     let db_id = "01jqqm3b4y6zq8f0v2w5x7k9ae";
-    // 打开引擎 → 目录/文件存在
+    // open the engine -> directory/file exists
     let e = reg.get(D1, db_id).unwrap();
     let leaf = vrt_sql::paths::derive_db_dir_readonly(&root, db_id)
         .unwrap()
         .expect("leaf exists after open");
     assert!(leaf.join("db.sqlite").exists());
     drop(e);
-    // DROP → true，目录消失
+    // DROP -> true, directory gone
     assert!(reg.drop_db(D1, db_id).unwrap());
     assert!(!leaf.exists());
-    // 幂等：再删 → false（不存在），不报错
+    // idempotent: delete again -> false (does not exist), no error
     assert!(!reg.drop_db(D1, db_id).unwrap());
-    // T35c：删除后 get() 永远 Dropped——tombstone 生效，目录不复活。
+    // T35c: after deletion get() is always Dropped -- the tombstone takes effect, the directory does not come back.
     assert!(matches!(
         reg.get(D1, db_id),
         Err(vrt_sql::engine::EngineError::Dropped)
@@ -760,16 +760,16 @@ fn registry_drop_rejects_bad_id_and_missing() {
     ] {
         assert!(reg.drop_db(D1, bad).is_err(), "{bad} must fail");
     }
-    // root 未被越权创建任何目录
+    // root had no directories created outside its authority
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-    // 从未存在的合法 id → Ok(false)
+    // a legal id that never existed -> Ok(false)
     assert!(!reg.drop_db(D1, "zzzzzzzzzzzzzzzzzzzzzzzz26").unwrap());
 }
 
-// ---------- T35c：DROP 并发安全（tombstone / 排空 / 防复活） ----------
+// ---------- T35c: DROP concurrency safety (tombstone / drain / anti-resurrection) ----------
 
-/// 被 DROP 的 id：tombstone marker 落盘、目录进 .trash 后被删，任何
-/// get()/open() 永远 Dropped，目录不会被惰性重建（复活防护）。
+/// A dropped id: the tombstone marker is persisted, the directory goes into .trash and is then deleted, and any
+/// get()/open() is Dropped forever; the directory is never lazily rebuilt (resurrection protection).
 #[test]
 fn drop_tombstone_blocks_reopen_and_resurrection() {
     use vrt_sql::engine::EngineRegistry;
@@ -780,22 +780,22 @@ fn drop_tombstone_blocks_reopen_and_resurrection() {
     let db_id = "01jqqm3b4y6zq8f0v2w5x7k9ae";
     let _e = reg.get(D1, db_id).unwrap();
     assert!(reg.drop_db(D1, db_id).unwrap());
-    // 持久 marker 已写
+    // persistent marker is written
     assert!(vrt_sql::paths::marker_exists(&root, db_id).unwrap());
-    // get() 与裸 open() 均 Dropped
+    // both get() and a bare open() are Dropped
     assert!(matches!(reg.get(D1, db_id), Err(EngineError::Dropped)));
     assert!(matches!(
         RusqliteEngine::open(&root, db_id),
         Err(EngineError::Dropped)
     ));
-    // 目录没有复活
+    // the directory did not come back
     assert!(vrt_sql::paths::derive_db_dir_readonly(&root, db_id)
         .unwrap()
         .is_none());
 }
 
-/// tombstone 跨进程重启：新 registry 扫盘预灌 marker + get() 冷路径
-/// stat 兜底，重启后同样拒绝打开（持久化语义）。
+/// tombstone across a process restart: a new registry scans the disk to pre-fill markers + the get() cold path's
+/// stat backstop, so opening is likewise refused after the restart (persistence semantics).
 #[test]
 fn drop_tombstone_survives_registry_restart() {
     use vrt_sql::engine::EngineRegistry;
@@ -808,7 +808,7 @@ fn drop_tombstone_survives_registry_restart() {
         let _e = reg.get(D1, db_id).unwrap();
         assert!(reg.drop_db(D1, db_id).unwrap());
     }
-    // 模拟进程重启：全新 registry（启动扫盘已把 marker 灌入 tombstone）
+    // simulate a process restart: a brand-new registry (the startup scan already fed the markers into the tombstone set)
     let reg2 = EngineRegistry::new(root.clone());
     assert!(matches!(reg2.get(D1, db_id), Err(EngineError::Dropped)));
     assert!(vrt_sql::paths::derive_db_dir_readonly(&root, db_id)
@@ -816,8 +816,8 @@ fn drop_tombstone_survives_registry_restart() {
         .is_none());
 }
 
-/// marker 先于一切写入：对从未存在的 id DROP 也留下 tombstone，
-/// 之后该 id 无法被创建打开（id 不复用语义 fail closed）。
+/// marker precedes all writes: DROP on an id that never existed also leaves a tombstone,
+/// after which that id can never be created/opened (ids are never reused; fail closed).
 #[test]
 fn drop_missing_db_still_tombstones() {
     use vrt_sql::engine::EngineRegistry;
@@ -826,16 +826,16 @@ fn drop_missing_db_still_tombstones() {
     std::fs::create_dir(&root).unwrap();
     let reg = EngineRegistry::new(root.clone());
     let db_id = "zzzzzzzzzzzzzzzzzzzzzzzz26";
-    assert!(!reg.drop_db(D1, db_id).unwrap()); // 未删到实体 → false
+    assert!(!reg.drop_db(D1, db_id).unwrap()); // no entity deleted -> false
     assert!(matches!(reg.get(D1, db_id), Err(EngineError::Dropped)));
-    // 但根下只有 marker 所在 shard 与 .trash，无 db leaf
+    // but under the root only the marker's shard and .trash exist, no db leaf
     assert!(vrt_sql::paths::derive_db_dir_readonly(&root, db_id)
         .unwrap()
         .is_none());
 }
 
-/// 摘除的引擎持有人会话：DROP 之后用已持有 Arc 发起的新批次
-/// 直接 Dropped——不存在"写成功但目录已被删"的假成功。
+/// Session of a detached engine's holder: after DROP, a new batch issued with the already-held Arc
+/// is directly Dropped -- there is no false success of "write succeeded but the directory was deleted".
 #[test]
 fn dropped_engine_rejects_new_batches() {
     use vrt_sql::engine::EngineRegistry;
@@ -847,15 +847,15 @@ fn dropped_engine_rejects_new_batches() {
     let e = reg.get(D1, db_id).unwrap();
     batch(&e, &["CREATE TABLE t(x)"]).unwrap();
     assert!(reg.drop_db(D1, db_id).unwrap());
-    // 持有的旧 Arc：新批次被拒（入口标志检查）
+    // the previously held Arc: the new batch is rejected (entry flag check)
     assert!(matches!(
         batch(&e, &["INSERT INTO t VALUES (1)"]),
         Err(EngineError::Dropped)
     ));
 }
 
-/// DROP 与并发 get/query 交错：drop 完成后任何 get 必须失败；
-/// 目录不得被重建；不允许出现"写成功但数据丢失"。
+/// DROP interleaved with concurrent get/query: after the drop completes any get must fail;
+/// the directory must not be rebuilt; no "write succeeded but data lost" is allowed.
 #[test]
 fn drop_vs_concurrent_get_no_resurrection() {
     use std::sync::Arc;
@@ -866,7 +866,7 @@ fn drop_vs_concurrent_get_no_resurrection() {
     let reg = Arc::new(EngineRegistry::new(root.clone()));
     let db_id = "01jqqm3b4y6zq8f0v2w5x7k9ae";
 
-    // 多个 worker 持续 get+写；drop 在中途落下。
+    // multiple workers keep doing get+write; the drop lands midway.
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut handles = Vec::new();
     for _ in 0..4 {
@@ -882,7 +882,7 @@ fn drop_vs_concurrent_get_no_resurrection() {
                 let dropped_before_get = reg.state_tombstoned_for_test(D1, db_id);
                 match reg.get(D1, db_id) {
                     Ok(e) => {
-                        // DROP 之后绝不允许再拿到引擎或写成功
+                        // after DROP, getting an engine or a successful write is never allowed again
                         if dropped_before_get {
                             post_drop_success += 1;
                         }
@@ -911,16 +911,16 @@ fn drop_vs_concurrent_get_no_resurrection() {
         violations += h.join().unwrap();
     }
     assert_eq!(violations, 0, "get() returned a live engine after drop");
-    // 再确认：目录不复活、get 永远拒
+    // confirm again: the directory does not come back, get is refused forever
     assert!(matches!(reg.get(D1, db_id), Err(EngineError::Dropped)));
     assert!(vrt_sql::paths::derive_db_dir_readonly(&root, db_id)
         .unwrap()
         .is_none());
 }
 
-/// 排空等待不得持有 registry 锁：一个 db 的 drop（在途 Arc 迟迟不
-/// 归还，走完整个 drain）期间，另一个 db 的 get+query 必须在有界
-/// 时延内完成——验证锁不跨 drain/remove_dir_all。
+/// The drain wait must not hold the registry lock: while one db's drop (the in-flight Arc is slow
+/// to return, running the whole drain) is in progress, another db's get+query must finish within a bounded
+/// time -- verifying the lock is not held across drain/remove_dir_all.
 #[test]
 fn drop_drain_does_not_starve_other_dbs() {
     use std::sync::Arc;
@@ -931,11 +931,11 @@ fn drop_drain_does_not_starve_other_dbs() {
     let reg = Arc::new(EngineRegistry::new(root.clone()));
     let victim = "01jqqm3b4y6zq8f0v2w5x7k9ae";
     let other = "aaaaaaaaaaaaaaaaaaaaaaaaaa";
-    // victim 的 Arc 被外部持有 → drop_db 走满 drain 窗口
+    // victim's Arc is held externally -> drop_db runs the full drain window
     let held = reg.get(D1, victim).unwrap();
     let reg2 = reg.clone();
     let dropper = std::thread::spawn(move || reg2.drop_db(D1, victim).unwrap());
-    std::thread::sleep(Duration::from_millis(100)); // 确保 drop 进入 drain
+    std::thread::sleep(Duration::from_millis(100)); // make sure drop enters the drain
     let t0 = Instant::now();
     let e = reg.get(D1, other).unwrap();
     batch(&e, &["CREATE TABLE t(x)", "INSERT INTO t VALUES (1)"]).unwrap();
@@ -948,7 +948,7 @@ fn drop_drain_does_not_starve_other_dbs() {
     assert!(dropper.join().unwrap());
 }
 
-/// 启动清扫：.trash 里的残骸（上次 drop 后崩溃）在 new() 时清除。
+/// Startup sweep: debris in .trash (a crash after the last drop) is cleared in new().
 #[test]
 fn registry_new_sweeps_stale_trash() {
     use vrt_sql::engine::EngineRegistry;

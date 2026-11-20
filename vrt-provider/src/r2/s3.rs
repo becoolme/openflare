@@ -45,8 +45,8 @@ use super::wire::{
 use super::{R2GetResult, R2Provider};
 use vrt_objstore::sigv4::{self, SignedRequest, Signer};
 
-/// T36: SecretString/SignedRequest/SigV4 共享自 vrt-objstore（抽取，
-/// 非复制）。`vrt_provider::r2::s3::SecretString` 再导出保持原路径。
+/// T36: SecretString/SignedRequest/SigV4 are shared from vrt-objstore (extracted,
+/// not copied). `vrt_provider::r2::s3::SecretString` is re-exported to keep the original path.
 pub use vrt_objstore::sigv4::SecretString;
 
 const META_PREFIX: &str = "x-amz-meta-vrt-";
@@ -103,7 +103,7 @@ impl fmt::Debug for S3Config {
 pub struct S3R2Provider {
     client: Client,
     config: S3Config,
-    /// T36: 共享 SigV4 签名器（vrt-objstore）。
+    /// T36: shared SigV4 signer (vrt-objstore).
     signer: Signer,
 }
 

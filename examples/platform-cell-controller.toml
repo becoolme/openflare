@@ -1,16 +1,16 @@
-# VRT 平台模式 —— cell-controller 示例配置。
-# 部署时把所有 __VRT_*__ 占位符替换为真实路径/地址；本文件不含真实密钥。
+# VRT platform mode -- cell-controller example config.
+# At deploy time replace every __VRT_*__ placeholder with a real path/address; this file contains no real secrets.
 cell_id = "cell-mvp-1"
 control_plane_url = "https://cp.internal"
-token_file = "__VRT_ROOT__/secrets/cell-token"       # 0600，scoped ingest token（vrt.cell-controller）
+token_file = "__VRT_ROOT__/secrets/cell-token"       # 0600, scoped ingest token (vrt.cell-controller)
 health_listen = "0.0.0.0:9090"
 poll_interval_secs = 10
-fence_file = "__VRT_ROOT__/state/fence.json"          # 持久化 revision fence（必需）
-# egress_required = true 是默认且生产必须保持 true：NetworkPolicy apply+读回
-# 确认前不会投递租户。仅在本地开发时允许显式置 false（会打结构化 warn 且
-# healthz 恒报 egressPolicyDisabled，见 workers-runtime-cell-controller.md）。
+fence_file = "__VRT_ROOT__/state/fence.json"          # persisted revision fence (required)
+# egress_required = true is the default and must stay true in production: tenants are not delivered until the
+# NetworkPolicy apply + read-back is confirmed. Only set it to false explicitly for local development (it emits a
+# structured warn and healthz always reports egressPolicyDisabled; see workers-runtime-cell-controller.md).
 
-# 运行时 NetworkPolicy（T13/M1；pod/service CIDR 按集群实际填写）
+# Runtime NetworkPolicy (T13/M1; fill in pod/service CIDRs for the actual cluster)
 [netpolicy]
 policy_name = "vrt-tenant-egress"
 namespace = "vrt"
@@ -19,28 +19,28 @@ ingress_port = { protocol = "tcp", port = 8080 }
 node_excepts = ["10.0.0.0/8"]
 pod_cidrs = ["10.42.0.0/16"]
 service_cidrs = ["10.43.0.0/16"]
-# 公网可达端口白名单（T13/M1：空 = 不可达，非放开）
+# Allowlist of publicly reachable ports (T13/M1: empty = unreachable, not open)
 public_ports = [{ protocol = "tcp", port = 80 }, { protocol = "tcp", port = 443 }]
-# 共享入口（Traefik）可达 workerd ingress 端口
+# The shared entrypoint (Traefik) can reach the workerd ingress port
 [[netpolicy.ingress_peers]]
 namespace_labels = { "kubernetes.io/metadata.name" = "traefik" }
 pod_labels = { app = "traefik" }
-# 集群 DNS（kube-dns）：UDP/TCP 53
+# Cluster DNS (kube-dns): UDP/TCP 53
 [netpolicy.dns_peer]
 namespace_labels = { "kubernetes.io/metadata.name" = "kube-system" }
 pod_labels = { "k8s-app" = "kube-dns" }
-# 平台数据面后端（kvrocks/s3 网关），selector 或 cidr + 单端口
+# Platform data-plane backends (kvrocks/s3 gateway), selector or cidr + a single port
 [[netpolicy.backends]]
 selector = { peer = { namespace_labels = { "kubernetes.io/metadata.name" = "vrt-data" }, pod_labels = { app = "kvrocks" } }, port = { protocol = "tcp", port = 6666 } }
 [[netpolicy.backends]]
 cidr = { cidr = "203.0.113.10/32", port = { protocol = "tcp", port = 443 } }
 
-# 控制面 Ed25519 验签公钥（示例值来自共享 golden fixture，非真实密钥）
+# Control-plane Ed25519 verification public key (example value from the shared golden fixture, not a real key)
 [[trusted_keys]]
 keyId = "bf29c9743adb0a97f43ae4bc"
 publicKey = "MCowBQYDK2VwAyEAO4cbNjsO7FQzisOvZshKKMa67lIim3ikig7RdntOAZM="
 
-# 每个 pod 一个投递目录 + readyz 探针（T14/B1 FileEnvelopePodChannel）
+# One delivery directory per pod + readyz probe (T14/B1 FileEnvelopePodChannel)
 [[pods]]
 id = "pod-0"
 dir = "__VRT_ROOT__/pods/pod-0"                        # 0700

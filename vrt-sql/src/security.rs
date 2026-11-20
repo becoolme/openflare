@@ -1,5 +1,5 @@
-//! SQL 能力限制（§3 R5）：authorizer 白名单 fail closed +
-//! sqlite3_limit 收口 + progress/interrupt 超时。
+//! SQL capability restrictions (section 3 R5): authorizer whitelist fail closed +
+//! sqlite3_limit tightening + progress/interrupt timeout.
 
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::limits::Limit;
@@ -11,12 +11,12 @@ use std::sync::{
 
 use crate::engine::EngineError;
 
-/// PRAGMA 只读白名单：name → (允许读, 允许写)。
-/// `foreign_keys` 引擎托管：读放行写禁止；journal_mode/synchronous/
-/// wal_checkpoint/cache_size 等由引擎统一接管，禁用户改。
-// S3（T33b）：database_list 泄漏服务器绝对路径，compile_options/
-// function_list 泄漏构建细节——移除。D1 生产可用 PRAGMA 清单未证实，
-// 按最小面放行。
+/// PRAGMA read-only whitelist: name -> (read allowed, write allowed).
+/// `foreign_keys` is engine-managed: reads allowed, writes forbidden; journal_mode/synchronous/
+/// wal_checkpoint/cache_size etc. are taken over by the engine and users may not change them.
+// S3 (T33b): database_list leaks the server's absolute path, compile_options/
+// function_list leak build details -- removed. The set of PRAGMAs usable in D1 production is unconfirmed,
+// so allow the minimal surface.
 const PRAGMA_RO_ALLOW: &[&str] = &[
     "table_info",
     "table_xinfo",
@@ -28,14 +28,14 @@ const PRAGMA_RO_ALLOW: &[&str] = &[
     "foreign_key_list",
 ];
 
-/// FUNCTION 白名单（S2，T33b）：对照 bundled SQLite 3.53.2
-/// `pragma_function_list` 实际编译结果枚举；未列出的函数（fts*/bm25/
+/// FUNCTION allowlist (S2, T33b): enumerated against the actual compiled result of bundled SQLite 3.53.2
+/// `pragma_function_list`; unlisted functions (fts*/bm25/
 /// rtree*/sqlite_compileoption_*/sqlite_log/load_extension/sqlite_offset
-/// 及任何未知函数）一律拒。tests 里有全量对照断言。
-/// sqlite_source_id 与 compileoption 同类（构建细节）→ 拒；
-/// sqlite_version 放行：仅版本号、不含路径/密钥，客户端常做兼容探测。
+/// and any unknown function) are always rejected. Tests contain a full cross-check assertion.
+/// sqlite_source_id is the same class as compileoption (build details) -> rejected;
+/// sqlite_version is allowed: version number only, no paths/keys, and clients often use it for compatibility probes.
 const FUNCTION_ALLOW: &[&str] = &[
-    // 核心标量
+    // core scalars
     "abs",
     "changes",
     "char",
@@ -85,14 +85,14 @@ const FUNCTION_ALLOW: &[&str] = &[
     "zeroblob",
     "->",
     "->>",
-    // 聚合
+    // aggregates
     "avg",
     "count",
     "group_concat",
     "string_agg",
     "sum",
     "total",
-    // 窗口
+    // window
     "cume_dist",
     "dense_rank",
     "first_value",
@@ -104,7 +104,7 @@ const FUNCTION_ALLOW: &[&str] = &[
     "percent_rank",
     "rank",
     "row_number",
-    // 日期时间
+    // date/time
     "date",
     "time",
     "datetime",
@@ -115,7 +115,7 @@ const FUNCTION_ALLOW: &[&str] = &[
     "current_date",
     "current_time",
     "current_timestamp",
-    // JSON1（标量+聚合；表值函数 json_each/json_tree 不走 Function action）
+    // JSON1 (scalars + aggregates; the table-valued functions json_each/json_tree do not go through the Function action)
     "json",
     "json_array",
     "json_array_insert",
@@ -148,8 +148,8 @@ const FUNCTION_ALLOW: &[&str] = &[
     "jsonb_set",
 ];
 
-/// 显式拒绝名单：bundled 中存在但**不应**出现在白名单的函数——
-/// 测试用它与 function_list 全量对照，防止"忘了评估的新函数"静默放行。
+/// Explicit deny list: functions present in the bundled build that **must not** be on the allowlist --
+/// tests cross-check it against the full function_list, so a "new function nobody evaluated" cannot be silently allowed.
 pub const FUNCTION_KNOWN_DENY: &[&str] = &[
     "load_extension",
     "fts3_tokenizer",
@@ -177,18 +177,18 @@ pub const FUNCTION_KNOWN_DENY: &[&str] = &[
     "sqlite_dbpage",
 ];
 
-/// Read/写禁表（防御纵深）。
-/// 注意：sqlite_master 不在禁表——SQLite 内部 DDL 会经 authorizer 产生
-/// 对 sqlite_master 的 Insert/Update/Read，拒之会连带破坏 CREATE TABLE；
-/// 用户直接写 sqlite_master 由 SQLite 自身拒（"may not be modified"）。
-/// `_vrt_dedup` 为用户不可见账本：读写都拒，引擎走 InternalFlag 旁路。
+/// Tables denied for read/write (defense in depth).
+/// Note: sqlite_master is not a denied table -- SQLite's internal DDL issues
+/// Insert/Update/Read on sqlite_master through the authorizer; denying it would break CREATE TABLE;
+/// a user writing sqlite_master directly is rejected by SQLite itself ("may not be modified").
+/// `_vrt_dedup` is a ledger invisible to users: reads and writes are both denied, and the engine bypasses via InternalFlag.
 const TABLE_WRITE_DENY: &[&str] = &["sqlite_dbpage", "_vrt_dedup"];
 const TABLE_READ_DENY: &[&str] = &["sqlite_dbpage", "_vrt_dedup"];
 
-/// 保留对象名：`_vrt_`（引擎账本/内部表）与 `sqlite_`（内部 schema）前缀。
-/// 用户对这些对象的一切 DDL 全拒（S1）——否则可在 `_vrt_dedup` 上挂
-/// trigger，在引擎 internal 旁路窗口内执行任意 SQL 绕过 authorizer。
-/// 注：`sqlite_` 前缀用户对象 SQLite 自身也会拒，此处叠防御纵深。
+/// Reserved object names: the `_vrt_` (engine ledger/internal tables) and `sqlite_` (internal schema) prefixes.
+/// All user DDL on these objects is rejected (S1) -- otherwise a
+/// trigger could be attached to `_vrt_dedup` and run arbitrary SQL inside the engine's internal bypass window, evading the authorizer.
+/// Note: SQLite itself also rejects user objects with the `sqlite_` prefix; this adds defense in depth.
 fn is_vrt_name(name: &str) -> bool {
     let n = name.as_bytes();
     n.len() >= 5 && n[..5].eq_ignore_ascii_case(b"_vrt_")
@@ -208,13 +208,13 @@ fn deny_table_write(name: &str) -> bool {
 
 fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
     if name.eq_ignore_ascii_case("foreign_keys") {
-        return value.is_none(); // 读放行写禁
+        return value.is_none(); // reads allowed, writes denied
     }
     if name.eq_ignore_ascii_case("miniflare_d1_export") {
         return false;
     }
-    // authorizer 把 `PRAGMA x(arg)` 的括号参数也作为 value 传入——
-    // 白名单内均为只读 pragma，带参与否都放行；写型 pragma 不在表内。
+    // The authorizer also passes the parenthesized argument of `PRAGMA x(arg)` as value --
+    // everything on the allowlist is a read-only pragma, allowed with or without an argument; write pragmas are not in the table.
     PRAGMA_RO_ALLOW.iter().any(|p| p.eq_ignore_ascii_case(name))
 }
 
@@ -224,7 +224,7 @@ pub fn function_allowed(name: &str) -> bool {
 
 pub fn authorize(ctx: AuthContext) -> Authorization {
     match ctx.action {
-        // 跨库逃逸与路径注入
+        // cross-database escape and path injection
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
         AuthAction::Pragma {
             pragma_name,
@@ -244,10 +244,10 @@ pub fn authorize(ctx: AuthContext) -> Authorization {
             }
         }
         AuthAction::Read { table_name, .. } => {
-            // 注意：不能把 sqlite_ 前缀并入——CREATE TABLE 的内部写会
-            // 对 sqlite_master 发 Read/Insert/Update，须放行；
-            // _vrt_dedup 由显式禁表覆盖；T37：`_vrt_q_*` 队列内部表
-            // 同拒（用户面一切 `_vrt_q_` 读写都不可达）。
+            // Note: the sqlite_ prefix must not be merged in -- the internal writes of CREATE TABLE
+            // issue Read/Insert/Update on sqlite_master, which must be allowed;
+            // _vrt_dedup is covered by the explicit denied-table list; T37: the `_vrt_q_*` queue internal tables
+            // are likewise rejected (every `_vrt_q_` read/write is unreachable from the user surface).
             if TABLE_READ_DENY
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(table_name))
@@ -261,8 +261,8 @@ pub fn authorize(ctx: AuthContext) -> Authorization {
         AuthAction::Insert { table_name }
         | AuthAction::Delete { table_name }
         | AuthAction::Update { table_name, .. } => {
-            // 同上：sqlite_master 的内部 DML 必须放行（CREATE TABLE 依赖）。
-            // T37：`_vrt_q_*` 队列内部表用户写同拒。
+            // Same as above: internal DML on sqlite_master must be allowed (CREATE TABLE depends on it).
+            // T37: user writes to the `_vrt_q_*` queue internal tables are likewise rejected.
             if deny_table_write(table_name)
                 || table_name.to_ascii_lowercase().starts_with("_vrt_q_")
             {
@@ -271,8 +271,8 @@ pub fn authorize(ctx: AuthContext) -> Authorization {
                 Authorization::Allow
             }
         }
-        // DDL：对象名带保留前缀一律拒（S1 trigger/索引/视图绕过防护）。
-        // sqlite_master 的内部写不受此影响（那是 DML 不是 DDL）。
+        // DDL: object names with a reserved prefix are always rejected (S1 trigger/index/view bypass protection).
+        // Internal writes to sqlite_master are unaffected (that is DML, not DDL).
         AuthAction::CreateIndex {
             index_name,
             table_name,
@@ -305,21 +305,21 @@ pub fn authorize(ctx: AuthContext) -> Authorization {
             trigger_name: index_name,
             table_name,
         } => {
-            // 对象名只查 _vrt_：sqlite_autoindex_* 是 SQLite 自生成名
-            // （UNIQUE/PK 约束在用户表上也会产生），用户同样建不出
-            // sqlite_* 对象；表名检查兜住 _vrt_dedup 上的 trigger/index。
+            // Object names only check _vrt_: sqlite_autoindex_* is a name SQLite generates itself
+            // (UNIQUE/PK constraints on user tables produce it too), and users likewise cannot create
+            // sqlite_* objects; the table-name check covers triggers/indexes on _vrt_dedup.
             if is_reserved_object(table_name) || is_vrt_name(index_name) {
                 Authorization::Deny
             } else {
                 Authorization::Allow
             }
         }
-        // AUTOINCREMENT（D1 支持）：SQLite 在首个 AUTOINCREMENT 表建表时
-        // 内部嵌套 `CREATE TABLE sqlite_sequence(name,seq)`，该语句同样经
-        // authorizer 发 CreateTable{sqlite_sequence}。只放行这一个精确名字、
-        // 且仅 CreateTable（非 Temp/Drop/Alter）；用户手写同名 DDL 由 SQLite
-        // 自身以 "object name reserved for internal use" 拒绝（有测试锁定），
-        // `sqlite_` 其它前缀名仍全拒。
+        // AUTOINCREMENT (D1 supports it): when the first AUTOINCREMENT table is created, SQLite
+        // internally nests `CREATE TABLE sqlite_sequence(name,seq)`, and that statement also goes through the
+        // authorizer as CreateTable{sqlite_sequence}. Only this one exact name is allowed,
+        // and only as CreateTable (not Temp/Drop/Alter); user-written DDL with the same name is rejected by SQLite
+        // itself with "object name reserved for internal use" (locked by a test),
+        // and other `sqlite_`-prefixed names are still all rejected.
         AuthAction::CreateTable { table_name } if table_name == "sqlite_sequence" => {
             Authorization::Allow
         }
@@ -350,18 +350,18 @@ pub fn authorize(ctx: AuthContext) -> Authorization {
         | AuthAction::Savepoint { .. }
         | AuthAction::Transaction { .. }
         | AuthAction::Recursive => Authorization::Allow,
-        // 保守默认：vtab 模块创建（可引入自定义 vtab）与其余未知 code 拒。
-        // 注：bundled SQLite 3.53.2 的 authorizer 码表止于 RECURSIVE=33，
-        // VACUUM 无专用 action code——`VACUUM INTO` 由语句文本预检拦截
-        // （engine::precheck_sql），authorizer 仍把任何 Unknown 拒死兜底。
+        // Conservative default: vtab module creation (could introduce a custom vtab) and all other unknown codes are rejected.
+        // Note: the authorizer code table of bundled SQLite 3.53.2 ends at RECURSIVE=33,
+        // and VACUUM has no dedicated action code -- `VACUUM INTO` is intercepted by a statement-text precheck
+        // (engine::precheck_sql); the authorizer still rejects any Unknown as a backstop.
         _ => Authorization::Deny,
     }
 }
 
-/// 引擎内部语句旁路：authorizer 只对用户 SQL 生效。
-/// 引擎管理语句（PRAGMA 设置、_vrt_dedup 建表/读写账、
-/// pragma_page_* 尺寸统计）先在 `internal` 标志下执行；
-/// 该标志只能由引擎代码置位（Mutex 串行化保证无并发泄漏）。
+/// Engine-internal statement bypass: the authorizer only applies to user SQL.
+/// Engine-managed statements (PRAGMA settings, _vrt_dedup create/read/write ledger,
+/// pragma_page_* size statistics) execute first under the `internal` flag;
+/// the flag can only be set by engine code (Mutex serialization guarantees no concurrent leak).
 #[derive(Clone, Default)]
 pub struct InternalFlag(pub Arc<AtomicBool>);
 
@@ -374,10 +374,10 @@ impl InternalFlag {
     }
 }
 
-/// 限额数值（§3；SQLite 侧硬上界，provider 预检另算）。
-/// SQL_LENGTH 100KB / VARIABLE_NUMBER 100（Cloudflare 公开限额口径，
-/// 文档标注待联网核实——先按此实现）。
-/// 返回 InternalFlag：引擎内部语句的 authorizer 旁路开关。
+/// Limit values (section 3; hard upper bounds on the SQLite side, provider precheck is separate).
+/// SQL_LENGTH 100KB / VARIABLE_NUMBER 100 (Cloudflare's public limits,
+/// the doc marks them as pending online verification -- implemented as such for now).
+/// Returns InternalFlag: the authorizer bypass switch for engine-internal statements.
 pub fn configure(conn: &Connection) -> Result<InternalFlag, EngineError> {
     conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
     conn.set_limit(Limit::SQLITE_LIMIT_SQL_LENGTH, 100 * 1024)?;
@@ -386,8 +386,8 @@ pub fn configure(conn: &Connection) -> Result<InternalFlag, EngineError> {
     conn.set_limit(Limit::SQLITE_LIMIT_TRIGGER_DEPTH, 10)?;
     conn.set_limit(Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH, 50_000)?;
     conn.set_limit(Limit::SQLITE_LIMIT_WORKER_THREADS, 0)?;
-    // S2：randomblob/zeroblob/printf('%.*c') 等放大构造的兜底上界。
-    // 32MiB 为保守口径（Cloudflare 实际行/blob 上限待联网核实）。
+    // S2: backstop upper bound for amplifying constructs such as randomblob/zeroblob/printf('%.*c').
+    // 32MiB is a conservative figure (Cloudflare's actual row/blob limit is pending online verification).
     conn.set_limit(Limit::SQLITE_LIMIT_LENGTH, 32 * 1024 * 1024)?;
     conn.set_limit(Limit::SQLITE_LIMIT_COLUMN, 2_000)?;
     conn.set_limit(Limit::SQLITE_LIMIT_FUNCTION_ARG, 127)?;
@@ -395,9 +395,9 @@ pub fn configure(conn: &Connection) -> Result<InternalFlag, EngineError> {
     let flag = internal.clone();
     conn.authorizer(Some(move |ctx: AuthContext<'_>| {
         if flag.0.load(Ordering::SeqCst) {
-            // S1 纵深防御：internal 窗口内也只放行引擎预期动作——
-            // 任何非预期 action（例如恶意 trigger 体在引擎写账时被
-            // 带入 prepare）仍被拒，宁可误杀引擎自身（fail closed）。
+            // S1 defense in depth: even inside the internal window only the actions the engine expects are allowed --
+            // any unexpected action (e.g. a malicious trigger body pulled into
+            // prepare while the engine writes its ledger) is still rejected; better to wrongly reject the engine itself (fail closed).
             authorize_internal(ctx)
         } else {
             authorize(ctx)
@@ -406,21 +406,21 @@ pub fn configure(conn: &Connection) -> Result<InternalFlag, EngineError> {
     Ok(internal)
 }
 
-/// 引擎内部表：`_vrt_dedup` 账本 + `_vrt_q_*` 队列对象（T37）。
+/// Engine internal tables: the `_vrt_dedup` ledger + `_vrt_q_*` queue objects (T37).
 fn is_internal_table(name: &str) -> bool {
     name.eq_ignore_ascii_case("_vrt_dedup") || name.to_ascii_lowercase().starts_with("_vrt_q_")
 }
 
-/// internal 语句的预期 action 全集：init PRAGMA、_vrt_dedup 建表、
-/// SELECT/INSERT _vrt_dedup、pragma_page_* 尺寸统计。其余一概拒。
+/// Full set of expected actions for internal statements: init PRAGMA, _vrt_dedup table creation,
+/// SELECT/INSERT on _vrt_dedup, pragma_page_* size statistics. Everything else is rejected.
 fn authorize_internal(ctx: AuthContext) -> Authorization {
     match ctx.action {
         AuthAction::Pragma { pragma_name, .. } => {
-            // 表值 pragma 函数（pragma_page_count() 等）实测发
-            // Pragma{name} 动作而非 Function——size_after 依赖它们。
-            // T36：`wal_checkpoint` 是引擎持久层内部 action（WAL 帧水位
-            // 读取 + TRUNCATE checkpoint）——只在 internal 窗口放行，
-            // 用户 pragma 路径仍走白名单（白名单不含它）。
+            // Table-valued pragma functions (pragma_page_count() etc.) were observed to emit a
+            // Pragma{name} action rather than Function -- size_after depends on them.
+            // T36: `wal_checkpoint` is an internal action of the engine persistence layer (WAL frame watermark
+            // read + TRUNCATE checkpoint) -- allowed only inside the internal window;
+            // the user pragma path still goes through the allowlist (which does not contain it).
             if matches!(
                 pragma_name.to_ascii_lowercase().as_str(),
                 "journal_mode"
@@ -438,16 +438,16 @@ fn authorize_internal(ctx: AuthContext) -> Authorization {
         AuthAction::CreateTable { table_name } | AuthAction::CreateIndex { table_name, .. }
             if is_internal_table(table_name) =>
         {
-            // PK 自动索引 sqlite_autoindex__vrt_dedup_N 也走这里。
-            // T37：`_vrt_q_*` 队列表（messages/dead/meta + _vrt_q_visible
-            // 索引）同属引擎内部对象，用户面仍被 `_vrt_` 保留前缀全拒。
+            // The PK auto-index sqlite_autoindex__vrt_dedup_N also goes through here.
+            // T37: the `_vrt_q_*` queue tables (messages/dead/meta + the _vrt_q_visible
+            // index) are also engine-internal objects, and the user surface still rejects them via the reserved `_vrt_` prefix.
             Authorization::Allow
         }
         AuthAction::Select | AuthAction::Transaction { .. } | AuthAction::Recursive => {
             Authorization::Allow
         }
-        // T37：CREATE INDEX 在建索引时对索引本身再发 Reindex
-        // action（实测 3.53.2）——放行内部索引名，拒其它。
+        // T37: when CREATE INDEX creates an index it emits a further Reindex
+        // action on the index itself (observed on 3.53.2) -- allow the internal index names, reject others.
         AuthAction::Reindex { index_name } => {
             if is_internal_table(index_name) {
                 Authorization::Allow
@@ -455,7 +455,7 @@ fn authorize_internal(ctx: AuthContext) -> Authorization {
                 Authorization::Deny
             }
         }
-        // 内部 DDL 对 sqlite_master 的 DML 回写 + _vrt_dedup 读写
+        // DML write-back to sqlite_master by internal DDL + _vrt_dedup reads/writes
         AuthAction::Read { table_name, .. }
         | AuthAction::Insert { table_name }
         | AuthAction::Update { table_name, .. }
@@ -464,7 +464,7 @@ fn authorize_internal(ctx: AuthContext) -> Authorization {
                 || table_name.eq_ignore_ascii_case("sqlite_master")
                 || table_name.to_ascii_lowercase().starts_with("pragma_")
             {
-                // pragma_page_count/pragma_page_size 表值函数的 Read
+                // Read of the table-valued functions pragma_page_count/pragma_page_size
                 Authorization::Allow
             } else {
                 Authorization::Deny
@@ -481,11 +481,11 @@ fn authorize_internal(ctx: AuthContext) -> Authorization {
     }
 }
 
-/// `VACUUM` 语句文本预检：剥行注释+折叠空白后小写匹配。
-/// T33 决定【全禁 VACUUM】（偏离 §3 的裸 VACUUM 放行）：bundled 3.53.2
-/// authorizer 无 VACUUM action code；实测裸 VACUUM 内部走
-/// `Attach{filename:""}`，与用户 `ATTACH ''` 在 authorizer 层不可区分，
-/// 而 ATTACH 必须整体拒——故 VACUUM 两种形态都禁，待复制落地再细化。
+/// `VACUUM` statement-text precheck: strip line comments + collapse whitespace, then match in lowercase.
+/// T33 decided to [ban VACUUM entirely] (deviating from section 3, which allowed bare VACUUM): bundled 3.53.2's
+/// authorizer has no VACUUM action code; a bare VACUUM was observed to go internally through
+/// `Attach{filename:""}`, indistinguishable at the authorizer layer from the user's `ATTACH ''`,
+/// and ATTACH must be rejected wholesale -- so both VACUUM forms are banned, to be refined once replication lands.
 pub fn looks_like_vacuum(sql: &str) -> bool {
     let normalized: String = sql
         .lines()
@@ -506,8 +506,8 @@ pub fn looks_like_vacuum(sql: &str) -> bool {
     normalized.contains("vacuum")
 }
 
-/// deadline 感知的 progress handler：每 ~10k VDBE ops 检查一次，
-/// 到期返回 true（中断当前语句）。
+/// Deadline-aware progress handler: checks every ~10k VDBE ops,
+/// returning true on expiry (interrupting the current statement).
 pub fn arm_deadline(conn: &Connection, deadline: std::time::Instant) {
     conn.progress_handler(10_000, Some(move || std::time::Instant::now() >= deadline))
         .expect("progress_handler install");

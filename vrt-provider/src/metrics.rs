@@ -152,7 +152,7 @@ pub(crate) fn quota_exceeded(tenant: &str, reason: &'static str) {
 }
 
 /// `outcome` ∈ `hit|not_modified|not_found|spa_fallback|redirect|error`.
-/// T34: vrt-sql 下游失败计数（metric 名内嵌 outcome，免新 label 维度）。
+/// T34: vrt-sql downstream failure counter (the outcome is embedded in the metric name, avoiding a new label dimension).
 pub(crate) fn d1_backend_unavailable(worker_id: &str) {
     reg().inc(
         "vrt_worker_subrequests_errors_total",
@@ -172,12 +172,12 @@ pub(crate) fn d1_outcome(worker_id: &str, outcome: &'static str) {
     );
 }
 
-/// T37 queue 指标（§11 P3b 四件套）：
-/// `vrt_queue_messages_sent_total{tenant,worker_id}`、
-/// `vrt_queue_send_rejected_total{tenant,worker_id,reason}`（reason 为有界枚举）、
-/// `vrt_queue_backlog_messages{tenant,queue}`、
-/// `vrt_queue_oldest_age_seconds{tenant,queue}`（近似：provider 采样时刻）。
-/// queue label 用截断防高基数（ULID 有界 26 chars）。
+/// T37 queue metrics (section 11 P3b four-piece set):
+/// `vrt_queue_messages_sent_total{tenant,worker_id}`,
+/// `vrt_queue_send_rejected_total{tenant,worker_id,reason}` (reason is a bounded enum),
+/// `vrt_queue_backlog_messages{tenant,queue}`,
+/// `vrt_queue_oldest_age_seconds{tenant,queue}` (approximate: the provider's sampling instant).
+/// The queue label is truncated to prevent high cardinality (ULID is bounded at 26 chars).
 pub(crate) fn queue_sent(tenant: &str, worker_id: &str, n: u64) {
     reg().inc(
         "vrt_queue_messages_sent_total",
@@ -188,7 +188,7 @@ pub(crate) fn queue_sent(tenant: &str, worker_id: &str, n: u64) {
 
 /// `reason` ∈ `bad_path|oversize|invalid|denied_identity|denied_authz|
 /// denied_permission|backend_unconfigured|body_error|dropped|fenced|
-/// backend_unavailable|backend_error|duplicate_id`（有界静态集）。
+/// backend_unavailable|backend_error|duplicate_id` (a bounded static set).
 pub(crate) fn queue_rejected(tenant: &str, worker_id: &str, reason: &'static str) {
     reg().inc(
         "vrt_queue_send_rejected_total",
@@ -201,8 +201,8 @@ pub(crate) fn queue_rejected(tenant: &str, worker_id: &str, reason: &'static str
     );
 }
 
-/// T37r：vrt-sql 报回的幂等去重数——`reason="duplicate_id"`，
-/// 正常路径为 0（provider 已拒客户端 id，DLQ 转投/传输重试才命中）。
+/// T37r: count of idempotent dedups reported back by vrt-sql -- `reason="duplicate_id"`,
+/// 0 on the normal path (the provider already rejects client ids; only DLQ forwarding/transport retries hit it).
 pub(crate) fn queue_duplicate_ids(tenant: &str, worker_id: &str, n: u64) {
     if n == 0 {
         return;
@@ -218,9 +218,9 @@ pub(crate) fn queue_duplicate_ids(tenant: &str, worker_id: &str, n: u64) {
     );
 }
 
-/// 每次成功 op 后由 metrics 响应刷新 backlog 水位与最老消息年龄。
-/// `queue` label = 授权 binding 的 queue id（ULID，有界基数）。
-/// `oldest_message_timestamp_ms=None`（空队列）时年龄置 0。
+/// After each successful op, the metrics response refreshes the backlog level and the oldest-message age.
+/// The `queue` label = the authorized binding's queue id (ULID, bounded cardinality).
+/// When `oldest_message_timestamp_ms=None` (empty queue) the age is set to 0.
 pub(crate) fn queue_backlog(tenant: &str, queue: &str, m: &crate::queue::WireMetrics) {
     let labels = [("tenant", tenant), ("queue", queue)];
     reg().set(

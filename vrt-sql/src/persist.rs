@@ -1,8 +1,8 @@
-//! 对象存储持久化面（T36 / §4）：manifest CAS lease + epoch fencing +
-//! ack 前段持久化 + 接管/恢复 + tombstone 删除 + 段 GC。
+//! Object-store persistence surface (T36 / section 4): manifest CAS lease + epoch fencing +
+//! pre-ack segment persistence + takeover/restore + tombstone deletion + segment GC.
 //!
-//! 所有方法同步签名（内部 `block_on_store` 桥接 async ObjectStore），
-//! 由引擎在单写者锁内调用——顺序天然串行。
+//! All methods have synchronous signatures (internally `block_on_store` bridges the async ObjectStore),
+//! called by the engine under the single-writer lock -- ordering is naturally serial.
 
 use crate::clock::Clock;
 use crate::paths;
@@ -12,21 +12,21 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vrt_objstore::{ObjectStore, StoreError};
 
-/// 持久化配置（`[persistence]` 的运行时形态）。
+/// Persistence config (the runtime form of `[persistence]`).
 #[derive(Debug, Clone)]
 pub struct PersistConfig {
-    /// lease 时长。
+    /// Lease duration.
     pub lease_ms: u64,
-    /// 时钟漂移安全边际：lease 只有在 `expires - margin > now` 时
-    /// 视作可用（读与写同门槛；§4.3）。
+    /// Clock-skew safety margin: a lease is only considered usable when `expires - margin > now`
+    /// (same gate for reads and writes; section 4.3).
     pub clock_skew_margin_ms: u64,
-    /// 本实例持有者标识（进程级唯一）。
+    /// Holder identifier of this instance (unique per process).
     pub holder: String,
-    /// 每 N 个已持久化提交做一次 checkpoint/snapshot（0=禁用）。
+    /// Run a checkpoint/snapshot every N persisted commits (0 = disabled).
     pub checkpoint_every_commits: u64,
-    /// tombstone/段对象的保留窗（ms）；GC 惰性执行。
+    /// Retention window (ms) for tombstone/segment objects; GC runs lazily.
     pub retention_ms: u64,
-    /// 快照对象上限（防御闸）。
+    /// Snapshot object cap (defensive gate).
     pub snapshot_max_bytes: u64,
 }
 
@@ -43,72 +43,72 @@ impl Default for PersistConfig {
     }
 }
 
-/// manifest 对象 `db/{id}/manifest` 的 typed serde（v1）。
+/// Typed serde (v1) of the manifest object `db/{id}/manifest`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    /// 格式版本（=1）。
+    /// Format version (=1).
     pub v: u32,
-    /// 当前写者 epoch（每次接管 +1）。
+    /// Current writer epoch (+1 on each takeover).
     pub epoch: u64,
-    /// 已确认的最后提交序号（跨 epoch 单调，不回退）。
+    /// Last confirmed commit sequence number (monotonic across epochs, never rolls back).
     pub lsn: u64,
-    /// 写者标识。
+    /// Writer identifier.
     pub holder: String,
-    /// lease 到期（unix ms）。
+    /// Lease expiry (unix ms).
     pub expires_at_ms: u64,
-    /// 删除墓碑：任何写者续租/CAS 都会失败 → 全员 fenced。
+    /// Deletion tombstone: any writer's renewal/CAS fails -> everyone is fenced.
     #[serde(default)]
     pub tombstone: bool,
-    /// 最新快照基线（可为空 = 仅靠段链，lsn 必须从 1 连续）。
+    /// Latest snapshot baseline (may be empty = segment chain only, lsn must be contiguous from 1).
     #[serde(default)]
     pub snapshot: Option<SnapshotRef>,
-    /// epoch 链：`{epoch, first_lsn}`——lsn → 所属 epoch 键空间的
-    /// 确定性映射（孤儿段永不进链）。按 epoch 升序。
+    /// epoch chain: `{epoch, first_lsn}` -- a deterministic mapping from lsn to the
+    /// owning epoch's key space (orphan segments never enter the chain). Ascending by epoch.
     #[serde(default)]
     pub chain: Vec<EpochSpan>,
 }
 
-/// 快照引用。
+/// Snapshot reference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotRef {
     pub key: String,
-    /// 快照覆盖到的 lsn（含）。
+    /// The lsn (inclusive) the snapshot covers up to.
     pub lsn: u64,
     pub sha256: String,
     pub size: u64,
 }
 
-/// epoch 链条目：该 epoch 写者的段从 `first_lsn` 开始。
+/// epoch chain entry: the segments of that epoch's writer start at `first_lsn`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpochSpan {
     pub epoch: u64,
     pub first_lsn: u64,
 }
 
-/// 引擎侧持有的 lease 状态（在 Inner 锁内维护）。
+/// Lease state held on the engine side (maintained under the Inner lock).
 #[derive(Debug, Clone)]
 pub struct ManifestHandle {
     pub epoch: u64,
-    /// 已持久化的 lsn（== manifest.lsn，也镜像 engine.commit_lsn）。
+    /// Persisted lsn (== manifest.lsn, also mirrors engine.commit_lsn).
     pub lsn: u64,
     pub expires_at_ms: u64,
-    /// 最近一次 CAS 成功的 etag（续租/推进都用它做 put_if_match）。
+    /// etag of the most recent successful CAS (used by put_if_match for both renewals and advances).
     pub etag: String,
     pub holder: String,
     pub snapshot: Option<SnapshotRef>,
     pub chain: Vec<EpochSpan>,
-    /// 距上次 checkpoint 的已持久化提交数。
+    /// Number of persisted commits since the last checkpoint.
     pub commits_since_ckpt: u64,
-    /// 续租失败但 lease 仍在 `expiry-margin` 内 → degraded 读放行。
+    /// Renewal failed but the lease is still within `expiry-margin` -> degraded, reads allowed.
     pub degraded: bool,
 }
 
 impl ManifestHandle {
-    /// lease 此刻是否可用（含 margin；§4.3 读/写统一门槛）。
+    /// Whether the lease is usable right now (including margin; the unified read/write gate of section 4.3).
     pub fn usable(&self, now_ms: u64, margin_ms: u64) -> bool {
         holder_usable(self.expires_at_ms, now_ms, margin_ms)
     }
-    /// 该续租了（提前量 = lease 1/4，给失败重试留窗）。
+    /// Time to renew (lead time = 1/4 of the lease, leaving a window for failure retries).
     pub fn due_renew(&self, now_ms: u64, margin_ms: u64, lease_ms: u64) -> bool {
         now_ms >= self.expires_at_ms.saturating_sub(margin_ms + lease_ms / 4)
     }
@@ -139,13 +139,13 @@ impl ManifestHandle {
     }
 }
 
-/// `.vrt-lsn` 进度标记（JSON，v1）——本地文件状态已达
-/// `manifest.lsn` 的耐久声明。
-/// - `file_frames`：写标记时 `-wal` 的**物理**帧数（含未提交
-///   死帧尾）。认领时本地 wal 全链解析出的帧数必须与之相等。
-/// - `intent=true`：commit 前的意图标记——永不作信任判定
-///   （崩溃窗口的未 ack 提交会留下 intent lsn > manifest.lsn
-///   或 intent 标记本身，两者都强制走恢复）。
+/// `.vrt-lsn` progress marker (JSON, v1) -- a durability statement that the local file state has reached
+/// `manifest.lsn`.
+/// - `file_frames`: the **physical** frame count of `-wal` when the marker was written (including the uncommitted
+///   dead-frame tail). At claim time the frame count parsed from the whole local wal chain must equal it.
+/// - `intent=true`: the pre-commit intent marker -- never used for trust decisions
+///   (an un-acked commit in a crash window leaves an intent lsn > manifest.lsn
+///   or the intent marker itself; both force recovery).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sidecar {
     pub v: u32,
@@ -157,36 +157,36 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
-    /// 标记是否允许信任本地文件为 manifest `lsn` 状态。
+    /// Whether the marker permits trusting the local file as the manifest `lsn` state.
     fn trusted(&self, manifest_lsn: u64) -> bool {
         self.v == 1 && !self.intent && self.lsn == manifest_lsn
     }
 }
 
-/// 恢复计划：快照 + 待重放段区间 + epoch 链。
+/// Restore plan: snapshot + segment range to replay + epoch chain.
 #[derive(Debug, Clone)]
 pub struct RestorePlan {
     pub snapshot: Option<SnapshotRef>,
-    /// 恢复到该 lsn（含）。
+    /// Restore up to this lsn (inclusive).
     pub up_to_lsn: u64,
     pub chain: Vec<EpochSpan>,
 }
 
-/// claim 结果。
+/// claim result.
 #[derive(Debug)]
 pub enum ClaimOutcome {
-    /// 拿到写权：lease 状态 + 是否需要先恢复本地文件。
+    /// Write authority obtained: lease state + whether the local file must be restored first.
     Ready {
         handle: ManifestHandle,
         restore: Option<RestorePlan>,
     },
-    /// manifest 被另一存活写者持有（`expiry-margin` 内）——拒开。
+    /// The manifest is held by another live writer (within `expiry-margin`) -- refuse to open.
     HeldByOther { expires_at_ms: u64 },
-    /// manifest.tombstone —— 库已删除。
+    /// manifest.tombstone -- the db has been deleted.
     Tombstoned,
 }
 
-/// 持久化错误。
+/// Persistence error.
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
     #[error("store: {0}")]
@@ -197,41 +197,41 @@ pub enum PersistError {
     HeldByOther,
     #[error("database tombstoned")]
     Tombstoned,
-    /// 快照超 `snapshot_max_bytes`（先 stat 判大小，不读文件）。
-    /// 恢复仍可用段链（代价随链长线性增长，见 §4.5）。
+    /// Snapshot exceeds `snapshot_max_bytes` (size is judged by stat first, without reading the file).
+    /// Restore can still use the segment chain (cost grows linearly with chain length, see section 4.5).
     #[error("snapshot over cap: {0} bytes")]
     SnapshotTooLarge(u64),
-    /// CAS 竞争失败（lease 丢失）——调用方必须 fence。
+    /// CAS contention failed (lease lost) -- the caller must fence.
     #[error("lease lost")]
     Fenced,
-    /// RV-R31 #2：本地落盘 I/O 失败（sidecar/restore tmp 等）——
-    /// 标记承诺写不进盘即本地持久层不可信，向上传播不忽略。
+    /// RV-R31 #2: local on-disk I/O failure (sidecar/restore tmp, etc.) --
+    /// a marker promise that cannot be written to disk means the local persistence layer is untrustworthy; propagate upward, do not ignore.
     #[error("local io: {0}")]
     LocalIo(String),
 }
 
-/// RV-R66：`gc_orphans` 单次最多删除（含失败尝试）的对象数。
+/// RV-R66: max number of objects a single `gc_orphans` deletes (including failed attempts).
 pub const MAX_GC_DELETES_PER_PASS: usize = 256;
 
-/// RV-R66：一次 GC 的结果（可观测，不吞错）。
+/// RV-R66: result of one GC (observable, errors not swallowed).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GcReport {
     pub deleted: usize,
     pub failed: usize,
-    /// 超过单次上限、留给下一轮的待删对象数。
+    /// Number of objects to delete that exceeded the per-run cap and are left for the next round.
     pub deferred: usize,
     pub list_failed: bool,
 }
 
-/// MIG-9/MIG-10：自检重试策略与 URL 净化现在住在共享 crate
-/// `vrt-objstore::self_check`（vrt-host placement 自检复用同一
-/// 原语）——此处 re-export 保持既有调用路径不变。
+/// MIG-9/MIG-10: the self-check retry policy and URL sanitization now live in the shared crate
+/// `vrt-objstore::self_check` (the vrt-host placement self-check reuses the same
+/// primitives) -- re-exported here to keep existing call paths unchanged.
 pub use vrt_objstore::self_check::{sanitize_self_check_error, SelfCheckRetry};
 
-/// MIG-9：一次自检失败是否值得重试——仅 `Unavailable(retryable)`
-///（网络/5xx/超时/429）是瞬时未就绪；403/认证类
-/// （`retryable=false`）、PreconditionFailed、NotFound、Corrupt、
-/// 本地 IO 都不会在 60 s 内自愈，立即 fail closed。
+/// MIG-9: whether a failed self-check is worth retrying -- only `Unavailable(retryable)`
+/// (network/5xx/timeout/429) is transient not-ready; 403/auth-class
+/// (`retryable=false`), PreconditionFailed, NotFound, Corrupt, and
+/// local IO will not self-heal within 60 s, so fail closed immediately.
 fn self_check_retryable(e: &PersistError) -> bool {
     matches!(
         e,
@@ -243,14 +243,14 @@ fn self_check_retryable(e: &PersistError) -> bool {
 }
 
 
-/// 持久化面。
+/// Persistence surface.
 pub struct Persister {
     store: Arc<dyn ObjectStore>,
     cfg: PersistConfig,
     clock: Arc<dyn Clock>,
     db_root: PathBuf,
-    /// T37r：资源种类——对象键前缀（db/ 或 q/）与本地 root 由
-    /// Persister 构造时绑定，同一 store 上两种 kind 各持一个实例。
+    /// T37r: resource kind -- the object-key prefix (db/ or q/) and local root are bound when the
+    /// Persister is constructed; on the same store each of the two kinds holds one instance.
     kind: crate::paths::ResourceKind,
 }
 
@@ -278,7 +278,7 @@ fn manifest_key(kind: crate::paths::ResourceKind, id: &str) -> String {
     seg::manifest_key(kind, id)
 }
 
-/// lsn → epoch 键空间解析（chain 升序）。
+/// lsn -> epoch key-space resolution (chain ascending).
 fn epoch_for_lsn(chain: &[EpochSpan], lsn: u64) -> Option<u64> {
     let mut hit = None;
     for span in chain {
@@ -308,7 +308,7 @@ impl Persister {
         }
     }
 
-    /// 本实例绑定的资源种类（对象键前缀 + 本地 root 的决定者）。
+    /// The resource kind bound to this instance (determines the object-key prefix + local root).
     pub fn kind(&self) -> crate::paths::ResourceKind {
         self.kind
     }
@@ -319,16 +319,16 @@ impl Persister {
     pub fn clock(&self) -> &Arc<dyn Clock> {
         &self.clock
     }
-    /// 测试观察口。
+    /// Test observation hook.
     pub fn store(&self) -> &Arc<dyn ObjectStore> {
         &self.store
     }
 
-    /// T36b：启动自检——写/读/删一个唯一 probe 对象，走通完整
-    /// CAS 路径（fs：lockfile+flock+tmp→rename+目录 fsync；s3：
-    /// If-None-Match 条件写）。失败 = 对象存储不可用/不可写，
-    /// 调用方必须拒绝启动（fail closed——优于运行期每次写 503）。
-    /// probe key 含 pid+nanos，多实例并发自检互不干扰；内容空。
+    /// T36b: startup self-check -- write/read/delete a unique probe object, exercising the complete
+    /// CAS path (fs: lockfile+flock+tmp->rename+directory fsync; s3:
+    /// If-None-Match conditional write). Failure = object store unavailable/unwritable,
+    /// and the caller must refuse to start (fail closed -- better than a 503 on every write at runtime).
+    /// The probe key contains pid+nanos, so concurrent self-checks of multiple instances do not interfere; content is empty.
     pub fn self_check(&self) -> Result<(), PersistError> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -346,15 +346,15 @@ impl Persister {
         Ok(())
     }
 
-    /// MIG-9：进程内有界自检重试——指数退避（initial→×2→cap），
-    /// 总预算 `budget` 耗尽返回最后一次错误（调用方退出非 0）。
-    /// 认证类/非重试错误（403、PreconditionFailed、Corrupt 等）立即
-    /// 返回不重试——瞬时未就绪才值得等，配置错误不会自愈。
-    /// 预算门控的是尝试之间的 sleep：总墙钟 ≤ budget + 单次自检耗时。
-    /// `log(attempt, elapsed, next_backoff, err)` 由调用方写结构化
-    /// 日志——错误文本先经 [`sanitize_self_check_error`] 剥离 URL。
-    /// 重试期间进程不应接流量：K8s 里 readiness 由 startupProbe
-    /// 门控（端口未绑定即 not-ready），liveness 不判死。
+    /// MIG-9: bounded in-process self-check retry -- exponential backoff (initial->x2->cap),
+    /// returns the last error when the total `budget` is exhausted (the caller exits non-zero).
+    /// Auth-class / non-retryable errors (403, PreconditionFailed, Corrupt, etc.) return
+    /// immediately without retry -- only transient not-ready is worth waiting for; config errors do not self-heal.
+    /// The budget gates the sleep between attempts: total wall clock <= budget + one self-check duration.
+    /// `log(attempt, elapsed, next_backoff, err)` is written by the caller as structured
+    /// logs -- error text is first stripped of URLs via [`sanitize_self_check_error`].
+    /// The process should not take traffic during retries: in K8s readiness is gated by the startupProbe
+    /// (port not bound = not-ready), and liveness does not declare it dead.
     pub fn self_check_with_retry(
         &self,
         retry: &SelfCheckRetry,
@@ -488,20 +488,20 @@ impl Persister {
         self.store_put_im(&manifest_key(self.kind, id), etag, &body)
     }
 
-    /// `.vrt-lsn` sidecar（本地上次 ack 到 manifest 的 lsn +
-    /// 当时 WAL 物理帧数——RV-R31 #2 信任判定的全部凭据）。
+    /// `.vrt-lsn` sidecar (the lsn last acked to the manifest locally +
+    /// the WAL physical frame count at that time -- all the credentials of the RV-R31 #2 trust decision).
     fn lsn_sidecar(&self, db_dir: &Path) -> PathBuf {
         db_dir.join(".vrt-lsn")
     }
     fn read_sidecar(&self, db_dir: &Path) -> Option<Sidecar> {
         let raw = std::fs::read(self.lsn_sidecar(db_dir)).ok()?;
-        // 旧版 hex 文本 / 截断 JSON 一律 None → 不信任 → 走恢复
-        // （升级兼容：旧标记保守失效，多付一次恢复的代价）。
+        // Old-version hex text / truncated JSON all yield None -> untrusted -> go through restore
+        // (upgrade compatibility: old markers are conservatively invalidated, at the cost of one extra restore).
         serde_json::from_slice(&raw).ok()
     }
-    /// tmp → fsync 文件 → rename → fsync 父目录（vrt_securefs::
-    /// atomic_write），错误向上传播——RV-R31 #2：标记承诺写不进
-    /// 盘即本地持久层不可信。
+    /// tmp -> fsync file -> rename -> fsync parent directory (vrt_securefs::
+    /// atomic_write), errors propagate upward -- RV-R31 #2: a marker promise that cannot be written
+    /// to disk means the local persistence layer is untrustworthy.
     fn write_sidecar(&self, db_dir: &Path, sc: &Sidecar) -> Result<(), PersistError> {
         let body = serde_json::to_vec(sc)
             .map_err(|e| PersistError::Corrupt(format!("sidecar json: {e}")))?;
@@ -509,11 +509,11 @@ impl Persister {
             .map_err(|e| PersistError::LocalIo(format!("sidecar write: {e}")))
     }
 
-    /// T36：commit 前写"意图 lsn"——sidecar 记录的是**本地文件可能
-    /// 包含的、未经 manifest 证实**的最高提交位点。崩溃窗口里本地
-    /// 若出现未 ack 提交，sidecar 必然 > manifest.lsn → claim 走
-    /// 恢复路径清掉。绝不出现"本地有未持久化数据却被信任"的洞。
-    /// RV-R31 #2：写失败向上返回——调用方回滚本批拒 ack。
+    /// T36: write the "intent lsn" before commit -- the sidecar records the highest commit position the **local file may
+    /// contain that is not yet confirmed by the manifest**. If an un-acked commit
+    /// appears locally in a crash window, the sidecar is necessarily > manifest.lsn -> claim goes through the
+    /// restore path and clears it. There is never a hole of "local unpersisted data being trusted".
+    /// RV-R31 #2: a write failure is returned upward -- the caller rolls back the batch and refuses to ack.
     pub fn mark_intent(&self, database_id: &str, lsn: u64) -> Result<(), PersistError> {
         self.write_sidecar(
             &self.db_dir(database_id),
@@ -526,10 +526,10 @@ impl Persister {
         )
     }
 
-    /// RV-R31 #2：本地 `-wal` 全量解析（header + salt + 累计
-    /// checksum 全链且**消费到文件末尾**）→ 返回物理帧数；
-    /// 任何撕裂/异代际/坏链/非帧对齐尾部 → None（不信任本地）。
-    /// 文件不存在/长度 0 → Some(0)。
+    /// RV-R31 #2: full parse of the local `-wal` (header + salt + cumulative
+    /// checksum over the whole chain, **consumed through end of file**) -> return the physical frame count;
+    /// any torn / other-generation / broken-chain / non-frame-aligned tail -> None (local not trusted).
+    /// File missing / length 0 -> Some(0).
     fn local_wal_frames(&self, dir: &Path) -> Option<u64> {
         let wal_path = dir.join("db.sqlite-wal");
         let buf = match std::fs::read(&wal_path) {
@@ -548,7 +548,7 @@ impl Persister {
         let fsz = (crate::wal::WAL_FRAME_HDR + ps as usize) as u64;
         let body_len = buf.len() as u64 - crate::wal::WAL_HDR as u64;
         if body_len % fsz != 0 {
-            return None; // 半帧/撕裂尾
+            return None; // half frame / torn tail
         }
         let seed = (
             u32::from_be_bytes(buf[24..28].try_into().unwrap()),
@@ -563,15 +563,15 @@ impl Persister {
             seed,
         );
         if vend != body_len {
-            return None; // 链中断/代际混入 → 文件状态不完整
+            return None; // chain broken / generations mixed -> file state incomplete
         }
         Some(heads.len() as u64)
     }
 
-    /// 本地 db 目录（`{shard}/{id}`）。derive_db_file 会 mkdir——
-    /// 仅在确实要打开/恢复时调用；claim 之前不得调用（否则空目录
-    /// 会让"不存在的库"看起来"本地已存在"——不过目录本身无 db
-    /// 文件，local_exists 按 db.sqlite 判定，安全）。
+    /// Local db directory (`{shard}/{id}`). derive_db_file does mkdir --
+    /// call only when we really are about to open/restore; it must not be called before claim (otherwise an empty directory
+    /// would make a "nonexistent db" look "locally existing" -- though the directory has no db
+    /// file and local_exists judges by db.sqlite, so it is safe).
     fn db_dir(&self, database_id: &str) -> PathBuf {
         match paths::derive_db_file(&self.db_root, database_id) {
             Ok(f) => f.parent().unwrap_or(&self.db_root).to_path_buf(),
@@ -579,7 +579,7 @@ impl Persister {
         }
     }
 
-    /// 认领写权（open 冷路径）。最多重试 3 轮 CAS 竞态。
+    /// Claim write authority (open cold path). Retries CAS contention for at most 3 rounds.
     pub fn claim(&self, database_id: &str) -> Result<ClaimOutcome, PersistError> {
         for _ in 0..3 {
             match self.claim_once(database_id)? {
@@ -601,13 +601,13 @@ impl Persister {
         let local_exists = db_file.exists();
         match self.read_manifest(database_id)? {
             None => {
-                // 无 manifest：全新 或 旧版本地库迁入（升级兼容）。
+                // No manifest: brand new, or an old-version local db being migrated in (upgrade compatibility).
                 if local_exists {
-                    // RV-R31 #3：ADOPT 前先把残留 `-wal` 合进主
-                    // 文件——SIGKILL 残留的 wal 里可能有已提交未
-                    // checkpoint 的页，直接快照主文件会丢数据。
-                    // busy（别的打开者/读钉位）→ fail closed 拒收；
-                    // 合并后 integrity_check 不通过同样拒收。
+                    // RV-R31 #3: before ADOPT, fold the leftover `-wal` into the main
+                    // file -- a wal left by SIGKILL may hold committed but
+                    // un-checkpointed pages; snapshotting the main file directly would lose data.
+                    // busy (another opener / read pin) -> fail closed and refuse adoption;
+                    // an integrity_check failure after the merge is likewise refused.
                     let wal_side = dir.join("db.sqlite-wal");
                     let wal_pending = std::fs::metadata(&wal_side)
                         .map(|m| m.len() > 0)
@@ -657,8 +657,8 @@ impl Persister {
                     };
                     match self.write_manifest_inm(database_id, &m) {
                         Ok(etag) => {
-                            // 快照已含 fold 后全量；wal 被 TRUNCATE
-                            // 归零 → file_frames=0。
+                            // The snapshot already holds the full post-fold content; the wal was TRUNCATEd
+                            // to zero -> file_frames=0.
                             self.write_sidecar(
                                 &dir,
                                 &Sidecar {
@@ -674,7 +674,7 @@ impl Persister {
                             }))
                         }
                         Err(PersistError::Store(StoreError::PreconditionFailed)) => {
-                            // 并发 adopt/create：重读决定归属。
+                            // Concurrent adopt/create: re-read to decide ownership.
                             Ok(ClaimStep::Retry)
                         }
                         Err(e) => Err(e),
@@ -709,14 +709,14 @@ impl Persister {
                 if m.tombstone {
                     return Ok(ClaimStep::Done(ClaimOutcome::Tombstoned));
                 }
-                // RV-R56: 取租方判定对方失效须 now >= expires + margin
-                // （比持有方更保守），避免双方同时服务读的窗口。
+                // RV-R56: the taker judges the other side stale only when now >= expires + margin
+                // (more conservative than the holder), avoiding a window where both sides serve reads.
                 if m.holder != self.cfg.holder && !taker_may_claim(m.expires_at_ms, now, margin) {
                     return Ok(ClaimStep::Done(ClaimOutcome::HeldByOther {
                         expires_at_ms: m.expires_at_ms,
                     }));
                 }
-                // 我们持有（续租）或对方已过期（接管）→ CAS。
+                // We hold it (renewal) or the other side has expired (takeover) -> CAS.
                 let takeover =
                     m.holder != self.cfg.holder || !holder_usable(m.expires_at_ms, now, margin);
                 let mut next = m.clone();
@@ -724,7 +724,7 @@ impl Persister {
                 if takeover {
                     next.epoch = m.epoch + 1;
                     next.holder = self.cfg.holder.clone();
-                    // epoch+1 写者从 manifest.lsn+1 继续段编号。
+                    // The epoch+1 writer continues segment numbering from manifest.lsn+1.
                     next.chain.push(EpochSpan {
                         epoch: next.epoch,
                         first_lsn: m.lsn + 1,
@@ -733,11 +733,11 @@ impl Persister {
                 match self.write_manifest_im(database_id, &etag, &next) {
                     Ok(new_etag) => {
                         let handle = ManifestHandle::from_manifest(&next, new_etag);
-                        // RV-R31 #2：信任本地文件需三重证据——sidecar
-                        // 标记已达 manifest.lsn 且非 intent；本地
-                        // `-wal` 从 header 到文件末尾全链可解析；
-                        // 解析帧数恰为标记时记录的物理帧数。缺一即
-                        // 本地不完整 → 走恢复（fail closed）。
+                        // RV-R31 #2: trusting the local file requires triple evidence -- the sidecar
+                        // marker has reached manifest.lsn and is not intent; the local
+                        // `-wal` is fully parseable from header to end of file;
+                        // the parsed frame count equals the physical frame count recorded in the marker. Missing any one means
+                        // the local copy is incomplete -> go through restore (fail closed).
                         let sidecar_ok = local_exists
                             && match self.read_sidecar(&dir) {
                                 Some(sc) if sc.trusted(m.lsn) => {
@@ -746,8 +746,8 @@ impl Persister {
                                 _ => false,
                             };
                         let restore = if sidecar_ok || (m.lsn == 0 && m.snapshot.is_none()) {
-                            // 无恢复必要；但本地有文件而 manifest 全空 →
-                            // 本地数据从未 ack → 当作未提交清掉。
+                            // No restore needed; but a local file exists while the manifest is entirely empty ->
+                            // local data was never acked -> treat as uncommitted and clear it.
                             if local_exists && m.lsn == 0 && m.snapshot.is_none() && !sidecar_ok {
                                 Some(RestorePlan {
                                     snapshot: None,
@@ -775,9 +775,9 @@ impl Persister {
         }
     }
 
-    /// 续租（CAS）：成功更新 handle.expires/etag/degraded=false。
-    /// `PreconditionFailed` → 重读：若 holder 不再是我们 → Fenced；
-    /// 若仍是我们（etag 漂移）→ 吸收新 etag 再 CAS 一次。
+    /// Renew (CAS): on success update handle.expires/etag/degraded=false.
+    /// `PreconditionFailed` -> re-read: if the holder is no longer us -> Fenced;
+    /// if it is still us (etag drift) -> absorb the new etag and CAS once more.
     pub fn renew(
         &self,
         database_id: &str,
@@ -833,11 +833,11 @@ impl Persister {
         }
     }
 
-    /// ack 前持久化（§4.2 方案 1，单写者锁内调用）：
-    /// put seg（key 唯一 → If-None-Match）→ CAS manifest lsn。
-    /// `wal_file_frames` = 提交后 `-wal` 物理帧数（含死帧尾）——
-    /// 写进 sidecar 供认领时核对本地文件完整性。
-    /// 任何一步失败 → Err（调用方 fence + 返回 retryable）。
+    /// Pre-ack persistence (section 4.2 option 1, called under the single-writer lock):
+    /// put seg (key unique -> If-None-Match) -> CAS manifest lsn.
+    /// `wal_file_frames` = the `-wal` physical frame count after commit (including the dead-frame tail) --
+    /// written into the sidecar so claim can verify local file integrity.
+    /// Any step failing -> Err (the caller fences + returns retryable).
     pub fn publish(
         &self,
         database_id: &str,
@@ -872,18 +872,18 @@ impl Persister {
         let key = seg::seg_key(self.kind, database_id, handle.epoch, new_lsn);
         self.store_put_inm_dl(&key, seg_bytes, dl)
             .map_err(|e| match e {
-                // 同 epoch+lsn 段已存在 = 我们不可能撞自己（串行）→ 语义冲突。
+                // A segment with the same epoch+lsn already exists = we cannot collide with ourselves (serial) -> semantic conflict.
                 PersistError::Store(StoreError::PreconditionFailed) => PersistError::Fenced,
                 other => other,
             })?;
         let mut next = handle.clone();
         next.lsn = new_lsn;
         next.commits_since_ckpt = handle.commits_since_ckpt + 1;
-        // RV-R31：lsn=0 基线——open 期 TRUNCATE 已把 init/dedup/ADOPT
-        // 页折进主文件，段链只记水位之后的帧；空镜像重放缺主文件页
-        // 必得畸形库（integrity_check 拒开）。首个段发布时把当前
-        // db.sqlite（恰是 post-TRUNCATE 基线）传为 snap-0，与
-        // manifest CAS 同批落定；上传失败同 publish 语义 → Err。
+        // RV-R31: lsn=0 baseline -- the open-time TRUNCATE has already folded the init/dedup/ADOPT
+        // pages into the main file, and the segment chain records only frames after the watermark; replaying onto an empty image misses main-file pages
+        // and necessarily yields a malformed db (integrity_check refuses to open). On publishing the first segment the current
+        // db.sqlite (exactly the post-TRUNCATE baseline) is uploaded as snap-0, landing in the same batch as
+        // the manifest CAS; an upload failure follows publish semantics -> Err.
         if new_lsn == 1 && handle.snapshot.is_none() {
             let snap = self.upload_snapshot_dl(
                 database_id,
@@ -900,10 +900,10 @@ impl Persister {
                 handle.etag = etag;
                 handle.commits_since_ckpt += 1;
                 handle.snapshot = next.snapshot;
-                // RV-R31 #2：标记必须耐久落盘（tmp→fsync→rename→
-                // dir fsync）且错误向上传播——此刻 commit 已 ack
-                // 给调用方的路径上，sidecar 失败 = 本地状态与标记
-                // 不一致 → Err 让引擎 fence（fail closed）。
+                // RV-R31 #2: the marker must be durably on disk (tmp->fsync->rename->
+                // dir fsync) and errors must propagate -- at this point the commit is on the path of being acked
+                // to the caller; a sidecar failure = local state and marker
+                // inconsistent -> Err makes the engine fence (fail closed).
                 self.write_sidecar(
                     &self.db_dir(database_id),
                     &Sidecar {
@@ -920,11 +920,11 @@ impl Persister {
         }
     }
 
-    /// checkpoint：TRUNCATE 后调用方传入 db 镜像路径；上传快照 +
-    /// CAS manifest.snapshot。**本函数不做 GC**（RV-R66 更正旧注释）：
-    /// 被新快照覆盖的段/旧快照由 `gc_orphans`（恢复收尾时惰性、有界
-    /// 地）清理，否则保留。无 PITR，保留策略见 sql-storage 文档。
-    /// 失败仅返回 Err（数据仍由段链保护）——调用方 warn 即可。
+    /// checkpoint: after TRUNCATE the caller passes the db image path; upload snapshot +
+    /// CAS manifest.snapshot. **This function does no GC** (RV-R66 corrects the old comment):
+    /// segments / old snapshots covered by the new snapshot are cleaned by `gc_orphans` (lazily, in bounded
+    /// fashion at the end of recovery), otherwise retained. No PITR; for the retention policy see the sql-storage doc.
+    /// Failure only returns Err (data is still protected by the segment chain) -- the caller just warns.
     pub fn checkpoint(
         &self,
         database_id: &str,
@@ -939,9 +939,9 @@ impl Persister {
                 handle.snapshot = Some(snap);
                 handle.etag = etag;
                 handle.commits_since_ckpt = 0;
-                // RV-R31 #2：TRUNCATE 已把 `-wal` 归零——标记里的
-                // file_frames 必须同步归零，否则认领时帧数核对失
-                // 败 → 永久强制恢复（自损）。失败向上传播。
+                // RV-R31 #2: TRUNCATE has zeroed `-wal` -- file_frames in the marker
+                // must be zeroed in sync, otherwise the frame-count check at claim time fails
+                // -> permanently forced recovery (self-inflicted). Failures propagate upward.
                 self.write_sidecar(
                     &self.db_dir(database_id),
                     &Sidecar {
@@ -976,8 +976,8 @@ impl Persister {
         db_file: &Path,
         dl: Option<std::time::Instant>,
     ) -> Result<SnapshotRef, PersistError> {
-        // T36b：先 stat 判上限——超限不读文件（病态重读整库的坑，
-        // §4.5）；fs 后端 put_file 流式拷贝也不 materialize。
+        // T36b: stat first to judge the cap -- over the cap the file is not read (the pitfall of pathologically re-reading the whole db,
+        // section 4.5); the fs backend's put_file streams the copy and does not materialize either.
         let len = std::fs::metadata(db_file)
             .map_err(|e| PersistError::Corrupt(format!("snapshot stat: {e}")))?
             .len();
@@ -999,9 +999,9 @@ impl Persister {
         })
     }
 
-    /// RV-R31 #5：恢复期间的租约续租——剩余租期跌破半个周期
-    /// 即续（给续租失败留重试窗）。续租失败 → Err → 恢复中止，
-    /// 调用方 fail closed（库不打开）。
+    /// RV-R31 #5: lease renewal during restore -- renew as soon as the remaining lease drops below half a period
+    /// (leaving a retry window for renewal failures). Renewal failure -> Err -> restore aborts,
+    /// and the caller fails closed (the db is not opened).
     fn restore_renew(
         &self,
         database_id: &str,
@@ -1018,13 +1018,13 @@ impl Persister {
         Ok(())
     }
 
-    /// 恢复：流式下载快照 + 按链重放段 → 重建本地 db 文件。
-    /// 任何损坏/断档/sha 不符 → Err（fail closed）。
+    /// Restore: stream-download the snapshot + replay segments along the chain -> rebuild the local db file.
+    /// Any corruption / gap / sha mismatch -> Err (fail closed).
     ///
-    /// 落盘顺序（RV-R31 #2/#5，缺一步都不写标记）：
-    /// 快照/重放写 `.restore.tmp` → fsync tmp → integrity_check →
-    /// 清陈旧 wal/shm → rename → fsync 目录 → 写 sidecar。
-    /// 恢复期间按半个租约周期续租；续租失败即中止。
+    /// On-disk order (RV-R31 #2/#5; the marker is not written if any step is missing):
+    /// snapshot/replay writes `.restore.tmp` -> fsync tmp -> integrity_check ->
+    /// clear stale wal/shm -> rename -> fsync directory -> write sidecar.
+    /// During restore the lease is renewed every half lease period; a renewal failure aborts.
     pub fn restore(
         &self,
         database_id: &str,
@@ -1035,7 +1035,7 @@ impl Persister {
         std::fs::create_dir_all(&dir).map_err(|e| PersistError::LocalIo(format!("db dir: {e}")))?;
         let db_file = dir.join("db.sqlite");
         let tmp = dir.join(".restore.tmp");
-        // 快照基线（或空文件）——流式落 tmp，不再整体进内存。
+        // Snapshot baseline (or empty file) -- streamed to tmp, no longer held whole in memory.
         match &plan.snapshot {
             Some(snap) => {
                 let out = vrt_objstore::block_on_store(self.store.get_to_file(&snap.key, &tmp))?
@@ -1052,9 +1052,9 @@ impl Persister {
                 self.restore_renew(database_id, handle)?;
             }
             None => {
-                // 无快照基线：从空文件重放全部段（1..=up_to）。段帧是
-                // 完整页镜像 + commit_db_size 截断，等价 SQLite 进程从
-                // 零重放 WAL——链校验保证 1..up_to 连续无断档。
+                // No snapshot baseline: replay all segments from an empty file (1..=up_to). Segment frames are
+                // full page images + commit_db_size truncation, equivalent to a SQLite process replaying the WAL from
+                // zero -- chain verification guarantees 1..up_to is contiguous with no gaps.
                 std::fs::write(&tmp, b"")
                     .map_err(|e| PersistError::LocalIo(format!("restore write: {e}")))?;
             }
@@ -1065,7 +1065,7 @@ impl Persister {
         }
         let mut page_size = 0u32;
         {
-            // 从快照读 page_size（偏移 16,2 字节 BE;1 表示 65536）。
+            // Read page_size from the snapshot (offset 16, 2 bytes BE; 1 means 65536).
             use std::io::{Read, Seek, SeekFrom};
             if plan.snapshot.is_some() {
                 let mut f = std::fs::File::open(&tmp)
@@ -1081,8 +1081,8 @@ impl Persister {
                 }
             }
         }
-        // 顺序重放 (base_lsn, up_to_lsn]——每段后做一次续租判定，
-        // 段越多恢复越久，租约不丢（RV-R31 #5）。
+        // Replay (base_lsn, up_to_lsn] in order -- one lease-renewal check after each segment,
+        // so the more segments, the longer the restore, yet the lease is not lost (RV-R31 #5).
         if plan.up_to_lsn > base_lsn {
             let mut f = std::fs::OpenOptions::new()
                 .read(true)
@@ -1119,9 +1119,9 @@ impl Persister {
                 self.restore_renew(database_id, handle)?;
             }
         }
-        // tmp 全部写完 → fsync → integrity_check（RV-R31 #1：拒开
-        // 损坏镜像——integrity_check 会以 WAL 模式建旁车文件，先
-        // 校验再清）。fsync 在 rename 前；rename 后 fsync 父目录。
+        // After all of tmp is written -> fsync -> integrity_check (RV-R31 #1: refuse to open a
+        // corrupt image -- integrity_check creates sidecar files in WAL mode, so verify first, then
+        // clean). fsync before rename; fsync the parent directory after rename.
         std::fs::OpenOptions::new()
             .read(true)
             .open(&tmp)
@@ -1143,9 +1143,9 @@ impl Persister {
                 return Err(PersistError::Corrupt(format!("integrity_check: {e}")));
             }
         }
-        // integrity_check 可能在 .restore.tmp 旁建 wal/shm——连同
-        // 陈旧 wal/shm 一并清掉（恢复态是完整镜像）。必须在 rename
-        // 前清，否则新镜像旁挂旧 wal 会被当活数据。
+        // integrity_check may create wal/shm beside .restore.tmp -- clear them together with the
+        // stale wal/shm (the restored state is a complete image). Must be cleared before
+        // rename, otherwise an old wal beside the new image would be treated as live data.
         for stale in [
             dir.join("db.sqlite-wal"),
             dir.join("db.sqlite-shm"),
@@ -1160,7 +1160,7 @@ impl Persister {
             .map_err(|e| PersistError::LocalIo(format!("restore dir open: {e}")))?;
         df.sync_all()
             .map_err(|e| PersistError::LocalIo(format!("restore dir fsync: {e}")))?;
-        // 全部耐久步骤完成后才写标记——wal 已被重建清零。
+        // The marker is written only after all durable steps complete -- the wal has been rebuilt and zeroed.
         self.write_sidecar(
             &dir,
             &Sidecar {
@@ -1170,7 +1170,7 @@ impl Persister {
                 intent: false,
             },
         )?;
-        // 惰性孤儿段 GC（best-effort）。
+        // Lazy orphan segment GC (best-effort).
         self.gc_orphans(
             database_id,
             plan.up_to_lsn,
@@ -1180,16 +1180,16 @@ impl Persister {
         Ok(())
     }
 
-    /// 孤儿对象 GC：list `db/{id}/`。
-    /// - `.seg`：不在链上 / 超出已提交 / 已被基线快照覆盖（`lsn <=
-    ///   baseline_lsn`，快照语义等价）→ delete。
-    /// - `.snap`：仅删 `lsn < baseline_lsn` 的旧基线快照——基线本身
-    ///   与在传快照（lsn ≥ baseline）绝不动（在传者由 manifest CAS
-    ///   收尾，删它会让 restore 缺基线）。
-    /// RV-R66：单次删除上限（有界）；余量留给下一轮（删除幂等）。
-    /// 删除失败不再静默——计入 `GcReport.failed` 并 warn，下一轮重试。
-    /// 注意：本 GC 只清"被基线快照覆盖/不在链上"的对象，**没有**
-    /// 按时间窗/N 代的保留链，因此不提供 PITR（见 sql-storage 文档）。
+    /// Orphan object GC: list `db/{id}/`.
+    /// - `.seg`: not on the chain / beyond committed / already covered by the baseline snapshot (`lsn <=
+    ///   baseline_lsn`, snapshot semantics equivalent) -> delete.
+    /// - `.snap`: only delete old baseline snapshots with `lsn < baseline_lsn` -- the baseline itself
+    ///   and an in-flight snapshot (lsn >= baseline) are never touched (an in-flight uploader is finalized by the manifest CAS;
+    ///   deleting it would leave restore without a baseline).
+    /// RV-R66: per-run deletion cap (bounded); the remainder is left for the next round (deletion is idempotent).
+    /// Deletion failures are no longer silent -- counted in `GcReport.failed` with a warn, retried next round.
+    /// Note: this GC only clears objects "covered by the baseline snapshot / not on the chain"; it has **no**
+    /// retention chain by time window / N generations, hence it provides no PITR (see the sql-storage doc).
     pub fn gc_orphans(
         &self,
         database_id: &str,
@@ -1199,8 +1199,8 @@ impl Persister {
     ) -> GcReport {
         let mut rep = GcReport::default();
         let prefix = format!("{}/{database_id}/", self.kind.object_prefix());
-        // best-effort GC：取得到的一页即干活，截断页也照常用
-        // （未列出的下一轮再收；删缺失 key 本来就是幂等）。
+        // best-effort GC: work with whatever page was obtained, a truncated page is used as normal too
+        // (unlisted objects are collected next round; deleting a missing key is idempotent anyway).
         let page = match self.store_list(&prefix) {
             Ok(p) => p,
             Err(e) => {
@@ -1242,33 +1242,33 @@ impl Persister {
         rep
     }
 
-    /// T36b 优雅停机：把 `expires_at` 置为 now-margin（epoch/holder/lsn
-    /// 不变、非 tombstone）——下一个写者立即接管，不必等满 lease。
-    /// CAS 失败 = lease 已被夺（他人接管或已过期被抢）→ 幂等 Ok；
-    /// 真错误（store 不可用等）向上传播由调用方 warn。
+    /// T36b graceful shutdown: set `expires_at` to now-margin (epoch/holder/lsn
+    /// unchanged, not a tombstone) -- the next writer takes over immediately without waiting out the lease.
+    /// CAS failure = lease already taken (someone took over or it expired and was seized) -> idempotent Ok;
+    /// real errors (store unavailable, etc.) propagate upward for the caller to warn.
     pub fn release(
         &self,
         database_id: &str,
         handle: &mut ManifestHandle,
         now_ms: u64,
     ) -> Result<(), PersistError> {
-        // RV-R56: 取租方须 `now >= expires + margin` 才能接管，故释放
-        // 把 expires 回拨一个 margin（饱和），下一个写者立即可接；本
-        // 引擎随后被强制 fence，不会在回拨窗口内继续服务。
+        // RV-R56: the taker needs `now >= expires + margin` to take over, so release
+        // winds expires back by one margin (saturating) so the next writer can take over at once; this
+        // engine is then forcibly fenced and will not keep serving inside the wound-back window.
         handle.expires_at_ms = now_ms.saturating_sub(self.cfg.clock_skew_margin_ms);
         match self.write_manifest_im(database_id, &handle.etag, &handle.to_manifest(false)) {
             Ok(etag) => {
                 handle.etag = etag;
                 Ok(())
             }
-            // 已丢权（含 tombstone 后）：无需释放。
+            // Authority already lost (including after tombstone): nothing to release.
             Err(PersistError::Store(StoreError::PreconditionFailed)) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
-    /// manifest tombstone（§7 delete 第一步）：旧写者全部 fencing。
-    /// 幂等；无 manifest → 直接建 tombstoned manifest。
+    /// manifest tombstone (step one of section 7 delete): fence all old writers.
+    /// Idempotent; no manifest -> directly create a tombstoned manifest.
     pub fn tombstone(&self, database_id: &str) -> Result<(), PersistError> {
         for _ in 0..3 {
             match self.read_manifest(database_id)? {
@@ -1308,18 +1308,18 @@ impl Persister {
         )))
     }
 
-    /// tombstone 保留期后回收段/快照/manifest（惰性调用）。
-    /// RV-R53.3：返回 typed 结果——调用方据此决定是否写 `.gc-done`
-    /// 旁挂哨兵，避免已完成项永久占用每轮扫描名额（饥饿修复）。
+    /// Reclaim segments/snapshots/manifest after the tombstone retention period (called lazily).
+    /// RV-R53.3: returns a typed result -- the caller decides from it whether to write the `.gc-done`
+    /// side sentinel, so finished items do not occupy each round's scan quota forever (starvation fix).
     pub fn gc_tombstoned(&self, database_id: &str) -> Result<GcTombstonedOutcome, PersistError> {
         let Some((m, _)) = self.read_manifest(database_id)? else {
-            // manifest 已回收（或无 manifest 的 marker）——对象前缀
-            // 可能仍有残留段，继续走完 listing 才能宣告 done。
+            // The manifest is already reclaimed (or a marker with no manifest) -- the object prefix
+            // may still hold leftover segments; the listing must be walked through before declaring done.
             return self.gc_tombstoned_prefix(database_id, true);
         };
         if !m.tombstone {
-            // marker 在但 manifest 尚未 tombstone ——状态未收敛，
-            // 保留在候选集里下轮重查（不写 done）。
+            // The marker exists but the manifest is not yet tombstoned -- state has not converged,
+            // keep it in the candidate set to re-check next round (do not write done).
             return Ok(GcTombstonedOutcome::Retained);
         }
         let now = self.clock.now_ms();
@@ -1329,8 +1329,8 @@ impl Persister {
         self.gc_tombstoned_prefix(database_id, false)
     }
 
-    /// 列出并删除一页 `db/{id}/`（或 `q/{id}/`）。截断报可重试错误，
-    /// 绝不假装删完。
+    /// List and delete one page of `db/{id}/` (or `q/{id}/`). A truncated listing reports a retryable error,
+    /// never pretending it is all deleted.
     fn gc_tombstoned_prefix(
         &self,
         database_id: &str,
@@ -1343,8 +1343,8 @@ impl Persister {
             freed += 1;
         }
         if page.truncated {
-            // RV-R8 #7：一页删不完——报出进度并让调用方重试收敛，
-            // 绝不假装已删完。
+            // RV-R8 #7: one page cannot delete everything -- report progress and let the caller retry to converge,
+            // never pretend everything was deleted.
             return Err(PersistError::Store(StoreError::unavailable(
                 true,
                 "tombstoned gc: listing truncated — retry to converge",
@@ -1357,16 +1357,16 @@ impl Persister {
     }
 }
 
-/// RV-R53.3：`gc_tombstoned` 一轮结果。`Empty`/`Reclaimed` 表示该
-/// marker 的对象已删净（可写 `.gc-done` 旁挂哨兵退出候选集）；
-/// `Retained` 留在集合里下轮重查。
+/// RV-R53.3: result of one `gc_tombstoned` round. `Empty`/`Reclaimed` mean the
+/// marker's objects are fully deleted (a `.gc-done` side sentinel may be written to leave the candidate set);
+/// `Retained` stays in the set to be re-checked next round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GcTombstonedOutcome {
-    /// 无 manifest 且对象前缀已空——终态。
+    /// No manifest and the object prefix is already empty -- terminal.
     Empty,
-    /// 已过保留期，本轮删除 freed 个对象——终态（前缀已空）。
+    /// Retention period has passed; this round deleted `freed` objects -- terminal (prefix empty).
     Reclaimed(u64),
-    /// 未到保留期或 manifest 未 tombstone——下轮再查。
+    /// Retention period not reached or manifest not tombstoned -- re-check next round.
     Retained,
 }
 
@@ -1375,8 +1375,8 @@ enum ClaimStep {
     Done(ClaimOutcome),
 }
 
-/// 解析 `db/{id}/{epoch}/{lsn}.seg` 的 epoch/lsn。
-/// `snap-{lsn:016x}.snap` → lsn（快照无需 epoch——同目录只留基线）。
+/// Parse the epoch/lsn of `db/{id}/{epoch}/{lsn}.seg`.
+/// `snap-{lsn:016x}.snap` -> lsn (a snapshot needs no epoch -- only the baseline remains in the directory).
 fn parse_snap_name(key: &str) -> Option<u64> {
     let name = key.rsplit('/').next()?;
     let rest = name.strip_prefix("snap-")?;
@@ -1395,15 +1395,15 @@ fn parse_seg_name(key: &str) -> Option<(u64, u64)> {
     Some((ep, lsn))
 }
 
-/// RV-R56: 持有方是否仍可服务——`now < expires - margin`。
-/// 与 [`taker_may_claim`] 配对：持有方在 `expires - margin` 前停止服务，
-/// 取租方在 `expires + margin` 后才接管，两者之间留出 2*margin 的
-/// 空档，时钟偏差 < margin 时不可能双方同时服务。
+/// RV-R56: whether the holder may still serve -- `now < expires - margin`.
+/// Paired with [`taker_may_claim`]: the holder stops serving before `expires - margin`,
+/// and the taker only takes over after `expires + margin`, leaving a gap of 2*margin between them;
+/// with clock skew < margin both sides can never serve at the same time.
 pub(crate) fn holder_usable(expires_at_ms: u64, now_ms: u64, margin_ms: u64) -> bool {
     expires_at_ms.saturating_sub(margin_ms) > now_ms
 }
 
-/// RV-R56: 取租方是否可接管他人租约——`now >= expires + margin`（饱和加）。
+/// RV-R56: whether the taker may take over someone else's lease -- `now >= expires + margin` (saturating add).
 pub(crate) fn taker_may_claim(expires_at_ms: u64, now_ms: u64, margin_ms: u64) -> bool {
     now_ms >= expires_at_ms.saturating_add(margin_ms)
 }
@@ -1412,7 +1412,7 @@ pub(crate) fn taker_may_claim(expires_at_ms: u64, now_ms: u64, margin_ms: u64) -
 mod rv_r56_tests {
     use super::*;
 
-    /// 已验证（2026-11-15）：边界 [expires-margin, expires+margin) 内双方都不可用。
+    /// Verified (2026-11-15): within the boundary [expires-margin, expires+margin) neither side is usable.
     #[test]
     fn lease_margin_inequalities() {
         let (exp, m) = (10_000u64, 500u64);

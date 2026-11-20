@@ -1,4 +1,4 @@
-//! RV-R72：`backend="none"` 与 s3 http endpoint 的 fail-closed 门禁。
+//! RV-R72: fail-closed gate for `backend="none"` and s3 http endpoints.
 
 fn cfg(persistence: &str) -> vrt_sql::service::ServiceConfig {
     let raw = format!(

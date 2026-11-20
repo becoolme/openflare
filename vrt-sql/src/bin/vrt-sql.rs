@@ -1,8 +1,8 @@
-//! `vrt-sql serve` — D1 数据面 SQL 服务。
+//! `vrt-sql serve` -- D1 data-plane SQL service.
 //!
-//! 认证：只有 provider 能调用（共享 0600 secret 签名 token）。
-//! 监听 unix socket 或 TCP，恰设其一；/healthz 无需认证；
-//! SIGTERM → 停止接收 → 排空在途事务 → 退出。
+//! Auth: only the provider may call (shared 0600 secret signed token).
+//! Listens on a unix socket or TCP, exactly one of them; /healthz needs no auth;
+//! SIGTERM -> stop accepting -> drain in-flight transactions -> exit.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -70,8 +70,8 @@ async fn run() -> ExitCode {
         tracing::error!(field, "invalid config");
         return ExitCode::FAILURE;
     }
-    // Secret 文件校验（0600）——缺失/不安全直接 fail closed；
-    // 内容绝不进日志。
+    // Secret file validation (0600) -- missing/insecure fails closed immediately;
+    // contents never enter logs.
     let bookmark_key = match load_secret_0600(&config.bookmark_secret_file, SecretPurpose::ServiceHmac) {
         Ok(k) => k,
         Err(e) => {
@@ -96,8 +96,8 @@ async fn run() -> ExitCode {
         .with_permits(config.global_concurrency)
         .with_body_max(config.body_max_bytes);
     state.txn_budget = std::time::Duration::from_millis(config.operation_timeout_ms);
-    // T36：对象存储持久化（§4，fail closed——配置已在 validate
-    // 卡死；none 仅测试/dev，启动 WARN）。
+    // T36: object-store persistence (section 4, fail closed -- config is already blocked in validate;
+    // none is test/dev only, with a startup WARN).
     match build_persister(&config) {
         Ok(Some(pair)) => {
             let registry = (*state.registry).clone().with_persisters(pair);
@@ -148,7 +148,7 @@ async fn run() -> ExitCode {
         });
     }
 
-    // metrics 内部监听。
+    // metrics internal listener.
     if let Some(addr) = &config.metrics_listen {
         let addr: std::net::SocketAddr = addr.parse().expect("validated");
         match tokio::net::TcpListener::bind(addr).await {
@@ -177,7 +177,7 @@ async fn run() -> ExitCode {
     };
 
     if let Some(dir) = &config.unix_dir {
-        // UDS：0700 dir + 0600 socket（与 vrt-provider unixsock 同口径）。
+        // UDS: 0700 dir + 0600 socket (same convention as vrt-provider unixsock).
         if let Err(e) = vrt_securefs::ensure_secure_dir(dir) {
             tracing::error!(error = %e, "unixDir unusable");
             return ExitCode::FAILURE;
@@ -236,9 +236,9 @@ async fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// T36b：停机序——closing 拒新请求 → drain 在途 → CAS 释放全部
-/// lease（下一个 holder 立即接管，不等 lease 自然过期）。lease
-/// 释放总预算 5s；store 卡死也不拖延停机。
+/// T36b: shutdown sequence -- closing rejects new requests -> drain in-flight -> CAS-release all
+/// leases (the next holder takes over immediately, without waiting for the lease to expire naturally). The total
+/// lease-release budget is 5s; a stuck store also does not delay shutdown.
 const RELEASE_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn shutdown_sequence(state: &std::sync::Arc<AppState>, drain: std::time::Duration) {
@@ -259,9 +259,9 @@ async fn shutdown_sequence(state: &std::sync::Arc<AppState>, drain: std::time::D
     }
 }
 
-/// T36：从 `[persistence]` 构造持久化面。
-/// `none` → Ok(None)（调用方 WARN）；`fs`/`s3` → Persister。
-/// 时钟 SystemClock；holder 缺省 `host:pid:start_nanos`。
+/// T36: build the persistence surface from `[persistence]`.
+/// `none` -> Ok(None) (the caller WARNs); `fs`/`s3` -> Persister.
+/// Clock is SystemClock; holder defaults to `host:pid:start_nanos`.
 fn build_persister(
     config: &ServiceConfig,
 ) -> Result<Option<vrt_sql::engine::PersisterPair>, String> {
@@ -289,7 +289,7 @@ fn build_persister(
         "fs" => {
             let fs = p.fs.as_ref().ok_or("persistence.fs missing")?;
             let root = fs.root.clone();
-            // RV-R66：持久层与本地库同设备 = 单份，非 dev 拒绝启动。
+            // RV-R66: persistence layer on the same device as the local db = a single copy; refuse to start unless dev.
             match vrt_sql::service::check_fs_durability_distinct(
                 &config.db_root,
                 &root,
@@ -298,7 +298,7 @@ fn build_persister(
                 Ok(false) => {}
                 Ok(true) => tracing::warn!(
                     root = %root.display(),
-                    "persistence fs root shares a device with dbRoot: NO disaster recovery (dev only)"
+                    "persistence.allowSameDeviceDurability is enabled: persistence fs root shares a device with dbRoot; this is dev mode and durability is NOT guaranteed (no disaster recovery)"
                 ),
                 Err(e) => return Err(e.to_string()),
             }
@@ -339,8 +339,8 @@ fn build_persister(
         }
         other => return Err(format!("persistence.backend {other}")),
     };
-    // T37r：每种资源一个 Persister——D1 写 `db/{id}`/`dbs/`，
-    // Queue 写 `q/{id}`/`queues/`（结构性命名空间分离）。
+    // T37r: one Persister per resource -- D1 writes `db/{id}`/`dbs/`,
+    // Queue writes `q/{id}`/`queues/` (structural namespace separation).
     let persister = Arc::new(vrt_sql::persist::Persister::new(
         store.clone(),
         cfg.clone(),
@@ -355,16 +355,16 @@ fn build_persister(
         vrt_sql::paths::queue_root_for(&config.db_root),
         vrt_sql::paths::ResourceKind::Queue,
     ));
-    // T36b/P0-B：启动自检——对象存储写/读/删探针；失败即拒启
-    // （容器卷属主/权限错误在此暴露为明确启动错误，而非运行期
-    // 每次写都返回 503 "backend unavailable"）。同 store 一探针即
-    // 覆盖两种 kind（探针写的是自检 key，不带资源前缀）。
-    // MIG-9：进程内有界重试——真机观测 R2 冷启动 `send: error`
-    // 在 1–3 次 pod CrashLoop 后自愈；改为启动线程内指数退避
-    // （0.5s 起 ×2 封顶 8s，预算 60s，可配）。重试期间端口未绑
-    // → readiness 天然 not-ready；startupProbe 决定 liveness 不判死。
-    // 认证类（403）/非重试错误立即返回不耗预算。日志错误文本经
-    // sanitize 剥离内嵌 URL，凭据/签名永不入日志（SigV4 走 header）。
+    // T36b/P0-B: startup self-check -- a write/read/delete probe on the object store; failure refuses startup
+    // (container volume ownership/permission errors surface here as a clear startup error, rather than every
+    // runtime write returning 503 "backend unavailable"). One probe per store
+    // covers both kinds (the probe writes a self-check key with no resource prefix).
+    // MIG-9: in-process bounded retry -- on real hardware R2 cold-start `send: error` was observed
+    // to self-heal after 1-3 pod CrashLoops; now exponential backoff inside the startup thread
+    // (0.5s start, x2, capped at 8s, 60s budget, configurable). During retries the port is unbound
+    // -> readiness is naturally not-ready; startupProbe decides, so liveness does not declare it dead.
+    // Auth-class (403) / non-retryable errors return immediately without spending the budget. Error text in logs goes through
+    // sanitize to strip embedded URLs, so credentials/signatures never enter logs (SigV4 uses headers).
     let retry = vrt_sql::persist::SelfCheckRetry {
         budget: std::time::Duration::from_millis(config.persistence.self_check_budget_ms),
         initial_backoff: std::time::Duration::from_millis(

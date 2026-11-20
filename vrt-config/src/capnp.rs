@@ -22,7 +22,7 @@
 //!   these services directly** (only facade system workers hold
 //!   `BINDING_BACKEND`); see the service-scope invariant below;
 //! - one `unix:` socket per worker (`<socketDir>/<workerId>.sock`):
-//!   vrt-host's local ingress maps `Host → workerId → socket` (主设计
+//!   vrt-host's local ingress maps `Host → workerId → socket` (main design
 //!   §5.1), so the capnp exposes one socket per worker, not per process.
 //!
 //! Determinism: services, sockets, bindings and module lists are emitted
@@ -136,7 +136,8 @@ pub struct ServiceEndpoint {
 pub struct FacadeRefs {
     /// `kv` bindings → this facade worker + entrypoint (`KVNamespace`).
     pub kv: ServiceEndpoint,
-    /// `r2` bindings → (`R2Transport`).
+    /// `r2` bindings → (`R2Transport`), rendered as a native `r2Bucket`
+    /// binding (see `docs/r2-binding.md`).
     pub r2: ServiceEndpoint,
     /// `assets` bindings → (`AssetTransport`).
     pub assets: ServiceEndpoint,
@@ -231,7 +232,7 @@ pub struct RuntimeParams {
     /// talk to `binding-backend`, so their outbound must be a worker
     /// that always denies. workerd defaults `globalOutbound` to
     /// `internet`, so an explicit deny designator is mandatory — a
-    /// network-service `allow = []` alternative is 未证实.
+    /// network-service `allow = []` alternative is unverified.
     pub deny_outbound: ServiceEndpoint,
     /// Facade service endpoints for `kv` / `r2` / `assets` bindings.
     pub facades: FacadeRefs,
@@ -995,8 +996,8 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
             worker_service_name(&worker.worker_id)
         }),
     ));
-    // T37b：consumer 派发端点 socket —— vrt-host `/v1/queue/dispatch`
-    // 代理到此；`*.qconsumer.sock` 与 `*.sock` 并列同目录。
+    // T37b: consumer dispatch endpoint socket -- vrt-host `/v1/queue/dispatch`
+    // proxies to it; `*.qconsumer.sock` sits alongside `*.sock` in the same directory.
     if !worker.queue_consumers.is_empty() {
         out.push_str(&format!(
             "    (name = {}, address = {}, http = (), service = {}),\n",
@@ -1302,7 +1303,7 @@ fn emit_binding(
             )?;
             // Secrets never enter the config text/digest: the binding is
             // `fromEnvironment` and vrt-host injects `env` into the
-            // child process (主文档 §2.3/§3).
+            // child process (main doc §2.3/§3).
             let env_name = secret_env_name(&worker.worker_id, &secret.name);
             if env.insert(env_name.clone(), value.clone()).is_some() {
                 return Err(ConfigError::Identifier("secretEnv"));
@@ -1326,7 +1327,7 @@ fn emit_binding(
             )?;
         }
         BindingDesired::R2(r2) => {
-            emit_facade_binding(
+            emit_r2_bucket_binding(
                 out,
                 &r2.name,
                 &input.params.facades.r2,
@@ -1480,6 +1481,63 @@ fn emit_facade_binding(
     permissions: &snapshot_protocol::compute_desired::BindingPermissions,
     props_binding_name: &str,
 ) -> Result<(), ConfigError> {
+    emit_facade_binding_as(
+        out,
+        "service",
+        binding_name,
+        facade,
+        resource_id,
+        worker,
+        input,
+        permissions,
+        props_binding_name,
+    )
+}
+
+/// Native workerd `r2Bucket` binding to the R2 facade. `Worker.Binding.r2Bucket`
+/// is a `ServiceDesignator`, so the facade/props contract is identical to
+/// [`emit_facade_binding`]; the difference is the tenant-facing surface.
+/// workerd supplies the real `R2Bucket` class (R2ObjectBody results,
+/// httpMetadata/customMetadata option parsing, `delete(key | keys[])`) and
+/// speaks its native R2 wire to the facade's `fetch()`, which the vendored
+/// native adapter serves. A plain `service` binding would instead expose the
+/// raw `R2Transport` RPC methods to the tenant: string bodies are rejected
+/// (stream-only), `get` returns `{meta, body}` without `text()`, and
+/// `delete("k")` posts `{keys: "k"}` which the provider rejects.
+fn emit_r2_bucket_binding(
+    out: &mut String,
+    binding_name: &str,
+    facade: &ServiceEndpoint,
+    resource_id: &str,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+    permissions: &snapshot_protocol::compute_desired::BindingPermissions,
+    props_binding_name: &str,
+) -> Result<(), ConfigError> {
+    emit_facade_binding_as(
+        out,
+        "r2Bucket",
+        binding_name,
+        facade,
+        resource_id,
+        worker,
+        input,
+        permissions,
+        props_binding_name,
+    )
+}
+
+fn emit_facade_binding_as(
+    out: &mut String,
+    binding_field: &str,
+    binding_name: &str,
+    facade: &ServiceEndpoint,
+    resource_id: &str,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+    permissions: &snapshot_protocol::compute_desired::BindingPermissions,
+    props_binding_name: &str,
+) -> Result<(), ConfigError> {
     let props = String::from_utf8(canonical_bytes(&json!({
         // Wire format `<workerId>~<bindingName>` — matches
         // vrt-provider::identity::parse_binding_id (single path segment).
@@ -1496,8 +1554,9 @@ fn emit_facade_binding(
     })))
     .expect("canonical props are utf8");
     out.push_str(&format!(
-        "        (name = {}, service = (name = {}, entrypoint = {}, props = (json = {}))),\n",
+        "        (name = {}, {} = (name = {}, entrypoint = {}, props = (json = {}))),\n",
         capnp_text(binding_name),
+        binding_field,
         capnp_text(&facade.service),
         capnp_text(&facade.entrypoint),
         capnp_text(&props),

@@ -572,7 +572,7 @@ mod tests {
             "..",
             "a/b",
             "a%2Fb",
-            "租户",
+            "\u{79df}\u{6237}",
             "x y",
             "\0nul",
             "vrt:kv:other:key",

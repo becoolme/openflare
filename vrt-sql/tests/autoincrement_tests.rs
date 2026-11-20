@@ -1,10 +1,10 @@
-//! 2026-11-15：D1 AUTOINCREMENT（sqlite_sequence）授权回归。
+//! 2026-11-15: D1 AUTOINCREMENT (sqlite_sequence) authorization regression.
 //!
-//! 现象：`CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, ...)` 返回
-//! `D1_ERROR: not authorized`——SQLite 为 AUTOINCREMENT 内部创建
-//! `sqlite_sequence`，该 CREATE TABLE 经 authorizer 被 `is_reserved_object`
-//! 的 `sqlite_` 前缀规则拒绝。Cloudflare D1 支持 AUTOINCREMENT，必须放行，
-//! 且只放行 SQLite 自身维护 sqlite_sequence 所需的最小动作。
+//! Symptom: `CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, ...)` returned
+//! `D1_ERROR: not authorized` -- SQLite internally creates `sqlite_sequence` for AUTOINCREMENT,
+//! and that CREATE TABLE was rejected by the authorizer via the `sqlite_` prefix rule of `is_reserved_object`.
+//! Cloudflare D1 supports AUTOINCREMENT, so it must be allowed,
+//! and only the minimal actions SQLite needs to maintain sqlite_sequence itself.
 
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ fn autoincrement_create_and_ids_increment() {
     let e = open(&tmp);
     batch(&e, &[CREATE_T]).expect("AUTOINCREMENT CREATE TABLE must be allowed (CF D1 supports it)");
     batch(&e, &["INSERT INTO t(b) VALUES('a')", "INSERT INTO t(b) VALUES('b')"]).unwrap();
-    // AUTOINCREMENT 不复用已删 id：删最大行后下一个仍递增
+    // AUTOINCREMENT does not reuse deleted ids: after deleting the max row the next id still increments
     batch(&e, &["DELETE FROM t WHERE id = 2"]).unwrap();
     batch(&e, &["INSERT INTO t(b) VALUES('c')"]).unwrap();
     let r = batch(&e, &["SELECT id FROM t ORDER BY id"]).unwrap();
@@ -56,10 +56,10 @@ fn autoincrement_create_and_ids_increment() {
         s.contains(r#"[Object {"id": Number(1)}, Object {"id": Number(3)}]"#),
         "ids: {s}"
     );
-    // 用户可读 sqlite_sequence（CF D1 行为），seq=3
+    // Users can read sqlite_sequence (CF D1 behavior), seq=3
     let r = batch(&e, &["SELECT name, seq FROM sqlite_sequence"]).unwrap();
     assert!(dump(&r).contains('3'), "{}", dump(&r));
-    // 用户可 DELETE sqlite_sequence 行（CF D1 行为，重置计数）
+    // Users can DELETE sqlite_sequence rows (CF D1 behavior, resets the counter)
     batch(&e, &["DELETE FROM sqlite_sequence WHERE name='t'"]).unwrap();
 }
 
@@ -99,14 +99,14 @@ fn sqlite_internal_objects_still_denied_to_users() {
     ] {
         assert!(batch(&e, &[sql]).is_err(), "must stay denied: {sql}");
     }
-    // 拒绝后表仍可用
+    // The table is still usable after the rejection
     batch(&e, &["INSERT INTO t(b) VALUES('ok')"]).unwrap();
 }
 
 #[test]
 fn user_cannot_create_sqlite_sequence_directly() {
-    // 没有 AUTOINCREMENT 表时，用户不能手工建 sqlite_sequence
-    // （否则可抢先建出带触发器/异常 schema 的同名表）。
+    // Without an AUTOINCREMENT table, users cannot hand-create sqlite_sequence
+    // (otherwise they could create a same-named table with triggers/odd schema first).
     let tmp = tempfile::tempdir().unwrap();
     let e = open(&tmp);
     assert!(batch(&e, &["CREATE TABLE sqlite_sequence(name,seq)"]).is_err());

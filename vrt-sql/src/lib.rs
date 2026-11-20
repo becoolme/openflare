@@ -1,9 +1,9 @@
-//! vrt-sql：D1/Queues 数据面 SQL 服务（Phase 3 / P3a）。
+//! vrt-sql: D1/Queues data-plane SQL service (Phase 3 / P3a).
 //!
-//! 本轮范围（T33）：单进程本地 rusqlite 引擎 + D1 `/query`/`/execute`
-//! wire 层 + 单写者（进程内 map + 文件锁）+ `_vrt_dedup` 同事务去重账。
-//! 持久化等级：**仅本地 fsync，无复制**；对象存储 LTX 复制、lease 与
-//! epoch fencing 留给后续阶段（TxnCtx 已预留 epoch 字段）。
+//! Scope of this round (T33): single-process local rusqlite engine + D1 `/query`/`/execute`
+//! wire layer + single writer (in-process map + file lock) + `_vrt_dedup` same-transaction dedup ledger.
+//! Durability level: **local fsync only, no replication**; object-store LTX replication, lease and
+//! epoch fencing are left to later phases (TxnCtx already reserves the epoch field).
 
 pub mod bookmark;
 pub mod clock;

@@ -1,13 +1,13 @@
-//! W3: production-path workflow-op dispatch — 真 `WfOpsExecutor`
-//! (cell-controller) + 真 vrt-host `/v1/wfops` 路由（生产
-//! router/handler/响应编码）。facade 由裸 TCP stub 替代——协议面
+//! W3: production-path workflow-op dispatch -- the real `WfOpsExecutor`
+//! (cell-controller) + the real vrt-host `/v1/wfops` route (production
+//! router/handler/response encoding). The facade is replaced by a raw TCP stub -- the protocol surface
 //! (hyper HTTP/1.1 POST `/vrt/wfops` + `x-vrt-wfop-token` +
-//! Host) 与 workerd socket 服务一致；facade→engine 真链由
-//! `wfops_smoke.rs` 的真 workerd 测试覆盖。
+//! Host) matches the workerd socket service; the facade->engine real chain is covered by
+//! the real workerd test in `wfops_smoke.rs`.
 //!
-//! 同时是双向契约测试：stub 断言 vrt-host 转发的请求行/头形状，
-//! executor 对 vrt-host 响应做白名单 + 截断 —— 任一侧 drift
-//! 在这里炸开。
+//! It is also a two-way contract test: the stub asserts the request line/header shape forwarded by vrt-host,
+//! and the executor applies a whitelist + truncation to the vrt-host response -- drift on either side
+//! blows up here.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -158,7 +158,7 @@ fn executor_to(host_addr: &str) -> WfOpsExecutor {
     .unwrap()
 }
 
-/// executor → vrt-host(生产路由) → stub facade → 白名单结果 → DONE。
+/// executor -> vrt-host (production route) -> stub facade -> whitelisted result -> DONE.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wfops_get_through_real_vrt_host() {
     let (endpoint, seen) =

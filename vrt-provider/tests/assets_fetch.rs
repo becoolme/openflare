@@ -633,7 +633,7 @@ async fn route_index_over_limit_returns_too_large_flag() {
 #[tokio::test]
 async fn percent_encoded_paths_decode_before_match() {
     let e = env(
-        &[("/my file.txt", b"s"), ("/中文 page.html", b"c")],
+        &[("/my file.txt", b"s"), ("/\u{4e2d}\u{6587} page.html", b"c")],
         "none",
         TENANT,
     );

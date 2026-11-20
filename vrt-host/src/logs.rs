@@ -276,6 +276,17 @@ pub struct DrainResponse {
     pub dropped: DropCounters,
 }
 
+/// Read-only tail response (`vrt logs` / dev output) — the mirror
+/// of drain minus the ack: `next_seq` is the caller's cursor for
+/// the next poll; buffered records are never consumed.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TailResponse {
+    pub boot_id: String,
+    pub records: Vec<LogRecord>,
+    pub next_seq: u64,
+}
+
 pub struct LogHub {
     limits: HubLimits,
     pepper: String,
@@ -806,6 +817,44 @@ impl LogHub {
         }
     }
 
+    /// Read-only tail for ONE worker — non-consuming: acking is
+    /// `drain`'s job. `after` is a seq cursor; records with
+    /// `seq > after` return oldest-first and `next_seq` carries the
+    /// cursor forward (or echoes `after` on an empty ring). `None`
+    /// when the worker is not registered — callers map it to 404,
+    /// which also keeps unknown ids indistinguishable from absent.
+    pub fn tail(
+        &self,
+        worker_id: &str,
+        boot_id: Option<&str>,
+        after: u64,
+        limit: usize,
+    ) -> Option<TailResponse> {
+        let limit = limit.clamp(1, self.limits.drain_max);
+        // Same bootId rule as drain: a cursor minted by a previous
+        // host process is meaningless here — reset to 0 instead of
+        // silently skipping the new buffer.
+        let after = if boot_id == Some(self.boot_id.as_str()) {
+            after
+        } else {
+            0
+        };
+        let g = self.lock();
+        let w = g.workers.get(worker_id)?;
+        let records: Vec<LogRecord> = w
+            .ring
+            .iter()
+            .filter(|r| r.seq > after)
+            .take(limit)
+            .cloned()
+            .collect();
+        Some(TailResponse {
+            boot_id: self.boot_id.clone(),
+            next_seq: records.last().map(|r| r.seq).unwrap_or(after),
+            records,
+        })
+    }
+
     /// Records currently buffered for a worker (tests/diagnostics).
     pub fn buffered(&self, worker_id: &str) -> usize {
         self.lock()
@@ -893,6 +942,42 @@ async fn drain_handler(State(hub): State<Arc<LogHub>>, body: Bytes) -> Response 
         .into_response()
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TailBody {
+    worker_id: String,
+    #[serde(default)]
+    boot_id: Option<String>,
+    #[serde(default)]
+    after_seq: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /v1/logs/tail` — read-only cursor read. The request body
+/// names the worker; responses are that worker's records only
+/// (per-worker isolation), already redacted at ingest time.
+async fn tail_handler(State(hub): State<Arc<LogHub>>, body: Bytes) -> Response {
+    let req: TailBody = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return err(StatusCode::BAD_REQUEST, "bad_body"),
+    };
+    match hub.tail(
+        &req.worker_id,
+        req.boot_id.as_deref(),
+        req.after_seq,
+        req.limit.unwrap_or(200),
+    ) {
+        Some(resp) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            axum::Json(resp),
+        )
+            .into_response(),
+        None => err(StatusCode::NOT_FOUND, "unknown_worker"),
+    }
+}
+
 /// Control-listener router (same loopback/pod-network trust model as
 /// `/v1/cron/trigger`: the pod NetworkPolicy admits only the cell
 /// controller and the in-pod tail workers can reach it).
@@ -900,6 +985,9 @@ pub fn router(hub: Arc<LogHub>) -> Router {
     Router::new()
         .route("/v1/logs/ingest", post(ingest_handler))
         .route("/v1/logs/drain", post(drain_handler))
+        // A3: `/v1/logs/tail` is READ-ONLY — many readers (vrt logs,
+        // vrt dev) share the buffer without touching drain's cursor.
+        .route("/v1/logs/tail", post(tail_handler))
         .layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT))
         .with_state(hub)
 }
@@ -1275,6 +1363,143 @@ mod tests {
         assert_eq!(
             r.headers().get("cache-control").unwrap().to_str().unwrap(),
             "no-store"
+        );
+    }
+
+    #[test]
+    fn tail_is_read_only_and_cursors_are_independent() {
+        let h = hub(small());
+        h.ingest("w1", &tok("w1"), &body(&["a", "b", "c"])).unwrap();
+        // Two readers at different cursors never starve each other.
+        let r1 = h.tail("w1", None, 0, 100).unwrap();
+        assert_eq!(r1.records.len(), 3);
+        let r2 = h.tail("w1", Some(&r1.boot_id), 1, 100).unwrap();
+        assert_eq!(r2.records.len(), 2);
+        assert_eq!(r2.records[0].message, "b");
+        // Re-reading the same cursor is lossless AND duplicate-free:
+        // identical results until the cursor advances. The cursor is
+        // (bootId, nextSeq) — the caller echoes the last response's
+        // bootId so a host restart cannot silently skip records.
+        let r3 = h.tail("w1", Some(&r2.boot_id), r2.next_seq, 100).unwrap();
+        assert!(r3.records.is_empty());
+        assert_eq!(r3.next_seq, r2.next_seq);
+        let r2b = h.tail("w1", Some(&r2.boot_id), 1, 100).unwrap();
+        assert_eq!(r2b.records, r2.records);
+        // Nothing was consumed — drain still sees every record.
+        assert_eq!(h.drain(None, 0, 100).records.len(), 3);
+        assert_eq!(h.buffered("w1"), 3);
+    }
+
+    #[test]
+    fn tail_follow_picks_up_new_records() {
+        let h = hub(small());
+        h.ingest("w1", &tok("w1"), &body(&["a"])).unwrap();
+        let r = h.tail("w1", None, 0, 100).unwrap();
+        h.ingest("w1", &tok("w1"), &body(&["b"])).unwrap();
+        let r2 = h.tail("w1", Some(&r.boot_id), r.next_seq, 100).unwrap();
+        assert_eq!(r2.records.len(), 1);
+        assert_eq!(r2.records[0].message, "b");
+        assert!(r2.next_seq > r.next_seq);
+    }
+
+    #[test]
+    fn tail_stale_boot_id_resets_cursor_to_zero() {
+        let h = hub(small());
+        h.ingest("w1", &tok("w1"), &body(&["a", "b"])).unwrap();
+        // A cursor minted by a previous host process (wrong bootId)
+        // restarts from 0 — never silently skips the new buffer.
+        let r = h.tail("w1", Some("old-boot"), 999, 100).unwrap();
+        assert_eq!(r.records.len(), 2);
+        assert_eq!(r.records[0].message, "a");
+    }
+
+    #[test]
+    fn tail_is_per_worker_and_unknown_is_none() {
+        let h = hub(small());
+        h.ingest("w1", &tok("w1"), &body(&["a"])).unwrap();
+        h.ingest("w2", &tok("w2"), &body(&["b"])).unwrap();
+        let r = h.tail("w1", None, 0, 100).unwrap();
+        assert_eq!(r.records.len(), 1);
+        assert_eq!(r.records[0].message, "a");
+        assert!(h.tail("ghost", None, 0, 100).is_none());
+    }
+
+    #[test]
+    fn tail_keeps_ingest_time_redaction() {
+        let h = LogHub::with_pepper(small(), "pep");
+        h.register_tenant(&["w1".into()], &["s3cret-value".to_string()]);
+        let b = serde_json::to_vec(&serde_json::json!({"records":[
+            {"kind":"log","level":"info","message":"token is s3cret-value ok"}
+        ]}))
+        .unwrap();
+        h.ingest("w1", &tok("w1"), &b).unwrap();
+        let r = h.tail("w1", None, 0, 100).unwrap();
+        assert_eq!(r.records.len(), 1);
+        assert!(!r.records[0].message.contains("s3cret-value"));
+        assert!(r.records[0].message.contains(REDACTED));
+    }
+
+    #[test]
+    fn tail_honors_limit() {
+        let h = hub(small());
+        h.ingest("w1", &tok("w1"), &body(&["a", "b", "c"])).unwrap();
+        let r = h.tail("w1", None, 0, 2).unwrap();
+        assert_eq!(r.records.len(), 2);
+        assert_eq!(r.records[1].message, "b");
+    }
+
+    #[tokio::test]
+    async fn http_tail_roundtrip_and_404() {
+        use tower::ServiceExt;
+        let h = hub(small());
+        h.ingest("w1", &tok("w1"), &body(&["hello"])).unwrap();
+        let app = router(h.clone());
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/logs/tail")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                "{\"workerId\":\"w1\",\"afterSeq\":0}",
+            ))
+            .unwrap();
+        let r = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["records"].as_array().unwrap().len(), 1);
+        // The same tail twice — nothing consumed between calls.
+        let again = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/logs/tail")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                "{\"workerId\":\"w1\",\"afterSeq\":0}",
+            ))
+            .unwrap();
+        let r = app.clone().oneshot(again).await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let missing = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/logs/tail")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{\"workerId\":\"ghost\"}"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        // Malformed body → 400, not a panic.
+        let bad = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/logs/tail")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("not json"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(bad).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
         );
     }
 }

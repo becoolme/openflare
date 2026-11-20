@@ -1,4 +1,4 @@
-//! databaseId → 存储路径派生（§7）：服务端单向派生 + 路径穿越防护。
+//! databaseId -> storage path derivation (section 7): one-way server-side derivation + path traversal protection.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,11 +14,11 @@ pub enum PathError {
     Io(#[from] std::io::Error),
 }
 
-/// T37r：资源种类——结构性命名空间分离。`EngineRegistry` 的键、
-/// 对象键前缀、本地 db_root 与 tombstone marker 全部按 kind 分面：
-/// 同一 id 以 D1 与 Queue 打开是两个互不相交的库（对象键 `db/{id}`
-/// 与 `q/{id}`、本地 `dbs/` 与 `queues/` 目录、各自 `.dropped`
-/// marker）。`_vrt_q_meta.kind` 保留为第二道校验。
+/// T37r: resource kind -- structural namespace separation. The `EngineRegistry` key,
+/// object-key prefix, local db_root and tombstone marker are all split by kind:
+/// opening the same id as D1 and as Queue yields two disjoint databases (object keys `db/{id}`
+/// vs `q/{id}`, local `dbs/` vs `queues/` directories, each with its own `.dropped`
+/// marker). `_vrt_q_meta.kind` is kept as a second-line check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResourceKind {
@@ -27,7 +27,7 @@ pub enum ResourceKind {
 }
 
 impl ResourceKind {
-    /// 对象键前缀：D1 `db/{id}/…`（T36 布局，不得变），Queue `q/{id}/…`。
+    /// Object-key prefix: D1 `db/{id}/...` (T36 layout, must not change), Queue `q/{id}/...`.
     pub fn object_prefix(self) -> &'static str {
         match self {
             Self::D1 => "db",
@@ -36,8 +36,8 @@ impl ResourceKind {
     }
 }
 
-/// queue 本地根 = D1 db_root 的同级 `queues/`（db_root 形如 `…/dbs`）。
-/// 父目录缺失时退化为 `db_root/queues`，仍与 D1 路径不相交。
+/// queue local root = `queues/` sibling of the D1 db_root (db_root looks like `.../dbs`).
+/// When the parent directory is missing it degrades to `db_root/queues`, still disjoint from D1 paths.
 pub fn queue_root_for(db_root: &Path) -> PathBuf {
     match db_root.parent() {
         Some(p) => p.join("queues"),
@@ -45,7 +45,7 @@ pub fn queue_root_for(db_root: &Path) -> PathBuf {
     }
 }
 
-/// databaseId 只允许 ULID 形态（26 位小写字母数字）。
+/// databaseId only allows the ULID shape (26 lowercase alphanumerics).
 pub fn validate_database_id(id: &str) -> Result<(), PathError> {
     if id.len() != 26
         || !id
@@ -57,9 +57,9 @@ pub fn validate_database_id(id: &str) -> Result<(), PathError> {
     Ok(())
 }
 
-/// 派生 `{dbRoot}/{sha256(id)[:8]}/{id}/` 目录（不存在则 0700 创建），
-/// 返回 `db.sqlite` 路径。sha256 前缀打散目录分布；id 本身做第二级目录。
-/// 任何穿越/软链接/逃逸 root 的解析结果都拒绝。
+/// Derive the `{dbRoot}/{sha256(id)[:8]}/{id}/` directory (created with 0700 if absent),
+/// and return the `db.sqlite` path. The sha256 prefix spreads the directory distribution; the id itself is the second level.
+/// Any resolution result that traverses / follows a symlink / escapes root is rejected.
 pub fn derive_db_file(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     validate_database_id(id)?;
     let shard = &hex::encode(sha2::Sha256::digest(id.as_bytes()))[..8];
@@ -67,13 +67,13 @@ pub fn derive_db_file(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
 
     vrt_securefs::ensure_secure_dir(&leaf_dir).map_err(PathError::Io)?;
 
-    // canonicalize 后必须仍在 canonical(db_root) 内（防软链接/挂载逃逸）。
+    // After canonicalize it must still be inside canonical(db_root) (guards against symlink/mount escape).
     let canon_root = db_root.canonicalize().map_err(PathError::Io)?;
     let canon_leaf = leaf_dir.canonicalize().map_err(PathError::Io)?;
     if !canon_leaf.starts_with(&canon_root) {
         return Err(PathError::Traversal);
     }
-    // 目标 db 文件若已存在，必须是普通文件（禁软链接）。
+    // If the target db file already exists it must be a regular file (symlinks forbidden).
     let db_file = canon_leaf.join("db.sqlite");
     if let Ok(meta) = fs::symlink_metadata(&db_file) {
         if meta.file_type().is_symlink() {
@@ -83,10 +83,10 @@ pub fn derive_db_file(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     Ok(db_file)
 }
 
-/// T35b DROP：同 `{dbRoot}/{sha256(id)[:8]}/{id}` 派生，但**不创建**
-/// 任何目录；不存在返回 None。canonical 校验与 derive_db_file 同规则
-/// （必须位于 canonical(db_root) 内、禁符号链接逃逸），路径只由
-/// 白名单 databaseId 组成。
+/// T35b DROP: derives the same `{dbRoot}/{sha256(id)[:8]}/{id}` path, but **does not create**
+/// any directory; returns None if absent. The canonical check follows the same rules as derive_db_file
+/// (must lie inside canonical(db_root), symlink escapes forbidden); the path is composed only of
+/// the whitelisted databaseId.
 pub fn derive_db_dir_readonly(db_root: &Path, id: &str) -> Result<Option<PathBuf>, PathError> {
     validate_database_id(id)?;
     let shard = &hex::encode(sha2::Sha256::digest(id.as_bytes()))[..8];
@@ -108,17 +108,17 @@ pub fn derive_db_dir_readonly(db_root: &Path, id: &str) -> Result<Option<PathBuf
     Ok(Some(canon_leaf))
 }
 
-/// T35c DROP tombstone：持久标记 `{dbRoot}/{shard}/{id}.dropped`，
-/// 与 db leaf 目录平级（绝不放 leaf 内——leaf 会整体 rename 进
-/// `.trash`）。marker 一旦写入永久保留：databaseId 由服务端随机
-/// mint，语义上不复用，重启后 open 仍须被拒。
+/// T35c DROP tombstone: persistent marker `{dbRoot}/{shard}/{id}.dropped`,
+/// a sibling of the db leaf directory (never inside the leaf -- the leaf is renamed whole into
+/// `.trash`). Once written the marker is kept forever: databaseId is randomly minted by the server,
+/// never semantically reused, and open must still be refused after a restart.
 pub fn marker_path(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     validate_database_id(id)?;
     let shard = &hex::encode(sha2::Sha256::digest(id.as_bytes()))[..8];
     Ok(db_root.join(shard).join(format!("{id}.dropped")))
 }
 
-/// marker 是否存在（regular file，拒符号链接——同 derive 规则）。
+/// Whether the marker exists (regular file, symlinks rejected -- same rule as derive).
 pub fn marker_exists(db_root: &Path, id: &str) -> Result<bool, PathError> {
     let p = marker_path(db_root, id)?;
     match fs::symlink_metadata(&p) {
@@ -133,8 +133,8 @@ pub fn marker_exists(db_root: &Path, id: &str) -> Result<bool, PathError> {
     }
 }
 
-/// 写入 tombstone marker（幂等覆盖）。shard 目录缺失时按 0700 创建；
-/// 内容仅取证用（drop 时间戳），不作解析。
+/// Write the tombstone marker (idempotent overwrite). A missing shard directory is created with 0700;
+/// the content is for forensics only (drop timestamp) and is not parsed.
 pub fn write_marker(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     let p = marker_path(db_root, id)?;
     if let Some(shard_dir) = p.parent() {
@@ -148,17 +148,17 @@ pub fn write_marker(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     Ok(p)
 }
 
-/// `{dbRoot}/.trash/` —— drop 的第一落点：leaf 先原子 rename 进来
-/// （同文件系统），再异步 remove_dir_all，把"半删状态可被读到"的
-/// 窗口缩到 rename 本身。
+/// `{dbRoot}/.trash/` -- the first landing spot of a drop: the leaf is first atomically renamed in
+/// (same filesystem), then asynchronously remove_dir_all'd, shrinking the window in which a "half-deleted state can be read"
+/// to the rename itself.
 pub fn ensure_trash_dir(db_root: &Path) -> Result<PathBuf, PathError> {
     let dir = db_root.join(".trash");
     vrt_securefs::ensure_secure_dir(&dir).map_err(PathError::Io)?;
     Ok(dir)
 }
 
-/// 启动扫描：返回 `{dbRoot}/*/*.dropped` 指向的全部 id（预灌进
-/// registry tombstone set，省掉每次 cold open 的 stat）。
+/// Startup scan: return all ids referenced by `{dbRoot}/*/*.dropped` (pre-filled into the
+/// registry tombstone set, saving a stat on every cold open).
 pub fn scan_dropped_ids(db_root: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let Ok(shards) = fs::read_dir(db_root) else {
@@ -184,10 +184,10 @@ pub fn scan_dropped_ids(db_root: &Path) -> Vec<String> {
     out
 }
 
-/// RV-R53.3 GC 完成旁挂哨兵：`{shard}/{id}.dropped.gc-done`。
-/// `.dropped` 本身永不删除（open 拒绝记录）；GC 完成后另写哨兵，
-/// 让 `scan_gc_pending_ids` 跳过它——否则永久 marker 会占满每轮
-/// 扫描名额，队尾 marker 被饿死。
+/// RV-R53.3 GC-complete side sentinel: `{shard}/{id}.dropped.gc-done`.
+/// The `.dropped` itself is never deleted (the open-refusal record); after GC completes a separate sentinel is written
+/// so `scan_gc_pending_ids` skips it -- otherwise permanent markers would fill every round's
+/// scan quota and markers at the tail of the queue would starve.
 pub fn gc_done_path(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     let mut p = marker_path(db_root, id)?;
     let name = p.file_name().unwrap_or_default().to_os_string();
@@ -195,15 +195,15 @@ pub fn gc_done_path(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     Ok(p)
 }
 
-/// 写 GC 完成哨兵（幂等）。
+/// Write the GC-complete sentinel (idempotent).
 pub fn write_gc_done(db_root: &Path, id: &str) -> Result<PathBuf, PathError> {
     let p = gc_done_path(db_root, id)?;
     fs::write(&p, b"gc-done\n").map_err(PathError::Io)?;
     Ok(p)
 }
 
-/// 是否有 GC 完成哨兵（regular file；符号链接视为未 done——fail
-/// closed 让下轮重查）。
+/// Whether a GC-complete sentinel exists (regular file; a symlink counts as not done -- fail
+/// closed so the next round re-checks).
 pub fn is_gc_done(db_root: &Path, id: &str) -> bool {
     gc_done_path(db_root, id)
         .map(|p| {
@@ -214,8 +214,8 @@ pub fn is_gc_done(db_root: &Path, id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// GC 扫描候选：全部 `.dropped` 中排除已写 `.gc-done` 的 id。
-/// 稳定排序（read_dir 顺序不稳）保证每轮上限内的处理确定性。
+/// GC scan candidates: all `.dropped` ids minus those with a `.gc-done` already written.
+/// Stable sort (read_dir order is unstable) keeps processing within each round's cap deterministic.
 pub fn scan_gc_pending_ids(db_root: &Path) -> Vec<String> {
     let mut ids = scan_dropped_ids(db_root);
     ids.sort();
@@ -223,8 +223,8 @@ pub fn scan_gc_pending_ids(db_root: &Path) -> Vec<String> {
     ids
 }
 
-/// 启动清扫：`.trash` 里只会有"已 tombstone、remove 前崩溃"的残骸，
-/// 全部清除。best-effort：单个失败不阻塞启动。
+/// Startup sweep: `.trash` can only hold debris that was "tombstoned, crashed before remove",
+/// clear it all. Best-effort: a single failure does not block startup.
 pub fn sweep_trash(db_root: &Path) {
     let dir = db_root.join(".trash");
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -309,7 +309,7 @@ mod tests {
             .unwrap()
             .contains(&format!("/{}/db.sqlite", id())));
 
-        // 软链接 db 文件 → 拒
+        // symlinked db file -> rejected
         let shard = &hex::encode(sha2::Sha256::digest(id().as_bytes()))[..8];
         let link = root.join(shard).join(id()).join("db.sqlite");
         std::fs::write(&link, b"x").unwrap();
@@ -333,7 +333,7 @@ mod tests {
         let shard = &hex::encode(sha2::Sha256::digest(id().as_bytes()))[..8];
         std::fs::create_dir(root.join(shard)).unwrap();
         std::os::unix::fs::symlink(&outside, root.join(shard).join(id())).unwrap();
-        // leaf 是软链接 → ensure_secure_dir 或 canonical 前缀检查拒绝
+        // leaf is a symlink -> rejected by ensure_secure_dir or the canonical prefix check
         assert!(derive_db_file(&root, id()).is_err());
     }
 }

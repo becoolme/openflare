@@ -13,7 +13,7 @@
 //!   (`UnixStream::pair` + `dup2`), and its own process group.
 //! - [`control`]/[`ready`]: bounded control-fd line parser behind a
 //!   replaceable [`ControlEventParser`](control::ControlEventParser) trait
-//!   (the real workerd event format is marked 未证实 in the design doc)
+//!   (the real workerd event format is marked unverified in the design doc)
 //!   plus the readiness check: listen events for every expected worker
 //!   socket AND a successful connect probe per endpoint.
 //! - [`state`]/[`backoff`]/[`monitor`]: `TenantState` machine, bounded

@@ -1,11 +1,11 @@
-//! 2026-11-15 回归：真实 `S3Store`（本地 mock S3 wire）上的
-//! 快照 → 重启恢复。内存/fs 后端的 `get_to_file` 是另一套实现，
-//! 曾掩盖 s3 后端 `get_to_file` 双重哈希（sha256(sha256(x))）致
-//! "snapshot sha256 mismatch"、重启后所有库恢复失败的 bug。
+//! 2026-11-15 regression: snapshot -> restart restore on the real `S3Store` (local mock S3 wire).
+//! The `get_to_file` of the in-memory/fs backends is a different implementation,
+//! and it once masked a double-hash bug in the s3 backend's `get_to_file` (sha256(sha256(x))) that caused
+//! "snapshot sha256 mismatch" and every db failing to restore after a restart.
 //!
-//! 覆盖：并发写 + 周期 checkpoint 期间的快照/段发布 → 新节点
-//! （全新本地盘）恢复；损坏快照 fail closed 且有界退避（不重复
-//! 下载、不拖垮他库、修复对象后自愈）。
+//! Covers: snapshot/segment publication during concurrent writes + periodic checkpoints -> restore on a new node
+//! (brand-new local disk); a corrupt snapshot fails closed with bounded backoff (no repeated
+//! downloads, no dragging down other dbs, self-heals once the object is repaired).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,7 +27,7 @@ const DB_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbb";
 #[derive(Default)]
 struct Mock {
     objects: BTreeMap<String, (Vec<u8>, String)>,
-    /// key → GET 次数（断言"有界重试"不重复下载）。
+    /// key -> GET count (asserts "bounded retry" does not re-download).
     gets: BTreeMap<String, usize>,
 }
 
@@ -250,9 +250,9 @@ fn counter(reason: &str) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// 并发写入 + 每 5 次提交一次 checkpoint 期间发布快照/段，然后
-/// "pod 重建"（新节点、空本地盘、租约过期）经 S3 恢复：所有 ack
-/// 过的写入必须在，且不得 sha 不符。
+/// Publish snapshots/segments during concurrent writes + a checkpoint every 5 commits, then
+/// a "pod rebuild" (new node, empty local disk, lease expired) restores via S3: every acked
+/// write must be present, with no sha mismatch.
 #[test]
 fn s3_restart_restores_after_concurrent_writes_and_checkpoints() {
     let tmp = tempfile::tempdir().unwrap();
@@ -290,8 +290,8 @@ fn s3_restart_restores_after_concurrent_writes_and_checkpoints() {
     assert_eq!(count(&e2), want);
 }
 
-/// 无 checkpoint 时快照为 snap-0（首个段发布时由 live db.sqlite
-/// 上传）——重启恢复同样必须通过 sha 校验。
+/// Without a checkpoint the snapshot is snap-0 (uploaded from the live db.sqlite when the first segment is published)
+/// -- restart restore must likewise pass the sha check.
 #[test]
 fn s3_restart_restores_snap0_baseline_plus_segments() {
     let tmp = tempfile::tempdir().unwrap();
@@ -316,9 +316,9 @@ fn s3_restart_restores_snap0_baseline_plus_segments() {
     assert_eq!(count(&reg2.get(D1, DB_A).unwrap()), 5);
 }
 
-/// 损坏快照：restore 仍 fail closed（不跳过校验），但进入有界
-/// 退避——窗口内 N 次 get 只下载一次；他库不受影响；对象修复且
-/// 窗口过后自愈。
+/// Corrupt snapshot: restore still fails closed (the check is not skipped), but enters bounded
+/// backoff -- within the window N gets download only once; other dbs are unaffected; once the object is repaired and
+/// the window passes it self-heals.
 #[test]
 fn corrupt_snapshot_fails_closed_with_bounded_backoff_and_isolates_other_dbs() {
     let tmp = tempfile::tempdir().unwrap();
@@ -332,7 +332,7 @@ fn corrupt_snapshot_fails_closed_with_bounded_backoff_and_isolates_other_dbs() {
     }
     drop(reg);
 
-    // 腐化 A 的快照（长度不变，内容变）。
+    // Corrupt A's snapshot (length unchanged, content changed).
     let (snap_key, good) = {
         let m = mock.lock().unwrap();
         let k = m
@@ -375,10 +375,10 @@ fn corrupt_snapshot_fails_closed_with_bounded_backoff_and_isolates_other_dbs() {
         counter("restore") - before >= 1.0,
         "restore failure must be counted"
     );
-    // 他库照常服务。
+    // Other dbs serve as usual.
     assert_eq!(count(&reg2.get(D1, DB_B).expect("other db unaffected")), 1);
 
-    // 修复对象 + 退避窗口过后 → 自愈。
+    // Repair the object + backoff window passes -> self-heal.
     {
         let mut m = mock.lock().unwrap();
         let etag = sha256_hex(&good)[..32].to_string();

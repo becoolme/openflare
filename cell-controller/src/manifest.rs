@@ -1,8 +1,8 @@
 //! `ManifestApplier` — typed sink for `vrt-config` generated
-//! NetworkPolicy YAML (T6 output lands here — "由 T8 下发").
+//! NetworkPolicy YAML (T6 output lands here -- "delivered by T8").
 //!
 //! This task ships only the trait + in-memory implementation; the
-//! production `kubectl`/`client-go` apply path is 未证实 and deliberately
+//! production `kubectl`/`client-go` apply path is unverified and deliberately
 //! not wired (no cluster access from tests or the binary in this task).
 
 use std::sync::Mutex;

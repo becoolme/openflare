@@ -43,10 +43,10 @@ mod tests {
 
     #[test]
     fn escapes_non_ascii_as_hex_bytes() {
-        // '中' is UTF-8 E4 B8 AD → three \xNN escapes; no raw multibyte
+        // U+4E2D is UTF-8 E4 B8 AD → three \xNN escapes; no raw multibyte
         // output, so a homoglyph or stray continuation byte cannot smuggle
         // structure into the text format.
-        assert_eq!(capnp_text("中"), "\"\\xe4\\xb8\\xad\"");
+        assert_eq!(capnp_text("\u{4e2d}"), "\"\\xe4\\xb8\\xad\"");
         assert_eq!(capnp_text("\t\r"), "\"\\x09\\x0d\"");
         assert_eq!(capnp_text("\u{7f}"), "\"\\x7f\"");
     }

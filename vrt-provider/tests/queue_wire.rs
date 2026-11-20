@@ -1,6 +1,6 @@
-//! T37: provider queue 生产端 wire 校验对抗测试 —— §8 限额边界
-//! （miniflare broker 十进制口径：128_000B / 100 条 / 288_000B /
-//! 86_400s）、批次头校验、非法头/体全拒且不入队。
+//! T37: provider queue producer wire validation adversarial test -- section 8 limit boundaries
+//! (miniflare broker decimal convention: 128_000B / 100 messages / 288_000B /
+//! 86_400s), batch header validation, illegal headers/bodies all rejected and nothing enqueued.
 
 use axum::http::header::{HeaderMap, HeaderValue};
 use vrt_provider::queue::*;
@@ -20,7 +20,7 @@ fn message_size_boundary_128000() {
     let over = vec![0u8; QUEUE_MSG_MAX_BYTES + 1];
     let (status, _) = producer_message(&HeaderMap::new(), &over).unwrap_err();
     assert_eq!(status, 413);
-    // Content-Length 头先验同样 413（与实际 body 无关也要校验）。
+    // The Content-Length header is likewise checked first for 413 (validated regardless of the actual body).
     let h = headers(&[("content-length", "128001")]);
     let (status, _) = producer_message(&h, &ok).unwrap_err();
     assert_eq!(status, 413);
@@ -36,7 +36,7 @@ fn message_fmt_validation() {
     let h = headers(&[("x-msg-fmt", "yaml")]);
     let (status, _) = producer_message(&h, &body).unwrap_err();
     assert_eq!(status, 400);
-    // 缺省 = v8。
+    // default = v8.
     assert!(producer_message(&HeaderMap::new(), &body).is_ok());
 }
 
@@ -70,7 +70,7 @@ fn batch_count_boundary_100() {
     assert!(producer_batch(&HeaderMap::new(), mk(100).as_bytes()).is_ok());
     let (status, _) = producer_batch(&HeaderMap::new(), mk(101).as_bytes()).unwrap_err();
     assert_eq!(status, 413);
-    // 批次头先验：count >100 → 413（与实际 body 无关）。
+    // Batch header checked first: count >100 -> 413 (regardless of the actual body).
     let h = headers(&[("cf-queue-batch-count", "101")]);
     let (status, _) = producer_batch(&h, mk(1).as_bytes()).unwrap_err();
     assert_eq!(status, 413);
@@ -78,7 +78,7 @@ fn batch_count_boundary_100() {
 
 #[test]
 fn batch_bytes_boundary_288000() {
-    // 单消息最大 128000 → 3×96000 = 288000 恰界 / 288001 超界。
+    // Max single message 128000 -> 3x96000 = 288000 exactly at the bound / 288001 over.
     use base64::Engine;
     let enc = |n: usize| base64::engine::general_purpose::STANDARD.encode(vec![0u8; n]);
     let mk = |sizes: &[usize]| {
@@ -91,10 +91,10 @@ fn batch_bytes_boundary_288000() {
     let (status, _) =
         producer_batch(&HeaderMap::new(), mk(&[96000, 96000, 96001]).as_bytes()).unwrap_err();
     assert_eq!(status, 413);
-    // 单消息超界同样 413。
+    // A single message over the bound also gets 413.
     let (status, _) = producer_batch(&HeaderMap::new(), mk(&[128_001]).as_bytes()).unwrap_err();
     assert_eq!(status, 413);
-    // 批次头先验：batch-bytes / largest-msg 超界 → 413。
+    // Batch header checked first: batch-bytes / largest-msg over the bound -> 413.
     let h = headers(&[("cf-queue-batch-bytes", "288001")]);
     let (status, _) = producer_batch(&h, mk(&[1]).as_bytes()).unwrap_err();
     assert_eq!(status, 413);
@@ -105,7 +105,7 @@ fn batch_bytes_boundary_288000() {
 
 #[test]
 fn batch_body_malformed_rejected() {
-    // 非 JSON / 缺 messages / 坏 base64 / 坏 contentType / 超限 delay / 空或过长 id。
+    // non-JSON / missing messages / bad base64 / bad contentType / over-limit delay / empty or overlong id.
     let bad = [
         "not json",
         "{}",
@@ -121,7 +121,7 @@ fn batch_body_malformed_rejected() {
             "{b}"
         );
     }
-    // 头域 delay 与每条 delaySecs 同规则。
+    // The header delay follows the same rule as each message's delaySecs.
     let h = headers(&[("x-msg-delay-secs", "86401")]);
     let ok_body = r#"{"messages":[{"contentType":"text","body":"aGk="}]}"#;
     let (status, _) = producer_batch(&h, ok_body.as_bytes()).unwrap_err();
@@ -130,11 +130,11 @@ fn batch_body_malformed_rejected() {
 
 #[test]
 fn queue_id_shape_enforced_in_client() {
-    // 纵深防御：即使 BindingContext 被构造出非法 queueId，client 渲染
-    // 路径前再拒一次（伪造 id 永不进入 URL）。
-    // QueueClient::forward 由 BindingResource::Queue 驱动 —— 形态校验
-    // 在 vrt-sql ingress（26 字符）与 provider 二次校验双重生效；
-    // 此断言覆盖 client 构造失败即 fail closed 的方向。
+    // Defense in depth: even if a BindingContext is constructed with an illegal queueId, the client rejects once more
+    // before rendering the path (a forged id never enters the URL).
+    // QueueClient::forward is driven by BindingResource::Queue -- the shape check
+    // takes effect twice, in vrt-sql ingress (26 chars) and in the provider's second validation;
+    // this assertion covers the direction where client construction failure fails closed.
     use vrt_provider::queue::QueueClient;
     assert!(QueueClient::new(
         "http://127.0.0.1:9".into(),
@@ -150,12 +150,12 @@ fn queue_id_shape_enforced_in_client() {
     .is_err());
 }
 
-// ---------- T37r：客户端 id/timestamp 拒收 + 服务端生成 ----------
+// ---------- T37r: client id/timestamp rejected + server-side generation ----------
 
 #[test]
 fn client_supplied_id_and_timestamp_rejected() {
     let h = headers(&[]);
-    // 任何 id（含空串）→ 400：workerd 常规路径不发 id。
+    // Any id (including the empty string) -> 400: the regular workerd path does not send an id.
     for body in [
         r#"{"messages":[{"contentType":"text","body":"aGk=","id":"x"}]}"#,
         r#"{"messages":[{"contentType":"text","body":"aGk=","id":""}]}"#,
@@ -164,7 +164,7 @@ fn client_supplied_id_and_timestamp_rejected() {
         assert_eq!(err.0, 400, "{body}");
         assert!(err.1.contains("id"), "{:?}", err.1);
     }
-    // timestamp（远古或未来同拒——不可信字段不进调度/指标）。
+    // timestamp (ancient or future both rejected -- an untrusted field does not enter scheduling/metrics).
     for ts in ["1", "9999999999999"] {
         let body =
             format!(r#"{{"messages":[{{"contentType":"text","body":"aGk=","timestamp":{ts}}}]}}"#);
@@ -186,7 +186,7 @@ fn server_generates_message_ids() {
     assert_eq!(msgs.len(), 2);
     let a = msgs[0]["id"].as_str().unwrap();
     let b = msgs[1]["id"].as_str().unwrap();
-    // 服务端生成 32-hex，互不相同且每次调用都不同（重试幂等的前提）。
+    // Server-generated 32-hex, all distinct and different on every call (the prerequisite for retry idempotence).
     for id in [a, b] {
         assert_eq!(id.len(), 32);
         assert!(id.bytes().all(|c| c.is_ascii_hexdigit()), "{id}");
@@ -194,20 +194,20 @@ fn server_generates_message_ids() {
     assert_ne!(a, b);
     let v2 = vrt_provider::queue::producer_batch(&h, body.as_bytes()).unwrap();
     assert_ne!(v2["messages"][0]["id"].as_str().unwrap(), a);
-    // 不转发 timestampMs——客户端本就不许提供，生成路径也不写。
+    // timestampMs is not forwarded -- the client is not allowed to supply it, and the generation path does not write it either.
     assert!(v["messages"][0].get("timestampMs").is_none());
-    // 单条 /message 同样生成 id。
+    // A single /message likewise generates an id.
     let hs = headers(&[("x-msg-fmt", "text")]);
     let single = vrt_provider::queue::producer_message(&hs, b"hi").unwrap();
     assert_eq!(single["messages"][0]["id"].as_str().unwrap().len(), 32);
 }
 
-/// T37r2：workerd 把 `oldestMessageTimestamp` 按 `date` 解析——必须是
-/// epoch-ms **数字**，空队列 = 0（miniflare `getMetricsResponseObject`
-/// 实测 `.getTime() ?? 0`）。null/字符串会 TypeError 吊死租户 send。
+/// T37r2: workerd parses `oldestMessageTimestamp` as `date` -- it must be an
+/// epoch-ms **number**, empty queue = 0 (measured from miniflare `getMetricsResponseObject`
+/// `.getTime() ?? 0`). null/a string would TypeError and hang the tenant's send.
 #[test]
 fn metrics_oldest_timestamp_is_number_never_null() {
-    // 空队列 → 0，非空 → 原样 ms 数字。
+    // Empty queue -> 0, non-empty -> the ms number as-is.
     let empty = vrt_provider::queue::broker_metrics_json(
         &serde_json::from_value::<vrt_provider::queue::WireMetrics>(
             serde_json::json!({"backlogCount":0,"backlogBytes":0}),
@@ -226,7 +226,7 @@ fn metrics_oldest_timestamp_is_number_never_null() {
         full["oldestMessageTimestamp"],
         serde_json::json!(1_700_000_000_000i64)
     );
-    // 任何路径都不得产出 null/字符串。
+    // No path may produce null/a string.
     assert!(empty["oldestMessageTimestamp"].is_number());
     assert!(full["oldestMessageTimestamp"].is_number());
 }

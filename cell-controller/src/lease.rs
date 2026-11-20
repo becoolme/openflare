@@ -11,7 +11,7 @@
 //!   a stale claim can be detected with [`LeaseStore::held`].
 //!
 //! The production implementation targets the Kubernetes Lease API —
-//! 未证实 in this task (no cluster client is wired here); `MemoryLeaseStore`
+//! unverified in this task (no cluster client is wired here); `MemoryLeaseStore`
 //! implements the same contract for tests.
 
 use chrono::{DateTime, Duration, Utc};

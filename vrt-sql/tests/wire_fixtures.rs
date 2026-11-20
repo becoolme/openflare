@@ -1,13 +1,13 @@
-//! RV-R68：跨语言 wire 契约 fixture —— vrt-sql 真实输出。
+//! RV-R68: cross-language wire contract fixtures -- real vrt-sql output.
 //!
-//! 每个 fixture 都是 REAL 序列化/真实 handler 输出（不走手写 mock）：
-//! - 成功 EXECUTE → `handle_d1` 的裸数组 body；
-//! - SQL 错误 → `handle_d1` 的 `{success:false,error}`；
-//! - fenced → `error_body(EngineError::Fenced)`（真实错误面）；
-//! - unavailable → `begin_shutdown` 后 `handle_d1` 的 503 typed body。
+//! Every fixture is REAL serialization / real handler output (no hand-written mocks):
+//! - successful EXECUTE -> the bare-array body of `handle_d1`;
+//! - SQL error -> the `{success:false,error}` of `handle_d1`;
+//! - fenced -> `error_body(EngineError::Fenced)` (the real error surface);
+//! - unavailable -> the 503 typed body of `handle_d1` after `begin_shutdown`.
 //!
-//! `UPDATE_FIXTURES=1` 重写 `server/src/test/fixtures/vrt-wire/`；
-//! 否则逐文件与已提交 fixture 比对（值级相等，容忍格式化差异）。
+//! `UPDATE_FIXTURES=1` rewrites `server/src/test/fixtures/vrt-wire/`;
+//! otherwise compare file by file against the committed fixtures (value-level equality, tolerating formatting differences).
 
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -22,8 +22,8 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../fixtures/vrt-wire")
 }
 
-/// 非确定性字段归一：引擎 `meta.duration` 是真实耗时，每次运行
-/// 不同——递归归零后比对，形状/键/其余值仍逐字段锁定。
+/// Normalize non-deterministic fields: the engine's `meta.duration` is real elapsed time and differs on every run
+/// -- compare after recursively zeroing it; shape/keys/other values are still locked field by field.
 fn deterministic(mut v: Value) -> Value {
     match &mut v {
         Value::Object(m) => {
@@ -41,7 +41,7 @@ fn deterministic(mut v: Value) -> Value {
     }
 }
 
-/// UPDATE 模式写文件；否则读已提交文件做值级比对，漂移即失败。
+/// UPDATE mode writes the files; otherwise read the committed files for value-level comparison, and any drift fails.
 fn check(name: &str, actual: Value) {
     let actual = deterministic(actual);
     let path = fixture_dir().join(name);
@@ -75,14 +75,14 @@ async fn d1_wire_fixtures() {
     let tmp = tempfile::tempdir().unwrap();
     let st = AppState::new(tmp.path().join("dbs"), KEY);
 
-    // 单语句成功：裸 Vec<QueryResult> 数组（这正是控制面 strict
-    // schema 拒绝、cell 必须规范化成 {results:[...]} 的形状）。
+    // Single-statement success: a bare Vec<QueryResult> array (exactly the shape the control-plane strict
+    // schema rejects and cell must normalize into {results:[...]}).
     let r = call(&st, &json!({"sql": "CREATE TABLE t(a)"})).await;
     assert_eq!(r.status, 200);
     assert!(r.body.is_array());
     check("d1-wire-execute.json", r.body);
 
-    // 多语句 batch：同样裸数组，逐语句 {success,results,meta}。
+    // Multi-statement batch: likewise a bare array, per statement {success,results,meta}.
     let r = call(
         &st,
         &json!([
@@ -95,23 +95,23 @@ async fn d1_wire_fixtures() {
     assert_eq!(r.body.as_array().unwrap().len(), 2);
     check("d1-wire-execute-batch.json", r.body);
 
-    // SQL 错误：HTTP 200 + {success:false,error}（无 code —— 语句级
-    // 错误是语句结果的一部分，不是引擎故障）。
+    // SQL error: HTTP 200 + {success:false,error} (no code -- a statement-level
+    // error is part of the statement result, not an engine fault).
     let r = call(&st, &json!({"sql": "SELEC bad"})).await;
     assert_eq!(r.status, 200);
     assert_eq!(r.body["success"], false);
     check("d1-wire-sql-error.json", r.body);
 
-    // Fenced：HTTP 200 + {success:false,error,code:"VRT_FENCED",
-    // retryable:true}（error_body 是真实线上序列化器）。
+    // Fenced: HTTP 200 + {success:false,error,code:"VRT_FENCED",
+    // retryable:true} (error_body is the real on-the-wire serializer).
     let e = EngineError::Fenced(7);
     check(
         "d1-wire-fenced.json",
         json!({ "status": wire::error_status(&e).as_u16(), "body": wire::error_body(&e) }),
     );
 
-    // Unavailable：begin_shutdown 后 handle_d1 → 503 + typed body
-    // （真实 handler 端到端）。
+    // Unavailable: after begin_shutdown handle_d1 -> 503 + typed body
+    // (real handler, end to end).
     st.registry.begin_shutdown();
     let r = call(&st, &json!({"sql": "SELECT 1"})).await;
     assert_eq!(r.status, 503);

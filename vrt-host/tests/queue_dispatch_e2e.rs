@@ -1,15 +1,15 @@
-//! T37b-r5: production-path queue dispatch — 真 `QueueDispatcher`
-//! (cell-controller) + 真 `HttpQueueInvoker` + 真 vrt-host
-//! `/v1/queue/dispatch` 路由（生产 router/handler/响应编码）。
-//! workerd 由 dev-stub TCP 端点替代——协议面 (hyper HTTP/1.1 POST
-//! `/vrt/queue-dispatch`) 与 facade 一致；vrt-sql 由进程内最小
-//! wire fake 替代（claim/ack/release 语义与真 wire 相同——本测试
-//! 关注 dispatcher↔vrt-host 这一跳，vrt-sql 真链已由
-//! `real_vrt_sql_restart_mid_dispatch_recovers` 覆盖）。
+//! T37b-r5: production-path queue dispatch -- the real `QueueDispatcher`
+//! (cell-controller) + the real `HttpQueueInvoker` + the real vrt-host
+//! `/v1/queue/dispatch` route (production router/handler/response encoding).
+//! workerd is replaced by a dev-stub TCP endpoint -- the protocol surface (hyper HTTP/1.1 POST
+//! `/vrt/queue-dispatch`) matches the facade; vrt-sql is replaced by a minimal in-process
+//! wire fake (claim/ack/release semantics are the same as the real wire -- this test
+//! focuses on the dispatcher<->vrt-host hop; the real vrt-sql chain is already covered by
+//! `real_vrt_sql_restart_mid_dispatch_recovers`).
 //!
-//! 同时是双向契约测试：facade 返回的 QueueOutcome JSON（真实编码
-//! 字节经 vrt-host 原样透传）必须能被生产 dispatcher 解析并按
-//! `ackAll` 结算——两侧 drift 会在本测试炸开。
+//! It is also a two-way contract test: the QueueOutcome JSON returned by the facade (the real encoded
+//! bytes pass through vrt-host verbatim) must be parseable by the production dispatcher and settle as
+//! `ackAll` -- drift on either side blows up in this test.
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,9 +28,9 @@ use snapshot_protocol::compute_desired::ComputeDesired;
 use vrt_host::endpoint::WorkerEndpoint;
 use vrt_host::supervisor::{TenantRegistry, TenantRuntime};
 
-// ---------------- 最小 vrt-sql wire fake ----------------
-// 与生产 wire 同形：claim 发 {leaseId,dispatchEpoch,messages[]}，
-// 消息租约/attempts+1/可见性语义一致，只裁掉与本测试无关的校验。
+// ---------------- minimal vrt-sql wire fake ----------------
+// Same shape as the production wire: claim sends {leaseId,dispatchEpoch,messages[]},
+// message lease/attempts+1/visibility semantics are consistent; only validation unrelated to this test is cut.
 
 #[derive(Default, Clone)]
 struct FakeMsg {
@@ -152,7 +152,7 @@ async fn fake_op(
     }
 }
 
-// ---------------- 生产路径测试 ----------------
+// ---------------- production path tests ----------------
 
 const QID: &str = "qqqqqqqqqqqqqqqqqqqqqqqqqq";
 
@@ -209,15 +209,15 @@ async fn serve_on(app: axum::Router) -> String {
     addr
 }
 
-/// dispatcher → vrt-host(生产路由) → stub facade → QueueOutcome →
-/// dispatcher 解析 → ack 结算。断言整条 wire 在生产代码下互通。
+/// dispatcher -> vrt-host (production route) -> stub facade -> QueueOutcome ->
+/// dispatcher parse -> ack settlement. Asserts the whole wire interoperates under production code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dispatch_through_real_vrt_host_acks() {
-    // 1. stub facade：dev-stub TCP 端点 + **裸 TCP 字节断言**。
-    //    axum/hyper server 会宽容接受 absolute-form 与缺 Host——
-    //    正是 r6 的线上缺陷（workerd socket 服务严格拒绝）——所以
-    //    stub 必须按 workerd 的严格面断言请求行/Host，不能再用
-    //    高层框架吞掉 wire 形状。
+    // 1. stub facade: dev-stub TCP endpoint + **raw TCP byte assertions**.
+    //    An axum/hyper server leniently accepts absolute-form and a missing Host --
+    //    exactly the r6 production defect (the workerd socket service strictly rejects it) -- so
+    //    the stub must assert the request line/Host against workerd's strict surface, and must no longer use
+    //    a high-level framework that swallows the wire shape.
     let facade_calls = Arc::new(AtomicU64::new(0));
     let fc = facade_calls.clone();
     let facade_l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -233,8 +233,8 @@ async fn dispatch_through_real_vrt_host_acks() {
                 let req = String::from_utf8_lossy(&buf[..n]);
                 fc.fetch_add(1, Ordering::Relaxed);
                 let line = req.lines().next().unwrap_or("");
-                // workerd 接受 origin-form；absolute-form 或无 Host
-                // → 裸文本 "Bad Request"（e2e 实际观察）。
+                // workerd accepts origin-form; absolute-form or no Host
+                // -> bare-text "Bad Request" (actually observed in e2e).
                 assert!(
                     line.starts_with("POST /vrt/queue-dispatch "),
                     "request line must be origin-form: {line:?}"
@@ -257,7 +257,7 @@ host:"
         }
     });
 
-    // 2. 真 vrt-host 路由：tenant ready + qconsumer slot → stub。
+    // 2. real vrt-host route: tenant ready + qconsumer slot -> stub.
     let rt = TenantRuntime::new("t1");
     let mut eps = BTreeMap::new();
     eps.insert("w1".to_string(), WorkerEndpoint::Tcp(facade_addr));
@@ -266,7 +266,7 @@ host:"
     registry.insert("t1".to_string(), rt);
     let host_addr = serve_on(vrt_host::queue_dispatch::router(registry)).await;
 
-    // 3. 最小 vrt-sql fake + 一条消息。
+    // 3. minimal vrt-sql fake + one message.
     let world: Shared = Arc::new(StdMutex::new(BTreeMap::new()));
     {
         let mut w = world.lock().unwrap();
@@ -287,7 +287,7 @@ host:"
     )
     .await;
 
-    // 4. 生产 dispatcher + HttpQueueInvoker（pods.local=host_addr）。
+    // 4. production dispatcher + HttpQueueInvoker (pods.local=host_addr).
     let sql = Arc::new(
         QueueSqlClient::new(&sql_addr, b"test-secret".to_vec(), Duration::from_secs(5)).unwrap(),
     );
@@ -312,7 +312,7 @@ host:"
     let exp = chrono::Utc::now() + chrono::Duration::minutes(5);
 
     // tick1 claim → batch_timeout(1s) → tick2 dispatch → facade
-    // QueueOutcome → ack 结算：消息出队。
+    // QueueOutcome -> ack settlement: the message is dequeued.
     let o1 = d
         .tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
         .await;
@@ -334,20 +334,20 @@ host:"
     panic!("message must be acked through the real vrt-host dispatch path");
 }
 
-/// 契约回归：vrt-host typed 拒绝（NO_CONSUMER）→ dispatcher 解析为
-/// 平台侧错误（不消耗 attempts——`release` 语义）而非 malformed。
-/// facade 端点缺失时 vrt-host 返回
-/// `{delivered:false,error:{code:VRT_QDISP_NO_CONSUMER}}`。
+/// Contract regression: a vrt-host typed rejection (NO_CONSUMER) -> the dispatcher parses it as a
+/// platform-side error (attempts not consumed -- `release` semantics) rather than malformed.
+/// When the facade endpoint is missing vrt-host returns
+/// `{delivered:false,error:{code:VRT_QDISP_NO_CONSUMER}}`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_consumer_typed_error_is_platform_not_malformed() {
-    // tenant ready 但无 qconsumer slot → vrt-host 404 NO_CONSUMER。
+    // tenant ready but no qconsumer slot -> vrt-host 404 NO_CONSUMER.
     let rt = TenantRuntime::new("t1");
     rt.test_set_state(vrt_host::state::TenantState::Ready);
     let registry = TenantRegistry::new();
     registry.insert("t1".to_string(), rt);
     let host_addr = serve_on(vrt_host::queue_dispatch::router(registry)).await;
 
-    // wire fake + release 支持（attempts 补偿断言）。
+    // wire fake + release support (attempts compensation assertion).
     let ops = Arc::new(StdMutex::new(Vec::<String>::new()));
     let ops2 = ops.clone();
     let world: Shared = Arc::new(StdMutex::new(BTreeMap::new()));
@@ -372,7 +372,7 @@ async fn no_consumer_typed_error_is_platform_not_malformed() {
                 async move {
                     ops.lock().unwrap().push(op.clone());
                     if op == "release" {
-                        // release 语义镜像：清 lease + attempts-1。
+                        // release semantics mirrored: clear lease + attempts-1.
                         let mut w = world.lock().unwrap();
                         let q = w.entry(qid).or_default();
                         let lease = body["leaseId"].as_str().unwrap_or("");
@@ -424,7 +424,7 @@ async fn no_consumer_typed_error_is_platform_not_malformed() {
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     d.tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
         .await;
-    // 等 release 落地：attempts 补偿回 0、消息留在队列。
+    // Wait for release to land: attempts compensated back to 0, message stays in the queue.
     for _ in 0..200 {
         if world
             .lock()

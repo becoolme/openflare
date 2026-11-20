@@ -677,7 +677,7 @@ fn t21_assets_rejects_traversal_outside_dir() {
     assert!(local.deploy(&dir, &DeployOverrides::default()).is_err());
 }
 
-/// T34c/F2: databaseId 派生含 tenant；user_id 非法 fail closed。
+/// T34c/F2: databaseId derivation includes tenant; an invalid user_id fails closed.
 #[test]
 fn pack_d1_derivation_is_tenant_scoped_and_validated() {
     use sha2::Digest;
@@ -715,7 +715,7 @@ fn pack_d1_derivation_is_tenant_scoped_and_validated() {
         })
         .expect("d1 binding");
     assert_eq!(d1.database_id, expected("local", "demo-db"));
-    // 同一声明、不同 tenant ⇒ 不同 databaseId（T35 免迁移）。
+    // Same declaration, different tenant => different databaseId (T35 no migration needed).
     let pkg2 = vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "other", &|_| None)
         .unwrap();
     let d1b = pkg2
@@ -728,7 +728,7 @@ fn pack_d1_derivation_is_tenant_scoped_and_validated() {
         .unwrap();
     assert_eq!(d1b.database_id, expected("other", "demo-db"));
     assert_ne!(d1b.database_id, d1.database_id);
-    // 非法 user_id ⇒ fail closed。
+    // Invalid user_id => fail closed.
     for bad in ["BAD$ID", "", "with space", "x".repeat(65).as_str()] {
         let dir = mk(&root, "bad");
         std::fs::write(

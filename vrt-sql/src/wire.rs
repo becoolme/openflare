@@ -1,6 +1,6 @@
-//! D1 wire 层（§2 协议规格）：`POST /dbs/{id}/query` 与 `POST /dbs/{id}/execute`
-//! 同一 handler。两个错误面：SQL 失败 = HTTP 200 + `{success:false,error}`；
-//! 畸形请求（schema 不合）= HTTP 400 + 非 `{success:false}` 形态。
+//! D1 wire layer (section 2 protocol spec): `POST /dbs/{id}/query` and `POST /dbs/{id}/execute`
+//! share one handler. Two error surfaces: SQL failure = HTTP 200 + `{success:false,error}`;
+//! malformed request (schema mismatch) = HTTP 400 + a non-`{success:false}` shape.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,10 +18,10 @@ use crate::bookmark::BookmarkSigner;
 use crate::engine::{EngineError, EngineRegistry, ResultsFormat, RusqliteEngine, SqlStmt, TxnCtx};
 
 pub const BOOKMARK_HEADER: &str = "x-cf-d1-session-commit-token";
-/// provider→vrt-sql 内部扩展头（§3 R4 的 (epoch, seq) 去重键）。
-/// **信任边界（S4）**：handler 不直接读原始头——由调用方在内部认证
-/// 通过后构造 `TrustedCallCtx`。用户 Worker 无法控制这两个值
-/// （facade/provider 会覆写）。T34 接入真实 provider 认证。
+/// provider->vrt-sql internal extension headers (the (epoch, seq) dedup key of section 3 R4).
+/// **Trust boundary (S4)**: the handler does not read raw headers directly -- the caller constructs
+/// `TrustedCallCtx` after internal authentication passes. User Workers cannot control these two values
+/// (facade/provider overwrite them). T34 wires in the real provider authentication.
 pub const EPOCH_HEADER: &str = "x-vrt-epoch";
 pub const SEQ_HEADER: &str = "x-vrt-seq";
 /// RV-R71: remaining request budget (ms) forwarded by vrt-provider.
@@ -40,20 +40,20 @@ pub fn clamp_budget(own: Duration, header: Option<&str>) -> Duration {
 
 const DEFAULT_TXN_BUDGET_MS: u64 = 30_000;
 
-/// 可信调用上下文（S4）：只能由已通过内部认证的调用方构造。
-/// T34：vrt-provider 侧服务间认证（mTLS/HMAC）通过后填充；
-/// 用户 Worker 流量永远到不了这一步。
+/// Trusted call context (S4): can only be constructed by a caller that has passed internal authentication.
+/// T34: populated after the vrt-provider side service-to-service auth (mTLS/HMAC) passes;
+/// user Worker traffic never reaches this step.
 pub struct TrustedCallCtx {
-    /// 当前写者 epoch（租约位点）。
+    /// Current writer epoch (lease position).
     pub epoch: u64,
-    /// 调用方提供的去重序列号；None = 不去重。
+    /// Caller-supplied dedup sequence number; None = no dedup.
     pub seq: Option<u64>,
-    /// 本批 deadline。
+    /// Deadline for this batch.
     pub deadline: Instant,
 }
 
 impl TrustedCallCtx {
-    /// 测试/内部直通构造（无去重）。
+    /// Test/internal pass-through constructor (no dedup).
     pub fn test(deadline: Instant) -> Self {
         Self {
             epoch: 0,
@@ -67,9 +67,9 @@ pub struct WireResponse {
     pub status: StatusCode,
     pub bookmark: Option<String>,
     pub body: serde_json::Value,
-    /// 本批累计读取行数（§10 近似口径；指标用）。
+    /// Rows read cumulatively in this batch (section 10 approximation; used for metrics).
     pub rows_read: u64,
-    /// 本批累计写入行数。
+    /// Rows written cumulatively in this batch.
     pub rows_written: u64,
 }
 
@@ -78,15 +78,15 @@ pub struct AppState {
     pub registry: Arc<EngineRegistry>,
     pub signer: BookmarkSigner,
     pub txn_budget: Duration,
-    /// T34：provider→vrt-sql 服务间认证。`None` 仅限单测直通。
+    /// T34: provider->vrt-sql service-to-service auth. `None` is for unit-test pass-through only.
     pub auth: Option<crate::service::ServiceAuth>,
-    /// 有界并发（try_acquire，超限拒绝）。
+    /// Bounded concurrency (try_acquire, reject when exceeded).
     pub permits: Arc<tokio::sync::Semaphore>,
-    /// 请求体上限——读 body 前校验 Content-Length。
+    /// Request body cap -- Content-Length is validated before reading the body.
     pub body_max: usize,
-    /// 有界 databaseId → label。
+    /// Bounded databaseId -> label.
     pub db_labels: Arc<crate::service::DbLabels>,
-    /// 排空计数（优雅退出）。
+    /// Drain counter (graceful shutdown).
     pub inflight: Arc<tokio::sync::Semaphore>,
 }
 
@@ -104,7 +104,7 @@ impl AppState {
         }
     }
 
-    /// 挂服务间认证（生产路径必设）。
+    /// Attach service-to-service auth (must be set on the production path).
     pub fn with_auth(mut self, auth: crate::service::ServiceAuth) -> Self {
         self.auth = Some(auth);
         self
@@ -120,9 +120,9 @@ impl AppState {
         self
     }
 
-    /// 优雅退出：等待所有在途许可归还。
+    /// Graceful shutdown: wait for all in-flight permits to be returned.
     pub async fn drain(&self) {
-        // inflight 满额信号量：等待能一次性拿满 ⇒ 在途为零。
+        // Full-quota inflight semaphore: if all permits can be acquired at once => nothing is in flight.
         let _ = self
             .inflight
             .clone()
@@ -133,9 +133,9 @@ impl AppState {
 
 use tokio::sync::Semaphore;
 
-/// 由原始头构造 TrustedCallCtx。**仅在服务间认证通过后调用**
-/// （T34 已落地：query_handler 先验签再进这里）——epoch/seq 头
-/// 值已被签名覆盖，篡改在验签阶段即被拒。
+/// Build a TrustedCallCtx from raw headers. **Call only after service-to-service auth passes**
+/// (T34 landed: query_handler verifies the signature before getting here) -- the epoch/seq header
+/// values are already covered by the signature, so tampering is rejected at the verification stage.
 fn trusted_ctx_from_headers(headers: &HeaderMap, deadline: Instant) -> Result<TrustedCallCtx, ()> {
     let epoch = headers.get(EPOCH_HEADER);
     let seq = headers.get(SEQ_HEADER);
@@ -163,10 +163,10 @@ fn trusted_ctx_from_headers(headers: &HeaderMap, deadline: Instant) -> Result<Tr
     })
 }
 
-/// T36：错误面扩展——`code`/`retryable` 附加字段（向后兼容，
-/// D1 `{success,error}` 形态不变）。Fenced/Unavailable 供 provider
-/// 映射为 D1 retryable。`pub`：跨语言 wire fixture 直接取真实输出
-/// (RV-R68)。
+/// T36: error surface extension -- additional `code`/`retryable` fields (backward compatible,
+/// the D1 `{success,error}` shape is unchanged). Fenced/Unavailable let the provider
+/// map to D1 retryable. `pub`: the cross-language wire fixtures take real output directly
+/// (RV-R68).
 pub fn error_body(e: &EngineError) -> serde_json::Value {
     match e {
         EngineError::Fenced(_) => json!({
@@ -200,8 +200,8 @@ pub fn error_body(e: &EngineError) -> serde_json::Value {
     }
 }
 
-/// 暂态不可用 → 503（其余错误面照旧 HTTP 200）。
-/// `pub`：wire fixture 同时记录状态码与 body (RV-R68)。
+/// Transient unavailability -> 503 (other error surfaces remain HTTP 200 as before).
+/// `pub`: the wire fixtures record both the status code and the body (RV-R68).
 pub fn error_status(e: &EngineError) -> StatusCode {
     match e {
         EngineError::Unavailable(_)
@@ -211,8 +211,8 @@ pub fn error_status(e: &EngineError) -> StatusCode {
     }
 }
 
-/// 纯函数 handler：`/query` 与 `/execute` 语义完全一致（§2）。
-/// `results_format` 由调用方解析 URL 参数传入（非法值回落 ARRAY_OF_OBJECTS）。
+/// Pure-function handler: `/query` and `/execute` have identical semantics (section 2).
+/// `results_format` is parsed from the URL parameter by the caller (invalid values fall back to ARRAY_OF_OBJECTS).
 pub async fn handle_d1(
     state: &AppState,
     database_id: &str,
@@ -220,7 +220,7 @@ pub async fn handle_d1(
     call: TrustedCallCtx,
     body: &[u8],
 ) -> WireResponse {
-    // 畸形请求面（非 {success:false}）：JSON 解析失败或 schema 不合
+    // Malformed-request surface (not {success:false}): JSON parse failure or schema mismatch
     let parsed: Result<Vec<SqlStmt>, ()> = (|| {
         let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
         let one_or_many = match v {
@@ -270,12 +270,12 @@ pub async fn handle_d1(
                     .map_err(|e| (e, false))?;
                 match run_query(&engine, &stmts, &ctx, format) {
                     Ok(results) => {
-                        // T36：degraded（lease 有效但续租失败）→ 读仍放行但计数。
+                        // T36: degraded (lease valid but renewal failed) -> reads still allowed but counted.
                         if engine.is_degraded() {
                             crate::metrics::degraded_read();
                         }
-                        // T36：bookmark epoch = 写者 lease epoch（有持久化时），
-                        // 与 manifest epoch 对齐；无持久化保持调用方 epoch。
+                        // T36: bookmark epoch = the writer lease epoch (when persistence is on),
+                        // aligned with the manifest epoch; without persistence the caller's epoch is kept.
                         let book_epoch = if engine.persistence_enabled() {
                             engine.lease_epoch()
                         } else {
@@ -285,7 +285,7 @@ pub async fn handle_d1(
                         Ok((results, bookmark))
                     }
                     Err(e) => {
-                        // T36：fenced → 摘除引擎，下次 get 走 claim/restore 自愈。
+                        // T36: fenced -> detach the engine; the next get self-heals via claim/restore.
                         if let EngineError::Fenced(ep) = e {
                             registry.evict_fenced(crate::paths::ResourceKind::D1, &database_id, ep);
                         }
@@ -347,8 +347,8 @@ pub async fn handle_d1(
                 body: json!(results),
             }
         }
-        // 路径/锁/打开失败 → {success:false} 错误面（与 SQL 失败同形）；
-        // T36: Unavailable → 503（held-elsewhere/restore 失败可重试）。
+        // Path/lock/open failure -> {success:false} error surface (same shape as SQL failure);
+        // T36: Unavailable -> 503 (held-elsewhere/restore failure is retryable).
         Err((e, _ran)) => WireResponse {
             status: error_status(&e),
             bookmark: None,
@@ -372,7 +372,7 @@ fn run_query(
     engine.query_batch_sync(stmts, ctx, format)
 }
 
-// ---------- axum 装配 ----------
+// ---------- axum wiring ----------
 
 #[derive(serde::Deserialize)]
 struct FormatParam {
@@ -388,10 +388,10 @@ fn endpoint_label(path: &str) -> &'static str {
     }
 }
 
-/// T34 装配顺序：并发许可 → Content-Length 先验 → body 收集
-/// （DefaultBodyLimit 兜底）→ 服务间验签 → 之后才解析
-/// `x-vrt-epoch`/`x-vrt-seq` 构造 TrustedCallCtx。认证失败一律
-/// 401 + `outcome="unauthorized"`，绝不读 x-vrt-*。
+/// T34 wiring order: concurrency permit -> Content-Length precheck -> body collection
+/// (DefaultBodyLimit as backstop) -> service-to-service signature verification -> only then parse
+/// `x-vrt-epoch`/`x-vrt-seq` to build TrustedCallCtx. Authentication failures are always
+/// 401 + `outcome="unauthorized"`, and x-vrt-* is never read.
 async fn query_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     let started = Instant::now();
     let endpoint = endpoint_label(request.uri().path());
@@ -403,7 +403,7 @@ async fn query_handler(State(state): State<AppState>, request: axum::extract::Re
             .body(Body::from(body.to_string()))
             .unwrap()
     };
-    // 有界并发（try_acquire，绝不排队）。
+    // Bounded concurrency (try_acquire, never queue).
     let _permit = match state.permits.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -424,7 +424,7 @@ async fn query_handler(State(state): State<AppState>, request: axum::extract::Re
             )
         }
     };
-    // Content-Length 先验：超限直接拒，不读 body（防未认证大包）。
+    // Content-Length precheck: reject oversize outright without reading the body (guards against unauthenticated large bodies).
     if let Some(cl) = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -474,7 +474,7 @@ async fn query_handler(State(state): State<AppState>, request: axum::extract::Re
             )
         }
     };
-    // 服务间认证：验签覆盖 method/path+query/body/epoch/seq。
+    // Service-to-service auth: the signature covers method/path+query/body/epoch/seq.
     if let Some(auth) = &state.auth {
         if !auth.verify(&headers, &method, &path_query, &body) {
             return fail(
@@ -484,7 +484,7 @@ async fn query_handler(State(state): State<AppState>, request: axum::extract::Re
             );
         }
     }
-    // 认证通过后才允许采信 x-vrt-*。
+    // x-vrt-* may be trusted only after authentication passes.
     let budget = clamp_budget(
         state.txn_budget,
         headers
@@ -503,7 +503,7 @@ async fn query_handler(State(state): State<AppState>, request: axum::extract::Re
         }
     };
     let r = handle_d1(&state, &db_id, results_format.as_deref(), call, &body).await;
-    // 指标：endpoint×outcome + rows（有界 db label）。
+    // Metrics: endpoint x outcome + rows (bounded db label).
     let outcome = if r.status != StatusCode::OK {
         if r.body.get("code") == Some(&serde_json::Value::String("VRT_UNAVAILABLE".into())) {
             "unavailable"
@@ -535,9 +535,9 @@ async fn query_handler(State(state): State<AppState>, request: axum::extract::Re
         .unwrap()
 }
 
-/// T36：只读诊断 `GET /internal/dbs`——fenced/degraded 库与最后
-/// 已上传 lsn。与查询同一 ServiceAuth 验签（GET + 空 body，
-/// epoch=0 seq=none 由签名串覆盖）。未配置 auth 时（单测）放行。
+/// T36: read-only diagnostic `GET /internal/dbs` -- fenced/degraded databases and the last
+/// uploaded lsn. Verified with the same ServiceAuth as queries (GET + empty body,
+/// epoch=0 seq=none are covered by the signing string). Allowed through when auth is not configured (unit tests).
 async fn diag_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     let method = request.method().clone();
     let path_query = request
@@ -572,29 +572,29 @@ async fn healthz() -> Response {
         .unwrap()
 }
 
-/// T35b：受限数据面删除 —— `POST /dbs/{id}/drop`。
-/// 与 query_handler 同一条信任链：并发许可 → Content-Length →
-/// 服务间验签（覆盖 method/path/body/epoch/seq）→ 白名单 id 派生
-/// 目录 → registry 摘引擎 + 删目录。幂等：不存在返回 dropped:false。
-/// 路径只由验签后且白名单校验过的 databaseId 组成，绝不读 body 里的
-/// 路径/目标字段。
+/// T35b: restricted data-plane delete -- `POST /dbs/{id}/drop`.
+/// Same trust chain as query_handler: concurrency permit -> Content-Length ->
+/// service-to-service signature (covers method/path/body/epoch/seq) -> allowlisted id derives the
+/// directory -> registry detaches the engine + deletes the directory. Idempotent: returns dropped:false if absent.
+/// The path is composed only of the signature-verified, allowlist-checked databaseId; path/target
+/// fields in the body are never read.
 ///
-/// T35c：整个 registry.drop_db（内含在途 Arc 排空等待与目录删除）
-/// 移到 spawn_blocking——同步阻塞不再卡住 tokio worker 线程、不影响
-/// 同 worker 上其它 db 的查询；外加 DROP_TOTAL_TIMEOUT 有界超时，
-/// 超时回 503 可重试（控制面 DROP op 会重派，幂等续跑）。阻塞任务
-/// 本身不可取消，但 tombstone 已提交，重试立刻走幂等路径返回。
+/// T35c: the whole registry.drop_db (including the in-flight Arc drain wait and directory deletion)
+/// is moved onto spawn_blocking -- synchronous blocking no longer stalls tokio worker threads or affects
+/// queries of other dbs on the same worker; plus a bounded DROP_TOTAL_TIMEOUT,
+/// on timeout it returns a retryable 503 (the control-plane DROP op is re-dispatched and resumes idempotently). The blocking task
+/// itself is not cancellable, but the tombstone is already committed, so a retry immediately takes the idempotent path and returns.
 const DROP_TOTAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 async fn drop_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
     drop_impl(state, request, crate::paths::ResourceKind::D1, "/dbs/").await
 }
 
-/// T37r：queue 删除走独立命名空间端点。`/dbs/{id}/drop` 只触 D1
-/// kind、`/queues/{id}/drop` 只触 Queue kind——命名空间分离后跨
-/// kind drop 会 tombstone 错误命名空间并泄漏另一边的库与对象
-/// （甚至误删同 id 的真 D1 库）。控制面 queue DROP op 的 payload
-/// 携带 {"kind":"queue"}，cell-controller 据其路由到本端点。
+/// T37r: queue deletion uses a separate namespace endpoint. `/dbs/{id}/drop` only touches the D1
+/// kind and `/queues/{id}/drop` only the Queue kind -- after namespace separation a cross-
+/// kind drop would tombstone the wrong namespace and leak the other side's db and objects
+/// (or even delete a real D1 db with the same id). The control-plane queue DROP op's payload
+/// carries {"kind":"queue"}, and cell-controller routes to this endpoint accordingly.
 async fn queue_drop_handler(
     State(state): State<AppState>,
     request: axum::extract::Request,
@@ -724,8 +724,8 @@ pub fn app(state: AppState) -> Router {
         .route("/queues/{id}/claim", post(queue_handler))
         .route("/queues/{id}/ack", post(queue_handler))
         .route("/queues/{id}/retry", post(queue_handler))
-        // T37b-r6：release 的 handler/op matcher 早已就位（r5），
-        // 唯独 route 漏挂 → axum 404 → client Transport ——补上。
+        // T37b-r6: the release handler/op matcher was already in place (r5),
+        // only the route was never mounted -> axum 404 -> client Transport -- fixed here.
         .route("/queues/{id}/release", post(queue_handler))
         .route("/queues/{id}/dead-letter", post(queue_handler))
         .route(
@@ -738,18 +738,18 @@ pub fn app(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// ---------- T37：Queues 内部 wire（§8）。与 D1 端点同一
-/// ServiceAuth 模型；queueId 入口按 §7 databaseId 规则校验。
-/// `/dbs/{id}/drop` 仅删 D1 命名空间；queue 删除走 `/queues/{id}/drop`
-///（T37r——cell-controller 依 op payload.kind 选择路径）。
+/// ---------- T37: Queues internal wire (section 8). Same ServiceAuth model as the
+/// D1 endpoints; queueId is validated at the entry per the section 7 databaseId rule.
+/// `/dbs/{id}/drop` only deletes the D1 namespace; queue deletion goes through `/queues/{id}/drop`
+/// (T37r -- cell-controller picks the path by op payload.kind).
 
-/// 队列请求体上限（T37r 精确化，只作用于 /queues/* 路由——D1
-/// 端点上限不受放大影响）：恰好覆盖"最大合法批次 + JSON 开销"。
+/// Queue request body cap (T37r refinement, applies only to /queues/* routes -- the D1
+/// endpoint cap is unaffected by the enlargement): exactly covers "the largest legal batch + JSON overhead".
 ///   hex(BATCH_MAX_BYTES=288_000)            = 576_000
-///   每消息 JSON 骨架 ≤256B×100（id 128 + 键名/引号/数值）
-///   + envelope（{"messages":[…]} + 逗号）   =    +256
-/// 超过即 413——发生在 JSON 解析之前（content-length 预检 +
-/// to_bytes 限长）。
+///   per-message JSON skeleton <=256B x 100 (id 128 + key names/quotes/numbers)
+///   + envelope ({"messages":[...]} + commas)   =    +256
+/// Anything over is 413 -- before JSON parsing (content-length precheck +
+/// to_bytes length limit).
 const QUEUE_BODY_MAX: usize =
     crate::queue::BATCH_MAX_BYTES * 2 + crate::queue::BATCH_MAX_MSGS as usize * 256 + 256;
 
@@ -1035,7 +1035,7 @@ async fn queue_handler(State(state): State<AppState>, request: axum::extract::Re
     }
 }
 
-/// `GET /queues/{id}/metrics`——同 ServiceAuth（GET + 空 body）。
+/// `GET /queues/{id}/metrics` -- same ServiceAuth (GET + empty body).
 async fn queue_metrics_handler(
     State(state): State<AppState>,
     request: axum::extract::Request,

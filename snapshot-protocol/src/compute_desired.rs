@@ -10,7 +10,7 @@
 //! Secrets never appear in this payload: `Secret` bindings carry only a
 //! `secretRef` the host resolves separately from encrypted storage, and
 //! `Var` bindings carry a `varRef` for the same reason (values are delivered
-//! out-of-band per version — see the Phase 0 report §B.3 "vars引用(不含量)").
+//! out-of-band per version — see the Phase 0 report §B.3 "vars refs (no values)").
 //!
 //! All fields are required on the wire: `#[serde(deny_unknown_fields)]` plus
 //! no `Option` fields, so an unknown or missing member fails closed at typed
@@ -38,17 +38,17 @@ pub const MAX_BINDINGS_PER_WORKER: usize = 64;
 pub const MAX_ROUTES_PER_WORKER: usize = 64;
 /// Maximum cron triggers per worker.
 pub const MAX_CRONS_PER_WORKER: usize = 32;
-/// T37b：一个 worker 最多声明的 queue consumer 数（与 bindings
-/// 容量同量级；CF 平台约束远小于此）。
+/// T37b: the max number of queue consumers a worker may declare (same order of magnitude as the bindings
+/// capacity; the CF platform constraint is far below this).
 const MAX_QUEUE_CONSUMERS_PER_WORKER: usize = 100;
-/// P3c-1：一个 worker 最多声明的 DO class 数（同 bindings 容量
-/// 量级；CF 无显式上限，取保守上限防快照膨胀）。
+/// P3c-1: the max number of DO classes a worker may declare (same order of magnitude as the bindings capacity;
+/// CF has no explicit limit, a conservative cap is chosen to prevent snapshot bloat).
 const MAX_DO_CLASSES_PER_WORKER: usize = 64;
 const MAX_WORKFLOWS_PER_WORKER: usize = 32;
 /// CF `limits.steps` bound — wrangler accepts positive ints; we cap
 /// conservatively (engine default is effectively unbounded).
 const MAX_WORKFLOW_STEPS: u32 = 100_000;
-/// queue/databaseId 共享的 26 位小写字母数字 id（vrt-sql 路径规则）。
+/// 26-char lowercase alphanumeric id shared by queue/databaseId (vrt-sql path rules).
 fn valid_queue_id(id: &str) -> bool {
     id.len() == 26
         && id
@@ -190,10 +190,10 @@ pub struct WorkerDesired {
     /// versionId, scheduledTime)` at most once.
     pub crons: Vec<CronDesired>,
 
-    /// T37b：queue consumers —— 本 worker 消费哪些队列（CF 语义：
-    /// 一个队列全局至多一个 consumer，快照级唯一性在
-    /// [`ComputeDesired::validate`] 校验）。缺省 = 无 consumer —
-    /// 旧快照升级兼容。
+    /// T37b: queue consumers -- which queues this worker consumes (CF semantics:
+    /// a queue has at most one consumer globally; snapshot-level uniqueness is validated in
+    /// [`ComputeDesired::validate`]). Default = no consumer --
+    /// compatible with upgrading from old snapshots.
     #[serde(default)]
     pub queue_consumers: Vec<QueueConsumerDesired>,
 
@@ -470,11 +470,11 @@ pub struct DoBindingDesired {
     pub service_worker_id: Option<String>,
 }
 
-/// P3c-1 `durableObjectClasses[]`：本 worker 声明的一个 DO class。
-/// 对应 wrangler `new_sqlite_classes`（`enableSql=true`）或
-/// `new_classes`（`enableSql=false` —— localDisk 下两者同一 sqlite
-/// 后端，`enableSql` 只控制 `state.storage.sql` 是否暴露，与 CF 的
-/// KV/SQLite 后端语义对齐）。
+/// P3c-1 `durableObjectClasses[]`: one DO class declared by this worker.
+/// Corresponds to wrangler `new_sqlite_classes` (`enableSql=true`) or
+/// `new_classes` (`enableSql=false` -- under localDisk both use the same sqlite
+/// backend, and `enableSql` only controls whether `state.storage.sql` is exposed, aligning with CF's
+/// KV/SQLite backend semantics).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DoClassDesired {
@@ -540,33 +540,33 @@ pub struct WorkflowDesired {
     pub limits_steps: Option<u32>,
 }
 
-/// T37b `queueConsumers[]`：worker 对一个队列的消费关系（非 binding ——
-/// 不出现在 `env.*`，只驱动 dispatcher 把消息投递到该 worker 的
-/// `queue(batch, env, ctx)` handler）。数值边界与 miniflare
-/// `QueueConsumerOptionsSchema`（broker.worker.js:57-70）核对：
-/// `maxBatchSize`/`maxBatchTimeout`/`maxRetries`/`retryDelay`/`deadLetterQueue`；
-/// `maxConcurrency` 是平台派发并发上限（miniflare 不建模，CF 文档上限
-/// 250 —— 本字段上限放宽到 1000，平台语义见 §8）。
+/// T37b `queueConsumers[]`: a worker's consumption relationship to a queue (not a binding --
+/// it does not appear in `env.*` and only drives the dispatcher to deliver messages to the worker's
+/// `queue(batch, env, ctx)` handler). Numeric bounds were checked against miniflare
+/// `QueueConsumerOptionsSchema` (broker.worker.js:57-70):
+/// `maxBatchSize`/`maxBatchTimeout`/`maxRetries`/`retryDelay`/`deadLetterQueue`;
+/// `maxConcurrency` is the platform dispatch concurrency cap (miniflare does not model it, CF docs cap it at
+/// 250 -- this field's cap is relaxed to 1000, see section 8 for platform semantics).
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueueConsumerDesired {
-    /// Platform queue id（`^[a-z0-9]{26}$`）。
+    /// Platform queue id (`^[a-z0-9]{26}$`).
     pub queue_id: String,
-    /// 队列显示名——`.queue(queueName)` 第一参与 `batch.queue`。
+    /// Queue display name -- the first argument of `.queue(queueName)` and `batch.queue`.
     pub queue_name: String,
-    /// 消费失败超限后的死信队列 id（另一队列，同团队——上游
-    /// 控制面已校验；此处查 id 形状与自指）。
+    /// Dead-letter queue id after consumption failures exceed the limit (another queue, same team -- already
+    /// validated by the upstream control plane; here we check id shape and self-reference).
     pub dead_letter_queue_id: Option<String>,
-    /// 批大小 1..=100（miniflare 允许 0 —— 0 永不派发是配置错误，
-    /// fail closed 拒绝）。默认 5。
+    /// Batch size 1..=100 (miniflare allows 0 -- 0 never dispatches and is a config error,
+    /// rejected fail closed). Default 5.
     pub max_batch_size: Option<u32>,
-    /// 批次填充等待秒数 0..=60。默认 1。
+    /// Seconds to wait for a batch to fill, 0..=60. Default 1.
     pub max_batch_timeout_secs: Option<u32>,
-    /// 额外重试次数 0..=100（投递总上限 = maxRetries+1）。默认 2。
+    /// Number of extra retries 0..=100 (total delivery cap = maxRetries+1). Default 2.
     pub max_retries: Option<u32>,
-    /// 消费失败后的重试延迟秒数 0..=86400。默认 0。
+    /// Retry delay in seconds after consumption failure, 0..=86400. Default 0.
     pub retry_delay_secs: Option<u32>,
-    /// 本队列在飞批数上限 1..=1000。默认 10。
+    /// Cap on in-flight batches for this queue, 1..=1000. Default 10.
     pub max_concurrency: Option<u32>,
 }
 
@@ -893,9 +893,9 @@ impl ComputeDesired {
         let mut tenant_ids = HashSet::new();
         let mut worker_ids = HashSet::new();
         let mut hostnames = HashSet::new();
-        // T37b：CF 语义——一个队列全局至多一个 consumer（跨 tenant
-        // 也唯一：queueId 是全平台唯一命名空间，两个 team 的消费
-        // 关系指向同一 queueId 必然是配置错误）。
+        // T37b: CF semantics -- a queue has at most one consumer globally (unique across tenants
+        // too: queueId is a platform-wide unique namespace, so two teams' consumer
+        // relations pointing at the same queueId must be a config error).
         let mut consumed_queues = HashSet::new();
         for tenant in &self.tenants {
             if !tenant_ids.insert(&tenant.tenant_id) {
@@ -1275,8 +1275,8 @@ impl WorkerDesired {
         Ok(())
     }
 
-    /// T37b queue consumers：id 形状、DLQ 自指、数值边界、worker 内
-    /// queueId 唯一（全局唯一性在 ComputeDesired::validate）。
+    /// T37b queue consumers: id shape, DLQ self-reference, numeric bounds, uniqueness of queueId
+    /// within a worker (global uniqueness is in ComputeDesired::validate).
     fn validate_queue_consumers(&self) -> Result<(), DesiredError> {
         if self.queue_consumers.len() > MAX_QUEUE_CONSUMERS_PER_WORKER {
             return Err(DesiredError::Capacity("queueConsumers"));
@@ -1312,9 +1312,9 @@ impl WorkerDesired {
         Ok(())
     }
 
-    /// P3c-1：DO class 声明——class_name JS 标识符且 worker 内唯一、
-    /// `uniqueKey` 恰为 64 位小写 hex（服务端 HMAC 派生的形状约束，
-    /// 派生本身发生在控制面/standalone pack）、容量有界。
+    /// P3c-1: DO class declaration -- class_name is a JS identifier and unique within a worker,
+    /// `uniqueKey` is exactly 64 lowercase hex chars (a shape constraint of the server-side HMAC derivation,
+    /// the derivation itself happens in the control plane / standalone pack), bounded capacity.
     fn validate_do_classes(&self) -> Result<(), DesiredError> {
         if self.durable_object_classes.len() > MAX_DO_CLASSES_PER_WORKER {
             return Err(DesiredError::Capacity("durableObjectClasses"));

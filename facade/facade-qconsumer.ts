@@ -61,7 +61,7 @@ function dispatchError(message: string, status = 400): Response {
   });
 }
 
-/// T37b-r: every error path logs ONE structured line — "不得静默吞错".
+/// T37b-r: every error path logs ONE structured line -- "never silently swallow errors".
 /// Fields are bounded and never carry message bodies (user data).
 /// `console.error` is the only channel a system worker has into
 /// workerd's own log; without it a consumer failure is invisible

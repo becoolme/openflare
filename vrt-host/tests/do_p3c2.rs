@@ -27,7 +27,7 @@ fn scope(dir: PathBuf) -> PlacementScope {
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
-    // 仓库约定：`target/tmp-p3c2/`（不落系统 temp；任务约束）。
+    // Repository convention: `target/tmp-p3c2/` (not the system temp; task constraint).
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../target/tmp-p3c2")
         .join(format!("{}-{}", tag, std::process::id()));
@@ -128,11 +128,11 @@ fn corrupted_snapshot_refuses_and_preserves() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// RV-R31 #4：本地 `o1.sqlite` 被掉电截成 0 字节（meta 中
-/// size/sha 不符）——`allow_replace=false` 也必须走恢复，
-/// 绝不能放行空存储直接服务。伴生的 -wal/-shm 一并清掉：
-/// 有快照外文件会按"活体目录 local-wins"判定，那是另一条
-/// 保护路径（post-snapshot 提交绝不丢）。
+/// RV-R31 #4: the local `o1.sqlite` was truncated to 0 bytes by a power loss (meta's
+/// size/sha mismatch) -- even `allow_replace=false` must go through restore,
+/// and an empty store must never be passed to serve directly. The accompanying -wal/-shm are cleared too:
+/// having files outside the snapshot would be judged as "live directory local-wins", which is a different
+/// protection path (post-snapshot commits are never lost).
 #[test]
 fn zero_byte_local_sqlite_triggers_restore() {
     let tmp = tmpdir("zb");
@@ -154,7 +154,7 @@ fn zero_byte_local_sqlite_triggers_restore() {
     )
     .unwrap();
 
-    // 掉电幽灵：目录还在、主文件被截成 0 字节。
+    // Power-loss ghost: the directory is still there, the main file truncated to 0 bytes.
     for e in std::fs::read_dir(&class_dir).unwrap() {
         std::fs::remove_file(e.unwrap().path()).unwrap();
     }

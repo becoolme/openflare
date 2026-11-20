@@ -1,5 +1,5 @@
-//! golden 门禁（§9）：同一矩阵回放 vrt-sql 与 miniflare fixture 规范化比对。
-//! 重录：node vrt-sql/golden/capture.mjs（miniflare 5.20260828.0-alpha）。
+//! golden gate (section 9): replay the same matrix against vrt-sql and the miniflare fixture, then compare after normalization.
+//! Re-record: node vrt-sql/golden/capture.mjs (miniflare 5.20260828.0-alpha).
 
 use serde_json::Value;
 use std::path::PathBuf;
@@ -18,10 +18,10 @@ fn fixture() -> Value {
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
-/// 规范化：剔除跨实现必然不同的动态字段。
-/// - meta.duration / served_by / size_after：实现相关（近似口径 §10）。
-/// - meta.rows_read / rows_written：近似算法，引擎侧口径不同。
-/// - error 文本逐条走 DIFF_ERROR 白名单。
+/// Normalize: drop dynamic fields that necessarily differ across implementations.
+/// - meta.duration / served_by / size_after: implementation-specific (approximate semantics, section 10).
+/// - meta.rows_read / rows_written: approximate algorithm, the engine side counts differently.
+/// - error text goes through the DIFF_ERROR allowlist entry by entry.
 fn normalize_body(b: &mut Value) {
     if let Some(arr) = b.as_array_mut() {
         for r in arr {
@@ -40,9 +40,9 @@ fn normalize_body(b: &mut Value) {
     }
 }
 
-/// error 文本白名单：fixture(miniflare better-sqlite3) → vrt-sql(rusqlite) 前缀。
-/// better-sqlite3 在文本后追加 `: SQLITE_*` 扩展码，rusqlite 不追加——属
-/// 客户端无关信息差，D1 客户端只用 success/error 形态。
+/// error text allowlist: fixture (miniflare better-sqlite3) -> vrt-sql (rusqlite) prefix.
+/// better-sqlite3 appends an `: SQLITE_*` extended code after the text and rusqlite does not -- this is
+/// client-irrelevant information difference; D1 clients only use the success/error shape.
 const DIFF_ERROR: &[(&str, &str)] = &[
     ("no such table: nope", "no such table: nope"),
     (
@@ -53,16 +53,16 @@ const DIFF_ERROR: &[(&str, &str)] = &[
         "no such table: missing_table",
         "no such table: missing_table",
     ),
-    // 注释语句（串首 `--` 不被剥）：better-sqlite3 报空语句，
-    // rusqlite prepare 返回 SQLITE_MISUSE——同语义不同文本。
+    // comment-only statement (a leading `--` is not stripped): better-sqlite3 reports an empty statement,
+    // rusqlite prepare returns SQLITE_MISUSE -- same semantics, different text.
     (
         "SQL code did not contain a statement",
         "bad parameter or other API misuse",
     ),
 ];
 
-/// 畸形请求面：miniflare 吐 500 + ZodError 纯文本；vrt-sql 用 400 + JSON。
-/// R1 的关键契约是"不是 {success:false} 面"，HTTP code 属实现自由度。
+/// Malformed-request surface: miniflare emits 500 + plain-text ZodError; vrt-sql uses 400 + JSON.
+/// The key R1 contract is "not the {success:false} surface"; the HTTP code is implementation freedom.
 const MALFORMED_CASES: &[&str] = &["malformed-sql-type", "malformed-scalar"];
 
 #[tokio::test]
@@ -72,7 +72,7 @@ async fn golden_compare() {
     let st = AppState::new(tmp.path().join("dbs"), KEY);
     let mut mismatches: Vec<String> = Vec::new();
 
-    // 回放与 capture.mjs 相同的建基数据
+    // replay the same base data as capture.mjs
     for s in fx["setup"].as_array().unwrap() {
         let body = serde_json::to_vec(&s["body"]).unwrap();
         let r = wire::handle_d1(&st, DBID, None, tctx(), &body).await;
@@ -96,7 +96,7 @@ async fn golden_compare() {
         let exp_body = &case["bodyJson"];
 
         if MALFORMED_CASES.contains(&name) {
-            // 畸形面：非 200 且非 {success:false} 形态即契约满足（code 白名单差异）
+            // malformed surface: non-200 and not the {success:false} shape satisfies the contract (code allowlist difference)
             if got.status == axum::http::StatusCode::OK || got.body["success"] == false {
                 mismatches.push(format!(
                     "{name}: malformed should not be 200/{{success:false}}: {:?}",
@@ -119,7 +119,7 @@ async fn golden_compare() {
         let mut exp_body_norm = exp_body.clone();
         normalize_body(&mut exp_body_norm);
 
-        // error 面：文本走白名单
+        // error surface: text goes through the allowlist
         if got_body["success"] == false {
             let exp_err = exp_body_norm["error"].as_str().unwrap_or("");
             let got_err = got_body["error"].as_str().unwrap_or("");

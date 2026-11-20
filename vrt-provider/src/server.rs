@@ -57,9 +57,9 @@ pub struct TenantService {
     pub global_permits: Arc<tokio::sync::Semaphore>,
     /// T13/H3: hard deadline for draining a request body.
     pub body_read_timeout: std::time::Duration,
-    /// T34: vrt-sql 下游（absent → D1 ops 返回 {success:false} 不可用面）。
+    /// T34: vrt-sql downstream (absent -> D1 ops return the {success:false} unavailable surface).
     pub d1: Option<Arc<crate::d1::D1Client>>,
-    /// T37: queue 下游（与 d1 同一 vrt-sql；absent → 队列 503）。
+    /// T37: queue downstream (the same vrt-sql as d1; absent -> queue 503).
     pub queue: Option<Arc<crate::queue::QueueClient>>,
     /// P1: PG HTTP data plane (absent → PG ops fail closed
     /// `PG_CREDENTIAL_UNAVAILABLE` — authorized but undeliverable).
@@ -1524,7 +1524,7 @@ async fn assets_dispatch(svc: Arc<TenantService>, request: Request) -> Response<
 
 // ---------------- D1 (T34) ----------------
 
-/// `/internal/bindings/v1/d1/{bindingId}/{op}`，op ∈ query|execute。
+/// `/internal/bindings/v1/d1/{bindingId}/{op}`, op in query|execute.
 fn parse_d1_path(path: &str) -> Option<(String, &'static str)> {
     let rest = path.strip_prefix("/internal/bindings/v1/d1/")?;
     let (id, op) = rest.split_once('/')?;
@@ -1539,9 +1539,9 @@ fn parse_d1_path(path: &str) -> Option<(String, &'static str)> {
     Some((id.to_string(), op))
 }
 
-/// D1 错误面：HTTP 200 + `{success:false,error:"D1_ERROR: …"}`。
+/// D1 error surface: HTTP 200 + `{success:false,error:"D1_ERROR: ..."}`.
 fn d1_wire_error(message: &str) -> Response<Body> {
-    // 错误文本有界：只放受限 message（绝不带 secret/路径）。
+    // Error text is bounded: only a restricted message goes in (never a secret/path).
     let bounded: String = message.chars().take(200).collect();
     json_response(
         serde_json::json!({"success": false, "error": format!("D1_ERROR: {bounded}")})
@@ -1574,7 +1574,7 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
             false,
         );
     };
-    // Content-Length 先验（读 body 前拒绝超限）。
+    // Content-Length is checked first (reject over-limit before reading the body).
     if request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -1617,8 +1617,8 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
             }
         };
     let permissions = ctx.permissions();
-    // D1 每条语句都可能写 —— require write grant（读由 write 覆盖；
-    // 细粒度拆分随 D1 权限模型后续明确）。
+    // Every D1 statement may write -- require the write grant (reads are covered by write;
+    // a finer-grained split follows once the D1 permission model is clarified).
     if !permissions.write {
         tracing::warn!(
             binding_id,
@@ -1643,7 +1643,7 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
         .query()
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
-    // 透传 session/bookmark 头（x-cf-d1-*），其余入站头丢弃。
+    // Pass through session/bookmark headers (x-cf-d1-*); drop all other inbound headers.
     let session_headers: Vec<(String, String)> = request
         .headers()
         .iter()
@@ -1704,7 +1704,7 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
                 .unwrap()
         }
         Err(_) => {
-            // vrt-sql 不可用：D1 错误面 + 结构化日志（forward 已 warn）。
+            // vrt-sql unavailable: D1 error surface + structured log (forward already warned).
             crate::metrics::d1_backend_unavailable(ctx.worker_id());
             crate::metrics::d1_outcome(&worker_id, "backend_error");
             d1_wire_error("backend unavailable")
@@ -1867,9 +1867,9 @@ async fn pg_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
     }
 }
 
-/// ---------- T37：queue 生产端（§8 broker wire→vrt-sql） ----------
+/// ---------- T37: queue producer (section 8 broker wire -> vrt-sql) ----------
 
-/// `/internal/bindings/v1/queue/{bindingId}/{op}`，op ∈ message|batch|metrics。
+/// `/internal/bindings/v1/queue/{bindingId}/{op}`, op in message|batch|metrics.
 fn parse_queue_path(path: &str) -> Option<(String, &'static str)> {
     let rest = path.strip_prefix("/internal/bindings/v1/queue/")?;
     let (id, op) = rest.rsplit_once('/')?;
@@ -1885,7 +1885,7 @@ fn parse_queue_path(path: &str) -> Option<(String, &'static str)> {
     Some((id.to_string(), op))
 }
 
-/// broker 错误面：状态码 + `{"error": msg}`（workerd 侧转为异常）。
+/// broker error surface: status code + `{"error": msg}` (turned into an exception on the workerd side).
 fn queue_wire_error(status: StatusCode, msg: &str) -> Response<Body> {
     Response::builder()
         .status(status)
@@ -1901,7 +1901,7 @@ async fn queue_dispatch(svc: Arc<TenantService>, request: Request) -> Response<B
         crate::metrics::queue_rejected(&tenant, &worker_id, "bad_path");
         return queue_wire_error(StatusCode::BAD_REQUEST, "bad queue route");
     };
-    // `GET /metrics` 无 body；写 op 先验 Content-Length。
+    // `GET /metrics` has no body; write ops check Content-Length first.
     if op != "metrics" {
         if request
             .headers()
@@ -1943,7 +1943,7 @@ async fn queue_dispatch(svc: Arc<TenantService>, request: Request) -> Response<B
             }
         };
     let permissions = ctx.permissions();
-    // 生产 op 要 write；metrics 要 read（任一授予即可读数）。
+    // Producer ops need write; metrics needs read (either grant allows reading the numbers).
     let allowed = if op == "metrics" {
         permissions.read || permissions.write
     } else {
@@ -2019,7 +2019,7 @@ async fn queue_dispatch(svc: Arc<TenantService>, request: Request) -> Response<B
                     );
                 }
             };
-            // broker wire → vrt-sql send 请求（含 413/400 语义）。
+            // broker wire -> vrt-sql send request (including 413/400 semantics).
             let parsed = if op == "message" {
                 crate::queue::producer_message(&headers, &body)
             } else {
@@ -2096,7 +2096,7 @@ async fn queue_dispatch(svc: Arc<TenantService>, request: Request) -> Response<B
     }
 }
 
-/// vrt-sql 非 200 → broker 错误面（透传 status，错误体统一）。
+/// vrt-sql non-200 -> broker error surface (status passed through, error body unified).
 fn queue_backend_error(
     status: u16,
     bytes: &axum::body::Bytes,

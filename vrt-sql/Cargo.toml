@@ -1,7 +1,7 @@
-# vrt-sql：D1/Queues 数据面 SQL 服务（Phase 3 / P3a 第一刀）。
+# vrt-sql: D1/Queues data-plane SQL service (Phase 3 / P3a first cut).
 #
-# 依赖约束（T33）：rusqlite 只能用本地 cargo 缓存中的 0.40.2（bundled，
-# libsqlite3-sys 0.38.2），其余依赖只用 workers-runtime workspace 已有项。
+# Dependency constraint (T33): rusqlite may only use 0.40.2 from the local cargo cache (bundled,
+# libsqlite3-sys 0.38.2); all other dependencies use only items already in the workers-runtime workspace.
 [package]
 name = "vrt-sql"
 version = "0.0.0"

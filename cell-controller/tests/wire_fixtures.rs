@@ -1,20 +1,20 @@
-//! RV-R68：跨语言 wire 契约 fixture —— cell 侧真实输出。
+//! RV-R68: cross-language wire contract fixtures -- the cell side's real output.
 //!
-//! 每个 fixture 都是 REAL 序列化（serde 输出 / 真实 whitelist /
-//! 真实 normalize_execute_body），不是手写对象：
-//! - `cell-op-ack-*.json`：`CellOpAck` 的 serde_json 输出——
-//!   `result`/`error` 的 `Option::None` 必须省略（绝不出现 null）；
-//! - `cell-op-ack-done-legacy-null.json`：旧 cell 的真实线上形状
-//!   （修复前的 serde 输出），控制面在滚动升级期间必须仍接受；
-//! - `d1-ack-*.json`：已提交的 `d1-wire-*.json`（vrt-sql 真实
-//!   输出）经 `normalize_execute_body` 规范化后包进 `CellOpAck`；
-//! - `wf-ack-*.json`：`whitelist()` 对 facade 结果的真实规范化；
-//! - `desired-ack-partial.json`：`AckReport` 的真实序列化
-//!   （PARTIAL + bounded reason + capabilities）。
+//! Every fixture is REAL serialization (serde output / the real whitelist /
+//! the real normalize_execute_body), not a hand-written object:
+//! - `cell-op-ack-*.json`: serde_json output of `CellOpAck` --
+//!   `Option::None` for `result`/`error` must be omitted (never null);
+//! - `cell-op-ack-done-legacy-null.json`: the real on-the-wire shape of an old cell
+//!   (serde output before the fix); the control plane must still accept it during a rolling upgrade;
+//! - `d1-ack-*.json`: the committed `d1-wire-*.json` (real vrt-sql
+//!   output) normalized by `normalize_execute_body` and wrapped into `CellOpAck`;
+//! - `wf-ack-*.json`: the real normalization of facade results by `whitelist()`;
+//! - `desired-ack-partial.json`: the real serialization of `AckReport`
+//!   (PARTIAL + bounded reason + capabilities).
 //!
-//! `UPDATE_FIXTURES=1` 重写 `server/src/test/fixtures/vrt-wire/`；
-//! 否则与已提交 fixture 做值级比对。`d1-ack-*` 依赖 `d1-wire-*`
-//! 先行生成（`UPDATE_FIXTURES=1 cargo test -p vrt-sql`）。
+//! `UPDATE_FIXTURES=1` rewrites `server/src/test/fixtures/vrt-wire/`;
+//! otherwise values are compared against the committed fixtures. `d1-ack-*` depends on `d1-wire-*`
+//! being generated first (`UPDATE_FIXTURES=1 cargo test -p vrt-sql`).
 
 use cell_controller::ack::{AckCapabilities, AckReport, AckStatus};
 use cell_controller::d1ops::normalize_execute_body;
@@ -41,7 +41,7 @@ fn check(name: &str, actual: Value) {
     }
     let committed: Value = serde_json::from_str(
         &std::fs::read_to_string(&path).unwrap_or_else(|_| {
-            panic!("fixture {name} missing — run UPDATE_FIXTURES=1 (vrt-sql 先行)")
+            panic!("fixture {name} missing — run UPDATE_FIXTURES=1 (vrt-sql first)")
         }),
     )
     .unwrap();
@@ -51,13 +51,13 @@ fn check(name: &str, actual: Value) {
 fn read_committed(name: &str) -> Value {
     serde_json::from_str(
         &std::fs::read_to_string(fixture_dir().join(name)).unwrap_or_else(|_| {
-            panic!("fixture {name} missing — 先 UPDATE_FIXTURES=1 cargo test -p vrt-sql")
+            panic!("fixture {name} missing — first run UPDATE_FIXTURES=1 cargo test -p vrt-sql")
         }),
     )
     .unwrap()
 }
 
-/// `CellOpAck` 的 serde 输出 = cell 真实 POST body 的单条。
+/// The serde output of `CellOpAck` = a single entry of the cell's real POST body.
 fn ack(seq: i64, status: &'static str, result: Option<Value>, error: Option<String>) -> Value {
     serde_json::to_value(CellOpAck {
         seq,
@@ -70,24 +70,24 @@ fn ack(seq: i64, status: &'static str, result: Option<Value>, error: Option<Stri
 
 #[test]
 fn cell_op_ack_fixtures() {
-    // DONE：result 有值、error 省略——线上绝不允许 "error":null
-    // （顶层可选字段必须为 None 时省略；result 内部的 null 值合法）。
+    // DONE: result has a value, error omitted -- "error":null is never allowed on the wire
+    // (top-level optional fields must be omitted when None; null values inside result are legal).
     let v = ack(7, "DONE", Some(json!({"status": "running"})), None);
     let s = serde_json::to_string(&v).unwrap();
     assert!(v.get("error").is_none(), "error:null leaked: {s}");
     assert!(v.get("result").is_some(), "result dropped: {s}");
     check("cell-op-ack-done.json", v);
 
-    // FAILED：error 有值、result 省略。
+    // FAILED: error has a value, result omitted.
     let v = ack(8, "FAILED", None, Some("boom".to_string()));
     check("cell-op-ack-failed.json", v);
 
-    // EXPIRED。
+    // EXPIRED.
     let v = ack(9, "EXPIRED", None, Some("dispatch deadline passed".to_string()));
     check("cell-op-ack-expired.json", v);
 
-    // 旧 cell（修复前 serde 输出）会把 None 写成 null——该形状在
-    // 滚动升级期间合法，控制面必须接受并按缺省处理。
+    // An old cell (pre-fix serde output) writes None as null -- that shape is
+    // legal during a rolling upgrade, and the control plane must accept it and treat it as default.
     check(
         "cell-op-ack-done-legacy-null.json",
         json!({"seq": 7, "status": "DONE", "result": {"status": "running"}, "error": null}),
@@ -100,7 +100,7 @@ fn cell_op_ack_fixtures() {
 
 #[test]
 fn d1_ack_fixtures() {
-    // 成功：vrt-sql 裸数组 → 规范化 {results:[...]} → DONE ack。
+    // Success: vrt-sql bare array -> normalized {results:[...]} -> DONE ack.
     for (wire, name) in [
         ("d1-wire-execute.json", "d1-ack-execute.json"),
         ("d1-wire-execute-batch.json", "d1-ack-execute-batch.json"),
@@ -111,16 +111,16 @@ fn d1_ack_fixtures() {
         check(name, ack(1, "DONE", Some(result), None));
     }
 
-    // SQL 错误体（{success:false,error}）是引擎 OUTCOME → DONE +
-    // 原样 result；控制面按既有契约 200 透传。
+    // The SQL error body ({success:false,error}) is an engine OUTCOME -> DONE +
+    // result verbatim; the control plane passes it through as 200 per the existing contract.
     let body = read_committed("d1-wire-sql-error.json");
     check(
         "d1-ack-sql-error.json",
         ack(2, "DONE", Some(normalize_execute_body(body)), None),
     );
 
-    // fenced/unavailable：{status,body}——cell 把 typed body 作为
-    // DONE result 透传（retryable/code 由控制面映射 HTTP 语义）。
+    // fenced/unavailable: {status,body} -- the cell passes the typed body through as the
+    // DONE result (retryable/code are mapped to HTTP semantics by the control plane).
     for (wire, name, seq) in [
         ("d1-wire-fenced.json", "d1-ack-fenced.json", 3),
         ("d1-wire-unavailable.json", "d1-ack-unavailable.json", 4),
@@ -132,16 +132,16 @@ fn d1_ack_fixtures() {
 
 #[test]
 fn wf_ack_fixtures() {
-    // running：whitelist 对 facade 响应的真实投影。
+    // running: the real projection of the facade response by whitelist.
     let out = whitelist(
         &json!({"status": "running", "output": "hello", "secret": "nope"}),
         &["status", "output", "error"],
     );
     check("wf-ack-running.json", ack(5, "DONE", Some(out), None));
 
-    // errored：facade 的 {name,message} 对象经 whitelist 保留结构、
-    // 双字段有界（修复前对象原样透传会被 strict schema 拒，WF_GET
-    // 永远失败）。
+    // errored: the facade's {name,message} object keeps its structure through the whitelist,
+    // both fields bounded (before the fix the object was passed through verbatim and rejected by the strict schema, so WF_GET
+    // always failed).
     let out = whitelist(
         &json!({"status": "errored", "error": {"name": "WorkflowFatalError", "message": "step blew up", "extra": "dropped"}}),
         &["status", "output", "error"],
@@ -154,7 +154,7 @@ fn wf_ack_fixtures() {
 
 #[test]
 fn desired_ack_fixture() {
-    // PARTIAL：真实 AckReport 序列化（reason 有界、capabilities 全位）。
+    // PARTIAL: real AckReport serialization (reason bounded, capabilities all bits).
     let report = AckReport {
         revision: 7,
         payload_digest: "a".repeat(64),
@@ -185,9 +185,9 @@ fn desired_ack_fixture() {
         serde_json::to_value(&report).unwrap(),
     );
 
-    // MIG-4: tenantFailures 的真实线形——具名 workerIds 与省略
-    // workerIds（tenant-wide）两种形状都必须固定；具名集合绝不出现
-    // 空数组，服务端以字段缺席判定 tenant-wide。
+    // MIG-4: the real wire shape of tenantFailures -- both the named workerIds and the omitted
+    // workerIds (tenant-wide) shapes must be pinned; a named set never appears as an
+    // empty array, and the server decides tenant-wide by the field's absence.
     use cell_controller::pod::TenantFailure;
     let mut named = report.clone();
     named.status = AckStatus::Partial;
@@ -214,9 +214,9 @@ fn desired_ack_fixture() {
     );
     check("desired-ack-tenant-failures.json", v);
 
-    // MIG-6: `Some([])` 显式序列化为 `[]` —— 服务端把它持久化为
-    // 该 revision 的空诊断集（覆盖 PARTIAL 阶段的残留）；`None`
-    // 才从 wire 上消失（pre-MIG-1 控制面 400 降级专用）。
+    // MIG-6: `Some([])` is explicitly serialized as `[]` -- the server persists it as
+    // the empty diagnostic set of that revision (overriding leftovers from the PARTIAL phase); `None`
+    // is the one that disappears from the wire (used only for the pre-MIG-1 control plane 400 downgrade).
     let mut empty = report.clone();
     empty.tenant_failures = Some(Vec::new());
     assert_eq!(serde_json::to_value(&empty).unwrap()["tenantFailures"], json!([]));
@@ -224,8 +224,8 @@ fn desired_ack_fixture() {
     stripped.tenant_failures = None;
     assert!(serde_json::to_value(&stripped).unwrap().get("tenantFailures").is_none());
 
-    // reason 超过 256 UTF-16 单元必须被截断——否则整条 ack 被
-    // 服务端 400 拒收、converge 永远卡住（RV-R68 配套修复）。
+    // A reason over 256 UTF-16 units must be truncated -- otherwise the whole ack is
+    // rejected with a server 400 and converge is stuck forever (companion fix of RV-R68).
     let long = "pods-not-applied:".to_string() + &"pod-x,".repeat(200);
     let bounded = cell_controller::ack::bounded_reason(Some(long));
     assert!(bounded.unwrap().encode_utf16().count() <= 256);
@@ -234,22 +234,22 @@ fn desired_ack_fixture() {
 #[test]
 fn truncation_is_utf16_units_and_never_splits_pairs() {
     use cell_controller::execset::truncate_utf16;
-    // ~40k emoji（2 UTF-16 单元/字符）：控制面 zod `.max` 按
-    // JS `.length`（UTF-16 单元）计数，两侧度量必须一致——旧实现
-    // 按 Unicode 标量截断会放行超额两倍的 payload。
+    // ~40k emoji (2 UTF-16 units per char): the control plane zod `.max` counts by
+    // JS `.length` (UTF-16 units), and both sides must measure the same -- the old implementation
+    // truncating by Unicode scalar would let through a payload twice over the limit.
     let emoji = "😀".repeat(40_000);
     let (out, truncated) = truncate_utf16(&emoji, 64 * 1024);
     assert!(truncated);
-    assert_eq!(out.encode_utf16().count(), 64 * 1024); // 恰好满界
-    assert_eq!(out.chars().count(), 32_768); // 恰好整字 —— 代理对绝不拆开
-    // 奇数边界：下一字符是 2 单元 → 不取，输出不满界但绝不残缺。
+    assert_eq!(out.encode_utf16().count(), 64 * 1024); // exactly at the limit
+    assert_eq!(out.chars().count(), 32_768); // exactly whole chars -- surrogate pairs are never split
+    // Odd boundary: the next char is 2 units -> not taken, output is under the limit but never mangled.
     let (out, truncated) = truncate_utf16("ab😀cd", 3);
     assert!(truncated);
     assert_eq!(out, "ab");
-    // CJK（1 UTF-16 单元/字符）与 ASCII 同权。
-    let (out, truncated) = truncate_utf16("你好世界", 3);
+    // CJK (1 UTF-16 unit per char) weighs the same as ASCII.
+    let (out, truncated) = truncate_utf16("\u{4f60}\u{597d}\u{4e16}\u{754c}", 3);
     assert!(truncated);
-    assert_eq!(out, "你好世");
+    assert_eq!(out, "\u{4f60}\u{597d}\u{4e16}");
 }
 
 /// `kv` is omitted while false (old strict control planes keep parsing

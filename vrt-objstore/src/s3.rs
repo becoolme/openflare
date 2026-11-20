@@ -1,9 +1,9 @@
-//! S3 兼容对象存储：共享 [`crate::sigv4`] 签名，path-style 寻址，
-//! If-Match / If-None-Match 条件写，ListObjectsV2 有界分页。
+//! S3-compatible object store: shares the [`crate::sigv4`] signing, path-style addressing,
+//! If-Match / If-None-Match conditional writes, ListObjectsV2 with bounded pagination.
 //!
-//! 兼容性（§12 未证实项）：S3 条件写在不同后端（R2/MinIO/AWS 新版）
-//! 语义不一；`conditional_writes=false` 时 CAS 调用直接
-//! `Unavailable{retryable:false}`——fail closed，绝不降级非原子写。
+//! Compatibility (section 12 unproven item): S3 conditional-write semantics differ across backends (R2/MinIO/newer AWS);
+//! when `conditional_writes=false`, CAS calls return
+//! `Unavailable{retryable:false}` directly -- fail closed, never degrade to a non-atomic write.
 
 use super::{
     sigv4::{sha256_hex, uri_escape, SecretString, SignedRequest, Signer},
@@ -14,26 +14,26 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::time::Duration;
 
-/// S3 存储配置。
+/// S3 store configuration.
 #[derive(Clone)]
 pub struct S3StoreConfig {
-    /// Base endpoint, e.g. `https://s3.internal:9000` (no path)。
+    /// Base endpoint, e.g. `https://s3.internal:9000` (no path).
     pub endpoint: String,
-    /// Signing region。
+    /// Signing region.
     pub region: String,
-    /// Physical bucket。
+    /// Physical bucket.
     pub bucket: String,
-    /// Access key id。
+    /// Access key id.
     pub access_key: String,
-    /// Secret access key。
+    /// Secret access key.
     pub secret_key: SecretString,
-    /// Per-request timeout。
+    /// Per-request timeout.
     pub timeout: Duration,
-    /// 后端支持 S3 条件写 headers；`false` → CAS fail closed。
+    /// The backend supports S3 conditional-write headers; `false` -> CAS fails closed.
     pub conditional_writes: bool,
-    /// 幂等操作重试次数（GET/HEAD/list/delete）。
+    /// Retry count for idempotent operations (GET/HEAD/list/delete).
     pub retries: u32,
-    /// 可选 key 前缀（隔离不同部署共用 bucket）。
+    /// Optional key prefix (isolates deployments sharing a bucket).
     pub prefix: String,
 }
 
@@ -51,7 +51,7 @@ impl std::fmt::Debug for S3StoreConfig {
     }
 }
 
-/// S3 store。
+/// S3 store.
 pub struct S3Store {
     client: Client,
     signer: Signer,
@@ -64,15 +64,15 @@ impl std::fmt::Debug for S3Store {
     }
 }
 
-// RV-R8 #7: 分页上界之上限本身只是 DoS 护栏——命中时通过
-// `ListPage.truncated` 显式告知调用方，绝不静默丢尾部 key。
-// 64 页 × 1000 keys 覆盖单个 class/库的合理规模。
+// RV-R8 #7: the cap on the pagination bound is only a DoS guardrail -- when hit, the caller is told explicitly via
+// `ListPage.truncated`, and tail keys are never silently dropped.
+// 64 pages x 1000 keys covers a reasonable size for a single class/db.
 const LIST_FETCH_BOUND: usize = 64;
 const LIST_KEY_BOUND: usize = 65_536;
 const MAX_OBJECT_BYTES: usize = 256 * 1024 * 1024;
 
 impl S3Store {
-    /// 构建（timeout 由 client 级强制）。
+    /// Build (timeout is enforced at the client level).
     pub fn new(cfg: S3StoreConfig) -> Result<Self, StoreError> {
         if cfg.endpoint.is_empty() || cfg.bucket.is_empty() {
             return Err(StoreError::unavailable(false, "s3 endpoint/bucket empty"));
@@ -105,7 +105,7 @@ impl S3Store {
         } else {
             format!("{}/{}", self.cfg.prefix.trim_matches('/'), key)
         };
-        // path-style：/{bucket}/{key}，key 逐段 escape 保 slash。
+        // path-style: /{bucket}/{key}, escape key segment by segment to keep slashes.
         let mut p = String::with_capacity(full.len() + self.cfg.bucket.len() + 2);
         p.push('/');
         p.push_str(&self.cfg.bucket);
@@ -122,9 +122,9 @@ impl S3Store {
             .sign(&req)
             .map_err(|_| StoreError::unavailable(false, "sign"))?;
         let url = self.signer.url_of(&req);
-        // T12/G7 fail-closed（与 provider send 同款）：签名 path 必须
-        // 等于上线 path；key 已由 validate_key 拒 `.`/`..`，任何分叉
-        // 是 bug 而非输入。
+        // T12/G7 fail-closed (same as provider send): the signed path must
+        // equal the on-the-wire path; key already has `.`/`..` rejected by validate_key, so any divergence
+        // is a bug rather than input.
         let parsed =
             reqwest::Url::parse(&url).map_err(|_| StoreError::unavailable(false, "url parse"))?;
         if parsed.path() != req.path {
@@ -134,11 +134,11 @@ impl S3Store {
         for (name, value) in headers.iter() {
             b = b.header(name, value);
         }
-        // RV-R8 #1: 签名里承诺的 payload hash 就是这些字节——必须
-        // 真的附到请求上；漏掉会让所有 PUT 上传空对象。
-        // R2 对缺少 Content-Length 的空 body PUT/POST 回 411：带 body 的
-        // 方法（含空 body）一律显式声明长度（空为 0）。content-length
-        // 不进 SigV4 SignedHeaders（与 payload hash 无关，签名不变）。
+        // RV-R8 #1: the payload hash committed to in the signature is exactly these bytes -- they must
+        // really be attached to the request; omitting them would make every PUT upload an empty object.
+        // R2 answers 411 to an empty-body PUT/POST lacking Content-Length: methods with a body
+        // (including empty bodies) always declare the length explicitly (0 for empty). content-length
+        // is not in the SigV4 SignedHeaders (unrelated to the payload hash, the signature is unchanged).
         if matches!(req.method, reqwest::Method::PUT | reqwest::Method::POST) {
             b = b.header(reqwest::header::CONTENT_LENGTH, req.body.len().to_string());
         }
@@ -221,7 +221,7 @@ impl S3Store {
 
 fn status_err(status: u16) -> StoreError {
     match status {
-        // 5xx/429 可重试；其余 4xx 属配置/语义错误。
+        // 5xx/429 are retryable; other 4xx are configuration/semantic errors.
         429 | 500..=599 => StoreError::unavailable(true, format!("s3 status {status}")),
         s => StoreError::unavailable(false, format!("s3 status {s}")),
     }
@@ -289,9 +289,9 @@ impl S3Store {
         let mut commons: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
         let mut fetches = 0usize;
-        // 默认假定截断：只有当某页声明"无更多"且我们未触上界时
-        // 才清零——任一路径命中界值都会保留 truncated=true 交给
-        // 调用方 fail closed（RV-R8 #7）。
+        // Assume truncation by default: only clear it when a page declares "no more" and we did not hit the bound
+        // -- any path that hits the bound keeps truncated=true and hands it to the
+        // caller to fail closed (RV-R8 #7).
         let mut truncated = true;
         while fetches < LIST_FETCH_BOUND && out.len() + commons.len() < LIST_KEY_BOUND {
             fetches += 1;
@@ -448,9 +448,9 @@ impl ObjectStore for S3Store {
         .await
     }
 
-    /// RV-R31 #5：流式下载——body 边到边写边算 sha256，快照不再
-    /// 整体进内存（MAX_OBJECT_BYTES 约束的是 put；GET 上限由
-    /// 调用方按快照预算校验）。
+    /// RV-R31 #5: streaming download -- the body is written and hashed with sha256 as it arrives, so snapshots no longer
+    /// go wholly into memory (MAX_OBJECT_BYTES constrains put; the GET cap is
+/// validated by the caller against the snapshot budget).
     async fn get_to_file(
         &self,
         key: &str,
@@ -499,8 +499,8 @@ impl ObjectStore for S3Store {
             }
             Ok(Some(FileGetOutcome {
                 etag,
-                // 2026-11-15：finalize() 已是摘要——不得再过 sha256_hex
-                // （那会算 sha256(sha256(x))，restore 永远 sha 不符）。
+                // 2026-11-15: finalize() is already a digest -- it must not go through sha256_hex again
+                // (that would compute sha256(sha256(x)), and restore would never match the sha).
                 sha256: hex::encode(hasher.finalize()),
                 len,
             }))
@@ -515,7 +515,7 @@ impl ObjectStore for S3Store {
                 "s3 conditional writes unsupported",
             ));
         }
-        // If-None-Match: * —— key 不存在才写。
+        // If-None-Match: * -- write only if the key does not exist.
         self.put_raw(key, body, Some(("if-none-match".into(), "*".into())))
             .await
     }

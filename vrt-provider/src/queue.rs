@@ -1,14 +1,14 @@
-//! Queue 生产端数据面（T37）：facade-queue → provider → vrt-sql。
+//! Queue producer data plane (T37): facade-queue -> provider -> vrt-sql.
 //!
-//! provider 的职责与 D1 同构：鉴权（签名 props→Authorizer）→ 按快照
-//! 把 `bindingId` 映射到 `queueId`（Worker 不可指定——请求里的任何
-//! 队列名/ID 一律不采信）→ 按 §8/miniflare broker 语义校验
-//! workerd `queue` binding 的线格式（`POST /message`、`POST /batch`、
-//! `GET /metrics`）→ 转发 vrt-sql 内部 wire。
+//! The provider's responsibilities mirror D1: authenticate (signed props -> Authorizer) -> from the snapshot
+//! map `bindingId` to `queueId` (the Worker cannot choose -- any queue
+//! name/ID in the request is never trusted) -> validate per section 8 / miniflare broker semantics
+//! the workerd `queue` binding wire format (`POST /message`, `POST /batch`,
+//! `GET /metrics`) -> forward to the vrt-sql internal wire.
 //!
-//! 限额数值 = miniflare broker 实测（B:50,82,379）——**十进制**字节：
-//! 单消息 ≤128_000B、批 ≤100 条、批总 ≤288_000B、delay ≤86_400s。
-//! 消息体为不透明字节（v8 序列化体不解释）。
+//! Limit values = measured on the miniflare broker (B:50,82,379) -- **decimal** bytes:
+//! single message <=128_000B, batch <=100 messages, batch total <=288_000B, delay <=86_400s.
+//! Message bodies are opaque bytes (v8-serialized bodies are not interpreted).
 
 use crate::context::{BindingContext, BindingResource};
 use crate::d1::SqlAuthSigner;
@@ -19,33 +19,33 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-/// miniflare broker 限额（§8，十进制——B:50 已核实）。
+/// miniflare broker limits (section 8, decimal -- B:50 verified).
 pub const QUEUE_MSG_MAX_BYTES: usize = 128_000;
 pub const QUEUE_BATCH_MAX_MSGS: usize = 100;
 pub const QUEUE_BATCH_MAX_BYTES: usize = 288_000;
 pub const QUEUE_DELAY_MAX_SECS: u32 = 86_400;
-/// provider 入口读 body 上限（batch base64 ≈ 384KB + 头部冗余）。
+/// Provider ingress body-read cap (batch base64 ~= 384KB + header slack).
 pub const QUEUE_MAX_BODY_BYTES: usize = 1024 * 1024;
-/// 上游响应上限（RV-R8 #8）：队列应答是小型 JSON 信封（ack/指标），
-/// 1MiB 已远超合法响应，超出即 fail closed。
+/// Upstream response cap (RV-R8 #8): queue replies are small JSON envelopes (ack/metrics),
+/// 1MiB is far above any legal response; exceeding it fails closed.
 pub const QUEUE_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
-/// workerd `queue` binding 的头域。
+/// Header fields of the workerd `queue` binding.
 pub const HDR_MSG_FMT: &str = "x-msg-fmt";
 pub const HDR_MSG_DELAY: &str = "x-msg-delay-secs";
 pub const HDR_BATCH_COUNT: &str = "cf-queue-batch-count";
 pub const HDR_BATCH_LARGEST: &str = "cf-queue-largest-msg";
 pub const HDR_BATCH_BYTES: &str = "cf-queue-batch-bytes";
 
-/// vrt-sql `/queues/{id}/send` 请求消息（body hex）。
+/// vrt-sql `/queues/{id}/send` request message (body hex).
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SendMsg<'a> {
-    /// T37r：id 一律服务端生成（uuid v4 32-hex）——workerd 常规路径
-    /// 不发 id（miniflare broker `/message` 只发 {contentType,
-    /// delaySecs,body}；`/batch` 的 id/timestamp 仅 DLQ 转投可选字
-    /// 段）。客户端提供的 id/timestamp 在入口一律 400；provider 生
-    /// 成 id 后传输重试天然幂等（vrt-sql 重复 id 去重）。
+    /// T37r: ids are always server-generated (uuid v4 32-hex) -- the regular workerd path
+    /// does not send an id (the miniflare broker `/message` only sends {contentType,
+    /// delaySecs,body}; `/batch` id/timestamp are optional fields only for DLQ
+    /// forwarding). An id/timestamp supplied by the client gets 400 at ingress; after the provider generates
+    /// the id, transport retries are naturally idempotent (vrt-sql dedups duplicate ids).
     id: String,
     body: String,
     content_type: &'a str,
@@ -58,7 +58,7 @@ struct SendReq<'a> {
     messages: Vec<SendMsg<'a>>,
 }
 
-/// `/batch` 入站消息（miniflare `QueueIncomingMessageSchema`）。
+/// `/batch` inbound message (miniflare `QueueIncomingMessageSchema`).
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BatchMsg {
@@ -77,7 +77,7 @@ struct BatchReq {
     messages: Vec<BatchMsg>,
 }
 
-/// vrt-sql 队列 op 响应的错误面（typed code）。
+/// Error surface of a vrt-sql queue op response (typed code).
 #[derive(Debug, Deserialize)]
 pub struct QueueWireError {
     #[serde(default)]
@@ -88,7 +88,7 @@ pub struct QueueWireError {
     pub retryable: Option<bool>,
 }
 
-/// vrt-sql `/queues/{id}/metrics` 与 send 响应共享的 metrics 形状。
+/// The metrics shape shared by vrt-sql `/queues/{id}/metrics` and the send response.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WireMetrics {
@@ -100,12 +100,12 @@ pub struct WireMetrics {
     pub oldest_message_timestamp_ms: Option<i64>,
 }
 
-/// broker `metrics` 响应形状：`oldestMessageTimestamp` 为 epoch-ms
-/// **数字**——miniflare `getMetricsResponseObject()` 实测
+/// broker `metrics` response shape: `oldestMessageTimestamp` is an epoch-ms
+/// **number** -- measured from miniflare `getMetricsResponseObject()`
 /// `this.#messages[0]?.timestamp.getTime() ?? 0`
-///（broker.worker.js:307-312），空队列 = **0**。workerd 按 `date`
-/// 类型解析该字段：null 抛 `TypeError … not of type 'date'`，
-/// 字符串同样不合法（T37r2 真 workerd 实测）。绝不输出 null/字符串。
+/// (broker.worker.js:307-312), empty queue = **0**. workerd parses this field as type `date`:
+/// null throws `TypeError ... not of type 'date'`,
+/// and a string is likewise invalid (measured on real workerd in T37r2). Never emit null/a string.
 pub fn broker_metrics_json(m: &WireMetrics) -> serde_json::Value {
     serde_json::json!({
         "backlogCount": m.backlog_count,
@@ -116,8 +116,8 @@ pub fn broker_metrics_json(m: &WireMetrics) -> serde_json::Value {
 
 const CONTENT_TYPES: [&str; 4] = ["text", "json", "bytes", "v8"];
 
-/// 入口侧 `X-Msg-Fmt` 解析（miniflare `validateContentType`）：
-/// 缺省 = `v8`；非法 → 400。
+/// Ingress-side `X-Msg-Fmt` parsing (miniflare `validateContentType`):
+/// default = `v8`; invalid -> 400.
 fn parse_msg_fmt(headers: &axum::http::HeaderMap) -> Result<&'static str, String> {
     let fmt = match headers.get(HDR_MSG_FMT).and_then(|v| v.to_str().ok()) {
         Some(f) => f,
@@ -134,7 +134,7 @@ fn parse_msg_fmt(headers: &axum::http::HeaderMap) -> Result<&'static str, String
         })
 }
 
-/// `X-Msg-Delay-Secs`（miniflare `validateMessageDelay`）：int 0..=86400。
+/// `X-Msg-Delay-Secs` (miniflare `validateMessageDelay`): int 0..=86400.
 fn parse_delay(headers: &axum::http::HeaderMap) -> Result<Option<u32>, String> {
     let v = match headers.get(HDR_MSG_DELAY).and_then(|v| v.to_str().ok()) {
         Some(v) => v,
@@ -149,13 +149,13 @@ fn parse_delay(headers: &axum::http::HeaderMap) -> Result<Option<u32>, String> {
     Ok(Some(d))
 }
 
-/// `POST /message`：raw body + 头域 → vrt-sql send 请求。
-/// 返回 (send_json, 拒绝原因 for metrics)。
+/// `POST /message`: raw body + headers -> vrt-sql send request.
+/// Returns (send_json, rejection reason for metrics).
 pub fn producer_message(
     headers: &axum::http::HeaderMap,
     body: &[u8],
 ) -> Result<serde_json::Value, (u16, String)> {
-    // miniflare：Content-Length 先验（超限 413）。
+    // miniflare: Content-Length is checked first (over the limit -> 413).
     if let Some(cl) = headers
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -190,7 +190,7 @@ pub fn producer_message(
     .unwrap())
 }
 
-/// `POST /batch`：批次头（存在才校验，miniflare 同口径）+ JSON body。
+/// `POST /batch`: batch headers (validated only if present, same convention as miniflare) + JSON body.
 pub fn producer_batch(
     headers: &axum::http::HeaderMap,
     body: &[u8],
@@ -261,10 +261,10 @@ pub fn producer_batch(
         if d > QUEUE_DELAY_MAX_SECS {
             return Err((400, format!("message delay {d} is invalid")));
         }
-        // T37r：workerd 常规 send/sendBatch 不发 id/timestamp（仅
-        // DLQ 转投可选）——客户端提供的两者一律拒绝而非透传：id 全
-        // 由服务端生成（重试幂等 + 去重可观测），timestamp 不可信
-        // （调度/指标只用服务端时钟）。
+        // T37r: the regular workerd send/sendBatch does not send id/timestamp (only
+        // optional for DLQ forwarding) -- when the client supplies either it is rejected rather than passed through: ids are all
+        // generated by the server (retry idempotence + observable dedup), and the timestamp is untrusted
+        // (scheduling/metrics use only the server clock).
         if m.id.is_some() {
             return Err((400, "client-provided message id is not accepted".into()));
         }
@@ -297,7 +297,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, ()> {
         .map_err(|_| ())
 }
 
-/// vrt-sql 下游客户端（queue 专用——不借 D1 类型，路径/无 session 头）。
+/// vrt-sql downstream client (queue-specific -- does not borrow D1 types; paths/no session headers).
 pub struct QueueClient {
     http: reqwest::Client,
     addr: String,
@@ -355,8 +355,8 @@ impl QueueClient {
         }
     }
 
-    /// 转发一次队列 op（`/queues/{id}/{op}`，GET for metrics）。
-    /// 返回（status, body）；**绝不重试**。
+    /// Forward one queue op (`/queues/{id}/{op}`, GET for metrics).
+    /// Returns (status, body); **never retries**.
     pub async fn forward(
         &self,
         ctx: &BindingContext,
@@ -372,7 +372,7 @@ impl QueueClient {
                 ))
             }
         };
-        // 与 d1.rs 同口径：渲染前白名单校验 id（纵深防御）。
+        // Same convention as d1.rs: allowlist-validate the id before rendering (defense in depth).
         if queue_id.len() != 26
             || !queue_id
                 .bytes()
@@ -407,7 +407,7 @@ impl QueueClient {
             ProviderError::ResourceUnavailable
         })?;
         let status = resp.status().as_u16();
-        // RV-R8 #8: chunked capped read（与 d1 同口径）。
+        // RV-R8 #8: chunked capped read (same convention as d1).
         let bytes = crate::upstream_body::read_body_capped(resp, QUEUE_MAX_RESPONSE_BYTES)
             .await
             .map_err(|e| {

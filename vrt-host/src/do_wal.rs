@@ -2066,7 +2066,7 @@ pub fn replay_for_restore(
             Err(e) => return Err(WalErr::Store(e)),
         };
         if page.truncated {
-            // 链前缀不完整 → 无法证明链连续性 → fail closed。
+            // chain prefix incomplete -> cannot prove chain continuity -> fail closed.
             return Err(WalErr::Store(vrt_objstore::StoreError::unavailable(
                 true,
                 "wal chain listing truncated",
@@ -3824,11 +3824,11 @@ mod r5_tests {
         );
     }
 
-    /// RV-R8 #7：list 截断 = 可能有未列出的段——回放必须 fail
-    /// closed 拒绝，绝不把短前缀当全集、静默丢尾部写入。
+    /// RV-R8 #7: list truncation = there may be segments not listed -- replay must fail
+    /// closed and refuse, never treat a short prefix as the full set and silently drop tail writes.
     struct TruncWhen {
         inner: MemoryStore,
-        /// 只把含该子串的 prefix 标成截断；"" = 全部截断。
+        /// Only mark prefixes containing this substring as truncated; "" = truncate all.
         marker: &'static str,
     }
     #[async_trait::async_trait]
@@ -3897,8 +3897,8 @@ mod r5_tests {
         let dir = tmpdir("r8trunc-chain");
         let dst = dir.join("dst");
         std::fs::create_dir_all(&dst).unwrap();
-        let _conn = mk_db(&dst, "obj1"); // 本地 stem → 走 per-stem 路径
-        // v2 anchor {B,E}——让回放推进到 chain list 一步。
+        let _conn = mk_db(&dst, "obj1"); // local stem -> takes the per-stem path
+        // v2 anchor {B,E} -- lets replay advance to one step of the chain list.
         let inner = MemoryStore::new();
         let mut ab = vec![2u8];
         ab.extend_from_slice(&1u64.to_be_bytes());

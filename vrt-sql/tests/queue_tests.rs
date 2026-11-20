@@ -1,5 +1,5 @@
-//! T37 QueueBackend 对抗测试：限额边界 / 幂等 / lease 语义 /
-//! 并发 claim / 库类型门禁 / 持久化恢复 / tombstone / wire 端点。
+//! T37 QueueBackend adversarial tests: limit boundaries / idempotence / lease semantics /
+//! concurrent claim / db type gate / persistence recovery / tombstone / wire endpoints.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,7 +36,7 @@ fn backend(tmp: &TempDir) -> (Arc<EngineRegistry>, SqliteQueueBackend) {
     (reg, be)
 }
 
-/// T37r：D1+Queue 双 Persister（同一 store/cfg/clock；root 各分面）。
+/// T37r: D1+Queue dual Persister (same store/cfg/clock; each with its own root facet).
 fn pair(
     store: Arc<MemoryStore>,
     cfg: PersistConfig,
@@ -63,7 +63,7 @@ fn pair(
 
 const NOW: i64 = 1_700_000_000_000;
 
-// ---------- 限额边界 ----------
+// ---------- limit boundaries ----------
 
 #[tokio::test]
 async fn limits_boundaries() {
@@ -71,7 +71,7 @@ async fn limits_boundaries() {
     let (_r, be) = backend(&tmp);
     let q = qid();
 
-    // 单消息 128_000 通过 / +1 拒
+    // single message 128_000 passes / +1 rejected
     assert!(be
         .send(&q, &[msg(&vec![b'x'; MSG_MAX_BYTES], "bytes")], NOW)
         .await
@@ -82,7 +82,7 @@ async fn limits_boundaries() {
         Err(QueueError::TooLarge)
     ));
 
-    // 100 条通过 / 101 拒
+    // 100 messages pass / 101 rejected
     let hundred: Vec<IncomingMsg> = (0..BATCH_MAX_MSGS).map(|_| msg(b"a", "text")).collect();
     assert!(be.send(&q, &hundred, NOW).await.is_ok());
     let mut over = hundred.clone();
@@ -92,7 +92,7 @@ async fn limits_boundaries() {
         Err(QueueError::TooLarge)
     ));
 
-    // 批总 288_000 通过 / +1 拒（各自消息合法）
+    // batch total 288_000 passes / +1 rejected (each message individually legal)
     let full: Vec<IncomingMsg> = (0..99)
         .map(|_| msg(&vec![0u8; BATCH_MAX_BYTES / 100], "bytes"))
         .chain(std::iter::once(msg(
@@ -111,7 +111,7 @@ async fn limits_boundaries() {
     ));
     over_bytes.clear();
 
-    // delay 边界
+    // delay boundaries
     let mut d = msg(b"a", "text");
     d.delay_secs = DELAY_MAX_SECS;
     assert!(be.send(&q, &[d], NOW).await.is_ok());
@@ -122,7 +122,7 @@ async fn limits_boundaries() {
         Err(QueueError::InvalidInput(_))
     ));
 
-    // 非法 content type / 非法 id / 空批
+    // invalid content type / invalid id / empty batch
     assert!(matches!(
         be.send(&q, &[msg(b"a", "evil")], NOW).await,
         Err(QueueError::InvalidInput(_))
@@ -138,12 +138,12 @@ async fn limits_boundaries() {
         Err(QueueError::InvalidInput(_))
     ));
 
-    // 被拒的批一个都不入队——backlog 只含合法批。
+    // A rejected batch enqueues nothing -- the backlog only holds the legal batch.
     let m = be.metrics(&q, NOW).await.unwrap();
     assert_eq!(m.backlog_count, 1 + 100 + 100 + 1, "{}", m.backlog_count);
 }
 
-// ---------- 幂等 ----------
+// ---------- idempotence ----------
 
 #[tokio::test]
 async fn duplicate_msg_id_is_idempotent() {
@@ -181,7 +181,7 @@ async fn send_persistence_failure_no_partial_batch() {
     let be = SqliteQueueBackend::new(reg.clone());
     let q = qid();
     assert!(be.send(&q, &[msg(b"ok", "text")], NOW).await.is_ok());
-    // 注入持久化失败 → send 必 retryable 且整批不落。
+    // Inject a persistence failure -> send must be retryable and the whole batch is not written.
     store.inject_put_failures(vec![StoreError::Unavailable {
         retryable: true,
         reason: "injected".into(),
@@ -215,17 +215,17 @@ async fn send_persistence_failure_no_partial_batch() {
         ),
         "{err:?}"
     );
-    // 崩溃语义：h1 进程消失——引擎析构释放 flock（manifest lease
-    // 不释放，靠 h2 推进时钟自然过期=接管路径）。
+    // Crash semantics: the h1 process vanishes -- the engine's drop releases the flock (the manifest lease
+    // is not released; it expires naturally as h2 advances the clock = the takeover path).
     drop(be);
     drop(reg);
-    // h2 时钟推进到 h1 lease 过期之后（崩溃接管路径）→ 立即接管。
+    // h2's clock advances past h1's lease expiry (crash takeover path) -> take over immediately.
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
     let clock2: Arc<dyn Clock> = Arc::new(TestClock::new(now_ms + 11_000));
-    // 新引擎接管后：只有第一条 ok 消息，p1/p2 不在。
+    // After the new engine takes over: only the first ok message, p1/p2 are absent.
     let reg2 = Arc::new(
         EngineRegistry::new(tmp.path().join("dbs")).with_persisters(pair(
             store.clone(),
@@ -250,7 +250,7 @@ async fn send_persistence_failure_no_partial_batch() {
     );
 }
 
-// ---------- lease 语义 ----------
+// ---------- lease semantics ----------
 
 #[tokio::test]
 async fn lease_expiry_reclaim_and_stale_ack() {
@@ -261,32 +261,32 @@ async fn lease_expiry_reclaim_and_stale_ack() {
     m.id = Some("m1".into());
     be.send(&q, &[m], NOW).await.unwrap();
 
-    // A claims（ttl=10s）
+    // A claims (ttl=10s)
     let a = be
         .claim(&q, "t", 300_000, 10, None, 10_000, NOW)
         .await
         .unwrap();
     assert_eq!(a.messages.len(), 1);
     assert_eq!(a.messages[0].attempts, 1);
-    // lease 未过期时 B 取不到
+    // B cannot get it while the lease has not expired
     let b_early = be
         .claim(&q, "t", 300_000, 10, None, 10_000, NOW + 5_000)
         .await
         .unwrap();
     assert!(b_early.messages.is_empty());
-    // lease 过期 → B 重取 attempts+1
+    // lease expired -> B re-claims, attempts+1
     let b = be
         .claim(&q, "t", 300_000, 10, None, 10_000, NOW + 11_000)
         .await
         .unwrap();
     assert_eq!(b.messages.len(), 1);
     assert_eq!(b.messages[0].attempts, 2);
-    // A 旧 lease ack → LeaseLost，消息仍在 B 租约下
+    // A's old lease ack -> LeaseLost, the message stays under B's lease
     assert!(matches!(
         be.ack(&q, &a.lease_id, &["m1".into()], NOW + 12_000).await,
         Err(QueueError::LeaseLost)
     ));
-    // B 正常 ack
+    // B acks normally
     assert_eq!(
         be.ack(&q, &b.lease_id, &["m1".into()], NOW + 12_000)
             .await
@@ -344,7 +344,7 @@ async fn retry_reschedules_and_dead_letter_moves() {
         .claim(&q, "t", 300_000, 10, None, 10_000, NOW)
         .await
         .unwrap();
-    // retry delay=60s → 不可见 → 60s 后可见
+    // retry delay=60s -> invisible -> visible after 60s
     assert_eq!(
         be.retry(&q, &c.lease_id, &[("r1".into(), 60)], NOW)
             .await
@@ -362,13 +362,13 @@ async fn retry_reschedules_and_dead_letter_moves() {
         .await
         .unwrap();
     assert_eq!(c2.messages.len(), 1);
-    // 旧 lease retry → LeaseLost
+    // old lease retry -> LeaseLost
     assert!(matches!(
         be.retry(&q, &c.lease_id, &[("r1".into(), 0)], NOW + 62_000)
             .await,
         Err(QueueError::LeaseLost)
     ));
-    // dead-letter：消息出 backlog、入审记表
+    // dead-letter: the message leaves the backlog and enters the audit table
     assert_eq!(
         be.dead_letter(
             &q,
@@ -384,14 +384,14 @@ async fn retry_reschedules_and_dead_letter_moves() {
     assert_eq!(be.metrics(&q, NOW).await.unwrap().backlog_count, 0);
 }
 
-// ---------- 库类型门禁 ----------
+// ---------- db type gate ----------
 
 #[tokio::test]
 async fn d1_db_rejected_by_queue_ops_and_internal_tables_hidden() {
     let tmp = TempDir::new().unwrap();
     let reg = Arc::new(EngineRegistry::new(tmp.path().join("dbs")));
     let q = qid();
-    // D1 面：建用户表 + 写行。
+    // D1 surface: create a user table + write a row.
     let eng = reg.get(Queue, q.as_str()).unwrap();
     let ctx = TxnCtx {
         epoch: 1,
@@ -408,7 +408,7 @@ async fn d1_db_rejected_by_queue_ops_and_internal_tables_hidden() {
     )
     .unwrap();
     let be = SqliteQueueBackend::new(reg.clone());
-    // 有用户表 → 队列 op 拒（库类型不匹配，fail closed）。
+    // With a user table -> queue ops are rejected (db type mismatch, fail closed).
     for r in [
         be.send(&q, &[msg(b"a", "text")], NOW).await.err(),
         be.claim(&q, "t", 300_000, 1, None, 1000, NOW).await.err(),
@@ -416,7 +416,7 @@ async fn d1_db_rejected_by_queue_ops_and_internal_tables_hidden() {
     ] {
         assert!(matches!(r, Some(QueueError::InvalidInput(_))), "{r:?}");
     }
-    // 反向：queue 库上用户 SQL 读 `_vrt_q_*` 被拒（保留前缀）。
+    // Reverse: user SQL on a queue db reading `_vrt_q_*` is rejected (reserved prefix).
     let q2 = QueueId::parse(&"r".repeat(26)).unwrap();
     be.send(&q2, &[msg(b"a", "text")], NOW).await.unwrap();
     let eng2 = reg.get(Queue, q2.as_str()).unwrap();
@@ -437,7 +437,7 @@ async fn d1_db_rejected_by_queue_ops_and_internal_tables_hidden() {
     assert!(denied2.is_err(), "user SQL must not write _vrt_q_*");
 }
 
-// ---------- 持久化恢复 ----------
+// ---------- persistence recovery ----------
 
 #[tokio::test]
 async fn recovery_preserves_backlog_and_acked() {
@@ -479,8 +479,8 @@ async fn recovery_preserves_backlog_and_acked() {
         .unwrap();
     drop(be);
     reg.release_leases(std::time::Instant::now() + Duration::from_secs(5));
-    drop(reg); // 引擎析构 → graceful lease release
-               // 新 registry（=重启）恢复：backlog=2。
+    drop(reg); // engine drop -> graceful lease release
+               // New registry (= restart) recovers: backlog=2.
     let reg2 = Arc::new(
         EngineRegistry::new(tmp.path().join("dbs"))
             .with_persisters(mk("h2", &tmp.path().join("dbs"))),
@@ -510,7 +510,7 @@ async fn dropped_queue_rejects_all_ops_idempotent() {
     }
 }
 
-// ---------- wire 端点 ----------
+// ---------- wire endpoints ----------
 
 async fn oneshot(
     app: axum::Router,
@@ -560,7 +560,7 @@ async fn wire_send_claim_ack_metrics_roundtrip() {
     assert_eq!(body["enqueued"].as_u64(), Some(1));
     assert_eq!(body["metrics"]["backlogCount"].as_i64(), Some(1));
 
-    // 非法 id 入口拒绝
+    // illegal id rejected at the entry
     for bad in ["UPPERCASE", "q/../x", "short"] {
         let (c, _) = oneshot(
             app.clone(),
@@ -603,7 +603,7 @@ async fn wire_send_claim_ack_metrics_roundtrip() {
         (200, Some(true)),
         "{body}"
     );
-    // 旧 lease 再 ack → 409 LeaseLost
+    // old lease acks again -> 409 LeaseLost
     let (code, body) = oneshot(
         app.clone(),
         "POST",
@@ -627,7 +627,7 @@ async fn wire_send_claim_ack_metrics_roundtrip() {
     );
 }
 
-// ---------- T37r：ResourceKind 命名空间分离 ----------
+// ---------- T37r: ResourceKind namespace separation ----------
 
 fn sctx() -> TxnCtx {
     TxnCtx {
@@ -637,8 +637,8 @@ fn sctx() -> TxnCtx {
     }
 }
 
-/// 同一 id 以 D1 与 Queue 打开：互不相交的两个库——本地目录分面、
-/// 表集合分面、drop/tombstone 分面、diag 带 kind。
+/// The same id opened as D1 and as Queue: two disjoint databases -- local directory facet,
+/// table-set facet, drop/tombstone facet, diag carries the kind.
 #[tokio::test]
 async fn same_id_d1_and_queue_are_independent() {
     let tmp = TempDir::new().unwrap();
@@ -663,7 +663,7 @@ async fn same_id_d1_and_queue_are_independent() {
     let id = qid();
     be.send(&id, &[msg(b"qm", "text")], NOW).await.unwrap();
 
-    // 同 id 的 D1 库：全新空库——无 _vrt_q_*，可建用户表。
+    // D1 db with the same id: a brand-new empty db -- no _vrt_q_*, user tables can be created.
     let d1 = reg
         .get(vrt_sql::paths::ResourceKind::D1, id.as_str())
         .unwrap();
@@ -694,12 +694,12 @@ async fn same_id_d1_and_queue_are_independent() {
     assert!(names.iter().any(|n| n == "t"), "{names:?}");
     assert!(
         names.iter().all(|n| !n.starts_with("_vrt_q")),
-        "D1 库绝不含 queue 内部表：{names:?}"
+        "a D1 db must never contain queue internal tables: {names:?}"
     );
-    // queue 数据不受同 id D1 打开影响。
+    // queue data is unaffected by opening a D1 with the same id.
     assert_eq!(be.metrics(&id, NOW).await.unwrap().backlog_count, 1);
 
-    // 本地路径分面：两个文件都存在且路径不同。
+    // Local path facet: both files exist and the paths differ.
     let dbs = tmp.path().join("dbs");
     let d1f = vrt_sql::paths::derive_db_file(&dbs, id.as_str()).unwrap();
     let qf =
@@ -709,7 +709,7 @@ async fn same_id_d1_and_queue_are_independent() {
     assert!(d1f.to_string_lossy().contains("dbs/"));
     assert!(qf.to_string_lossy().contains("queues/"));
 
-    // diag：两种 kind 各自成条目且带 kind。
+    // diag: each of the two kinds is its own entry and carries the kind.
     let diags = reg.diagnostics();
     let by_kind = |k| {
         diags
@@ -728,7 +728,7 @@ async fn same_id_d1_and_queue_are_independent() {
         "diag JSON must carry kind: {j}"
     );
 
-    // drop queue：同 id D1 库不受影响；queue 侧 tombstone 生效。
+    // drop queue: the D1 db with the same id is unaffected; the queue-side tombstone takes effect.
     assert!(be.drop_queue(&id).unwrap());
     assert!(matches!(
         be.send(&id, &[msg(b"x", "text")], NOW).await.err(),
@@ -744,8 +744,8 @@ async fn same_id_d1_and_queue_are_independent() {
     assert_eq!(out[0].results[0]["count"].as_i64().unwrap(), 0);
 }
 
-/// `/dbs/{id}/query` 端点走 D1 kind——结构上无法触及 queue 数据：
-/// 同 id 的 queue 已写入时，D1 端点面对的是独立空库。
+/// The `/dbs/{id}/query` endpoint goes through the D1 kind -- structurally unable to touch queue data:
+/// when the queue with the same id has data, the D1 endpoint faces an independent empty db.
 #[tokio::test]
 async fn d1_query_endpoint_cannot_reach_queue_data() {
     let tmp = TempDir::new().unwrap();
@@ -761,7 +761,7 @@ async fn d1_query_endpoint_cannot_reach_queue_data() {
     )
     .await;
     assert_eq!(code, 200, "queue send");
-    // D1 端点打开同 id → 独立库，无 _vrt_q_messages（连表都不存在）。
+    // The D1 endpoint opens the same id -> an independent db, no _vrt_q_messages (the table does not even exist).
     let (code, body) = oneshot(
         app.clone(),
         "POST",
@@ -778,9 +778,9 @@ async fn d1_query_endpoint_cannot_reach_queue_data() {
         .collect();
     assert!(
         names.iter().all(|n| !n.starts_with("_vrt_q")),
-        "D1 端点绝不可见 queue 内部表：{names:?}"
+        "the D1 endpoint must never see queue internal tables: {names:?}"
     );
-    // queue 数据仍在。
+    // The queue data is still there.
     let (code, body) = oneshot(
         app,
         "GET",
@@ -792,16 +792,16 @@ async fn d1_query_endpoint_cannot_reach_queue_data() {
     assert_eq!(body["metrics"]["backlogCount"], 1, "{body}");
 }
 
-// ---------- T37r：客户端 timestamp 不可信 ----------
+// ---------- T37r: client timestamp is untrusted ----------
 
-/// 伪造远古/未来 timestamp：client_ts 只作属性回显，created_at /
-/// visible_at / oldestMessageTimestamp 一律服务端时钟。
+/// Forged ancient/future timestamps: client_ts is only an echoed attribute; created_at /
+/// visible_at / oldestMessageTimestamp always use the server clock.
 #[tokio::test]
 async fn forged_timestamp_cannot_affect_scheduling_or_metrics() {
     let tmp = TempDir::new().unwrap();
     let (_r, be) = backend(&tmp);
     let q = qid();
-    // 远古 timestamp（epoch+1ms）——合法属性，但不参与任何调度/指标。
+    // Ancient timestamp (epoch+1ms) -- a legal attribute, but it takes no part in scheduling/metrics.
     let mut ancient = msg(b"old", "text");
     ancient.timestamp_ms = Some(1);
     assert_eq!(be.send(&q, &[ancient], NOW).await.unwrap().inserted, 1);
@@ -809,23 +809,23 @@ async fn forged_timestamp_cannot_affect_scheduling_or_metrics() {
     assert_eq!(
         m.oldest_message_timestamp_ms,
         Some(NOW),
-        "oldestMessageTimestamp 必须由服务端 created_at 驱动"
+        "oldestMessageTimestamp must be driven by the server-side created_at"
     );
     let c = be
         .claim(&q, "t", 300_000, 1, None, 60_000, NOW)
         .await
         .unwrap();
     assert_eq!(c.messages.len(), 1);
-    // consumer 回显 client_ts 属性（DLQ 转投语义）——不影响 lease/可见性。
+    // The consumer echoes the client_ts attribute (DLQ forwarding semantics) -- no effect on lease/visibility.
     assert_eq!(c.messages[0].timestamp_ms, 1);
-    // 未来 timestamp 超容忍（>now+5min）→ 拒绝而非截断。
+    // A future timestamp beyond tolerance (>now+5min) -> rejected rather than clamped.
     let mut future = msg(b"fut", "text");
     future.timestamp_ms = Some(NOW + 1_000_000_000);
     assert!(matches!(
         be.send(&q, &[future], NOW).await.err(),
         Some(QueueError::InvalidInput(_))
     ));
-    // 容忍边界内（now+5min）→ 接受为属性，指标仍服务端时钟。
+    // Within the tolerance boundary (now+5min) -> accepted as an attribute; metrics still use the server clock.
     let mut skew = msg(b"skew", "text");
     skew.timestamp_ms = Some(NOW + 300_000);
     assert_eq!(be.send(&q, &[skew], NOW).await.unwrap().inserted, 1);
@@ -839,7 +839,7 @@ async fn forged_timestamp_cannot_affect_scheduling_or_metrics() {
     assert_eq!(be.metrics(&q, NOW).await.unwrap().backlog_count, 2);
 }
 
-// ---------- T37r：queue 路由独立 body 上限 ----------
+// ---------- T37r: independent body cap for the queue route ----------
 
 async fn oneshot_raw(
     app: axum::Router,
@@ -865,8 +865,8 @@ async fn oneshot_raw(
     )
 }
 
-/// QUEUE_BODY_MAX = 576_000 + 25_600 + 256 = 601_856：
-/// 最大合法批次通过；+1 字节（含垃圾非 JSON 体）在 JSON 解析前被 413。
+/// QUEUE_BODY_MAX = 576_000 + 25_600 + 256 = 601_856:
+/// the largest legal batch passes; +1 byte (including a junk non-JSON body) gets 413 before JSON parsing.
 #[tokio::test]
 async fn wire_queue_body_max_boundary() {
     const LIMIT: usize = 601_856;
@@ -874,8 +874,8 @@ async fn wire_queue_body_max_boundary() {
     let app = wire::app(AppState::new(tmp.path().join("dbs"), [7u8; 32]));
     let q = "q".repeat(26);
 
-    // 最大合法批次：3 条消息共 288_000B（128K+128K+32K；单消息
-    // 上限 128K），hex 合计 576_000 → 200。
+    // Largest legal batch: 3 messages totaling 288_000B (128K+128K+32K; the per-message
+    // cap is 128K), hex totals 576_000 -> 200.
     let mk = |n: usize, id: &str| {
         serde_json::json!({
             "id": id,
@@ -906,7 +906,7 @@ async fn wire_queue_body_max_boundary() {
         "{resp}"
     );
 
-    // 恰好 LIMIT 字节：合法 JSON + 尾部填充空格 → 仍通过（上限含头不含挤）。
+    // Exactly LIMIT bytes: legal JSON + trailing padding spaces -> still passes (the cap includes the header but excludes padding).
     let json = serde_json::json!({"messages":[{"body":"","contentType":"text","delaySecs":0}]})
         .to_string();
     let padded = format!("{json}{}", " ".repeat(LIMIT - json.len()));
@@ -914,21 +914,21 @@ async fn wire_queue_body_max_boundary() {
     let (code, _) = oneshot_raw(app.clone(), "POST", &format!("/queues/{q}/send"), padded).await;
     assert_eq!(code, 200);
 
-    // LIMIT+1 字节的垃圾（非 JSON）→ 413，发生在 JSON 解析之前
-    // （若为解析层命中会是 400 invalid json，而非 413）。
+    // LIMIT+1 bytes of junk (non-JSON) -> 413, which happens before JSON parsing
+    // (if the parse layer caught it, it would be 400 invalid json, not 413).
     let junk = "x".repeat(LIMIT + 1);
     let (code, resp) = oneshot_raw(app.clone(), "POST", &format!("/queues/{q}/send"), junk).await;
     assert_eq!(code, 413, "{resp}");
 
-    // LIMIT+1 的合法 JSON（填充到超限）→ 同样 413——上限在语义层之上。
+    // LIMIT+1 of legal JSON (padded past the cap) -> likewise 413 -- the cap sits above the semantic layer.
     let over = format!("{json}{}", " ".repeat(LIMIT - json.len() + 1));
     let (code, _) = oneshot_raw(app.clone(), "POST", &format!("/queues/{q}/send"), over).await;
     assert_eq!(code, 413);
 
-    // D1 端点上限未被放大：同进程 body_max=1MiB 默认下，D1 端点行为
-    // 不变——>QUEUE_BODY_MAX 的 D1 请求仍按其自身 1MiB 上限判定。
-    // （反向断言：queue 路由用的是 min(QUEUE_BODY_MAX, body_max)，
-    //   601KB 的 D1 请求在其自身 1MiB 限制内，照常受理。）
+    // The D1 endpoint cap is not enlarged: with the same process's default body_max=1MiB, D1 endpoint behavior
+    // is unchanged -- a D1 request >QUEUE_BODY_MAX is still judged by its own 1MiB cap.
+    // (Reverse assertion: the queue route uses min(QUEUE_BODY_MAX, body_max);
+    //   a 601KB D1 request is within its own 1MiB limit and is accepted as usual.)
     let d1_ok = serde_json::json!({"sql":"SELECT 1"}).to_string();
     let d1_padded = format!("{d1_ok}{}", " ".repeat(700_000 - d1_ok.len()));
     let (code, _) = oneshot_raw(
@@ -938,20 +938,20 @@ async fn wire_queue_body_max_boundary() {
         d1_padded,
     )
     .await;
-    assert_ne!(code, 413, "D1 端点不得受 queue 上限影响");
+    assert_ne!(code, 413, "the D1 endpoint must not be affected by the queue cap");
 }
 
-/// `/queues/{id}/drop` 只 tombstone queue 命名空间——cell-controller
-/// 按 op payload.kind 路由；同 id 的 D1 库不受影响，反之亦然
-///（T37r：命名空间分离前 queue DROP 会 tombstone D1 命名空间、
-/// 泄漏 queue 库，同 id 真 D1 库存在时甚至误删）。
+/// `/queues/{id}/drop` only tombstones the queue namespace -- cell-controller
+/// routes by op payload.kind; the D1 db with the same id is unaffected, and vice versa
+/// (T37r: before namespace separation, a queue DROP would tombstone the D1 namespace,
+/// leak the queue db, and even delete a real D1 db with the same id if present).
 #[tokio::test]
 async fn queue_drop_endpoint_kind_scoped() {
     let tmp = TempDir::new().unwrap();
     let app = wire::app(AppState::new(tmp.path().join("dbs"), [7u8; 32]));
     let id = "q".repeat(26);
 
-    // queue 与同 id D1 库各有数据。
+    // The queue and the D1 db with the same id each hold data.
     let (code, _) = oneshot(
         app.clone(),
         "POST",
@@ -971,8 +971,8 @@ async fn queue_drop_endpoint_kind_scoped() {
     .await;
     assert_eq!(code, 200, "d1 create");
 
-    // 先验证反向隔离：queue-only 语义下 /dbs/{id}/drop 只动 D1
-    // 命名空间（dropped:false 或删掉 D1 库），queue 仍可用。
+    // First verify reverse isolation: under queue-only semantics /dbs/{id}/drop only touches the D1
+    // namespace (dropped:false or deletes the D1 db), and the queue stays usable.
     let (code, body) = oneshot(
         app.clone(),
         "POST",
@@ -985,7 +985,7 @@ async fn queue_drop_endpoint_kind_scoped() {
         (200, Some(true), Some(true)),
         "{body}"
     );
-    // queue 侧 tombstone：一切 op 拒绝（410 VRT_QUEUE_DROPPED），幂等。
+    // queue-side tombstone: every op is rejected (410 VRT_QUEUE_DROPPED), idempotent.
     let (code, body) = oneshot(
         app.clone(),
         "POST",
@@ -1007,14 +1007,14 @@ async fn queue_drop_endpoint_kind_scoped() {
         serde_json::json!({}),
     )
     .await;
-    // 幂等重放：tombstone 命中，dropped:false——同 /dbs/{id}/drop
-    // 语义（wire_tests drop_endpoint_roundtrip_and_tombstone）。
+    // Idempotent replay: the tombstone hits, dropped:false -- same as /dbs/{id}/drop
+    // semantics (wire_tests drop_endpoint_roundtrip_and_tombstone).
     assert_eq!(
         (code, body["success"].as_bool(), body["dropped"].as_bool()),
         (200, Some(true), Some(false)),
         "drop idempotent: {body}"
     );
-    // 同 id D1 库完好。
+    // The D1 db with the same id is intact.
     let (code, body) = oneshot(
         app.clone(),
         "POST",
@@ -1024,8 +1024,8 @@ async fn queue_drop_endpoint_kind_scoped() {
     .await;
     assert_eq!(code, 200, "d1 survives queue drop: {body}");
 
-    // D1 drop 不触 queue tombstone 集——再建同 id queue 被拒（D1
-    // tombstone 属于另一命名空间，不互相可见）。
+    // A D1 drop does not touch the queue tombstone set -- creating a queue with the same id again is rejected (the D1
+    // tombstone belongs to a different namespace and they are not visible to each other).
     let (code, _) = oneshot(
         app.clone(),
         "POST",
@@ -1041,12 +1041,12 @@ async fn queue_drop_endpoint_kind_scoped() {
         serde_json::json!({"sql": "SELECT 1"}),
     )
     .await;
-    // D1 错误面是 HTTP 200 + success:false（wire 语义）。
+    // The D1 error surface is HTTP 200 + success:false (wire semantics).
     assert_eq!(body["success"].as_bool(), Some(false), "{body}");
     assert_eq!(body["error"].as_str(), Some("database dropped"), "{body}");
 }
 
-/// T37b：派发租约互斥、续约、过期接管、纯续约（max=0）。
+/// T37b: dispatch lease mutual exclusion, renewal, takeover on expiry, pure renewal (max=0).
 #[tokio::test]
 async fn dispatch_lease_exclusion_renew_takeover() {
     let tmp = TempDir::new().unwrap();
@@ -1056,14 +1056,14 @@ async fn dispatch_lease_exclusion_renew_takeover() {
     m.id = Some("d1".into());
     be.send(&q, &[m], NOW).await.unwrap();
 
-    // A 持约（ttl=10s）→ epoch=1，拿到消息
+    // A holds the lease (ttl=10s) -> epoch=1, gets messages
     let a = be
         .claim(&q, "disp-a", 10_000, 10, None, 60_000, NOW)
         .await
         .unwrap();
     assert_eq!(a.dispatch_epoch, 1);
     assert_eq!(a.messages.len(), 1);
-    // B 同期 claim → DispatchLeaseLost（持约者与到期时刻可观察）
+    // B claims concurrently -> DispatchLeaseLost (the holder and expiry time are observable)
     match be
         .claim(&q, "disp-b", 10_000, 10, None, 60_000, NOW + 1_000)
         .await
@@ -1077,7 +1077,7 @@ async fn dispatch_lease_exclusion_renew_takeover() {
         }
         other => panic!("expected DispatchLeaseLost, got {other:?}"),
     }
-    // A 到期前续约 → expires 推后，B 到原到期点仍不能接管
+    // A renews before expiry -> expires moves later, and B still cannot take over at the original expiry point
     let renew = be
         .claim(&q, "disp-a", 10_000, 0, None, 60_000, NOW + 9_000)
         .await
@@ -1093,9 +1093,9 @@ async fn dispatch_lease_exclusion_renew_takeover() {
         }
         other => panic!("expected DispatchLeaseLost, got {other:?}"),
     }
-    // A 不再续约 → 过期后 B 接管派发租约：epoch++。但 B 当刻仍取
-    // 不到消息——派发租约接管不等于消息租约失效（A claim 的消息
-    // 租约 60s 未满，分层语义：B 要等消息租约过期才重取）。
+    // A no longer renews -> after expiry B takes over the dispatch lease: epoch++. But B still cannot get
+    // messages at that moment -- taking over the dispatch lease does not invalidate the message lease (the message
+    // lease A claimed has not reached 60s; layered semantics: B must wait for the message lease to expire before re-claiming).
     let b = be
         .claim(&q, "disp-b", 10_000, 10, None, 60_000, NOW + 20_000)
         .await
@@ -1111,14 +1111,14 @@ async fn dispatch_lease_exclusion_renew_takeover() {
         b2.messages[0].attempts, 2,
         "reclaimed after msg lease expiry"
     );
-    // 旧 A 结算被拒——msg lease 属于 B 的重新 claim
+    // The old A's settlement is rejected -- the msg lease belongs to B's re-claim
     assert!(matches!(
         be.ack(&q, &a.lease_id, &["d1".into()], NOW + 62_000).await,
         Err(QueueError::LeaseLost)
     ));
 }
 
-/// T37b：派发租约参数校验——holder 字符集/长度、ttl、max 边界。
+/// T37b: dispatch lease parameter validation -- holder charset/length, ttl, max boundaries.
 #[tokio::test]
 async fn dispatch_lease_input_validation() {
     let tmp = TempDir::new().unwrap();
@@ -1147,23 +1147,23 @@ async fn dispatch_lease_input_validation() {
             .await,
         Err(QueueError::InvalidInput(_))
     ));
-    // 边界：holder=64 字符、ttl=300_000、max=0 均合法
+    // Boundaries: holder=64 chars, ttl=300_000, max=0 are all legal
     assert!(be
         .claim(&q, &"h".repeat(64), 300_000, 0, None, 60_000, NOW)
         .await
         .is_ok());
 }
 
-/// T37b-r：claim `maxBytes` —— 按 RAW body 字节累计、≥1 保底、
-/// 预算耗尽即截断（不跨批补凑）。
+/// T37b-r: claim `maxBytes` -- accumulated by RAW body bytes, >=1 floor,
+/// truncated once the budget is exhausted (no cross-batch topping up).
 #[tokio::test]
 async fn claim_max_bytes_budget() {
     let tmp = TempDir::new().unwrap();
     let (_r, be) = backend(&tmp);
     let q = qid();
-    // 3 × 100B + 1 × 128KB 大消息。
-    // 递增 created_at 定序（ORDER BY visible_at,created_at——
-    // client_ts 不参与排序，平局按 PK 不能假设顺序）。
+    // 3 x 100B + 1 x 128KB large message.
+    // Increasing created_at fixes the order (ORDER BY visible_at,created_at --
+    // client_ts does not take part in ordering, and ties by PK cannot assume an order).
     for i in 0..3i64 {
         be.send(
             &q,
@@ -1193,7 +1193,7 @@ async fn claim_max_bytes_budget() {
     .await
     .unwrap();
 
-    // 预算 250B → 只取 s0+s1（s2 会使累计 300>250）。
+    // Budget 250B -> only s0+s1 are taken (s2 would make the cumulative 300>250).
     let c = be
         .claim(&q, "h", 10_000, 10, Some(250), 60_000, NOW + 10)
         .await
@@ -1213,7 +1213,7 @@ async fn claim_max_bytes_budget() {
         .await
         .unwrap();
 
-    // 预算 50B < 单条 100B —— ≥1 保底：仍返回 s2。
+    // Budget 50B < a single 100B -- the >=1 floor: s2 is still returned.
     let c2 = be
         .claim(&q, "h", 10_000, 10, Some(50), 60_000, NOW + 10)
         .await
@@ -1228,7 +1228,7 @@ async fn claim_max_bytes_budget() {
         .await
         .unwrap();
 
-    // 预算 1B —— 128KB 大消息照样可取（保底优先于预算）。
+    // Budget 1B -- the 128KB large message is still claimable (the floor takes priority over the budget).
     let c3 = be
         .claim(&q, "h", 10_000, 10, Some(1), 60_000, NOW + 10)
         .await
@@ -1239,7 +1239,7 @@ async fn claim_max_bytes_budget() {
         .await
         .unwrap();
 
-    // 边界：0 / >32MB 拒绝；None 兼容旧行为。
+    // Boundaries: 0 / >32MB rejected; None keeps the old behavior.
     assert!(matches!(
         be.claim(&q, "h", 10_000, 10, Some(0), 60_000, NOW + 10)
             .await,
@@ -1260,16 +1260,16 @@ async fn claim_max_bytes_budget() {
     ));
 }
 
-/// T37b-r4：e2e 复现——dispatcher 已持派发租约时 vrt-sql 重启
-///（新 EngineRegistry、同 db 目录；模拟 SIGTERM 后新进程打开同库）：
-/// 消息必须仍在、派发租约 CAS 对同 holder 正常续约、claim 返回消息。
-/// 覆盖旧 fake `recovers_after_sql_restart` 未触达的真实引擎路径。
+/// T37b-r4: e2e reproduction -- vrt-sql restarts while the dispatcher already holds the dispatch lease
+/// (new EngineRegistry, same db directory; simulates a new process opening the same db after SIGTERM):
+/// messages must still be there, the dispatch-lease CAS renews normally for the same holder, and claim returns messages.
+/// Covers the real engine path that the old fake `recovers_after_sql_restart` never reached.
 #[tokio::test]
 async fn claim_recovers_across_registry_restart() {
     let tmp = TempDir::new().unwrap();
     let dbs = tmp.path().join("dbs");
     let q = qid();
-    // 进程 1：dispatcher claim → `_vrt_q_dispatch` holder=vrt-serve 落盘。
+    // Process 1: dispatcher claim -> `_vrt_q_dispatch` holder=vrt-serve lands on disk.
     {
         let reg = Arc::new(EngineRegistry::new(dbs.clone()));
         let be = SqliteQueueBackend::new(reg);
@@ -1279,7 +1279,7 @@ async fn claim_recovers_across_registry_restart() {
             .unwrap();
         assert!(r.messages.is_empty());
     }
-    // 进程 2（重启）：producer send → dispatcher claim 必须取到。
+    // Process 2 (restart): producer send -> the dispatcher claim must get them.
     {
         let reg2 = Arc::new(EngineRegistry::new(dbs.clone()));
         let be2 = SqliteQueueBackend::new(reg2);
@@ -1304,11 +1304,11 @@ async fn claim_recovers_across_registry_restart() {
             )
             .await
             .unwrap();
-        assert_eq!(r.messages.len(), 3, "restart 后 claim 必须看到存量消息");
-        // 租约 CAS：同 holder 未过期 → 续约（epoch 保持首次接管值 1）。
-        assert_eq!(r.dispatch_epoch, 1, "同 holder 续约不得再 bump epoch");
+        assert_eq!(r.messages.len(), 3, "claim after restart must see the existing messages");
+        // Lease CAS: same holder, unexpired -> renew (epoch stays at the first takeover value 1).
+        assert_eq!(r.dispatch_epoch, 1, "renewal by the same holder must not bump the epoch again");
     }
-    // 进程 3（重启 + 派发租约已过期）：接管 epoch++ 后 claim 正常。
+    // Process 3 (restart + dispatch lease expired): after takeover epoch++, claim works normally.
     {
         let reg3 = Arc::new(EngineRegistry::new(dbs.clone()));
         let be3 = SqliteQueueBackend::new(reg3);
@@ -1324,13 +1324,13 @@ async fn claim_recovers_across_registry_restart() {
             )
             .await
             .unwrap();
-        assert_eq!(r.dispatch_epoch, 2, "过期接管必须 bump epoch");
+        assert_eq!(r.dispatch_epoch, 2, "takeover on expiry must bump the epoch");
     }
 }
 
-/// T37b-r5：平台侧归还——`release` 清 lease、`visible_at` 延迟、
-/// `attempts-1` 补偿 claim 的 +1（同一 UPDATE 原子）。consumer 未
-/// 执行的平台失败不烧重试预算、不进死信。
+/// T37b-r5: platform-side return -- `release` clears the lease, delays `visible_at`,
+/// and `attempts-1` compensates the +1 of claim (atomic in the same UPDATE). Platform failures where the consumer did not
+/// run neither burn the retry budget nor go to the dead-letter table.
 #[tokio::test]
 async fn release_compensates_attempt_and_delays_visibility() {
     let tmp = TempDir::new().unwrap();
@@ -1341,14 +1341,14 @@ async fn release_compensates_attempt_and_delays_visibility() {
     let mut m2 = msg(b"b", "text");
     m2.id = Some("m2".into());
     be.send(&q, &[m1, m2], NOW).await.unwrap();
-    // claim 消费 attempts(+1=1)。
+    // claim consumes attempts (+1=1).
     let c = be
         .claim(&q, "h", 10_000, 10, None, 60_000, NOW)
         .await
         .unwrap();
     assert_eq!(c.messages.len(), 2);
     assert!(c.messages.iter().all(|m| m.attempts == 1));
-    // release：attempts 补偿回 0，visible_at 推到 now+5s。
+    // release: attempts is compensated back to 0, visible_at is pushed to now+5s.
     be.release(
         &q,
         &c.lease_id,
@@ -1357,15 +1357,15 @@ async fn release_compensates_attempt_and_delays_visibility() {
     )
     .await
     .unwrap();
-    // 立即 claim —— 消息不可见（visible_at 未来）→ 空批；
-    // 派发租约仍由 h 持有。
+    // Claim immediately -- the message is invisible (visible_at in the future) -> empty batch;
+    // the dispatch lease is still held by h.
     let c2 = be
         .claim(&q, "h", 10_000, 10, None, 60_000, NOW + 20)
         .await
         .unwrap();
     assert!(c2.messages.is_empty(), "released msgs must stay invisible");
-    // visible 到期 → 重新 claim：attempts=1（补偿后 0 + claim 的
-    // +1）——平台失败一轮下来 attempts 净增 0。
+    // visible expires -> claim again: attempts=1 (0 after compensation + claim's
+    // +1) -- after one platform-failure round attempts nets +0.
     let c3 = be
         .claim(&q, "h", 10_000, 10, None, 60_000, NOW + 6_000)
         .await
@@ -1375,7 +1375,7 @@ async fn release_compensates_attempt_and_delays_visibility() {
         c3.messages.iter().all(|m| m.attempts == 1),
         "attempts must equal 1 after release+reclaim (platform failure is free)"
     );
-    // 正常消费 → ack。
+    // Normal consumption -> ack.
     be.ack(&q, &c3.lease_id, &["m1".into(), "m2".into()], NOW + 6_000)
         .await
         .unwrap();
@@ -1383,8 +1383,8 @@ async fn release_compensates_attempt_and_delays_visibility() {
     assert_eq!(m.backlog_count, 0);
 }
 
-/// release 的 lease 守卫：错 lease / 过期 lease → LeaseLost，消息
-/// 原状保留（由真实 holder 结算或到期重投）。
+/// release's lease guard: wrong lease / expired lease -> LeaseLost, the message
+/// is left as-is (settled by the real holder or redelivered on expiry).
 #[tokio::test]
 async fn release_rejects_stale_lease() {
     let tmp = TempDir::new().unwrap();
@@ -1402,7 +1402,7 @@ async fn release_rejects_stale_lease() {
         .await
         .unwrap_err();
     assert!(matches!(err, QueueError::LeaseLost), "{err:?}");
-    // 原消息仍由真 lease 持有 → ack 正常完成。
+    // The original message is still held by the real lease -> ack completes normally.
     be.ack(&q, &c.lease_id, &["m1".into()], NOW + 20)
         .await
         .unwrap();

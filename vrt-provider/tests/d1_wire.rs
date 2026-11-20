@@ -1,5 +1,5 @@
-//! T34: provider→vrt-sql 签名 wire 兼容测试——provider 的
-//! `SqlAuthSigner` 必须被 vrt-sql 的 `ServiceAuth::verify` 接受。
+//! T34: provider->vrt-sql signing wire compatibility test -- the provider's
+//! `SqlAuthSigner` must be accepted by vrt-sql's `ServiceAuth::verify`.
 
 use axum::http::{HeaderMap, HeaderValue, Method};
 use vrt_provider::d1::{
@@ -19,7 +19,7 @@ fn signer_output_verifies_against_vrt_sql() {
     h.insert(SQL_EPOCH_HEADER, HeaderValue::from_static("1"));
     h.insert(SQL_SEQ_HEADER, HeaderValue::from_static("42"));
     assert!(verifier.verify(&h, &Method::POST, pq, body));
-    // seq 与实际上送不一致 → 拒绝（签名覆盖 seq）。
+    // seq differs from what was actually sent -> rejected (the signature covers seq).
     h.insert(SQL_SEQ_HEADER, HeaderValue::from_static("43"));
     assert!(!verifier.verify(&h, &Method::POST, pq, body));
 }
@@ -60,8 +60,8 @@ fn client_addr_validated() {
 
 #[test]
 fn seq_monotonic_across_client_restart() {
-    // T34b: 重启后新 client 的 seq 必须高于旧 client 已发出的值
-    // （epoch 固定 1，回绕会撞 _vrt_dedup）。间隔 >1ms 使纳秒种子必然前移。
+    // T34b: after a restart the new client's seq must be higher than any value the old client already issued
+    // (epoch fixed at 1, wrapping back would collide with _vrt_dedup). A gap >1ms guarantees the nanosecond seed moves forward.
     let a = D1Client::new(
         "http://127.0.0.1:9".into(),
         b"s".to_vec(),
@@ -78,6 +78,6 @@ fn seq_monotonic_across_client_restart() {
     .unwrap();
     let sb = b.next_seq();
     assert!(sb > sa, "restart seq regressed: {sa} -> {sb}");
-    // 进程内严格递增。
+    // Strictly increasing within the process.
     assert!(b.next_seq() > sb);
 }

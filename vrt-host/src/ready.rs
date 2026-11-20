@@ -1,7 +1,7 @@
 //! Readiness: control-fd listen events **and** a bounded probe per
 //! worker socket. Both must hold before a generation is installed —
-//! the task contract ("control-fd 收到就绪消息 + 每个 worker socket
-//! 可连接").
+//! the task contract ("control-fd receives the ready message + every worker socket
+//! is connectable").
 //!
 //! Real workerd 1.20261103.1 emits
 //! `{"event":"listen","socket":"sock-<id>","port":0}` with NO address

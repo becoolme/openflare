@@ -11,7 +11,7 @@
 //! (+ parent-dir fsync where the platform allows). A corrupt or
 //! malformed file **fails closed** (`load` errors; the operator must
 //! remove it manually after confirming the cell is drained — see
-//! workers-runtime-cell-controller.md §恢复).
+//! workers-runtime-cell-controller.md section "Recovery").
 
 use serde::{Deserialize, Serialize};
 use std::fs;

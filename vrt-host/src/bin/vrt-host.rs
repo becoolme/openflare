@@ -168,8 +168,8 @@ fn render_params(args: &[String]) -> ExitCode {
 fn run(config: HostConfig) -> Result<(), ExitCode> {
     for dir in [&config.work_dir, &config.cache_dir] {
         vrt_securefs::ensure_secure_dir(dir).map_err(|e| {
-            // io::Error 只含 errno/原因与安全校验信息（路径、属主/mode），
-            // 不含密钥或配置内容。
+            // io::Error only contains errno/cause and safety-check info (path, owner/mode),
+            // not secrets or config content.
             tracing::error!(dir = %dir.display(), error = %e, "secure directory check failed");
             ExitCode::from(2)
         })?;
@@ -520,6 +520,12 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     );
     if let Some(hub) = &log_hub {
         ingress_state.set_log_hub(hub.clone());
+    }
+    // `vrt dev` only: unmatched-Host fallback to a single-worker
+    // route table (`ingress.devCatchAll`, default off).
+    if config.ingress.dev_catch_all {
+        ingress_state.set_dev_catch_all(true);
+        tracing::warn!("ingress.devCatchAll enabled — any Host routes to the single dev worker");
     }
 
     let status = vrt_host::status::new_status();
