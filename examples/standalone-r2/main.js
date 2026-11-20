@@ -1,38 +1,13 @@
-// R2 example (W5 e2e) — exercises the VRT R2 transport surface:
-// put/get plus the multipart chain (create → parts → complete → get,
-// abort, and signed-uploadId scope enforcement).
+// R2 example (W5 e2e) — exercises the Cloudflare R2Bucket API served by the
+// VRT R2 binding: put/get plus the multipart chain (create → parts →
+// complete → get, abort, and signed-uploadId scope enforcement).
 //
-// NOTE: `env.BUCKET` is the vendored facade's R2Transport entrypoint —
-// put/uploadPart take a ReadableStream body, get returns {meta, body},
-// completeMultipartUpload takes {partNumber, etag} pairs. There is no
-// upstream-style R2Object wrapper and no resumeMultipartUpload.
+// NOTE: `env.BUCKET` is workerd's native `r2Bucket` binding. It is the
+// upstream R2Bucket class: get() returns an R2ObjectBody (text/arrayBuffer/
+// body/...), createMultipartUpload() and resumeMultipartUpload() return an
+// R2MultipartUpload whose uploadPart()/complete()/abort() carry the key and
+// uploadId. The facade translates workerd's native wire to the provider.
 const PART = 5 * 1024 * 1024;
-
-function streamOf(u8) {
-  return new ReadableStream({
-    start(c) {
-      c.enqueue(u8);
-      c.close();
-    },
-  });
-}
-
-async function readAll(stream) {
-  const chunks = [];
-  const reader = stream.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-  const out = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0));
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
-}
 
 async function sha256hex(u8) {
   const buf = await crypto.subtle.digest("SHA-256", u8);
@@ -45,13 +20,13 @@ export default {
     const key = url.searchParams.get("key") || "obj";
     if (url.pathname === "/put") {
       const body = new Uint8Array(await request.arrayBuffer());
-      await env.BUCKET.put(key, streamOf(body));
+      await env.BUCKET.put(key, body);
       return Response.json({ ok: true, size: body.byteLength });
     }
     if (url.pathname === "/get") {
       const res = await env.BUCKET.get(key);
-      if (!res || res.body === undefined) return new Response("missing", { status: 404 });
-      const body = await readAll(res.body);
+      if (!res) return new Response("missing", { status: 404 });
+      const body = new Uint8Array(await res.arrayBuffer());
       return Response.json({ size: body.byteLength, sha256: await sha256hex(body) });
     }
     if (url.pathname === "/multipart") {
@@ -61,16 +36,16 @@ export default {
         new Uint8Array(PART).fill(0x62),
         new TextEncoder().encode("-tail"),
       ];
-      const { uploadId } = await env.BUCKET.createMultipartUpload(key, {
+      const upload = await env.BUCKET.createMultipartUpload(key, {
         customMetadata: { origin: "e2e" },
       });
       const uploaded = [];
       for (let i = 0; i < parts.length; i++) {
-        uploaded.push(await env.BUCKET.uploadPart(key, uploadId, i + 1, streamOf(parts[i])));
+        uploaded.push(await upload.uploadPart(i + 1, parts[i]));
       }
-      const meta = await env.BUCKET.completeMultipartUpload(key, uploadId, uploaded);
+      const meta = await upload.complete(uploaded);
       const res = await env.BUCKET.get(key);
-      const body = res && res.body !== undefined ? await readAll(res.body) : new Uint8Array(0);
+      const body = res ? new Uint8Array(await res.arrayBuffer()) : new Uint8Array(0);
       const expected = new Uint8Array(2 * PART + 5);
       expected.set(parts[0], 0);
       expected.set(parts[1], PART);
@@ -84,12 +59,14 @@ export default {
       });
     }
     if (url.pathname === "/abort") {
-      const { uploadId } = await env.BUCKET.createMultipartUpload(key);
-      await env.BUCKET.uploadPart(key, uploadId, 1, streamOf(new Uint8Array(8)));
-      await env.BUCKET.abortMultipartUpload(key, uploadId);
+      const upload = await env.BUCKET.createMultipartUpload(key);
+      await upload.uploadPart(1, new Uint8Array(8));
+      await upload.abort();
       let rejected = false;
       try {
-        await env.BUCKET.completeMultipartUpload(key, uploadId, []);
+        // Resume by (key, uploadId) as a separate handle; the upload is
+        // terminal, so completing it must fail.
+        await env.BUCKET.resumeMultipartUpload(key, upload.uploadId).complete([]);
       } catch {
         rejected = true;
       }
@@ -98,14 +75,17 @@ export default {
     if (url.pathname === "/crosskey") {
       // uploadId minted for `key` must not operate on another key —
       // the HMAC scope check in the provider rejects it.
-      const { uploadId } = await env.BUCKET.createMultipartUpload(key);
+      const upload = await env.BUCKET.createMultipartUpload(key);
       let rejected = false;
       try {
-        await env.BUCKET.uploadPart("other-key", uploadId, 1, streamOf(new Uint8Array(8)));
+        await env.BUCKET.resumeMultipartUpload("other-key", upload.uploadId).uploadPart(
+          1,
+          new Uint8Array(8),
+        );
       } catch {
         rejected = true;
       }
-      await env.BUCKET.abortMultipartUpload(key, uploadId);
+      await upload.abort();
       return Response.json({ crossKeyRejected: rejected });
     }
     return new Response("not found", { status: 404 });

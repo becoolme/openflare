@@ -40,7 +40,24 @@ tenant worker -- r2Bucket binding --> facade-r2 (R2Transport.fetch) --> native a
   multipart uploads.
 - `vrt-config/tests/golden/tenant.capnp` pins the rendered binding form.
 
+- `vrt-host/tests/r2_smoke.rs` (gated on `VRT_WORKERD_BIN`) renders the real
+  tenant config and runs `examples/standalone-r2/main.js` against real workerd
+  and the real in-process provider (fs backend): put/get, the multipart chain,
+  abort-then-complete rejection, and cross-key signed-uploadId rejection.
+  `deploy/standalone/e2e.sh` asserts against the same example.
+
+## Multipart through the native API
+
+`createMultipartUpload` returns an `R2MultipartUpload` (`uploadPart`,
+`complete`, `abort`). `resumeMultipartUpload(key, uploadId)` is local to
+workerd; every call still carries `(key, uploadId)` to the provider, so the
+HMAC scope check keeps rejecting an uploadId used on a different key.
+
 ## Changelog
+
+- 2026-11-19: Ported `examples/standalone-r2/main.js` to the R2Bucket API
+  (R2ObjectBody, R2MultipartUpload, resumeMultipartUpload) with the same
+  assertions, including cross-key uploadId rejection.
 
 - 2026-11-19: Render R2 bindings as native `r2Bucket` instead of a plain
   service binding. Fixes tenant `put` with httpMetadata/customMetadata
