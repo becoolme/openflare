@@ -1551,9 +1551,27 @@ async fn transient_restore_failure_recovers_at_later_epoch() {
         vrt_host::supervisor::spawn_supervisor(runtime_b.clone(), spec_b, deps_b, test_params());
 
     // Epoch-2 attempt: gate passes (Final@1 == writer_epoch 1) but the
-    // manifest GET fails → release → retry. Give it one full acquire/
-    // fail/release cycle before unblocking.
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // manifest GET fails → release → retry. Wait for one full acquire/
+    // fail/release cycle to land before unblocking — a fixed sleep is a
+    // race on a loaded runner: zero completed cycles lets the FIRST
+    // unblocked attempt claim epoch 2 and the `epoch >= 3` check below
+    // can never hold. The released record (empty holder, epoch advanced
+    // past the dead-marker) is the proof a cycle ran.
+    let cycle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rec = plc_a.record(&scope).unwrap();
+        if rec
+            .as_ref()
+            .is_some_and(|r| r.epoch >= 2 && r.holder.is_empty())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < cycle_deadline,
+            "blocked attempt never completed an acquire/release cycle: {rec:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_ne!(runtime_b.state(), TenantState::Ready);
     let rec_mid = plc_a.record(&scope).unwrap().unwrap();
     assert!(
@@ -1713,7 +1731,24 @@ async fn sibling_fail_closed_recovers_transfer_class() {
     let runtime_b = TenantRuntime::new("t1");
     let handle_b =
         vrt_host::supervisor::spawn_supervisor(runtime_b.clone(), spec_b, deps_b, test_params());
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Same cycle wait as above: a completed acquire/fail/release round
+    // is what bumps the victim lease past the dead-marker epoch — a bare
+    // sleep leaves it to scheduler luck on a loaded runner.
+    let cycle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rec = plc_a.record(&scope_b).unwrap();
+        if rec
+            .as_ref()
+            .is_some_and(|r| r.epoch >= 2 && r.holder.is_empty())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < cycle_deadline,
+            "blocked sibling attempt never completed an acquire/release cycle: {rec:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_ne!(runtime_b.state(), TenantState::Ready);
 
     // Sibling's outage clears → retry acquires both at later epochs;
