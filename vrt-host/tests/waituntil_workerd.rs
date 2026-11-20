@@ -454,6 +454,11 @@ async fn get_dbg(port: u16, path: &str, dbg: bool) -> Option<(u16, String)> {
     loop {
         match tokio::time::timeout(Duration::from_secs(3), s.read(&mut chunk)).await {
             Ok(Ok(0)) | Err(_) if complete(&buf) => break,
+            // Peer closed mid-response: EOF with a partial body must NOT
+            // fall into the data arm — a zero-length extend never
+            // completes `buf`, spinning the read loop forever (seen as
+            // 15 min binary hangs in CI). Fail the probe; callers retry.
+            Ok(Ok(0)) => return None,
             Ok(Ok(n)) => {
                 buf.extend_from_slice(&chunk[..n]);
                 if complete(&buf) {
