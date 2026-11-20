@@ -175,6 +175,7 @@ pub fn init_begin(root: &Path) -> Result<PathBuf, LocalError> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
                 if meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o777 != 0o700 {
                     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
                         .map_err(|e| {

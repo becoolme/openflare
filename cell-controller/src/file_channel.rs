@@ -293,6 +293,7 @@ fn validate_pod_dir(dir: &Path) -> Result<(), String> {
         if meta.mode() & 0o777 != 0o700 {
             return Err(format!("mode {:o} != 0700", meta.mode() & 0o777));
         }
+        // SAFETY: geteuid(2) has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
         if meta.uid() != euid && meta.uid() != 0 {
             return Err(format!("owner uid {} != euid {euid}", meta.uid()));

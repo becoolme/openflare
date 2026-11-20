@@ -440,6 +440,7 @@ impl RusqliteEngine {
             .write(true)
             .create(true)
             .open(&lock_path)?;
+// SAFETY: flock(2) only requires an fd open on the lock file; the fd is a live owned or borrowed File.
         if unsafe { libc::flock(lock_file_fd(&lock_file), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(EngineError::AlreadyOpen);
         }

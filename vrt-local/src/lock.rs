@@ -33,6 +33,7 @@ impl StateLock {
         // bound, not on first sight.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
         loop {
+// SAFETY: flock(2) only requires an fd open on the lock file; the fd is a live owned or borrowed File.
             let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
             if rc == 0 {
                 return Ok(Self { _file: file });

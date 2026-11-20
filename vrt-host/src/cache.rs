@@ -391,6 +391,7 @@ impl CacheService {
                     std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "cache root path nul")
                     })?;
+// SAFETY: the path is a valid NUL-terminated CString and mode 0o711 is a valid mode_t.
                 if unsafe { libc::mkdir(c.as_ptr(), 0o711) } != 0 {
                     let e = io::Error::last_os_error();
                     // A concurrent creator is fine — fall through to the
@@ -403,6 +404,7 @@ impl CacheService {
                     // would land the dir at 0700 and fail validation.
                     // The dir is provably fresh and ours, so an explicit
                     // chmod here carries no foreign-dir risk.
+// SAFETY: the path is a valid NUL-terminated CString and 0o711 is a valid mode_t.
                     if unsafe { libc::chmod(c.as_ptr(), 0o711) } != 0 {
                         return Err(io::Error::last_os_error());
                     }
@@ -423,6 +425,7 @@ impl CacheService {
                 "cache root is not a directory",
             ));
         }
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
         if meta.uid() != unsafe { libc::geteuid() } {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -479,6 +482,7 @@ impl CacheService {
             // on permission; a real failure is a hard error.
             let cpath = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path nul"))?;
+// SAFETY: path is a valid NUL-terminated CString; uid/gid are plain integers and the result is checked.
             if unsafe { libc::chown(cpath.as_ptr(), uid, gid) } != 0 {
                 let _ = std::fs::remove_file(&path);
                 return Err(io::Error::last_os_error());

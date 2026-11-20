@@ -71,6 +71,7 @@ impl FsStore {
             .write(true)
             .open(&lp)
             .map_err(|e| StoreError::unavailable(true, format!("lock open: {e}")))?;
+// SAFETY: flock(2) only requires an fd open on the lock file; the fd is a live owned or borrowed File.
         let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
         if rc != 0 {
             return Err(StoreError::unavailable(

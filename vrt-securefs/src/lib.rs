@@ -131,6 +131,7 @@ fn validate_dir_mode(dir: &Path, mode: u32) -> io::Result<()> {
             "path is not a directory",
         ));
     }
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
     if meta.uid() != unsafe { libc::geteuid() } {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -288,6 +289,7 @@ fn ensure_dir_mode(dir: &Path, mode: u32) -> io::Result<()> {
                 if (cur == 0o700 || cur == 0o711) && (mode == 0o700 || mode == 0o711) {
                     // Ownership is checked inside validate_dir_mode's
                     // sibling path — mirror it before relaxing.
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
                     if meta.uid() != unsafe { libc::geteuid() } {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -463,6 +465,7 @@ pub fn bind_unix_private(path: &Path, mode: u32) -> io::Result<std::os::unix::ne
     // dir briefly exists world-writable before a chmod lands.
     let cstage = std::ffi::CString::new(stage.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path nul"))?;
+// SAFETY: the path is a valid NUL-terminated CString and mode 0o711 is a valid mode_t.
     if unsafe { libc::mkdir(cstage.as_ptr(), 0o700) } != 0 {
         return Err(io::Error::last_os_error());
     }
