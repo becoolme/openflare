@@ -503,12 +503,18 @@ async fn waituntil_side_effect_survives_generation_switch() {
     let (p1_w1, p1_w2, p1_wu) = (free_port(), free_port(), free_port());
     let r1 = render_spec(&fx, p1_w1, p1_w2, p1_wu, 1, MOD_W1, false);
     let rt = TenantRuntime::new("t1");
-    // The armed waitUntil must outlive any plausible `workerd check`
-    // preflight of gen2 (slow on loaded CI runners), so "gen2 served while
-    // gen1 still had it pending" is an ordering fact, not a wall-clock race.
-    const ARM_MS: u64 = 15_000;
+    // The armed waitUntil must outlive ANY gen2 bringup — the
+    // `workerd check` preflight alone may burn its whole 20 s bound on a
+    // loaded CI runner (observed >15 s) — so "gen2 served while gen1
+    // still had it pending" stays an ordering fact, not a wall-clock
+    // race. `drain_timeout` is the TOTAL cap on the deferred-SIGTERM
+    // wait and `wait_until_grace` the idle bound: both must exceed the
+    // arm plus delivery slack or the gate kills gen1 before the side
+    // effect lands.
+    const ARM_MS: u64 = 45_000;
     let mut params = wu_params();
-    params.wait_until_grace = Duration::from_secs(40);
+    params.wait_until_grace = Duration::from_secs(75);
+    params.drain_timeout = Duration::from_secs(75);
     let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
