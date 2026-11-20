@@ -518,6 +518,12 @@ async fn waituntil_side_effect_survives_generation_switch() {
     const ARM_MS: u64 = 15_000;
     let mut params = wu_params();
     params.wait_until_grace = Duration::from_secs(40);
+    // `wait_until_grace` is capped by `drain_timeout` (15 s in `wu_params`).
+    // At that cap the SIGKILL lands within ~100 ms of the 15 s waitUntil
+    // settling: the gate below then passes or fails on runner scheduling
+    // alone, which is how 1.20261120 lost it. Give the drain the same runway
+    // as the grace so the deferral — not the deadline — is what ends gen1.
+    params.drain_timeout = Duration::from_secs(40);
     let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
