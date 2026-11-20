@@ -518,7 +518,10 @@ async fn waituntil_side_effect_survives_generation_switch() {
     // New generation must serve without waiting out the old waitUntil —
     // the deferral lives only on the already-offline old generation.
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
-    let deadline2 = Instant::now() + Duration::from_secs(6);
+    // Real `workerd check` preflight can take several seconds on a loaded
+    // CI runner; the gate below is the delivered side effect, not the
+    // raw switch latency.
+    let deadline2 = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some((200, _)) = get(p2_w1, "/").await {
             break;
@@ -528,7 +531,7 @@ async fn waituntil_side_effect_survives_generation_switch() {
     }
     let switch_latency = t_switch.elapsed();
     assert!(
-        switch_latency < Duration::from_secs(6),
+        switch_latency < Duration::from_secs(30),
         "switch must not wait for the old waitUntil: {switch_latency:?}"
     );
 

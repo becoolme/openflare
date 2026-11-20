@@ -174,7 +174,7 @@ export default {
         const o = {};
         if (u.searchParams.get("off")) o.range = { offset: +u.searchParams.get("off"), length: +u.searchParams.get("len") };
         const r = await env.BKT.get(u.searchParams.get("k"), o);
-        return j({ r: r === null ? null : { text: await new Response(r.body).text(), size: r.meta.size } });
+        return j({ r: r === null ? null : { text: await new Response(r.body).text(), size: r.size } });
       }
       if (op === "list") {
         const o = {};
