@@ -132,6 +132,7 @@ jobs:
       - name: Allow virtual address reservations for workerd
         run: sudo sysctl -w vm.overcommit_memory=1
       - name: Run VRT_WORKERD_BIN-gated tests
+        timeout-minutes: 40
         env:
           CARGO_INCREMENTAL: '0'
           CARGO_PROFILE_DEV_DEBUG: '0'

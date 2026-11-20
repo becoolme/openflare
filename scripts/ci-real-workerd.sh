@@ -123,7 +123,9 @@ TIER2=(
 FAILED=()
 for t in "${TIER2[@]}"; do
   echo "-- $t"
+  # Bound each target: a wedged test must fail with its log, not eat the job.
   if ! env "VRT_HOST_UNIX_TESTS=${VRT_HOST_UNIX_TESTS:-1}" \
+    timeout -k 15 "${TARGET_TIMEOUT:-900}" \
     cargo test --locked -p vrt-host --test "$t" \
     -- --ignored --test-threads="$THREADS" --nocapture; then
     FAILED+=("$t")
