@@ -748,6 +748,61 @@ fn pack_d1_derivation_is_tenant_scoped_and_validated() {
     }
 }
 
+#[test]
+fn pack_wrangler_hyperdrive_and_ratelimits_into_bindings() {
+    use sha2::Digest;
+    use snapshot_protocol::compute_desired::BindingDesired;
+
+    let root = root();
+    let dir = root.join("worker-hd-rl");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"hd-rl-worker\"\nmain = \"main.js\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         [[hyperdrive]]\nbinding = \"DB\"\ndatabase_tenant = \"tenant-prod\"\nid = \"cf-id-ignored\"\n\
+         [[ratelimits]]\nname = \"RL\"\nnamespace_id = \"1001\"\n\
+         simple = { limit = 1500, period = 60 }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("main.js"), "export default {}\n").unwrap();
+
+    let pkg =
+        vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "tenant-a", &|_| None)
+            .unwrap();
+    let hyperdrive = pkg
+        .bindings
+        .iter()
+        .find_map(|binding| match binding {
+            BindingDesired::Hyperdrive(value) => Some(value),
+            _ => None,
+        })
+        .expect("hyperdrive binding");
+    let binding_id = "vrthd:tenant-a:DB";
+    let digest = hex::encode(sha2::Sha256::digest(binding_id.as_bytes()));
+    assert_eq!(hyperdrive.binding_id, binding_id);
+    assert_eq!(
+        hyperdrive.synthetic_host,
+        format!("hd{}.hyperdrive.vrt.internal", &digest[..24])
+    );
+    assert_eq!(hyperdrive.credential_ref, "vrtpgcred:tenant-prod");
+    assert_eq!(hyperdrive.permissions.read, true);
+    assert_eq!(hyperdrive.permissions.write, true);
+
+    let limiter = pkg
+        .bindings
+        .iter()
+        .find_map(|binding| match binding {
+            BindingDesired::Ratelimit(value) => Some(value),
+            _ => None,
+        })
+        .expect("rate limit binding");
+    assert_eq!(limiter.name, "RL");
+    assert_eq!(limiter.namespace_id, "1001");
+    assert_eq!(limiter.limit, 1500);
+    assert_eq!(limiter.period, 60);
+}
+
 // ---------- P3c-1: Durable Objects ----------
 
 fn mk_do_worker(root: &Path, extra_toml: &str) -> PathBuf {

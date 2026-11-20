@@ -60,5 +60,11 @@ None — counters live in the facade system worker's process memory
 ## Examples and tests
 
 - `facade/test/ratelimit.test.mjs` — facade rate-limit contract tests.
+- `vrt-local/tests/local_ops.rs` — standalone Wrangler projection into
+  the signed rate limit binding.
 - `shared/vrt-project-config-vectors.json` — golden vectors covering
   `ratelimits` normalization and every rejected field/bounds case.
+
+## Changelog
+
+- 2026-11-20: Standalone Wrangler projection carries rate-limit settings into the signed desired state.
