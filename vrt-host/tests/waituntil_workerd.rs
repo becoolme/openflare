@@ -530,7 +530,8 @@ async fn waituntil_side_effect_survives_generation_switch() {
     params.wait_until_grace = Duration::from_secs(105);
     params.drain_timeout = Duration::from_secs(105);
     let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), params);
-    wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
+    // The initial Ready bound must leave room for the full preflight timeout.
+    wait_state(&rt, TenantState::Ready, Duration::from_secs(60)).await;
 
     // Hold waitUntil behind a test-controlled gate, then switch generations.
     let (st, body) = get(p1_w1, "/arm?gate=manual").await.expect("arm reply");
