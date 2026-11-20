@@ -521,13 +521,14 @@ async fn waituntil_side_effect_survives_generation_switch() {
     let r1 = render_spec(&fx, p1_w1, p1_w2, p1_wu, 1, MOD_W1, false);
     let rt = TenantRuntime::new("t1");
     let mut params = wu_params();
-    // The pending work is manually released after gen2 serves, so this
-    // deadline only bounds preflight + launch. It exceeds the actor-side
-    // preflight bound (20 s + 10 s slack) with 30 s scheduling margin,
-    // without timing the assertion against a JavaScript timer or the
-    // drain deadline.
-    params.wait_until_grace = Duration::from_secs(75);
-    params.drain_timeout = Duration::from_secs(75);
+    // The pending work is manually released after gen2 serves, so the
+    // serving deadline only bounds preflight + launch. Leave 45 s for
+    // workerd check and another 45 s for a loaded runner to schedule and
+    // start gen2; keep the old generation's grace/drain bounds longer so
+    // the waitUntil stays pending until the test releases it.
+    params.preflight_timeout = Duration::from_secs(45);
+    params.wait_until_grace = Duration::from_secs(105);
+    params.drain_timeout = Duration::from_secs(105);
     let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
@@ -542,8 +543,8 @@ async fn waituntil_side_effect_survives_generation_switch() {
 
     // New generation must serve without waiting out the old waitUntil —
     // the deferral lives only on the already-offline old generation.
-    wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
-    let deadline2 = t_switch + Duration::from_secs(60);
+    wait_state(&rt, TenantState::Ready, Duration::from_secs(60)).await;
+    let deadline2 = t_switch + Duration::from_secs(90);
     loop {
         if let Some((200, _)) = get(p2_w1, "/").await {
             break;
