@@ -73,7 +73,9 @@ export function buildLock(manifest, options = {}) {
     source: "github-release",
     version: tag,
     upstream: {
-      version: manifest.upstream.tag || upstreamCommit.slice(0, 12),
+      // Consumers (vrt-config compat checks) parse this as a workerd semver, so prefer the
+      // upstream tag; a commit prefix is only a fallback for a release made ahead of tagging.
+      version: (manifest.upstream.tag || "").replace(/^v/, "") || upstreamCommit.slice(0, 12),
       commit: upstreamCommit,
     },
     artifacts,

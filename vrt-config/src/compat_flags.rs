@@ -2,7 +2,7 @@
 //! `compat/compatibility-date.capnp` — do not edit by hand.
 //! Provenance (RV-R83): vendored capnp sha256 aedc87ae5fbc4bb4450e7d73c64bc369e54c9df680dfbd7cc132017c55c30fb4;
 //! snapshot pulled from upstream main on 2026-11-09, workerd binary dated
-//! 2026-07-22; pinned runtime is workerd 1.20260916.1 (deploy/docker/workerd.lock).
+//! 2026-07-22; pinned runtime is workerd 1.20261120.1 (deploy/docker/workerd.lock).
 //! `gen_compat_flags.py --check` runs in CI and fails on any drift.
 //!
 //! Tenant `compatibilityFlags[]` are validated against
@@ -475,13 +475,13 @@ pub const COMPAT_FLAG_ENABLE_DATES: &[(&str, &str)] = &[
 ];
 
 /// workerd release pinned by `deploy/docker/workerd.lock`.
-pub const PINNED_WORKERD_VERSION: &str = "1.20260916.1";
+pub const PINNED_WORKERD_VERSION: &str = "1.20261120.1";
 /// Date of the workerd build the vendored capnp snapshot was taken from.
 /// Differs from the pinned release until the snapshot is re-vendored.
 pub const SNAPSHOT_WORKERD_DATE: &str = "2026-07-22";
 /// Latest `compatibility_date` the pinned workerd implements (the date in
 /// its release version). Later dates must be rejected.
-pub const WORKERD_MAX_COMPAT_DATE: &str = "2026-09-16";
+pub const WORKERD_MAX_COMPAT_DATE: &str = "2026-11-20";
 
 /// Tenant-declarable flag: known to the vendored snapshot AND not
 /// marked `$experimental`. Unknown names are rejected (fail closed —

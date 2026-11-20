@@ -33,9 +33,15 @@ LOCK = pathlib.Path(__file__).parent.parent.parent / "deploy" / "docker" / "work
 SNAPSHOT_PULLED = "2026-11-09"
 SOURCE_WORKERD_DATE = "2026-07-22"
 
-_lock_version = json.loads(LOCK.read_text())["version"]
+_lock = json.loads(LOCK.read_text())
+# A fork pin names its own release (vrt-<date>-<sha>); the workerd version it is based on lives in
+# `upstream.version`. Prefer it, and fall back to `version` for the npm pin.
+_lock_version = (_lock.get("upstream") or {}).get("version") or _lock["version"]
 _m = re.fullmatch(r"1\.(\d{4})(\d{2})(\d{2})\.\d+", _lock_version)
-assert _m, f"unparseable workerd.lock version {_lock_version!r}"
+assert _m, (
+    f"workerd.lock needs an upstream workerd version (1.YYYYMMDD.N), got {_lock_version!r}; "
+    "fork pins must record upstream.version"
+)
 PINNED_WORKERD_VERSION = _lock_version
 # Upper bound for tenant compat dates: the pinned release's own date —
 # a later date names behaviour the pinned workerd does not implement.
