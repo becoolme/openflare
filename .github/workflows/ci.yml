@@ -32,17 +32,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # vrt-config/tests/workerd_schema.rs checks generated configs against
-      # the workerd.capnp of the pinned workerd version. Take it from the
-      # npm package of exactly that version (the schema only, no binary).
+      # the workerd.capnp of the pinned workerd version. The lock knows where
+      # that schema lives for either pin source (npm, or a GitHub release of
+      # the fork); this only downloads the schema, no binary.
       - name: Fetch workerd.capnp for the pinned workerd
         run: |
           set -euo pipefail
-          version=$(node -p "JSON.parse(require('fs').readFileSync('deploy/docker/workerd.lock', 'utf8')).version")
-          mkdir -p "$RUNNER_TEMP/workerd"
-          cd "$RUNNER_TEMP/workerd"
-          npm pack --silent "workerd@${version}"
-          tar -xzf "workerd-${version}.tgz" package/workerd.capnp
-          echo "WORKERD_CAPNP=$RUNNER_TEMP/workerd/package/workerd.capnp" >> "$GITHUB_ENV"
+          scripts/fetch-workerd.sh --capnp-only --out "$RUNNER_TEMP/workerd"
+          echo "WORKERD_CAPNP=$RUNNER_TEMP/workerd/workerd.capnp" >> "$GITHUB_ENV"
       # Tests that need a real workerd binary (VRT_WORKERD_BIN) skip here.
       # No debuginfo: tests do not need it and it keeps the linker small.
       - name: cargo test
@@ -75,7 +72,7 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24.22.1'
-      - name: Read pinned version and digests from workerd.lock
+      - name: Read pinned version and digest from workerd.lock
         id: lock
         run: |
           set -euo pipefail
@@ -83,12 +80,12 @@ jobs:
             const fs = require("fs");
             const lock = JSON.parse(fs.readFileSync("deploy/docker/workerd.lock", "utf8"));
             const art = lock.artifacts && lock.artifacts["linux-x64"];
-            if (!lock.version || !art || !art.binarySha256 || !art.integrity) {
-              console.error("workerd.lock has no linux-x64.binarySha256/integrity — update the lock (see deploy/docker/workerd.lock) and retry");
+            if (!lock.version || !art || !art.binarySha256) {
+              console.error("workerd.lock has no linux-x64.binarySha256 — update the lock (see deploy/docker/workerd.lock) and retry");
               process.exit(1);
             }
             fs.appendFileSync(process.env.GITHUB_OUTPUT,
-              `version=${lock.version}\nsha256=${art.binarySha256}\nintegrity=${art.integrity}\n`);
+              `version=${lock.version}\nsha256=${art.binarySha256}\n`);
           '
       # Cache keyed on the binary digest: a lock bump or a tampered
       # cache both miss; the post-restore step re-verifies the digest.
@@ -102,26 +99,11 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
-          mkdir -p .ci/dl .ci/workerd
-          cd .ci/dl
-          npm pack --silent "@cloudflare/workerd-linux-64@${{ steps.lock.outputs.version }}"
-          tgz="$(echo *.tgz)"
-          # 1) tarball integrity (sha512, base64) must equal the lock.
-          got="$(openssl dgst -sha512 -binary "$tgz" | openssl base64 -A)"
-          [ "sha512-$got" = "${{ steps.lock.outputs.integrity }}" ] || \
-            { echo "tarball integrity mismatch: sha512-$got != ${{ steps.lock.outputs.integrity }}" >&2; exit 1; }
-          tar -xzf "$tgz"
-          # 2) the packaged binary must equal lock.artifacts.linux-x64.binarySha256.
-          bin="$(find package -type f -name workerd | head -1)"
-          [ -n "$bin" ] || { echo "no workerd binary inside $tgz" >&2; exit 1; }
-          echo "${{ steps.lock.outputs.sha256 }}  $bin" | sha256sum -c -
-          cp "$bin" ../workerd/workerd && chmod +x ../workerd/workerd
-          # The schema file used by vrt-config/tests/workerd_schema.rs
-          # comes from the meta package of the same pinned version —
-          # same source the `rust` job already uses.
-          npm pack --silent "workerd@${{ steps.lock.outputs.version }}"
-          tar -xzf "workerd-${{ steps.lock.outputs.version }}.tgz" package/workerd.capnp
-          cp package/workerd.capnp ../workerd/workerd.capnp
+          # scripts/fetch-workerd.sh verifies every digest the lock lists
+          # (sha512 tarball integrity for npm pins, sha256 for the asset and
+          # the decompressed binary otherwise) and materializes both the
+          # binary and the schema the same way local runs do.
+          scripts/fetch-workerd.sh --out .ci/workerd --platform linux-x64
       - name: Verify binary digest (cache hit or fresh fetch)
         run: |
           set -euo pipefail

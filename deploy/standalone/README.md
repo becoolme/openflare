@@ -19,6 +19,9 @@ by default; the management socket never leaves the container.
 run it after building with a REAL workerd:
 
 ```sh
+# Either fetch the pinned binary (verifies digests from workerd.lock):
+scripts/fetch-workerd.sh --out .workerd && cp .workerd/workerd deploy/standalone/workerd
+# or bring your own build of the pinned version:
 cp /path/to/workerd deploy/standalone/workerd            # pinned binary
 # RV-R25: take the expected value from the in-repo pin, never from the same file.
 WORKERD_SHA256=$(node -p "JSON.parse(require('fs').readFileSync('deploy/docker/workerd.lock','utf8')).artifacts['linux-x64'].binarySha256")
