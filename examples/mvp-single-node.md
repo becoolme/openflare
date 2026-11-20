@@ -58,3 +58,14 @@ Delivery contract: `envelope.json` = the signed `compute.desired`, verbatim;
 envelopeDigest, generatedAt, workers:[{tenantId,workerId}]}`.
 The host only adopts pairs whose digest matches; the controller sends ACK APPLIED only after the pod's readyz reports
 `ready && revision==target && payloadDigest==signed`.
+
+Controller readiness has two endpoints on the health listener:
+
+- `GET /readyz` is the serving check the kubelet probes. It fails closed on a
+  NetworkPolicy apply failure, a missing or expired desired snapshot, a probe
+  failure or a not-ready pod. A ready pod that is still on the previous revision
+  keeps it passing for up to 120 s after the pod last proved an applied revision,
+  so a tenant deploy does not pull a single-replica cell out of the Service
+  endpoints while the host switches generations.
+- `GET /readyz/converged` passes only when every pod loaded the applied revision.
+  Use it in rollout checks that need to know a revision has landed everywhere.

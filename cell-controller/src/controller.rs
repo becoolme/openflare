@@ -257,7 +257,8 @@ impl CellController {
         self.health.clone()
     }
 
-    /// Readiness at `now` (same predicate the axum route evaluates).
+    /// Converged readiness at `now` — every pod loaded the applied
+    /// revision (the `/readyz/converged` predicate).
     pub fn readyz(&self, now: DateTime<Utc>) -> ReadyState {
         let health = self
             .health
@@ -265,6 +266,17 @@ impl CellController {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         crate::health::readiness(&health, now)
+    }
+
+    /// Serving readiness at `now` — the kubelet-facing `/readyz`
+    /// predicate, which tolerates a bounded previous-revision window.
+    pub fn serving_readyz(&self, now: DateTime<Utc>) -> ReadyState {
+        let health = self
+            .health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        crate::health::serving_readiness(&health, now)
     }
 
     /// Cell id this controller serves.
@@ -1199,6 +1211,10 @@ impl CellController {
         {
             let mut health = self.health.write().unwrap_or_else(|e| e.into_inner());
             for (pod_id, result) in results {
+                // Proof of the applied revision only moves forward; an
+                // unproven tick keeps the previous anchor so the
+                // stale-serving grace ages from the last real proof.
+                let previous_current_at = health.pods.get(&pod_id).and_then(|p| p.last_current_at);
                 let entry = match result {
                     Ok(PodProbeResult {
                         ready,
@@ -1217,6 +1233,11 @@ impl CellController {
                             ready,
                             loaded_revision,
                             probe_failed: false,
+                            last_current_at: if loaded_current {
+                                Some(now)
+                            } else {
+                                previous_current_at
+                            },
                         }
                     }
                     Err(_) => {
@@ -1226,6 +1247,7 @@ impl CellController {
                             ready: false,
                             loaded_revision: None,
                             probe_failed: true,
+                            last_current_at: previous_current_at,
                         }
                     }
                 };

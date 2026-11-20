@@ -467,6 +467,48 @@ async fn stale_pod_failures_never_ride_a_new_revisions_ack() {
     );
 }
 
+/// A tenant deploy bumps the applied revision before the host loads it.
+/// The kubelet-facing serving predicate must keep the single-replica
+/// cell in the Service endpoints through that switch (every other
+/// tenant would otherwise get a 503), while the converged predicate
+/// still reports the lag — and the tolerance ages out if the pod never
+/// catches up.
+#[tokio::test]
+async fn previous_revision_keeps_cell_serving_for_a_bounded_window() {
+    let mut rig = rig(&["p0"]);
+    let snap7 = publish("cell-1", 7, &[worker("w1", None)], 3600);
+    rig.source.push(Ok(Some(snap7.bytes.clone())));
+    assert_eq!(
+        rig.controller.reconcile_once(now()).await,
+        ReconcileOutcome::Applied { revision: 7, acked: true }
+    );
+    rig.controller.probe_tick(now()).await;
+    assert_eq!(rig.controller.serving_readyz(now()), ReadyState::Ready);
+
+    let snap8 = publish("cell-1", 8, &[worker("w1", None), worker("w2", None)], 3600);
+    rig.channel.set_probe_loaded("p0", Some(7), Some(snap7.payload_digest.clone()));
+    rig.source.push(Ok(Some(snap8.bytes.clone())));
+    let t = now() + Duration::seconds(10);
+    assert!(matches!(
+        rig.controller.reconcile_once(t).await,
+        ReconcileOutcome::Partial { revision: 8, .. }
+    ));
+    rig.controller.probe_tick(t).await;
+    assert_eq!(rig.controller.serving_readyz(t), ReadyState::Ready);
+    assert_eq!(
+        rig.controller.readyz(t),
+        ReadyState::NotReady("pod-stale-revision")
+    );
+
+    // Still stuck on rev7 well past the grace: fail closed.
+    let late = now() + Duration::seconds(300);
+    rig.controller.probe_tick(late).await;
+    assert_eq!(
+        rig.controller.serving_readyz(late),
+        ReadyState::NotReady("pod-stale-revision")
+    );
+}
+
 /// MIG-6/B: a clean APPLIED serializes `tenantFailures: []` explicitly
 /// — the server persists the empty set as a clear instead of leaving
 /// a PARTIAL-era diagnostic row behind.

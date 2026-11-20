@@ -1,11 +1,22 @@
 //! `/healthz` + `/readyz` surface — fail-closed readiness.
 //!
-//! `healthz` is process liveness (always 200 while running). `readyz` is
-//! only ready when the controller's applied desired is unexpired AND every
-//! assigned pod probed ready with the applied revision loaded.
+//! `healthz` is process liveness (always 200 while running).
+//!
+//! Two readiness predicates share one fail-closed core:
+//!
+//! - `/readyz` ([`serving_readiness`]) answers "can this cell serve
+//!   traffic right now?" and is what the kubelet probes. A pod that is
+//!   ready but still on the PREVIOUS revision keeps the cell Ready for a
+//!   bounded [`STALE_SERVING_GRACE`] after it last proved the applied
+//!   revision. Without this, every tenant deploy bumped the applied
+//!   revision, the single-replica host Pod left the Service endpoints
+//!   until it loaded the new snapshot, and every tenant on the cell got
+//!   a 503 during any one tenant's deploy.
+//! - `/readyz/converged` ([`readiness`]) answers "has every pod loaded
+//!   the applied revision?" for operators and rollout checks.
 //!
 //! The view carries no secrets, payloads, env or tenant data — only
-//! revision numbers and pod ids, so it can be scraped freely.
+//! revision numbers, timestamps and pod ids, so it can be scraped freely.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -23,6 +34,13 @@ pub struct PodHealth {
     pub loaded_revision: Option<u64>,
     /// Probe failed entirely (unreachable) — treated as not ready.
     pub probe_failed: bool,
+    /// Last probe time at which this pod was ready AND had loaded the
+    /// revision applied at that moment (`None` = never proven). Anchors
+    /// the bounded stale-serving grace; it only moves forward on proof,
+    /// so a pod stuck on an old revision ages out even while revisions
+    /// keep churning.
+    #[serde(default)]
+    pub last_current_at: Option<DateTime<Utc>>,
 }
 
 /// Shared readiness view — updated by `probe_tick`/`reconcile_once`.
@@ -69,9 +87,31 @@ pub fn new_health() -> SharedHealth {
     std::sync::Arc::new(RwLock::new(CellHealth::default()))
 }
 
-/// Evaluate readiness at `now`: applied desired unexpired AND every
-/// assigned pod ready AND loaded the applied revision.
+/// How long a ready pod that is still on an older revision keeps the
+/// cell serving-ready, measured from the pod's `last_current_at`. A
+/// generation switch takes tens of seconds (preflight alone is ~20 s);
+/// a pod that has not proven any applied revision for this long is
+/// treated as stuck and the cell fails closed.
+pub const STALE_SERVING_GRACE: chrono::Duration = chrono::Duration::seconds(120);
+
+/// Converged readiness at `now`: applied desired unexpired AND every
+/// assigned pod ready AND loaded the applied revision. Served on
+/// `/readyz/converged`.
 pub fn readiness(health: &CellHealth, now: DateTime<Utc>) -> ReadyState {
+    evaluate(health, now, false)
+}
+
+/// Serving readiness at `now`, served on `/readyz` (the kubelet probe).
+/// Same fail-closed rules as [`readiness`] — netpolicy failure, missing
+/// or expired desired, probe failure and not-ready pods all refuse —
+/// except that a ready pod on an OLDER revision is tolerated while it
+/// proved an applied revision within [`STALE_SERVING_GRACE`]. A pod
+/// reporting no revision, or a revision NEWER than applied, never is.
+pub fn serving_readiness(health: &CellHealth, now: DateTime<Utc>) -> ReadyState {
+    evaluate(health, now, true)
+}
+
+fn evaluate(health: &CellHealth, now: DateTime<Utc>, tolerate_stale: bool) -> ReadyState {
     if health.netpolicy_error.is_some() {
         // Isolation guarantee not in place — surface this before the
         // desired-state axis (both fail closed; the cause matters).
@@ -90,6 +130,12 @@ pub fn readiness(health: &CellHealth, now: DateTime<Utc>) -> ReadyState {
             Some(pod)
                 if pod.ready && !pod.probe_failed && pod.loaded_revision == Some(revision) => {}
             Some(pod) if pod.probe_failed => return ReadyState::NotReady("pod-probe-failed"),
+            Some(pod)
+                if tolerate_stale
+                    && pod.ready
+                    && matches!(pod.loaded_revision, Some(loaded) if loaded < revision)
+                    && matches!(pod.last_current_at, Some(at)
+                        if at <= now && now - at < STALE_SERVING_GRACE) => {}
             Some(pod) if pod.loaded_revision != Some(revision) => {
                 return ReadyState::NotReady("pod-stale-revision")
             }
@@ -109,7 +155,16 @@ pub fn router(shared: SharedHealth) -> axum::Router {
         State(shared): State<SharedHealth>,
     ) -> Result<Json<serde_json::Value>, StatusCode> {
         let health = shared.read().unwrap_or_else(|e| e.into_inner()).clone();
-        match readiness(&health, Utc::now()) {
+        verdict(serving_readiness(&health, Utc::now()))
+    }
+    async fn readyz_converged(
+        State(shared): State<SharedHealth>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        let health = shared.read().unwrap_or_else(|e| e.into_inner()).clone();
+        verdict(readiness(&health, Utc::now()))
+    }
+    fn verdict(state: ReadyState) -> Result<Json<serde_json::Value>, StatusCode> {
+        match state {
             ReadyState::Ready => Ok(Json(serde_json::json!({ "status": "ready" }))),
             ReadyState::NotReady(reason) => {
                 let _ = reason; // static code only; never echoed
@@ -120,6 +175,7 @@ pub fn router(shared: SharedHealth) -> axum::Router {
     axum::Router::new()
         .route("/healthz", axum::routing::get(healthz))
         .route("/readyz", axum::routing::get(readyz))
+        .route("/readyz/converged", axum::routing::get(readyz_converged))
         .with_state(shared)
 }
 
@@ -148,6 +204,7 @@ mod tests {
                 ready: true,
                 loaded_revision: Some(7),
                 probe_failed: false,
+                last_current_at: None,
             },
         );
         // missing probe for p1 → not ready
@@ -159,6 +216,7 @@ mod tests {
                 ready: true,
                 loaded_revision: Some(7),
                 probe_failed: false,
+                last_current_at: None,
             },
         );
         assert_eq!(readiness(&h, at(0)), ReadyState::Ready);
@@ -179,6 +237,87 @@ mod tests {
         assert_eq!(
             readiness(&h, at(0)),
             ReadyState::NotReady("pod-probe-failed")
+        );
+    }
+
+    fn serving_cell() -> CellHealth {
+        let mut h = CellHealth::default();
+        h.applied_revision = Some(8);
+        h.applied_expires_at = Some(at(600));
+        h.assigned_pods = vec!["p0".into()];
+        h.pods.insert(
+            "p0".into(),
+            PodHealth {
+                pod_id: "p0".into(),
+                ready: true,
+                loaded_revision: Some(7),
+                probe_failed: false,
+                last_current_at: Some(at(0)),
+            },
+        );
+        h
+    }
+
+    #[test]
+    fn serving_tolerates_previous_revision_within_grace() {
+        let h = serving_cell();
+        assert_eq!(serving_readiness(&h, at(30)), ReadyState::Ready);
+        // converged view still reports the switch in flight
+        assert_eq!(
+            readiness(&h, at(30)),
+            ReadyState::NotReady("pod-stale-revision")
+        );
+        // grace is bounded from the last proof, not from the apply
+        assert_eq!(
+            serving_readiness(&h, at(120)),
+            ReadyState::NotReady("pod-stale-revision")
+        );
+    }
+
+    #[test]
+    fn serving_stays_fail_closed() {
+        // never proven current (fresh boot) → not tolerated
+        let mut h = serving_cell();
+        h.pods.get_mut("p0").unwrap().last_current_at = None;
+        assert_eq!(
+            serving_readiness(&h, at(1)),
+            ReadyState::NotReady("pod-stale-revision")
+        );
+        // proof timestamp in the future is not trusted
+        let mut h = serving_cell();
+        h.pods.get_mut("p0").unwrap().last_current_at = Some(at(50));
+        assert!(matches!(serving_readiness(&h, at(1)), ReadyState::NotReady(_)));
+        // no loaded revision, or a revision newer than applied
+        for loaded in [None, Some(9)] {
+            let mut h = serving_cell();
+            h.pods.get_mut("p0").unwrap().loaded_revision = loaded;
+            assert!(matches!(serving_readiness(&h, at(1)), ReadyState::NotReady(_)));
+        }
+        // stale AND not ready
+        let mut h = serving_cell();
+        h.pods.get_mut("p0").unwrap().ready = false;
+        assert!(matches!(serving_readiness(&h, at(1)), ReadyState::NotReady(_)));
+        // probe failure, netpolicy, expired desired all win over grace
+        let mut h = serving_cell();
+        h.pods.get_mut("p0").unwrap().probe_failed = true;
+        assert_eq!(
+            serving_readiness(&h, at(1)),
+            ReadyState::NotReady("pod-probe-failed")
+        );
+        let mut h = serving_cell();
+        h.netpolicy_error = Some("apply-failed".into());
+        assert_eq!(serving_readiness(&h, at(1)), ReadyState::NotReady("netpolicy"));
+        let h = serving_cell();
+        assert_eq!(
+            serving_readiness(&h, at(601)),
+            ReadyState::NotReady("desired-expired")
+        );
+        // unassigned-but-missing probe stays not ready
+        let mut h = serving_cell();
+        h.assigned_pods.push("p1".into());
+        assert_eq!(
+            serving_readiness(&h, at(1)),
+            ReadyState::NotReady("pod-not-ready")
         );
     }
 }
