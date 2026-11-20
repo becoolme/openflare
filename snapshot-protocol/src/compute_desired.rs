@@ -1584,9 +1584,10 @@ fn valid_compat_flag(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'.' | b'-'))
 }
 
-/// Standard 5-field cron expression:
+/// Cloudflare's 5-field cron expression:
 /// `minute hour day-of-month month day-of-week`. Supports `*`, lists,
-/// ranges, steps, and JAN–DEC / SUN–SAT names.
+/// ranges, steps, and JAN–DEC / SUN–SAT names; numeric weekdays use
+/// 1=Sunday through 7=Saturday.
 fn valid_cron_expression(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_CRON_EXPR_LEN {
         return false;
@@ -1605,7 +1606,7 @@ fn valid_cron_expression(value: &str) -> bool {
         (0, 23, &[]),
         (1, 31, &[]),
         (1, 12, &MONTH_NAMES),
-        (0, 7, &DAY_NAMES),
+        (1, 7, &DAY_NAMES),
     ];
     fields
         .iter()
@@ -1651,13 +1652,13 @@ fn valid_cron_part(part: &str, min: u32, max: u32, names: &[&str], dow: bool) ->
     match base.split_once('-') {
         Some((lo, hi)) => {
             !lo.is_empty() && !hi.is_empty() && atom(lo) && atom(hi) && {
-                // Range endpoints must be ordered. Day-of-week (RV-R69):
-                // a range upper bound of `7` or the name `SUN` means
-                // Sunday-at-end-of-week (vixie), so `5-7` and `FRI-SUN`
-                // are valid and the matcher expands them across Sunday.
+                // Range endpoints must be ordered. Day-of-week names use
+                // Sunday=0 internally; a named `SUN` upper bound means
+                // Sunday-at-end-of-week, while numeric values are converted
+                // from Cloudflare's 1=Sunday..7=Saturday convention.
                 match (
-                    cron_atom_value(lo, min, max, names, false),
-                    cron_atom_value(hi, min, max, names, dow),
+                    cron_atom_value(lo, min, max, names, dow, false),
+                    cron_atom_value(hi, min, max, names, dow, true),
                 ) {
                     (Some(l), Some(h)) => l <= h,
                     _ => false,
@@ -1675,17 +1676,22 @@ fn cron_atom_value(
     min: u32,
     max: u32,
     names: &[&str],
+    dow: bool,
     range_hi_dow: bool,
 ) -> Option<u32> {
     if let Some(n) = parse_cron_uint(value) {
-        return (min..=max).contains(&n).then_some(n);
+        return (min..=max)
+            .contains(&n)
+            .then_some(if dow { n - 1 } else { n });
     }
     names
         .iter()
         .position(|n| value.eq_ignore_ascii_case(n))
         .map(|i| {
-            if range_hi_dow && i == 0 {
+            if dow && range_hi_dow && i == 0 {
                 7
+            } else if dow {
+                i as u32
             } else {
                 i as u32 + min
             }
@@ -2405,6 +2411,8 @@ mod tests {
             "*/5 * * * *",
             "0 0 * * *",
             "30 14 1 * *",
+            "0 0 * * 1",
+            "0 0 * * 7",
             "0 0 * * SUN",
             "0 9 * * MON-FRI",
             "0,30 * * * *",
@@ -2423,6 +2431,7 @@ mod tests {
             "* 24 * * *",
             "* * 0 * *",
             "* * * 13 *",
+            "* * * * 0",
             "* * * * 8",
             "*/0 * * * *",
             "*/61 * * * *",

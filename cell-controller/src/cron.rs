@@ -27,7 +27,7 @@
 //!   signed snapshot there is no authority to run tenant work (fail
 //!   closed — same rule as provider lookups).
 //!
-//! Cron matching implements standard 5-field vixie semantics
+//! Cron matching implements Cloudflare's 5-field cron semantics
 //! (`minute hour dom month dow`), `*`/lists/ranges/steps/name literals,
 //! and the dom-or-dow rule (when both fields are restricted the trigger
 //! fires when EITHER matches) — the same grammar `snapshot-protocol`
@@ -576,7 +576,8 @@ pub fn cron_matches(expression: &str, dt: DateTime<Utc>) -> bool {
             "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
         ],
     );
-    // cron dow: 0 and 7 are Sunday; names SUN..SAT map to 0..6.
+    // Cloudflare numeric dow is 1=Sunday .. 7=Saturday. The matcher uses
+    // chrono's Sunday=0 .. Saturday=6 internally, as do the name literals.
     let dow = {
         let raw = dt.weekday().num_days_from_sunday(); // 0=Sun
         field_matches_dow(fields[4], raw)
@@ -633,17 +634,14 @@ fn atom(value: &str, min: u32, max: u32, names: &[&str]) -> Option<u32> {
         .map(|i| i as u32 + min)
 }
 
-/// Day-of-week matcher (RV-R69). Accepts `0-7` (7 = Sunday) and
-/// SUN–SAT; `raw_sunday0` is 0=Sun..6=Sat.
+/// Day-of-week matcher. Cloudflare numbers are 1=Sunday..7=Saturday;
+/// names and the runtime value use 0=Sun..6=Sat internally.
 ///
-/// Ranges are expanded on the 0..=7 axis and folded with `% 7`, so an
-/// upper bound of `7` (or the name `SUN` after a non-Sunday start)
-/// covers Sunday at the end of the week — vixie semantics:
-///   * `5-7`, `FRI-SUN` → Fri, Sat, Sun
-///   * `1-7/2`          → Mon, Wed, Fri, Sun (steps count from the lower bound)
-///   * `*/2`            → Sun, Tue, Thu, Sat (`*` is 0..=6 here)
-///   * `0-7`            → every day
-///   * `SUN-SUN`, `7-7` → Sunday only
+/// Ranges are expanded on the 0..=7 internal axis and folded with `% 7`.
+/// A named `SUN` upper bound after a non-Sunday start covers Sunday at
+/// the end of the week. Numeric values are translated from Cloudflare's
+/// 1..=7 axis before matching: `5-7` is Thu-Sat and `1-7/2` is Sun/Tue/
+/// Thu/Sat. `*/2` likewise fires Sun/Tue/Thu/Sat.
 fn field_matches_dow(field: &str, raw_sunday0: u32) -> bool {
     const NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
     field.split(',').any(|part| {
@@ -657,7 +655,7 @@ fn field_matches_dow(field: &str, raw_sunday0: u32) -> bool {
         // (value on the 0..=7 axis, was a name)
         let resolve = |a: &str| -> Option<(u32, bool)> {
             match a.parse::<u32>() {
-                Ok(n) if n <= 7 => Some((n, false)),
+                Ok(n) if (1..=7).contains(&n) => Some((n - 1, false)),
                 Ok(_) => None,
                 Err(_) => NAMES
                     .iter()
@@ -972,6 +970,28 @@ mod tests {
     }
 
     #[test]
+    fn matcher_numeric_dow_uses_cloudflare_numbering() {
+        let days = [
+            "2026-11-08T00:00:00Z", // Sunday = 1
+            "2026-11-09T00:00:00Z", // Monday = 2
+            "2026-11-10T00:00:00Z", // Tuesday = 3
+            "2026-11-11T00:00:00Z", // Wednesday = 4
+            "2026-11-12T00:00:00Z", // Thursday = 5
+            "2026-11-13T00:00:00Z", // Friday = 6
+            "2026-11-14T00:00:00Z", // Saturday = 7
+        ];
+        for (index, day) in days.iter().enumerate() {
+            let expr = format!("0 0 * * {}", index + 1);
+            assert!(cron_matches(&expr, at(day)), "{expr} should fire on {day}");
+            assert!(days
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .all(|(_, other_day)| !cron_matches(&expr, at(other_day))));
+        }
+    }
+
+    #[test]
     fn matcher_month_end_leap_and_utc_edges() {
         // Month-end: a restricted dom fires only when the month HAS
         // that day — no "nearest-day" drift (matches CF/vixie: an
@@ -994,16 +1014,17 @@ mod tests {
         assert!(cron_matches("59 23 31 12 *", at("2026-12-31T23:59:00Z")));
         assert!(!cron_matches("59 23 31 12 *", at("2027-01-01T00:00:00Z")));
         assert!(cron_matches("0 0 1 1 *", at("2027-01-01T00:00:00Z")));
-        // dow 0 and 7 are both Sunday; names case-insensitive.
-        assert!(cron_matches("0 0 * * 0", at("2026-11-08T00:00:00Z")));
-        assert!(cron_matches("0 0 * * 7", at("2026-11-08T00:00:00Z")));
+        // Cloudflare numeric DOW: 1=Sunday, 7=Saturday; names agree.
+        assert!(cron_matches("0 0 * * 1", at("2026-11-08T00:00:00Z")));
+        assert!(cron_matches("0 0 * * 7", at("2026-11-14T00:00:00Z")));
+        assert!(!cron_matches("0 0 * * 0", at("2026-11-08T00:00:00Z")));
         // Step at a range edge: `1-31/2` = odd days only.
         assert!(cron_matches("0 0 1-31/2 * *", at("2026-11-29T00:00:00Z")));
         assert!(!cron_matches("0 0 1-31/2 * *", at("2026-11-30T00:00:00Z")));
     }
 
-    /// RV-R69 #4: DOW ranges whose upper bound is 7 / `SUN` expand across
-    /// Sunday (vixie) instead of silently never firing.
+    /// Cloudflare uses 1=Sunday..7=Saturday while named days retain
+    /// their calendar meaning. A named SUN upper bound includes Sunday.
     #[test]
     fn matcher_dow_upper_bound_seven_and_sun() {
         // 2026-11-08 is Sunday; Mon 09 .. Sat 14.
@@ -1019,36 +1040,44 @@ mod tests {
         let fired = |expr: &str| -> Vec<bool> {
             days.iter().map(|d| cron_matches(expr, at(d))).collect()
         };
-        // order: Sun Mon Tue Wed Thu Fri Sat
+        // order: Sun Mon Tue Wed Thu Fri Sat; numeric 5-7 means Thu-Sat.
         assert_eq!(
             fired("0 0 * * 5-7"),
+            [false, false, false, false, true, true, true]
+        );
+        assert_eq!(
+            fired("0 0 * * FRI-SUN"),
             [true, false, false, false, false, true, true]
         );
-        assert_eq!(fired("0 0 * * FRI-SUN"), fired("0 0 * * 5-7"));
-        assert_eq!(fired("0 0 * * fri-sun"), fired("0 0 * * 5-7"));
-        // Steps count from the lower bound: 1,3,5,7(=Sun).
+        assert_eq!(fired("0 0 * * fri-sun"), fired("0 0 * * FRI-SUN"));
+        // Steps count from Cloudflare's lower bound: 1,3,5,7.
         assert_eq!(
             fired("0 0 * * 1-7/2"),
-            [true, true, false, true, false, true, false]
+            [true, false, true, false, true, false, true]
         );
-        // `*/2` = 0,2,4,6.
+        // `*/2` = 1,3,5,7 on Cloudflare's numeric axis.
         assert_eq!(
             fired("0 0 * * */2"),
             [true, false, true, false, true, false, true]
         );
-        assert_eq!(fired("0 0 * * 0-7"), [true; 7]);
+        assert_eq!(fired("0 0 * * 1-7"), [true; 7]);
         assert_eq!(
             fired("0 0 * * SUN-SUN"),
             [true, false, false, false, false, false, false]
         );
         assert_eq!(
-            fired("0 0 * * 7-7"),
+            fired("0 0 * * 1-1"),
             [true, false, false, false, false, false, false]
         );
         assert_eq!(
             fired("0 0 * * 6-7"),
-            [true, false, false, false, false, false, true]
+            [false, false, false, false, false, true, true]
         );
+        assert_eq!(
+            fired("0 0 * * 7-7"),
+            [false, false, false, false, false, false, true]
+        );
+        assert_eq!(fired("0 0 * * 0"), [false; 7]);
     }
 
     /// RV-R69 #4 structural property: whatever `ComputeDesired` accepts
@@ -1059,7 +1088,7 @@ mod tests {
     /// (vixie/CF) and are excluded from generation.
     #[test]
     fn validate_accepts_implies_cron_fires_within_a_year() {
-        fn desired_with(expr: &str) -> Result<ComputeDesired, serde_json::Error> {
+        fn desired_with(expr: &str) -> Result<ComputeDesired, String> {
             let mut p = serde_json::json!({
                 "schemaVersion": 1, "cellId": "cell-1", "revision": 1,
                 "tenants": [{"tenantId": "t", "workers": [{
@@ -1072,7 +1101,10 @@ mod tests {
                 }]}]
             });
             p["tenants"][0]["workers"][0]["crons"][0]["expression"] = expr.into();
-            serde_json::from_value(p)
+            let desired: ComputeDesired =
+                serde_json::from_value(p).map_err(|error| error.to_string())?;
+            desired.validate().map_err(|error| format!("{error:?}"))?;
+            Ok(desired)
         }
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move |n: usize| -> usize {
@@ -1086,8 +1118,8 @@ mod tests {
         let dom = ["*", "1", "15", "28", "*/10", "1-7", "1,15", "1-28/3"];
         let month = ["*", "1", "6", "12", "JAN", "dec", "*/3", "JAN-MAR", "2-11/2"];
         let dow = [
-            "*", "0", "1", "6", "7", "SUN", "MON", "*/2", "1-5", "MON-FRI", "5-7", "FRI-SUN",
-            "1-7/2", "0-7", "SUN-SUN", "6-7", "SAT-SUN", "0,7", "3-7/3", "*/7",
+            "*", "1", "2", "6", "7", "SUN", "MON", "*/2", "1-5", "MON-FRI", "5-7", "FRI-SUN",
+            "1-7/2", "1-7", "SUN-SUN", "6-7", "SAT-SUN", "1,7", "3-7/3", "*/7",
         ];
         let mut accepted = 0;
         let mut seen = std::collections::HashSet::new();

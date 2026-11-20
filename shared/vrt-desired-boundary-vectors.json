@@ -795,9 +795,15 @@
       "expect": "accept"
     },
     {
-      "name": "r69-cron-dow-0-7",
+      "name": "r69-cron-dow-0-7-rejected",
       "field": "cron",
       "value": "0 0 * * 0-7",
+      "expect": "reject"
+    },
+    {
+      "name": "r70-cron-dow-1-7",
+      "field": "cron",
+      "value": "0 0 * * 1-7",
       "expect": "accept"
     },
     {

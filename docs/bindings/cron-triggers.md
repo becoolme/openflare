@@ -50,10 +50,11 @@ None — no data plane. The claim log lives under the state root
 
 ## Known differences from Cloudflare
 
-- Expressions are standard 5-field vixie cron (`min hour dom mon dow`,
-  names `JAN`-`DEC` / `SUN`-`SAT`, `*` lists ranges steps), minute
+- Expressions use Cloudflare's 5-field cron format (`min hour dom mon dow`,
+  names `JAN`-`DEC` / `SUN`-`SAT`, `*`, lists, ranges, and steps), at minute
   granularity — validated at deploy in `snapshot-protocol`'s
-  `compute_desired`. There is no seconds field.
+  `compute_desired`. Numeric weekdays follow Cloudflare's mapping: `1` is
+  Sunday through `7` Saturday; `0` is invalid. There is no seconds field.
 - Standalone derives `scheduleId` deterministically (`cfg:{name}:{i}`)
   from the wrangler `triggers.crons` array index.
 - `scheduledTime` is the canonical minute the cron fires on; the worker
@@ -77,3 +78,7 @@ None — no data plane. The claim log lives under the state root
   without a real workerd).
 - `cell-controller/src/cron.rs` — runner, matcher, claim log and
   transport (unit-tested expression matcher).
+
+## Changelog
+
+- 2026-11-20: Align numeric weekday matching and validation with Cloudflare (`1` = Sunday, `7` = Saturday).
