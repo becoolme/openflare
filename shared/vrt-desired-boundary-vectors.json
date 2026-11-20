@@ -807,6 +807,48 @@
       "expect": "accept"
     },
     {
+      "name": "r71-cron-dom-last-day",
+      "field": "cron",
+      "value": "0 0 L * *",
+      "expect": "accept"
+    },
+    {
+      "name": "r71-cron-dom-last-weekday",
+      "field": "cron",
+      "value": "0 0 LW * *",
+      "expect": "accept"
+    },
+    {
+      "name": "r71-cron-dom-nearest-weekday",
+      "field": "cron",
+      "value": "0 0 15W * *",
+      "expect": "accept"
+    },
+    {
+      "name": "r71-cron-dow-last",
+      "field": "cron",
+      "value": "0 0 * * 6L",
+      "expect": "accept"
+    },
+    {
+      "name": "r71-cron-dow-nth",
+      "field": "cron",
+      "value": "0 0 * * MON#2",
+      "expect": "accept"
+    },
+    {
+      "name": "r71-cron-dom-nearest-weekday-overflow-rejected",
+      "field": "cron",
+      "value": "0 0 32W * *",
+      "expect": "reject"
+    },
+    {
+      "name": "r71-cron-dow-nth-overflow-rejected",
+      "field": "cron",
+      "value": "0 0 * * MON#6",
+      "expect": "reject"
+    },
+    {
       "name": "r69-cron-dow-7-5",
       "field": "cron",
       "value": "0 0 * * 7-5",
