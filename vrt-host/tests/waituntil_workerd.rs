@@ -503,11 +503,17 @@ async fn waituntil_side_effect_survives_generation_switch() {
     let (p1_w1, p1_w2, p1_wu) = (free_port(), free_port(), free_port());
     let r1 = render_spec(&fx, p1_w1, p1_w2, p1_wu, 1, MOD_W1, false);
     let rt = TenantRuntime::new("t1");
-    let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), wu_params());
+    // The armed waitUntil must outlive any plausible `workerd check`
+    // preflight of gen2 (slow on loaded CI runners), so "gen2 served while
+    // gen1 still had it pending" is an ordering fact, not a wall-clock race.
+    const ARM_MS: u64 = 15_000;
+    let mut params = wu_params();
+    params.wait_until_grace = Duration::from_secs(40);
+    let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
-    // Arm the 1.5 s waitUntil, then immediately switch generations.
-    let (st, body) = get(p1_w1, "/arm?ms=1500").await.expect("arm reply");
+    // Arm the long waitUntil, then immediately switch generations.
+    let (st, body) = get(p1_w1, &format!("/arm?ms={ARM_MS}")).await.expect("arm reply");
     assert_eq!((st, body.as_str()), (200, "armed"));
 
     let t_switch = Instant::now();
@@ -518,10 +524,7 @@ async fn waituntil_side_effect_survives_generation_switch() {
     // New generation must serve without waiting out the old waitUntil —
     // the deferral lives only on the already-offline old generation.
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
-    // Real `workerd check` preflight can take several seconds on a loaded
-    // CI runner; the gate below is the delivered side effect, not the
-    // raw switch latency.
-    let deadline2 = Instant::now() + Duration::from_secs(30);
+    let deadline2 = t_switch + Duration::from_millis(ARM_MS);
     loop {
         if let Some((200, _)) = get(p2_w1, "/").await {
             break;
@@ -530,22 +533,24 @@ async fn waituntil_side_effect_survives_generation_switch() {
         tokio::time::sleep(Duration::from_millis(60)).await;
     }
     let switch_latency = t_switch.elapsed();
-    assert!(
-        switch_latency < Duration::from_secs(30),
-        "switch must not wait for the old waitUntil: {switch_latency:?}"
-    );
 
-    // The draining generation stays alive while pending>0 — its probe
-    // answers on the private socket.
-    let probe = get(p1_wu, "/vrt/waituntil").await;
-    if let Some((st, body)) = probe {
-        assert_eq!(st, 200, "probe must answer: {body}");
-        assert!(body.contains("\"pending\":1"), "pending must count the armed waitUntil: {body}");
-    }
+    // Gen2 serves while the old waitUntil is still pending: the switch did
+    // not wait for it. Both probes are mandatory — a dead gen1 or a landed
+    // side effect here means the switch was held behind the drain.
+    let (st, body) = get(p1_wu, "/vrt/waituntil")
+        .await
+        .unwrap_or_else(|| panic!("gen1 must still drain when gen2 serves ({switch_latency:?})"));
+    assert_eq!(st, 200, "probe must answer: {body}");
+    assert!(
+        body.contains("\"pending\":1"),
+        "switch must not wait for the old waitUntil ({switch_latency:?}): {body}"
+    );
+    let (_, early) = get(p1_w2, "/read").await.expect("side counter reachable");
+    assert_eq!(early.trim(), "0", "side effect landed before gen2 served ({switch_latency:?})");
 
     // THE GATE: the deferred SIGTERM lets the waitUntil complete — the
     // side effect must land on w2 while gen1 is still alive.
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = t_switch + Duration::from_millis(ARM_MS) + Duration::from_secs(10);
     let mut hits = String::new();
     while Instant::now() < deadline {
         if let Some((200, b)) = get(p1_w2, "/read").await {
