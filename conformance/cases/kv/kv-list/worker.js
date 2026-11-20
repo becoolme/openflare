@@ -17,6 +17,18 @@ export default {
         k.expiration > Date.now() / 1000,
     });
     try {
+      if (url.pathname === "/reset") {
+        // The namespace outlives redeploys; drop keys earlier runs
+        // left behind so the pagination counts are exact.
+        let cursor;
+        for (let i = 0; i < 50; i++) {
+          const r = await env.KV.list({ cursor });
+          await Promise.all(r.keys.map((k) => env.KV.delete(k.name)));
+          if (r.list_complete) return j({ ok: true });
+          cursor = r.cursor;
+        }
+        return j({ error: "reset runaway" });
+      }
       if (url.pathname === "/put") {
         const { key, value, options } = await request.json();
         await env.KV.put(key, value, options);

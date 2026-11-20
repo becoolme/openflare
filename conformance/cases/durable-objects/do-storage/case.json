@@ -11,6 +11,19 @@
   ],
   "steps": [
     {
+      "name": "reset leftover state",
+      "request": {
+        "method": "POST",
+        "path": "/reset"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
       "name": "init via blockConcurrencyWhile",
       "request": {
         "path": "/init"

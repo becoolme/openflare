@@ -10,6 +10,19 @@
   ],
   "steps": [
     {
+      "name": "reset leftover state",
+      "request": {
+        "method": "POST",
+        "path": "/reset"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
       "name": "seed pa/a1",
       "request": {
         "method": "POST",

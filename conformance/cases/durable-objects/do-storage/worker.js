@@ -17,6 +17,14 @@ export class Counter extends DurableObject {
     const url = new URL(req.url);
     const s = this.ctx.storage;
     const j = (v) => Response.json(v);
+    if (url.pathname === "/reset") {
+      // Storage outlives redeploys; clear what earlier runs left so
+      // the counter and row-count steps start from zero. The
+      // constructor-written "initialized" flag is kept on purpose.
+      await s.delete(["n", "a", "b", "t1"]);
+      s.sql.exec("DROP TABLE IF EXISTS t");
+      return j({ ok: true });
+    }
     if (url.pathname === "/init") {
       return j({ initialized: await s.get("initialized") });
     }
