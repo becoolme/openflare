@@ -23,7 +23,7 @@ export const content = {
     B('Rate limiting', 'lim', 'wrangler ratelimits with limit and period; per-process fixed window.'),
     B('Static assets', 'lim', 'Assets directory and binding, with not_found_handling and deploy caps.'),
     B('Cache API', 'lim', 'caches.default and caches.open; per-host and in-memory.'),
-    B('Service bindings', 'lim', 'wrangler services; default entrypoint only.'),
+    B('Service bindings', 'lim', 'wrangler services, including named WorkerEntrypoint exports.'),
     B('WebSockets', 'lim', 'Passthrough to Workers and Durable Objects, with session caps.'),
     B('Vars and secrets', 'lim', 'vars arrive as strings; secrets via vrt secret put.')
   ],

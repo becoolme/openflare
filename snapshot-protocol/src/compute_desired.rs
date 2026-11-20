@@ -411,6 +411,25 @@ pub struct ServiceBinding {
     /// Target worker identifier; must resolve to a worker in the SAME
     /// tenant's `workers` list — cross-tenant service bindings fail closed.
     pub worker_id: String,
+    /// Named `WorkerEntrypoint` export of the target worker (wrangler
+    /// `services[].entrypoint`). Absent = the default export; absent is
+    /// also omitted on the wire, so legacy snapshots keep their bytes.
+    /// JS identifier; `default` and the platform-reserved `Vrt`/`vrt`
+    /// prefix are rejected (one canonical form for the default export,
+    /// and no tenant binding onto a platform-injected entrypoint).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+}
+
+/// Prefix of entrypoint names the platform injects into tenant workers
+/// (e.g. the waitUntil probe). A tenant service binding may not name one.
+pub const RESERVED_ENTRYPOINT_PREFIXES: [&str; 2] = ["Vrt", "vrt"];
+
+/// Whether `ep` is an entrypoint a tenant service binding may target.
+pub fn valid_service_entrypoint(ep: &str) -> bool {
+    valid_binding_name(ep)
+        && ep != "default"
+        && !RESERVED_ENTRYPOINT_PREFIXES.iter().any(|p| ep.starts_with(p))
 }
 
 /// `{"type":"d1"}` — server-assigned database identity + writer epoch.
@@ -1180,9 +1199,14 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.credentialRef"));
                     }
                 }
-                BindingDesired::Service(_) => {
+                BindingDesired::Service(s) => {
                     // Target checked against the tenant worker set in
                     // ComputeDesired::validate (needs tenant scope).
+                    if let Some(ep) = &s.entrypoint {
+                        if !valid_service_entrypoint(ep) {
+                            return Err(DesiredError::Identifier("bindings.entrypoint"));
+                        }
+                    }
                 }
                 BindingDesired::DurableObject(d) => {
                     // class_name is a JS identifier too (it exports a
@@ -1921,6 +1945,55 @@ mod tests {
             ),
             ("service-ok-same-tenant", Box::new(|_| {}), ""),
             (
+                "service-named-entrypoint-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("Greeter")
+                }),
+                "",
+            ),
+            (
+                "service-entrypoint-not-identifier",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("a-b")
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
+                "service-entrypoint-empty",
+                Box::new(|v| v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("")),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
+                "service-entrypoint-default",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("default")
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
+                "service-entrypoint-reserved-probe",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] =
+                        json!("VrtWaituntilProbe")
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
+                "service-entrypoint-reserved-lower",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("vrtX")
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
+                "service-entrypoint-too-long",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] =
+                        json!("E".repeat(MAX_BINDING_NAME_LEN + 1))
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
                 "bad-assets-digest",
                 Box::new(|v| {
                     v["tenants"][0]["workers"][0]["bindings"][6]["manifestDigest"] = json!("zz")
@@ -2471,6 +2544,41 @@ mod tests {
             };
             assert_eq!(a.run_worker_first, a2.run_worker_first);
         }
+    }
+
+    #[test]
+    fn service_entrypoint_wire_shape() {
+        let legacy = serde_json::json!({"type": "service", "name": "AUTH", "workerId": "w-2"});
+        let b: BindingDesired = serde_json::from_value(legacy.clone()).unwrap();
+        let BindingDesired::Service(s) = &b else { panic!() };
+        assert_eq!(s.entrypoint, None);
+        // Absent stays absent: legacy snapshots keep their canonical bytes.
+        assert_eq!(serde_json::to_value(&b).unwrap(), legacy);
+
+        let named = serde_json::json!(
+            {"type": "service", "name": "AUTH", "workerId": "w-2", "entrypoint": "Greeter"}
+        );
+        let b: BindingDesired = serde_json::from_value(named.clone()).unwrap();
+        let BindingDesired::Service(s) = &b else { panic!() };
+        assert_eq!(s.entrypoint.as_deref(), Some("Greeter"));
+        assert_eq!(serde_json::to_value(&b).unwrap(), named);
+
+        let unknown = serde_json::json!(
+            {"type": "service", "name": "AUTH", "workerId": "w-2", "ns": "other"}
+        );
+        assert!(serde_json::from_value::<BindingDesired>(unknown).is_err());
+    }
+
+    #[test]
+    fn service_entrypoint_rules() {
+        for ok in ["Greeter", "_x", "$y", "Admin2", "VRT"] {
+            assert!(valid_service_entrypoint(ok), "{ok}");
+        }
+        for bad in ["", "default", "1A", "a-b", "a.b", "VrtWaituntilProbe", "vrtX", "Vrt"] {
+            assert!(!valid_service_entrypoint(bad), "{bad}");
+        }
+        assert!(!valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN + 1)));
+        assert!(valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN)));
     }
 
     #[test]

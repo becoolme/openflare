@@ -331,6 +331,7 @@ mod tests {
         t.workers[0].bindings.push(BindingDesired::Service(ServiceBinding {
             name: "SVC".to_string(),
             worker_id: "bad".to_string(),
+            entrypoint: None,
         }));
         assert_eq!(
             exclusion_verdict(&t, "bad", &BTreeSet::new()),

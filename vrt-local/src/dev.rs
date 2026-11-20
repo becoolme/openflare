@@ -397,7 +397,10 @@ fn binding_table(meta: &crate::WorkerToml) -> Vec<String> {
             out.push(format!("pg       {name} -> {db}"));
         }
         for (name, svc) in &b.service {
-            out.push(format!("service  {name} -> {svc}"));
+            match svc.entrypoint() {
+                Some(ep) => out.push(format!("service  {name} -> {}#{ep}", svc.service())),
+                None => out.push(format!("service  {name} -> {}", svc.service())),
+            }
         }
         for (name, digest) in &b.assets {
             out.push(format!("assets   {name} -> {digest}"));

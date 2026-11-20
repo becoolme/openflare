@@ -108,6 +108,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         kv: storage_purge_exec.as_ref().is_some_and(|e| e.has_kv()),
         // R2 object data ops: only when an R2 backend was actually built.
         r2: storage_purge_exec.as_ref().is_some_and(|e| e.has_r2()),
+        // Named service entrypoints render with this generation --
+        // unconditionally on (same reasoning as `workflows_cross_worker`).
+        service_entrypoint: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

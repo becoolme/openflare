@@ -1362,11 +1362,31 @@ fn emit_binding(
             {
                 return Err(ConfigError::ServiceTarget);
             }
-            out.push_str(&format!(
-                "        (name = {}, service = (name = {})),\n",
-                capnp_text(&service.name),
-                capnp_text(&worker_service_name(&service.worker_id)),
-            ));
+            match service.entrypoint.as_deref() {
+                // Legacy bytes: a default-export binding renders exactly
+                // as before the field existed.
+                None => out.push_str(&format!(
+                    "        (name = {}, service = (name = {})),\n",
+                    capnp_text(&service.name),
+                    capnp_text(&worker_service_name(&service.worker_id)),
+                )),
+                Some(ep) => {
+                    // Re-checked here (the render is the last trusted
+                    // boundary): never route a tenant onto a
+                    // platform-injected entrypoint such as the probe.
+                    if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep)
+                        || ep == crate::waituntil::PROBE_ENTRYPOINT
+                    {
+                        return Err(ConfigError::ServiceTarget);
+                    }
+                    out.push_str(&format!(
+                        "        (name = {}, service = (name = {}, entrypoint = {})),\n",
+                        capnp_text(&service.name),
+                        capnp_text(&worker_service_name(&service.worker_id)),
+                        capnp_text(ep),
+                    ));
+                }
+            }
         }
         BindingDesired::Queue(q) => {
             emit_queue_binding(out, q, worker, input)?;

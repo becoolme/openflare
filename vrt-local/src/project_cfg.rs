@@ -9,8 +9,8 @@
 //!   * `vrt.toml` keeps precedence — it is the native standalone config;
 //!   * `cloudflare.config.ts` / `wrangler.config.ts` are never executed —
 //!     they fail closed telling the user to convert via the platform CLI;
-//!   * a wrangler `service` entrypoint and missing KV/R2 ids are rejected
-//!     or derived at the WorkerToml conversion boundary (documented).
+//!   * a wrangler `service` entrypoint is validated and missing KV/R2 ids are
+//!     derived at the WorkerToml conversion boundary (documented).
 
 #[cfg(test)]
 use serde::Deserialize;
@@ -1435,7 +1435,7 @@ pub fn load_wrangler_project_config(
 /// Standalone derivations (documented in workers-runtime-project-config.md):
 ///   * missing KV id / R2 bucket → the binding name (the local store
 ///     treats declaration as creation);
-///   * service `entrypoint` has no standalone binding field → rejected;
+///   * service `entrypoint` → `{ service, entrypoint }` table (validated);
 ///   * crons get deterministic `scheduleId`s (`cfg:{name}:{i}`);
 ///   * non-string vars are JSON-encoded (vrt vars are string→string).
 fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectConfigError> {
@@ -1596,17 +1596,31 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     d1.insert(name.into(), Value::from(id));
                 }
                 "service" => {
-                    if b.get("entrypoint").is_some() {
-                        return Err(unsupported(
-                            &format!("bindings.{name}.entrypoint"),
-                            Some("standalone service bindings have no entrypoint"),
-                        ));
-                    }
                     let target = b
                         .get("service")
                         .and_then(|s| s.as_str())
                         .unwrap_or_default();
-                    service.insert(name.into(), Value::from(target));
+                    match b.get("entrypoint") {
+                        None => {
+                            service.insert(name.into(), Value::from(target));
+                        }
+                        Some(ep) => {
+                            let ep = ep.as_str().unwrap_or_default();
+                            if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep) {
+                                return Err(unsupported(
+                                    &format!("bindings.{name}.entrypoint"),
+                                    Some(
+                                        "entrypoint must be a JS identifier of at most 64 chars, \
+                                         not `default` and not starting with `Vrt`/`vrt`",
+                                    ),
+                                ));
+                            }
+                            let mut t = Map::new();
+                            t.insert("service".into(), Value::from(target));
+                            t.insert("entrypoint".into(), Value::from(ep));
+                            service.insert(name.into(), Value::Object(t));
+                        }
+                    }
                 }
                 "queue" => {
                     // User-side queue name (wrangler `queue`); the real queueId
@@ -1808,6 +1822,65 @@ mod tests {
         // missing kv id → binding name derivation
         let bind = meta.bindings.unwrap();
         assert_eq!(bind.kv.get("K").map(|s| s.as_str()), Some("K"));
+    }
+
+    fn wrangler_services(services: &str) -> Result<WorkerToml, LocalError> {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.json"),
+            format!(
+                r#"{{"name":"w","main":"m.js","compatibility_date":"2025-01-01",
+                   "services":{services}}}"#
+            ),
+        )
+        .unwrap();
+        load_worker_meta(dir.path()).map(|(meta, _)| meta)
+    }
+
+    #[test]
+    fn service_entrypoint_into_pack_shape() {
+        use crate::worker_pkg::ServiceTargetToml;
+        let meta = wrangler_services(
+            r#"[{"binding":"A","service":"t"},
+                {"binding":"B","service":"t","entrypoint":"Greeter"}]"#,
+        )
+        .unwrap();
+        let svc = meta.bindings.unwrap().service;
+        // Default entrypoint keeps the original plain-string wire shape.
+        assert_eq!(svc.get("A"), Some(&ServiceTargetToml::Worker("t".into())));
+        let b = svc.get("B").unwrap();
+        assert_eq!(b.service(), "t");
+        assert_eq!(b.entrypoint(), Some("Greeter"));
+    }
+
+    #[test]
+    fn service_entrypoint_rules_fail_closed() {
+        for ep in ["default", "VrtWaituntilProbe", "vrtX", "a-b", ""] {
+            let err = wrangler_services(&format!(
+                r#"[{{"binding":"B","service":"t","entrypoint":"{ep}"}}]"#
+            ))
+            .expect_err(ep);
+            assert!(format!("{err:?}").contains("entrypoint"), "{ep}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn vrt_toml_service_table_shape() {
+        use crate::worker_pkg::{BindingsToml, ServiceTargetToml};
+        let b: BindingsToml = toml::from_str(
+            "[service]\nA = \"t\"\nB = { service = \"t\", entrypoint = \"Greeter\" }\n",
+        )
+        .unwrap();
+        assert_eq!(b.service.get("A"), Some(&ServiceTargetToml::Worker("t".into())));
+        assert_eq!(b.service.get("B").unwrap().entrypoint(), Some("Greeter"));
+        // Unknown keys inside the table fail closed.
+        assert!(toml::from_str::<BindingsToml>(
+            "[service]\nB = { service = \"t\", entrypoint = \"G\", ns = \"x\" }\n"
+        )
+        .is_err());
+        // Plain string serializes exactly as before.
+        let json = serde_json::to_string(&b.service.get("A").unwrap()).unwrap();
+        assert_eq!(json, "\"t\"");
     }
 }
 

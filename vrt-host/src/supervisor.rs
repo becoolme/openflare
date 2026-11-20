@@ -12411,6 +12411,7 @@ sleep 10
                 vec![BindingDesired::Service(ServiceBinding {
                     name: "S".into(),
                     worker_id: "w0".into(),
+                    entrypoint: None,
                 })],
                 false,
             ),
@@ -12419,6 +12420,7 @@ sleep 10
                 vec![BindingDesired::Service(ServiceBinding {
                     name: "S".into(),
                     worker_id: "w1".into(),
+                    entrypoint: None,
                 })],
                 false,
             ),

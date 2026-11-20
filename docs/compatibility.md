@@ -68,8 +68,10 @@ These are not tied to one binding.
   `(tenant, worker, class)`; rename/delete migrations are supported.
 - **DO/Workflow tenants never hibernate** — alarms cannot wake a frozen
   workerd process.
-- **Service binding `entrypoint`** (named entrypoints) rejected at
-  pack; default entrypoint only.
+- **Service binding `entrypoint`** (named entrypoints): a missing
+  named export fails the publish (generation start) instead of the
+  first call; `ctx.waitUntil()` inside named entrypoint classes is not
+  tracked by the drain probe.
 - **Cache API** is per-host, in-memory, non-persistent; `match`
   options (`ignoreMethod`, `ignoreSearch`, `ignoreVary`, `cacheName`)
   are not implemented by the pinned workerd.

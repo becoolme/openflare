@@ -126,6 +126,13 @@ pub struct AckCapabilities {
     /// wire while false (rolling-upgrade compatibility, like `kv`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub r2: bool,
+    /// `ServiceBinding.entrypoint` (named `WorkerEntrypoint` export) is
+    /// understood by this generation. A pre-entrypoint host rejects the
+    /// field via `deny_unknown_fields`, which would refuse the WHOLE
+    /// snapshot, so the control plane only admits named entrypoints onto
+    /// cells that claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_entrypoint: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

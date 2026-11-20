@@ -178,6 +178,7 @@ fn desired_ack_fixture() {
             storage_purge: true,
             kv: false,
             r2: false,
+            service_entrypoint: true,
         }),
     };
     check(
@@ -273,7 +274,16 @@ fn kv_capability_wire_shape() {
     .unwrap();
     assert_eq!(r2_on["r2"], serde_json::json!(true));
     assert!(r2_on.get("kv").is_none());
+    // Named service entrypoints: same omit-while-false shape.
+    assert!(off.get("serviceEntrypoint").is_none());
+    let ep_on = serde_json::to_value(AckCapabilities {
+        service_entrypoint: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(ep_on["serviceEntrypoint"], serde_json::json!(true));
     let back: AckCapabilities =
         serde_json::from_value(serde_json::json!({"cron": true, "assets": true})).unwrap();
     assert!(!back.kv);
+    assert!(!back.service_entrypoint);
 }

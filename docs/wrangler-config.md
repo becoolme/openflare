@@ -50,7 +50,7 @@ at top level (`TOP_LEVEL_ONLY_ENV_KEYS`, `project_cfg.rs:81`).
 | `hyperdrive` | supported — see [Hyperdrive](bindings/hyperdrive.md); per-entry keys `binding`, `id`, `database_tenant`, `localConnectionString`, `remote` | `project_cfg.rs:623` |
 | `ratelimits` | supported — see [Rate limiting](bindings/rate-limiting.md); `name` + `namespace_id` + `simple.{limit,period}` | `project_cfg.rs:677` |
 | `r2_buckets` | supported — see [R2](bindings/r2.md); per-entry keys `binding`, `bucket_name` | `project_cfg.rs:745` |
-| `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (entrypoint rejected later at pack) | `project_cfg.rs:772` |
+| `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint, validated at pack) | `project_cfg.rs:772` |
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:804` |
 | `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:833` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:961` |
@@ -81,10 +81,9 @@ Also type-checked then dropped inside supported blocks:
 - `kv_namespaces[].id`, `.preview_id`, `.remote` — `id` becomes the
   local namespace identifier; `preview_id`/`remote` are dropped.
 - `d1_databases[].preview_database_id`, `.remote` — dropped.
-- `services[].entrypoint` — parsed into the normalized document but
-  rejected at pack time because the standalone wire shape has no
-  entrypoint field (`worker_pkg.rs`; see
-  [Service bindings](bindings/service-bindings.md)).
+- `services[].entrypoint` — becomes the `{ service, entrypoint }` table
+  form of `[bindings.service]`; the name is validated at pack
+  (`worker_pkg.rs`; see [Service bindings](bindings/service-bindings.md)).
 
 ## Rejected
 

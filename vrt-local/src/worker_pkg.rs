@@ -120,9 +120,43 @@ pub(crate) struct BindingsToml {
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
     #[serde(default)]
-    pub(crate) service: BTreeMap<String, String>,
+    pub(crate) service: BTreeMap<String, ServiceTargetToml>,
     #[serde(default)]
     pub(crate) assets: BTreeMap<String, String>,
+}
+
+/// `[bindings.service]` value: either the target worker name (default
+/// entrypoint, the original wire shape) or `{ service, entrypoint }` for a
+/// named `WorkerEntrypoint` export. The plain-string form serializes exactly
+/// as before, so existing packages keep their bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum ServiceTargetToml {
+    Worker(String),
+    Named(NamedServiceTargetToml),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NamedServiceTargetToml {
+    pub(crate) service: String,
+    pub(crate) entrypoint: String,
+}
+
+impl ServiceTargetToml {
+    pub(crate) fn service(&self) -> &str {
+        match self {
+            Self::Worker(s) => s,
+            Self::Named(n) => &n.service,
+        }
+    }
+
+    pub(crate) fn entrypoint(&self) -> Option<&str> {
+        match self {
+            Self::Worker(_) => None,
+            Self::Named(n) => Some(&n.entrypoint),
+        }
+    }
 }
 
 /// T37b `[[queueConsumers]]`: fields aligned with wrangler `queues.consumers[]`
@@ -782,10 +816,18 @@ pub fn assemble(
             }));
         }
         for (binding, target) in &b.service {
-            let worker_id = resolve_worker(target).ok_or(LocalError::Worker("service target"))?;
+            let worker_id =
+                resolve_worker(target.service()).ok_or(LocalError::Worker("service target"))?;
+            let entrypoint = target.entrypoint().map(str::to_string);
+            if let Some(ep) = &entrypoint {
+                if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep) {
+                    return Err(LocalError::Worker("service entrypoint"));
+                }
+            }
             bindings.push(BindingDesired::Service(ServiceBinding {
                 name: binding.clone(),
                 worker_id,
+                entrypoint,
             }));
         }
         for (binding, digest) in &b.assets {

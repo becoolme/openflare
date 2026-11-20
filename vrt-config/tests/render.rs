@@ -46,6 +46,50 @@ fn assets_binding_props_carry_tenant_namespaced_key() {
     );
 }
 
+fn with_auth_entrypoint(ep: &str) -> snapshot_protocol::compute_desired::TenantDesired {
+    let mut tenant = tenant();
+    let auth = tenant.workers[0]
+        .bindings
+        .iter_mut()
+        .find_map(|b| match b {
+            snapshot_protocol::compute_desired::BindingDesired::Service(s) => Some(s),
+            _ => None,
+        })
+        .expect("fixture has a service binding");
+    auth.entrypoint = Some(ep.to_string());
+    tenant
+}
+
+#[test]
+fn service_binding_named_entrypoint_renders() {
+    let tenant = with_auth_entrypoint("Greeter");
+    let bs = bundles();
+    let params = runtime_params();
+    let out = render_tenant_config(&input(&tenant, &bs, &params))
+        .unwrap()
+        .text;
+    assert!(out.contains(
+        "(name = \"AUTH\", service = (name = \"worker-w-alpha-2\", entrypoint = \"Greeter\"))"
+    ));
+}
+
+#[test]
+fn service_binding_reserved_entrypoint_is_refused() {
+    let bs = bundles();
+    let params = runtime_params();
+    for ep in ["VrtWaituntilProbe", "vrtAnything", "default", "not-ident"] {
+        let tenant = with_auth_entrypoint(ep);
+        // Per-worker isolation: the caller is excluded with a typed
+        // reason; the target keeps serving.
+        let rendered = render_tenant_config(&input(&tenant, &bs, &params)).unwrap();
+        assert_eq!(rendered.skipped_workers, vec!["w-alpha-1".to_string()], "{ep}");
+        let reason = &rendered.skipped_reasons[0];
+        assert_eq!(reason.code, "CONFIG_SERVICE_TARGET_SCOPE", "{ep}");
+        assert!(!rendered.text.contains("(name = \"AUTH\""), "{ep}");
+        assert!(rendered.text.contains("name = \"worker-w-alpha-2\""), "{ep}");
+    }
+}
+
 /// PT1: the watchdog heartbeat worker + private socket appear iff
 /// `params.heartbeat_socket` is set — and are the ONLY delta vs the
 /// legacy shape (byte-compat when unset is pinned by golden.rs).
