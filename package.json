@@ -6,6 +6,11 @@
   "engines": {
     "node": ">=24"
   },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "pg": "8.16.3",
+    "pg-cloudflare": "1.4.0"
+  },
   "scripts": {
     "facade:build": "node facade/tools/gen-manifest.mjs",
     "facade:check": "node facade/tools/gen-manifest.mjs --check",
