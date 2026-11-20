@@ -476,6 +476,8 @@ fn wu_params() -> vrt_host::supervisor::SupervisorParams {
     p.wait_until_grace = Duration::from_secs(8);
     p.drain_timeout = Duration::from_secs(15);
     p.kill_grace = Duration::from_millis(300);
+    // Real `workerd check` can stall past the 5 s test default on a loaded CI runner.
+    p.preflight_timeout = Duration::from_secs(20);
     p
 }
 
