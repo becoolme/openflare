@@ -136,7 +136,8 @@ pub struct ServiceEndpoint {
 pub struct FacadeRefs {
     /// `kv` bindings → this facade worker + entrypoint (`KVNamespace`).
     pub kv: ServiceEndpoint,
-    /// `r2` bindings → (`R2Transport`).
+    /// `r2` bindings → (`R2Transport`), rendered as a native `r2Bucket`
+    /// binding (see `docs/r2-binding.md`).
     pub r2: ServiceEndpoint,
     /// `assets` bindings → (`AssetTransport`).
     pub assets: ServiceEndpoint,
@@ -1326,7 +1327,7 @@ fn emit_binding(
             )?;
         }
         BindingDesired::R2(r2) => {
-            emit_facade_binding(
+            emit_r2_bucket_binding(
                 out,
                 &r2.name,
                 &input.params.facades.r2,
@@ -1480,6 +1481,63 @@ fn emit_facade_binding(
     permissions: &snapshot_protocol::compute_desired::BindingPermissions,
     props_binding_name: &str,
 ) -> Result<(), ConfigError> {
+    emit_facade_binding_as(
+        out,
+        "service",
+        binding_name,
+        facade,
+        resource_id,
+        worker,
+        input,
+        permissions,
+        props_binding_name,
+    )
+}
+
+/// Native workerd `r2Bucket` binding to the R2 facade. `Worker.Binding.r2Bucket`
+/// is a `ServiceDesignator`, so the facade/props contract is identical to
+/// [`emit_facade_binding`]; the difference is the tenant-facing surface.
+/// workerd supplies the real `R2Bucket` class (R2ObjectBody results,
+/// httpMetadata/customMetadata option parsing, `delete(key | keys[])`) and
+/// speaks its native R2 wire to the facade's `fetch()`, which the vendored
+/// native adapter serves. A plain `service` binding would instead expose the
+/// raw `R2Transport` RPC methods to the tenant: string bodies are rejected
+/// (stream-only), `get` returns `{meta, body}` without `text()`, and
+/// `delete("k")` posts `{keys: "k"}` which the provider rejects.
+fn emit_r2_bucket_binding(
+    out: &mut String,
+    binding_name: &str,
+    facade: &ServiceEndpoint,
+    resource_id: &str,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+    permissions: &snapshot_protocol::compute_desired::BindingPermissions,
+    props_binding_name: &str,
+) -> Result<(), ConfigError> {
+    emit_facade_binding_as(
+        out,
+        "r2Bucket",
+        binding_name,
+        facade,
+        resource_id,
+        worker,
+        input,
+        permissions,
+        props_binding_name,
+    )
+}
+
+fn emit_facade_binding_as(
+    out: &mut String,
+    binding_field: &str,
+    binding_name: &str,
+    facade: &ServiceEndpoint,
+    resource_id: &str,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+    permissions: &snapshot_protocol::compute_desired::BindingPermissions,
+    props_binding_name: &str,
+) -> Result<(), ConfigError> {
     let props = String::from_utf8(canonical_bytes(&json!({
         // Wire format `<workerId>~<bindingName>` — matches
         // vrt-provider::identity::parse_binding_id (single path segment).
@@ -1496,8 +1554,9 @@ fn emit_facade_binding(
     })))
     .expect("canonical props are utf8");
     out.push_str(&format!(
-        "        (name = {}, service = (name = {}, entrypoint = {}, props = (json = {}))),\n",
+        "        (name = {}, {} = (name = {}, entrypoint = {}, props = (json = {}))),\n",
         capnp_text(binding_name),
+        binding_field,
         capnp_text(&facade.service),
         capnp_text(&facade.entrypoint),
         capnp_text(&props),
