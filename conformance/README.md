@@ -71,11 +71,22 @@ Options (`node conformance/run.mjs --help`):
 | `--ready-timeout <ms>` | per-case readiness budget (default 90 s) |
 | `--timeout <ms>` | per-request timeout (default 15 s) |
 | `--fail-fast` | stop a case at its first failed step |
+| `--fail-on-skip` | exit 1 when any case is skipped (release gate: a skipped case did not prove its binding) |
 | `--list` | print `real-projects.json` entries and exit |
 | `--validate` | validate all manifests and exit |
 
-Exit code: `0` when nothing failed (skips are fine), `1` on any failed
-step, `2` on usage/manifest errors.
+Exit code: `0` when nothing failed (skips are fine unless
+`--fail-on-skip` is passed), `1` on any failed step (or on a skip with
+`--fail-on-skip`), `2` on usage/manifest errors.
+
+## Release gate
+
+`.github/workflows/conformance.yml` runs this suite weekly and on
+`workflow_dispatch`: it builds the standalone compose stack with the
+workerd binary pinned in `deploy/docker/workerd.lock`, deploys every
+case, and runs with `--fail-on-skip`. A release must cite a green run of
+that workflow (attach the `conformance-report` artifact); the per-PR
+`ci` job only runs the runner's unit tests, which never touch a stack.
 
 ## Adding a case
 

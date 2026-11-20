@@ -584,6 +584,15 @@ export function summarize(results) {
   return totals;
 }
 
+/// Release-gate exit code. A plain run treats skips as acceptable (a
+/// capability the stack does not have yet); `--fail-on-skip` makes them
+/// fatal so a scheduled/CI run cannot report green while cases never ran.
+export function conformanceExitCode(totals, { failOnSkip = false } = {}) {
+  if (totals.failed > 0) return 1;
+  if (failOnSkip && totals.skipped > 0) return 1;
+  return 0;
+}
+
 export function buildReport({ url, stack, results }) {
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -712,6 +721,8 @@ Run the binding-conformance cases against a running OpenFlare stack.
   --timeout <ms>        per-request timeout (15000)
   --deploy-timeout <ms> deploy command budget (180000)
   --fail-fast           stop the case at its first failed step
+  --fail-on-skip        exit 1 when any case is skipped (release gate;
+                        a skipped case did not prove its binding)
   --results <dir>       report output dir (conformance/results)
   --list                print the real-projects manifest and exit
   --validate            validate all manifests and exit
@@ -739,6 +750,7 @@ function parseArgs(argv) {
       case "--timeout": o.timeoutMs = Number(val()); break;
       case "--deploy-timeout": o.deployTimeoutMs = Number(val()); break;
       case "--fail-fast": o.keepGoing = false; break;
+      case "--fail-on-skip": o.failOnSkip = true; break;
       case "--results": o.resultsDir = val(); break;
       case "--list": o.list = true; break;
       case "--validate": o.validate = true; break;
@@ -818,7 +830,11 @@ export async function main(argv, { log = console.log, errlog = console.error } =
   const { jsonPath, mdPath } = writeReport(report, opts.resultsDir ?? path.join(here, "results"));
   const t = report.totals;
   log(`\n${t.passed} passed, ${t.failed} failed, ${t.skipped} skipped — ${jsonPath} + ${mdPath}`);
-  return t.failed === 0 ? 0 : 1;
+  const code = conformanceExitCode(t, { failOnSkip: opts.failOnSkip });
+  if (code !== 0 && opts.failOnSkip && t.failed === 0 && t.skipped > 0) {
+    errlog(`--fail-on-skip: ${t.skipped} case(s) skipped`);
+  }
+  return code;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

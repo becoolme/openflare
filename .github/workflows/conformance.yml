@@ -1,0 +1,92 @@
+name: Binding conformance
+
+# Weekly end-to-end run of the binding cases against the standalone
+# compose stack (real workerd). The per-PR jobs only run the runner's
+# unit tests; this is the release gate that actually exercises KV / R2 /
+# D1 / DO / queues / cron / cache through the facade + provider.
+#
+# Manual dispatch is the supported way to produce the report for a
+# release: attach the `conformance-report` artifact to the release notes.
+
+on:
+  schedule:
+    # Monday 03:00 UTC.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  conformance:
+    name: Standalone stack + binding cases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.22.1"
+      - name: Read the pinned workerd version and digest
+        id: lock
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const lock = JSON.parse(fs.readFileSync("deploy/docker/workerd.lock", "utf8"));
+            const art = lock.artifacts && lock.artifacts["linux-x64"];
+            if (!lock.version || !art || !art.binarySha256) {
+              console.error("workerd.lock has no linux-x64.binarySha256 — update the lock and retry");
+              process.exit(1);
+            }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              `version=${lock.version}\nsha256=${art.binarySha256}\n`);
+          '
+      # Same pin of record AND the same fetch helper as
+      # .github/workflows/ci.yml: scripts/fetch-workerd.sh verifies every
+      # digest the lock lists for either pin source (npm tarball integrity,
+      # or the fork release asset and the decompressed binary), and the
+      # compose build re-checks WORKERD_SHA256. Sharing the cache key means
+      # this run reuses the binary the PR jobs already verified.
+      - name: Cache workerd binary
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .ci/workerd
+          key: workerd-linux-x64-${{ steps.lock.outputs.sha256 }}
+      - name: Fetch the pinned workerd binary
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: scripts/fetch-workerd.sh --out .ci/workerd --platform linux-x64
+      - name: Verify the binary and stage it for the compose build
+        run: |
+          set -euo pipefail
+          echo "${{ steps.lock.outputs.sha256 }}  .ci/workerd/workerd" | sha256sum -c -
+          .ci/workerd/workerd --version
+          cp .ci/workerd/workerd deploy/standalone/workerd
+          chmod +x deploy/standalone/workerd
+      - name: Build and start the standalone stack
+        env:
+          WORKERD_SOURCE: file
+          WORKERD_SHA256: ${{ steps.lock.outputs.sha256 }}
+        run: docker compose -f deploy/standalone/docker-compose.yml up --build --wait
+      # --fail-on-skip: a skipped case did not prove its binding, so the
+      # report cannot be green with cases that never ran.
+      - name: Run the binding cases
+        run: |
+          node conformance/run.mjs \
+            --url http://127.0.0.1:8080 \
+            --deploy-cmd ./conformance/deploy-standalone.sh \
+            --fail-on-skip
+      - name: Stack logs on failure
+        if: failure()
+        run: |
+          docker compose -f deploy/standalone/docker-compose.yml logs \
+            --no-color --tail 500
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-report
+          path: conformance/results/
+          if-no-files-found: warn
+          retention-days: 30

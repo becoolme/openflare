@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   buildReport,
+  conformanceExitCode,
   renderMarkdown,
   runCase,
   stageCaseDir,
@@ -182,4 +183,18 @@ test("stageCaseDir copies asset subdirectories and drops case metadata", () => {
   );
   assert.equal(fs.readFileSync(path.join(staged, "public", "nested", "deep.txt"), "utf8"), "deep");
   assert.equal(fs.readFileSync(path.join(staged, "public", "notes.md"), "utf8"), "# asset");
+});
+
+test("conformanceExitCode: skips are fatal only under fail-on-skip", () => {
+  assert.equal(conformanceExitCode({ passed: 11, failed: 0, skipped: 0 }), 0);
+  assert.equal(conformanceExitCode({ passed: 10, failed: 0, skipped: 1 }), 0);
+  assert.equal(
+    conformanceExitCode({ passed: 10, failed: 0, skipped: 1 }, { failOnSkip: true }),
+    1,
+  );
+  assert.equal(
+    conformanceExitCode({ passed: 0, failed: 1, skipped: 0 }, { failOnSkip: true }),
+    1,
+  );
+  assert.equal(conformanceExitCode({ passed: 0, failed: 1, skipped: 2 }), 1);
 });
