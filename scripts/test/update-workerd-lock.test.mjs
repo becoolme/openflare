@@ -26,7 +26,8 @@ test("builds a github-release lock from a fork manifest", () => {
     source: "github-release",
     version: "vrt-20261121-abc1234",
     upstream: {
-      version: "v1.20261120.1",
+      // The `v` is stripped: `upstream.version` is consumed as a workerd semver.
+      version: "1.20261120.1",
       commit: "7545be644952d71d76b904b37ae71b10c0ba8cad",
     },
     artifacts: {
@@ -50,11 +51,34 @@ test("builds a github-release lock from a fork manifest", () => {
   });
 });
 
-test("uses the upstream commit prefix when the release has no upstream tag", () => {
+test("requires an explicit upstream version when the release has no upstream tag", () => {
   const lock = buildLock(
     manifest({ upstream: { commit: "7545be644952d71d76b904b37ae71b10c0ba8cad" } }),
+    { upstreamVersion: "1.20261120.1" },
   );
-  assert.equal(lock.upstream.version, "7545be644952");
+  assert.equal(lock.upstream.version, "1.20261120.1");
+});
+
+test("rejects a release that cannot name its upstream workerd version", () => {
+  assert.throws(
+    () => buildLock(manifest({ upstream: { commit: "7545be644952d71d76b904b37ae71b10c0ba8cad" } })),
+    /--upstream-version/,
+  );
+  assert.throws(
+    () =>
+      buildLock(
+        manifest({ upstream: { commit: "7545be644952d71d76b904b37ae71b10c0ba8cad" } }),
+        { upstreamVersion: "7545be644952" },
+      ),
+    /1\.YYYYMMDD\.N/,
+  );
+});
+
+test("rejects an upstream version that contradicts the manifest tag", () => {
+  assert.throws(
+    () => buildLock(manifest(), { upstreamVersion: "1.20261121.1" }),
+    /contradicts/,
+  );
 });
 
 test("rejects a tag that is not a VRT release", () => {

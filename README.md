@@ -181,6 +181,15 @@ node scripts/update-workerd-lock.mjs --manifest manifest.json
 node scripts/update-workerd-lock.mjs --manifest manifest.json --check  # what CI can verify
 ```
 
+The lock records the workerd release the fork is based on (`upstream.version`), because the
+compat-flag generator parses it as a workerd version. A release cut from an upstream commit that
+carries no release tag yet has an empty `upstream.tag` in its manifest; name the version
+explicitly then:
+
+```sh
+node scripts/update-workerd-lock.mjs --manifest manifest.json --upstream-version 1.20261120.1
+```
+
 `conformance/` holds the binding-layer conformance suite: declarative
 golden-behavior cases (worker + HTTP steps + expectations citing
 Cloudflare docs) executed against a running stack — see
