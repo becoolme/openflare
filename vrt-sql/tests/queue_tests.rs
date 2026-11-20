@@ -146,6 +146,30 @@ async fn limits_boundaries() {
 // ---------- idempotence ----------
 
 #[tokio::test]
+async fn same_timestamp_claim_orders_by_id() {
+    // One sendBatch shares visible_at/created_at; the provider assigns
+    // time-ordered ids, so the id tie-break is what keeps send order.
+    let tmp = TempDir::new().unwrap();
+    let (_r, be) = backend(&tmp);
+    let q = qid();
+    let batch: Vec<IncomingMsg> = ["0003", "0001", "0002"]
+        .iter()
+        .map(|id| {
+            let mut m = msg(id.as_bytes(), "text");
+            m.id = Some((*id).into());
+            m
+        })
+        .collect();
+    be.send(&q, &batch, NOW).await.unwrap();
+    let got = be
+        .claim(&q, "t", 300_000, 10, None, 10_000, NOW)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = got.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["0001", "0002", "0003"]);
+}
+
+#[tokio::test]
 async fn duplicate_msg_id_is_idempotent() {
     let tmp = TempDir::new().unwrap();
     let (_r, be) = backend(&tmp);

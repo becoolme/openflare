@@ -202,6 +202,35 @@ fn server_generates_message_ids() {
     assert_eq!(single["messages"][0]["id"].as_str().unwrap().len(), 32);
 }
 
+#[test]
+fn batch_ids_preserve_send_order() {
+    // Messages of one batch share a timestamp; vrt-sql breaks that tie by
+    // id, so ids must strictly increase in send order (lowercase 32-hex).
+    let body = serde_json::json!({
+        "messages": (0..50)
+            .map(|_| serde_json::json!({"contentType": "text", "body": "aGk="}))
+            .collect::<Vec<_>>()
+    })
+    .to_string();
+    let v = producer_batch(&HeaderMap::new(), body.as_bytes()).unwrap();
+    let ids: Vec<String> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(ids.len(), 50);
+    for id in &ids {
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')), "{id}");
+    }
+    assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids must strictly increase");
+    // Back-to-back single sends in the same millisecond keep order too.
+    let a = queue_message_id();
+    let b = queue_message_id();
+    assert!(a < b);
+}
+
 /// T37r2: workerd parses `oldestMessageTimestamp` as `date` -- it must be an
 /// epoch-ms **number**, empty queue = 0 (measured from miniflare `getMetricsResponseObject`
 /// `.getTime() ?? 0`). null/a string would TypeError and hang the tenant's send.

@@ -149,6 +149,18 @@ fn parse_delay(headers: &axum::http::HeaderMap) -> Result<Option<u32>, String> {
     Ok(Some(d))
 }
 
+/// Server-assigned message id (32 lowercase hex, same shape as before).
+///
+/// UUIDv7 is time-ordered and strictly increasing within this process
+/// (`Uuid::now_v7` keeps a shared monotonic counter), and vrt-sql breaks
+/// `(visible_at, created_at)` ties by id. Together that keeps send order:
+/// the messages of one `sendBatch` (which share a timestamp) and back-to-back
+/// sends within one millisecond are delivered in the order they were sent.
+/// A random v4 id would shuffle them.
+pub fn queue_message_id() -> String {
+    uuid::Uuid::now_v7().simple().to_string()
+}
+
 /// `POST /message`: raw body + headers -> vrt-sql send request.
 /// Returns (send_json, rejection reason for metrics).
 pub fn producer_message(
@@ -181,7 +193,7 @@ pub fn producer_message(
     let delay = parse_delay(headers).map_err(|m| (400u16, m))?.unwrap_or(0);
     Ok(serde_json::to_value(SendReq {
         messages: vec![SendMsg {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: queue_message_id(),
             body: hex::encode(body),
             content_type,
             delay_secs: delay,
@@ -275,7 +287,7 @@ pub fn producer_batch(
             ));
         }
         msgs.push(SendMsg {
-            id: uuid::Uuid::new_v4().simple().to_string(),
+            id: queue_message_id(),
             body: hex::encode(&raw),
             content_type: &m.content_type,
             delay_secs: d,

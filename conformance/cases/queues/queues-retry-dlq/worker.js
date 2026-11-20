@@ -9,6 +9,12 @@ export default {
     const url = new URL(request.url);
     const j = (v) => Response.json(v);
     try {
+      if (url.pathname === "/reset") {
+        // Durable stores (D1 on CF and on a platform) outlive a
+        // redeploy, so a rerun must start from an empty log.
+        await env.DB.exec("DROP TABLE IF EXISTS log");
+        return j({ ok: true });
+      }
       if (url.pathname === "/send") {
         await env.Q.send("will-retry", { contentType: "text" });
         return j({ ok: true });

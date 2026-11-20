@@ -11,6 +11,19 @@
   ],
   "steps": [
     {
+      "name": "reset delivery log",
+      "request": {
+        "method": "POST",
+        "path": "/reset"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
       "name": "send message that always retries",
       "request": {
         "method": "POST",

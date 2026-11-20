@@ -747,13 +747,16 @@ impl QueueBackend for SqliteQueueBackend {
             // budget can bound the batch (hex/encoding must not
             // count). First eligible row is always taken — a
             // single oversize message can never starve forever.
+            // The table is WITHOUT ROWID, so rows of one sendBatch
+            // (same visible_at/created_at) need the explicit id tie
+            // break; the provider issues time-ordered (v7) ids.
             let mut st = tx.prepare(
                 "SELECT id, body, content_type, attempts, \
                      COALESCE(client_ts, created_at) \
                      FROM _vrt_q_messages \
                      WHERE visible_at<=?3 \
                        AND (lease_id IS NULL OR lease_expiry<=?3)\
-                     ORDER BY visible_at, created_at LIMIT ?4",
+                     ORDER BY visible_at, created_at, id LIMIT ?4",
             )?;
             let candidates = st
                 .query_map(params![lid, expiry, now_ms, max as i64], |r| {
