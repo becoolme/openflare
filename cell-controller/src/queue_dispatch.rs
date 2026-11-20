@@ -1386,6 +1386,8 @@ async fn settle(
     result: &QueueOutcome,
 ) -> SettleFailure {
     let retry_all = result.outcome != "ok" || result.retry_batch.retry;
+    let explicit_ack_ids: BTreeSet<&str> =
+        result.explicit_acks.iter().map(|s| s.as_str()).collect();
     let explicit_retry: BTreeSet<&str> =
         result.explicit_retries.iter().map(|s| s.as_str()).collect();
     let msg_delay: BTreeMap<&str, u32> = result
@@ -1406,6 +1408,13 @@ async fn settle(
     let mut failure = SettleFailure::default();
     for m in batch {
         let lease = m.lease_id.as_str();
+        // Cloudflare Queues preserves a per-message ack even when a later
+        // message fails or the handler returns an error. Apply it before
+        // batch-level retryAll/outcome handling.
+        if explicit_ack_ids.contains(m.id.as_str()) {
+            acks.entry(lease).or_default().push(m.id.clone());
+            continue;
+        }
         let retry_this = retry_all
             || explicit_retry_ids.contains(m.id.as_str())
             || msg_delay.contains_key(m.id.as_str());
@@ -2214,6 +2223,53 @@ mod tests {
         let a = &q.msgs["a"];
         assert!(a.visible_at > now_ms() + 2_000, "msg-level delay honored");
         assert_eq!(a.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_ack_survives_batch_failure() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            let q = w.queues.entry(QID.into()).or_default();
+            q.msgs.insert(
+                "acked".into(),
+                FakeMsg {
+                    body_hex: "aa".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let inv = Arc::new(FakeInvoker {
+            result: StdMutex::new(Ok(outcome(json!({
+                "outcome": "exception",
+                "retryBatch": {"retry": true},
+                "explicitAcks": ["acked"]
+            })))),
+            calls: AtomicU64::new(0),
+            delay: None,
+            last: StdMutex::new(vec![]),
+        });
+        let d = dispatcher(&addr, inv, cfg("h1"));
+        let desired = desired_with(json!([{
+            "queueId": QID,
+            "queueName": "q",
+            "maxBatchSize": 1,
+            "retryDelaySecs": 0
+        }]));
+        tick_pair(
+            &d,
+            &desired,
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+            &assignments(),
+        )
+        .await;
+        settle_until(&world, |w| {
+            w.queues.get(QID).is_some_and(|q| q.msgs.is_empty())
+        })
+        .await;
+        let w = world.lock().unwrap();
+        let q = &w.queues[QID];
+        assert!(q.msgs.is_empty(), "explicit ack survives the batch failure");
     }
 
     #[tokio::test]

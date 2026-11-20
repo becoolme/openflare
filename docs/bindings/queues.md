@@ -31,8 +31,10 @@ From `examples/standalone-queue/wrangler.jsonc`:
   as its dispatch lease, posts to `vrt-host` `/v1/queue/dispatch`, which
   reaches `facade-qconsumer` over `sock-qconsumer-<workerId>` and calls
   the worker's `queue(batch)` handler via `Fetcher.queue()`.
-- Settlement mirrors the miniflare broker semantics: non-`ok` outcomes
-  or `retryBatch` retry the whole batch; `explicitRetries` and
+- Settlement mirrors Cloudflare's per-message precedence: an explicit
+  `ack()` remains acknowledged when a later message fails or the handler
+  returns an error. Otherwise non-`ok` outcomes or `retryBatch` retry the
+  whole batch; `explicitRetries` and
   `retryMessages` retry individual messages (message delay > batch delay
   > consumer `retry_delay`); messages that exhaust `max_retries + 1`
   deliveries move to the dead-letter queue or drop with an audit record.
