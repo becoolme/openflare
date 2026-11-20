@@ -123,6 +123,7 @@ async fn dev_start_request_redeploy_cleanup() {
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let session = vrt_local::dev::start(vrt_local::dev::DevOptions {
         worker_dir: worker_dir.clone(),
+        env_name: None,
         listen: Some(listen.clone()),
         no_watch: false,
         workerd: None,
@@ -249,6 +250,7 @@ async fn dev_no_watch_never_redeploys() {
     let (_stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     let session = vrt_local::dev::start(vrt_local::dev::DevOptions {
         worker_dir: worker_dir.clone(),
+        env_name: None,
         listen: Some(ephemeral()),
         no_watch: true,
         workerd: None,

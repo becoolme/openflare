@@ -36,6 +36,8 @@ pub(crate) const WORKERD_LOCK: &str = include_str!("../../deploy/docker/workerd.
 pub struct DevOptions {
     /// Project directory holding vrt.toml / wrangler config + modules.
     pub worker_dir: PathBuf,
+    /// Wrangler named environment selected with `--env`.
+    pub env_name: Option<String>,
     /// Ingress listen address (`ip:port`); default 127.0.0.1:8787.
     pub listen: Option<String>,
     /// Disable the file watcher (`--no-watch`).
@@ -87,6 +89,8 @@ pub struct DevSummary {
     pub root: PathBuf,
     /// Worker name from the resolved project config.
     pub worker_name: String,
+    /// Selected Wrangler environment, if any.
+    pub environment: Option<String>,
     /// Host control listener base (`http://<addr>`) — readyz/healthz
     /// and the log tail (loopback only).
     pub control_base: String,
@@ -147,8 +151,9 @@ pub async fn start(opts: DevOptions) -> Result<DevSession, LocalError> {
 
     // First deploy — also validates the worker dir before children
     // spawn, so config errors surface before "listening" prints.
-    let (meta, _src) = crate::project_cfg::load_worker_meta(&worker_dir)?;
-    deploy_once(&local, &worker_dir, &meta)?;
+    let (meta, _src) =
+        crate::project_cfg::load_worker_meta_for_env(&worker_dir, opts.env_name.as_deref())?;
+    deploy_once(&local, &worker_dir, &meta, opts.env_name.as_deref())?;
     let summary_bindings = binding_table(&meta);
     let worker_name = meta.name.clone();
 
@@ -206,6 +211,7 @@ pub async fn start(opts: DevOptions) -> Result<DevSession, LocalError> {
         url: format!("http://{}", ports.listen),
         root: root.clone(),
         worker_name,
+        environment: opts.env_name.clone(),
         control_base: format!("http://{}", ports.control),
         bindings: summary_bindings,
         ready_after: t0.elapsed(),
@@ -224,6 +230,7 @@ pub async fn start(opts: DevOptions) -> Result<DevSession, LocalError> {
         serve_task,
         loop_stop,
         opts.no_watch,
+        opts.env_name,
         log_guard,
     ));
 
@@ -281,6 +288,7 @@ async fn run_loop(
     mut serve_task: tokio::task::JoinHandle<Result<(), LocalError>>,
     mut stop_rx: tokio::sync::watch::Receiver<bool>,
     no_watch: bool,
+    env_name: Option<String>,
     _log_guard: Option<LogTailGuard>,
 ) -> Result<(), LocalError> {
     let mut sig = watch_signature(&worker_dir);
@@ -311,7 +319,7 @@ async fn run_loop(
                 if let Some(t) = changed_at {
                     if t.elapsed() >= WATCH_DEBOUNCE {
                         changed_at = None;
-                        redeploy(&root, &worker_dir);
+                        redeploy(&root, &worker_dir, env_name.as_deref());
                     }
                 }
             }
@@ -321,7 +329,7 @@ async fn run_loop(
 
 /// One deploy pass: `.dev.vars` → secret puts + var overrides, then
 /// `VrtLocal::deploy`. Errors are surfaced, never fatal to the loop.
-fn redeploy(root: &Path, worker_dir: &Path) {
+fn redeploy(root: &Path, worker_dir: &Path, env_name: Option<&str>) {
     let local = match crate::VrtLocal::open(root) {
         Ok(l) => l,
         Err(e) => {
@@ -329,14 +337,14 @@ fn redeploy(root: &Path, worker_dir: &Path) {
             return;
         }
     };
-    let meta = match crate::project_cfg::load_worker_meta(worker_dir) {
+    let meta = match crate::project_cfg::load_worker_meta_for_env(worker_dir, env_name) {
         Ok((m, _)) => m,
         Err(e) => {
             eprintln!("dev: config reload failed: {e}");
             return;
         }
     };
-    match deploy_once(&local, worker_dir, &meta) {
+    match deploy_once(&local, worker_dir, &meta, env_name) {
         Ok(r) => eprintln!("dev: reloaded {} (version {})", meta.name, r.version_id),
         Err(e) => eprintln!("dev: redeploy failed: {e}"),
     }
@@ -349,8 +357,12 @@ fn deploy_once(
     local: &crate::VrtLocal,
     worker_dir: &Path,
     meta: &crate::WorkerToml,
+    env_name: Option<&str>,
 ) -> Result<crate::DeployResult, LocalError> {
-    let mut overrides = crate::worker_pkg::DeployOverrides::default();
+    let mut overrides = crate::worker_pkg::DeployOverrides {
+        env_name: env_name.map(str::to_owned),
+        ..Default::default()
+    };
     let dev_vars_path = worker_dir.join(".dev.vars");
     if dev_vars_path.is_file() {
         let text = std::fs::read_to_string(&dev_vars_path)

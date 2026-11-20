@@ -132,8 +132,23 @@ pub enum MetaSource {
 /// wrangler family in packer order. Programmatic configs (.ts/.js) fail
 /// closed — standalone has no JS evaluator by design.
 pub fn load_worker_meta(worker_dir: &Path) -> Result<(WorkerToml, MetaSource), LocalError> {
+    load_worker_meta_for_env(worker_dir, None)
+}
+
+/// Load worker meta from `vrt.toml` or Wrangler config, selecting the
+/// requested Wrangler named environment before normalization. `vrt.toml`
+/// has no environment blocks and rejects an explicit selection.
+pub fn load_worker_meta_for_env(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+) -> Result<(WorkerToml, MetaSource), LocalError> {
     let vrt_path = worker_dir.join("vrt.toml");
     if vrt_path.exists() {
+        if env_name.is_some() {
+            return Err(LocalError::WorkerOwned(
+                "[VRT_CONFIG_INVALID] --env only selects Wrangler named environments; vrt.toml has no env blocks".into(),
+            ));
+        }
         let raw = std::fs::read_to_string(&vrt_path).map_err(|_| LocalError::Worker("vrt.toml"))?;
         if raw.len() > 64 * 1024 {
             return Err(LocalError::Worker("vrt.toml size"));
@@ -184,7 +199,7 @@ pub fn load_worker_meta(worker_dir: &Path) -> Result<(WorkerToml, MetaSource), L
         None => Err(LocalError::Worker("vrt.toml")),
         Some(&file) => {
             let (config, _resolved, _shadowed) =
-                load_wrangler_project_config(worker_dir, None, None)
+                load_wrangler_project_config(worker_dir, None, env_name)
                     .map_err(|e| LocalError::Worker(Box::leak(e.to_string().into_boxed_str())))?;
             let meta = wrangler_config_to_worker_toml(&config)
                 .map_err(|e| LocalError::Worker(Box::leak(e.to_string().into_boxed_str())))?;
@@ -1823,6 +1838,42 @@ mod tests {
         fs::write(dir.path().join("cloudflare.config.ts"), "export default {}").unwrap();
         let err = load_worker_meta(dir.path()).expect_err("must fail");
         assert!(format!("{err:?}").contains("programmatic config"));
+    }
+
+    #[test]
+    fn wrangler_named_environment_requires_and_uses_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"w","main":"m.js","compatibility_date":"2025-01-01",
+               "vars":{"MODE":"base"},
+               "env":{"staging":{"vars":{"MODE":"staging","ONLY_STAGING":"yes"}}}}"#,
+        )
+        .unwrap();
+
+        let err = load_worker_meta(dir.path()).expect_err("named env must be selected");
+        assert!(format!("{err:?}").contains("named environments found"));
+
+        let (meta, source) = load_worker_meta_for_env(dir.path(), Some("staging")).unwrap();
+        assert_eq!(source, MetaSource::Wrangler("wrangler.json".into()));
+        assert_eq!(meta.vars.get("MODE").map(String::as_str), Some("staging"));
+        assert_eq!(
+            meta.vars.get("ONLY_STAGING").map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn vrt_toml_rejects_wrangler_environment_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("vrt.toml"),
+            "name=\"w\"\nmainModule=\"m.js\"\ncompatibilityDate=\"2025-01-01\"\n",
+        )
+        .unwrap();
+        let err = load_worker_meta_for_env(dir.path(), Some("staging"))
+            .expect_err("vrt.toml cannot silently ignore --env");
+        assert!(format!("{err:?}").contains("vrt.toml has no env blocks"));
     }
 
     #[test]

@@ -202,6 +202,7 @@ fn failed_validation_persists_nothing() {
     let w2 = worker_dir(&root, "api2", "export default {v:2}", &[("LOG", "z")]);
     let bad = DeployOverrides {
         name: None,
+        env_name: None,
         bindings: vec![],
         hostnames: vec!["invalid_hostname!".to_string()],
         vars: Default::default(),

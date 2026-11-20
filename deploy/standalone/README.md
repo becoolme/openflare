@@ -105,6 +105,7 @@ and report format.
 compose="docker compose -f deploy/standalone/docker-compose.yml exec vrt"
 $compose vrt status --root /data
 $compose vrt deploy --root /data <dir>
+$compose vrt deploy --root /data --env staging <dir>
 $compose vrt rollback --root /data <worker> <version_id>
 $compose vrt hostnames add --root /data <worker> <host>
 printf 's3cret' | $compose vrt secret put --root /data <ref>
@@ -136,7 +137,7 @@ CLI can deploy a local directory without copying it in:
 printf '%s' "$(openssl rand -hex 32)" > /etc/vrt-mgmt-token && chmod 600 /etc/vrt-mgmt-token
 docker compose -f deploy/standalone/docker-compose.yml exec vrt   vrt serve --root /data --supervise     --mgmt-tcp-listen 127.0.0.1:9090 --mgmt-tcp-token-file /etc/vrt-mgmt-token
 
-vrt deploy --url http://127.0.0.1:9090 --token-file /etc/vrt-mgmt-token ./my-worker
+vrt deploy --url http://127.0.0.1:9090 --token-file /etc/vrt-mgmt-token --env staging ./my-worker
 ```
 
 The client packs the bundle locally (same validation, digests and
@@ -171,6 +172,7 @@ flags):
 
 ```sh
 vrt dev ./my-worker                    # 127.0.0.1:8787, watch+redeploy, live logs
+vrt dev ./my-worker --env staging     # select wrangler env.staging
 vrt dev ./my-worker --stub --no-watch  # stub runtime, redeploy by hand
 ```
 
