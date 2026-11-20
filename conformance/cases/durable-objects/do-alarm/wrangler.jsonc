@@ -1,0 +1,12 @@
+// Conformance case: DO alarms — storage.setAlarm/getAlarm/deleteAlarm
+// and the alarm() handler firing after the scheduled time.
+{
+  "name": "conf-do-alarm",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-do-alarm.vrt.local/*"],
+  "durable_objects": {
+    "bindings": [{ "name": "ALARMS", "class_name": "AlarmBox" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AlarmBox"] }],
+}

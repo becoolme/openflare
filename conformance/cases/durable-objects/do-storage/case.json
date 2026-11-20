@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "id": "do-storage",
+  "binding": "durable-objects",
+  "title": "Durable Object storage: kv get/put/delete/list, sql.exec, transaction atomicity, blockConcurrencyWhile",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/durable-objects/api/storage-api/ (storage get/put/delete/list, sql.exec cursor, transaction atomicity, blockConcurrencyWhile)",
+    "https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/ (new_sqlite_classes enables sql storage)",
+    "examples/standalone-do/main.js (same surface proven on the standalone stack e2e)"
+  ],
+  "steps": [
+    {
+      "name": "init via blockConcurrencyWhile",
+      "request": {
+        "path": "/init"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "initialized": true
+        }
+      }
+    },
+    {
+      "name": "kv counter inc 1",
+      "request": {
+        "path": "/inc"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "n": 1
+        }
+      }
+    },
+    {
+      "name": "kv counter inc 2 (persists)",
+      "request": {
+        "path": "/inc"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "n": 2
+        }
+      }
+    },
+    {
+      "name": "bulk kv ops + list prefix",
+      "request": {
+        "path": "/kv-misc"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "gotA": 1,
+          "gotB": 2,
+          "gotMissing": null,
+          "afterDelete": null,
+          "listNames": [
+            "b"
+          ]
+        }
+      }
+    },
+    {
+      "name": "sql exec + cursor + one()",
+      "request": {
+        "path": "/sql"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "rows": [
+            7
+          ],
+          "count": 1,
+          "rowsReadIsNum": true
+        }
+      }
+    },
+    {
+      "name": "transaction rolls back on throw",
+      "request": {
+        "path": "/txn"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true,
+          "rolledBack": true
+        }
+      }
+    }
+  ]
+}

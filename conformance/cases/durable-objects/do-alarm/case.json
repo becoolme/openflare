@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "id": "do-alarm",
+  "binding": "durable-objects",
+  "title": "DO alarms: setAlarm schedules alarm() delivery; getAlarm reports the armed time; deleteAlarm cancels",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/durable-objects/api/storage-api/ (setAlarm/getAlarm/deleteAlarm + the alarm() handler)",
+    "examples/standalone-do/main.js (alarm handler firing proven on the standalone stack e2e; armed alarms persist in metadata.sqlite)"
+  ],
+  "steps": [
+    {
+      "name": "arm alarm in ~300ms",
+      "request": {
+        "path": "/arm?ms=300"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "armed": true
+        }
+      }
+    },
+    {
+      "name": "getAlarm reports scheduled time",
+      "request": {
+        "path": "/armed-at"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "isNumber": true
+        },
+        "bodyMatches": "\"scheduled\":1[0-9]{12}"
+      }
+    },
+    {
+      "name": "alarm() handler fires",
+      "request": {
+        "path": "/fired"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "fired": 1
+        }
+      },
+      "retry": {
+        "timeoutMs": 30000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "re-arm then disarm leaves nothing scheduled",
+      "request": {
+        "path": "/arm?ms=60000"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "armed": true
+        }
+      }
+    },
+    {
+      "name": "disarm",
+      "request": {
+        "path": "/disarm"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "after": null
+        }
+      }
+    }
+  ]
+}

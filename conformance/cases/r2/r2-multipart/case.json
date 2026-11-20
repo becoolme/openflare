@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "r2-multipart",
+  "binding": "r2",
+  "title": "R2 multipart: create/uploadPart/complete round-trip, abort, min part-size rule",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/r2/api/workers/workers-api-usage/ (multipart flow; each non-final part >=5MiB)",
+    "examples/standalone-r2/main.js (the same chain proven on the standalone stack e2e)",
+    "vrt-provider/tests/r2_multipart.rs (part-order, min-size and signed-uploadId rules)"
+  ],
+  "steps": [
+    {
+      "name": "multipart round-trip (5MiB+5MiB+3B)",
+      "request": {
+        "path": "/multipart?key=mp1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "uploadIdKey": "mp1",
+          "partNumbers": [
+            1,
+            2,
+            3
+          ],
+          "etagsOk": true,
+          "size": 10485763,
+          "bytes": 10485763,
+          "head": true,
+          "customMetadata": {
+            "origin": "conformance"
+          }
+        }
+      }
+    },
+    {
+      "name": "abort leaves no object",
+      "request": {
+        "path": "/abort?key=ab1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "getAfterAbort": false
+        }
+      }
+    },
+    {
+      "name": "undersized non-final part rejected",
+      "request": {
+        "path": "/bad-part-size?key=bad1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+// Conformance case: KV list() — prefix, limit, cursor pagination,
+// per-key expiration/metadata surface, empty-prefix miss.
+{
+  "name": "conf-kv-list",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-kv-list.vrt.local/*"],
+  "kv_namespaces": [{ "binding": "KV", "id": "conf-kv-list" }],
+}

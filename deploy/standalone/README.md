@@ -82,6 +82,20 @@ The image ships `facade/dist` + `facade/manifest.json` under
 there automatically (manifest digests are verified at seed time;
 bare-metal installs can pass `--facade-dist`).
 
+With the real-workerd stack up, the binding-layer conformance suite
+can run against it — it deploys each case worker through `vrt deploy`
+inside the `vrt` container and checks responses at the ingress:
+
+```sh
+node conformance/run.mjs \
+  --url http://127.0.0.1:8080 \
+  --deploy-cmd ./conformance/deploy-standalone.sh
+```
+
+See [`conformance/README.md`](../../conformance/README.md) for
+options (`--stub` against the stub compose, `--only`, `--no-deploy`)
+and report format.
+
 ## Day-2 ops
 
 ```sh

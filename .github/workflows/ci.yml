@@ -52,6 +52,124 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: '0'
         run: cargo test --locked --workspace --no-fail-fast
 
+  # The repo never downloads workerd for build/runtime images (README
+  # "Quick start": you supply the pinned binary yourself). This job is
+  # the sanctioned exception: a TEST-ONLY helper that fetches the
+  # @cloudflare/workerd-linux-64 npm package at exactly the version
+  # pinned in deploy/docker/workerd.lock, verifies BOTH the tarball
+  # integrity (sha512) and the binary SHA-256 against the lock, and
+  # runs the VRT_WORKERD_BIN-gated tests via
+  # scripts/ci-real-workerd.sh. Any digest mismatch fails the job —
+  # the lock is the pin of record, never worked around.
+  real-workerd:
+    name: Real-workerd tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    concurrency:
+      group: real-workerd-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24.22.1'
+      - name: Read pinned version and digests from workerd.lock
+        id: lock
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const lock = JSON.parse(fs.readFileSync("deploy/docker/workerd.lock", "utf8"));
+            const art = lock.artifacts && lock.artifacts["linux-x64"];
+            if (!lock.version || !art || !art.binarySha256 || !art.integrity) {
+              console.error("workerd.lock has no linux-x64.binarySha256/integrity — update the lock (see deploy/docker/workerd.lock) and retry");
+              process.exit(1);
+            }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              `version=${lock.version}\nsha256=${art.binarySha256}\nintegrity=${art.integrity}\n`);
+          '
+      # Cache keyed on the binary digest: a lock bump or a tampered
+      # cache both miss; the post-restore step re-verifies the digest.
+      - name: Cache workerd binary
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .ci/workerd
+          key: workerd-linux-x64-${{ steps.lock.outputs.sha256 }}
+      - name: Fetch and verify pinned workerd binary
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/dl .ci/workerd
+          cd .ci/dl
+          npm pack --silent "@cloudflare/workerd-linux-64@${{ steps.lock.outputs.version }}"
+          tgz="$(echo *.tgz)"
+          # 1) tarball integrity (sha512, base64) must equal the lock.
+          got="$(openssl dgst -sha512 -binary "$tgz" | openssl base64 -A)"
+          [ "sha512-$got" = "${{ steps.lock.outputs.integrity }}" ] || \
+            { echo "tarball integrity mismatch: sha512-$got != ${{ steps.lock.outputs.integrity }}" >&2; exit 1; }
+          tar -xzf "$tgz"
+          # 2) the packaged binary must equal lock.artifacts.linux-x64.binarySha256.
+          bin="$(find package -type f -name workerd | head -1)"
+          [ -n "$bin" ] || { echo "no workerd binary inside $tgz" >&2; exit 1; }
+          echo "${{ steps.lock.outputs.sha256 }}  $bin" | sha256sum -c -
+          cp "$bin" ../workerd/workerd && chmod +x ../workerd/workerd
+          # The schema file used by vrt-config/tests/workerd_schema.rs
+          # comes from the meta package of the same pinned version —
+          # same source the `rust` job already uses.
+          npm pack --silent "workerd@${{ steps.lock.outputs.version }}"
+          tar -xzf "workerd-${{ steps.lock.outputs.version }}.tgz" package/workerd.capnp
+          cp package/workerd.capnp ../workerd/workerd.capnp
+      - name: Verify binary digest (cache hit or fresh fetch)
+        run: |
+          set -euo pipefail
+          echo "${{ steps.lock.outputs.sha256 }}  .ci/workerd/workerd" | sha256sum -c -
+          .ci/workerd/workerd --version
+      # d1_smoke locates target/debug/vrt-sql itself — build bins once.
+      - name: cargo build --bins
+        env:
+          CARGO_INCREMENTAL: '0'
+          CARGO_PROFILE_DEV_DEBUG: '0'
+        run: cargo build --locked --workspace --bins
+      # workerd's tcmalloc reserves tens of GB of virtual address space
+      # per process; under the default heuristic overcommit mode the
+      # kernel refuses that mprotect once a second generation starts
+      # next to a live one ("Cannot allocate memory"). Reservations are
+      # not touched memory, so allow them on the throwaway runner.
+      - name: Allow virtual address reservations for workerd
+        run: sudo sysctl -w vm.overcommit_memory=1
+      - name: Run VRT_WORKERD_BIN-gated tests
+        timeout-minutes: 40
+        env:
+          CARGO_INCREMENTAL: '0'
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+        run: |
+          scripts/ci-real-workerd.sh \
+            "$GITHUB_WORKSPACE/.ci/workerd/workerd" \
+            "$GITHUB_WORKSPACE/.ci/workerd/workerd.capnp"
+      # Tests keep their /tmp/vrt-* roots on panic (announced via
+      # stderr) — collect them plus rendered configs and workerd logs.
+      - name: Collect test logs on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          mkdir -p .ci/logs
+          shopt -s nullglob
+          for d in /tmp/vrt-* "$GITHUB_WORKSPACE"/vrt-host/target/tmp-*; do
+            cp -a "$d" .ci/logs/ 2>/dev/null || true
+          done
+      - name: Upload workerd/host logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-workerd-logs
+          path: .ci/logs
+          if-no-files-found: ignore
+          retention-days: 14
+
   node:
     name: Facade and contract checks
     runs-on: ubuntu-24.04
@@ -69,5 +187,7 @@ jobs:
         run: npm run test:facade
       - name: Contract checks
         run: npm run test:contract
+      - name: Conformance runner tests
+        run: npm run test:conformance
       - name: Compat flag list is up to date
         run: python3 vrt-config/compat/gen_compat_flags.py --check

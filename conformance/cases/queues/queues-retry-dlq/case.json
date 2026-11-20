@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "queues-retry-dlq",
+  "binding": "queues",
+  "title": "Queue retry + dead-letter queue: retried deliveries increment attempts, then land in the DLQ",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/queues/configuration/dead-letter-queues/ (a message exhausting retries lands in the consumer's dead_letter_queue)",
+    "https://developers.cloudflare.com/queues/configuration/configure-queues/ (max_retries, retry_delay consumer settings)",
+    "cell-controller/src/queue_dispatch.rs (messages failing their maxRetries+1-th delivery go to the DLQ; attempts increment per delivery)"
+  ],
+  "steps": [
+    {
+      "name": "send message that always retries",
+      "request": {
+        "method": "POST",
+        "path": "/send"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "deliveries retry then dead-letter (max_retries=2)",
+      "request": {
+        "path": "/stats"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "mainDeliveries": 3,
+          "mainAttempts": [
+            1,
+            2,
+            3
+          ],
+          "dlqDeliveries": 1,
+          "dlqBodies": [
+            "will-retry"
+          ]
+        }
+      },
+      "retry": {
+        "timeoutMs": 90000,
+        "intervalMs": 3000
+      }
+    }
+  ]
+}

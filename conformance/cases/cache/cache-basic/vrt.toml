@@ -1,0 +1,7 @@
+# Conformance case: Cache API — caches.default/caches.open
+# put/match/delete lifecycle, namespace isolation, miss → undefined.
+# (vrt.toml exercises the non-wrangler config family on purpose.)
+name = "conf-cache-basic"
+mainModule = "worker.js"
+compatibilityDate = "2024-09-25"
+hostnames = ["conf-cache-basic.vrt.local"]

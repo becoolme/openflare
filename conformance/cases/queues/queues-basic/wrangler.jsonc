@@ -1,0 +1,19 @@
+// Conformance case: queue producer send/sendBatch (+delaySeconds) and
+// consumer batch shape — a producer+consumer in ONE worker is CF-legal.
+// The consumer records every delivered batch into the bound D1 so the
+// runner can read durable side effects over HTTP.
+{
+  "name": "conf-queues-basic",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-queues-basic.vrt.local/*"],
+  "queues": {
+    "producers": [{ "binding": "Q", "queue": "conf-q" }],
+    "consumers": [
+      { "queue": "conf-q", "max_batch_size": 10, "max_batch_timeout": 1 },
+    ],
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "conf-queues-basic-db", "database_id": "conf-queues-basic" },
+  ],
+}

@@ -1,0 +1,317 @@
+{
+  "schemaVersion": 1,
+  "id": "kv-basic",
+  "binding": "kv",
+  "title": "KV put/get/delete round-trip, read types, metadata, bulk get, validation errors",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/kv/api/read-key-value-pairs/",
+    "https://developers.cloudflare.com/kv/api/write-key-value-pairs/",
+    "https://developers.cloudflare.com/kv/api/delete-key-value-pairs/",
+    "third_party/open-compute/facade/kv/transport.ts (typed TypeError codes: KV_INVALID_OPTIONS, KV_KEY_TOO_LARGE)"
+  ],
+  "steps": [
+    {
+      "name": "put k1",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "k1",
+          "value": "v1"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "get k1 (text)",
+      "request": {
+        "path": "/get?key=k1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": "v1"
+        }
+      }
+    },
+    {
+      "name": "get missing \u2192 null",
+      "request": {
+        "path": "/get?key=nope"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": null
+        }
+      }
+    },
+    {
+      "name": "put json text + get type=json",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "k2",
+          "value": "{\"a\":1}"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "get k2 as json",
+      "request": {
+        "path": "/get?key=k2&type=json"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": {
+            "a": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "get k1 as arrayBuffer",
+      "request": {
+        "path": "/get?key=k1&type=arrayBuffer"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "byteLength": 2,
+          "text": "v1"
+        }
+      }
+    },
+    {
+      "name": "put k3 with metadata",
+      "request": {
+        "method": "POST",
+        "path": "/put",
+        "json": {
+          "key": "k3",
+          "value": "v3",
+          "options": {
+            "metadata": {
+              "m": 2
+            }
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "getWithMetadata k3",
+      "request": {
+        "path": "/getwm?key=k3"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": "v3",
+          "metadata": {
+            "m": 2
+          }
+        }
+      }
+    },
+    {
+      "name": "getWithMetadata missing \u2192 nulls",
+      "request": {
+        "path": "/getwm?key=nope"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": null,
+          "metadata": null
+        }
+      }
+    },
+    {
+      "name": "bulk get (k1, missing, k3)",
+      "request": {
+        "method": "POST",
+        "path": "/getmany",
+        "json": {
+          "keys": [
+            "k1",
+            "missing",
+            "k3"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "k1": "v1",
+          "missing": null,
+          "k3": "v3"
+        }
+      }
+    },
+    {
+      "name": "bulk getWithMetadata (k3, missing)",
+      "request": {
+        "method": "POST",
+        "path": "/getmany-wm",
+        "json": {
+          "keys": [
+            "k3",
+            "missing"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "k3": {
+            "value": "v3",
+            "metadata": {
+              "m": 2
+            }
+          },
+          "missing": null
+        }
+      }
+    },
+    {
+      "name": "delete k1",
+      "request": {
+        "method": "POST",
+        "path": "/delete",
+        "json": {
+          "key": "k1"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "get deleted \u2192 null",
+      "request": {
+        "path": "/get?key=k1"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": null
+        }
+      }
+    },
+    {
+      "name": "delete missing still ok",
+      "request": {
+        "method": "POST",
+        "path": "/delete",
+        "json": {
+          "key": "k1"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "put expirationTtl<60 rejected",
+      "request": {
+        "method": "POST",
+        "path": "/err",
+        "json": {
+          "op": "put",
+          "args": [
+            "kx",
+            "v",
+            {
+              "expirationTtl": 30
+            }
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true,
+          "name": "TypeError"
+        },
+        "bodyContains": [
+          "KV_INVALID_OPTIONS"
+        ]
+      }
+    },
+    {
+      "name": "list limit>1000 rejected",
+      "request": {
+        "method": "POST",
+        "path": "/err",
+        "json": {
+          "op": "list",
+          "args": [
+            {
+              "limit": 1001
+            }
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true,
+          "name": "TypeError"
+        },
+        "bodyContains": [
+          "KV_INVALID_OPTIONS"
+        ]
+      }
+    },
+    {
+      "name": "key >512B rejected",
+      "request": {
+        "method": "POST",
+        "path": "/err",
+        "json": {
+          "op": "put",
+          "args": [
+            "kxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            "v"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true,
+          "name": "TypeError"
+        },
+        "bodyContains": [
+          "KV_KEY_TOO_LARGE"
+        ]
+      }
+    }
+  ]
+}

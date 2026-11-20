@@ -1,0 +1,23 @@
+# Unverified behaviors
+
+Behaviors that are **plausibly Cloudflare-compatible but lack a
+sufficient citation** (official docs or a workerd repo test) — the
+rule for `cases/` is that every `expect` must cite its basis in the
+case's `evidence` list. Each entry below names the gap; when the
+reference is found, promote it to a case.
+
+| # | Area | Behavior in question | Why it is not asserted yet |
+| --- | --- | --- | --- |
+| 1 | KV | Exact error text when `get(key,"json")` hits non-JSON content (CF throws, message shape uncited) | Only generic TypeError codes are cited (`facade/kv/transport.ts`) |
+| 2 | KV | `cacheTtl` semantics — edge/disk caching hint <30 s rejected (`KV_INVALID_OPTIONS` is asserted; the actual caching effect is not) | No public doc fixes observable hit/miss timing |
+| 3 | R2 | `ssecKey` (SSE-C) end-to-end; the wire carries it but no CF Workers doc commits to behavior | vendor surface only |
+| 4 | R2 | `uploadedBefore`/`uploadedAfter`/`secondsGranularity`/`httpHeaders` condition branches | covered partially by `r2_s3_conditional.rs` for puts; `get` side uncited |
+| 5 | D1 | `withSession()`/bookmarks (`x-cf-d1-*` headers) round-trip semantics | forwarded verbatim (d1-wire.ts) but no doc pins the local-mode result |
+| 6 | D1 | `dump()` / `raw({columnNames:false})` variants and `D1_RESULT_TOO_LARGE` limits | workerd-d1 surface exists; limit values differ by deployment |
+| 7 | Queues | `sendBatch` partial failure (one oversized item) — whether the call rejects atomically | broker semantics in open-compute; not cited from CF docs |
+| 8 | Queues | Exact `delaySeconds` floor — consumer-side `delaySecs` is recorded but wall-clock delay is only asserted loosely | CI timing noise makes a tight bound flaky |
+| 9 | Queues | `max_concurrency` fan-out behavior | configured (`queues.consumers[].max_concurrency`) but its observable effect on delivery ordering is uncited |
+| 10 | Cache | `max-age=1` real expiry: TTL eviction vs. lazy miss-on-read | cache.rs honors s-maxage/max-age but a wall-clock expiry assertion would be timing-flaky |
+| 11 | Cron | `event.retry`/`noRetry` on scheduled() controller | not surfaced by the standalone CronRunner path yet |
+| 12 | DO | `storage.sql` KV↔SQL visibility interplay and alarm persistence across a process restart | restart persistence is proven manually; an automated restart step is not wired into the runner yet |
+| 13 | DO | `blockConcurrencyWhile` reject → surface to waiting fetch (error propagation shape) | needs a failing init fixture; added when a workerd-side citation is found |

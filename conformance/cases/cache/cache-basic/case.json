@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "id": "cache-basic",
+  "binding": "cache",
+  "title": "Cache API put/match/delete lifecycle, named-cache isolation, request no-store, cached headers",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/workers/runtime-apis/cache/ (match returns undefined on miss; put honors Cache-Control; delete returns boolean; caches.default + caches.open)",
+    "examples/standalone-cache/main.js (the same lifecycle proven on the standalone stack e2e)",
+    "vrt-host/src/cache.rs (request-side no-store honored; namespace subdivision per cache name)"
+  ],
+  "steps": [
+    {
+      "name": "default cache lifecycle",
+      "request": {
+        "path": "/flow"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "miss": true,
+          "hit": "F",
+          "del": true,
+          "after": true
+        }
+      }
+    },
+    {
+      "name": "named cache isolated from default",
+      "request": {
+        "path": "/named"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "hit": "N",
+          "defaultMiss": true
+        }
+      }
+    },
+    {
+      "name": "request no-store is honored",
+      "request": {
+        "path": "/nostore"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "after": true
+        }
+      }
+    },
+    {
+      "name": "cached response keeps headers",
+      "request": {
+        "path": "/response-headers"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "body": "H",
+          "xConf": "yes"
+        }
+      }
+    }
+  ]
+}

@@ -7,6 +7,12 @@
 deploy/standalone/workerd
 deploy/docker/workerd
 
+# CI scratch dir (real-workerd job artifact staging)
+.ci/
+
 # local cargo home / node deps
 .cargo-home/
 node_modules/
+
+# Generated conformance reports (conformance/run.mjs output)
+conformance/results/

@@ -1,0 +1,13 @@
+// Conformance case: Durable Object storage — kv ops + SQLite storage
+// (new_sqlite_classes migration enables ctx.storage.sql), atomic
+// transaction, blockConcurrencyWhile init ordering.
+{
+  "name": "conf-do-storage",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-do-storage.vrt.local/*"],
+  "durable_objects": {
+    "bindings": [{ "name": "COUNTER", "class_name": "Counter" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+}

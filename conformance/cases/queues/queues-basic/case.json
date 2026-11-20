@@ -1,0 +1,133 @@
+{
+  "schemaVersion": 1,
+  "id": "queues-basic",
+  "binding": "queues",
+  "title": "Queue send/sendBatch producer + consumer batch shape (queue name, message fields, attempts)",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/queues/configuration/javascript-apis/ (send/sendBatch, Message{id,timestamp,attempts,body}, MessageBatch{queue,messages,ackAll,retryAll})",
+    "facade/facade-qconsumer.ts (wire: {id,timestamp:Date,attempts>=1,body} \u2192 Fetcher.queue)",
+    "vrt-provider/src/queue.rs (128_000B per-message cap, 100-msg batch cap, delay \u226486_400s)"
+  ],
+  "steps": [
+    {
+      "name": "send one json message",
+      "request": {
+        "method": "POST",
+        "path": "/send"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "delivery lands with full message shape",
+      "request": {
+        "path": "/deliveries"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "count": 1,
+          "deliveries": [
+            {
+              "queue": "conf-q",
+              "count": 1,
+              "messages": [
+                {
+                  "idIsString": true,
+                  "tsIsNumber": true,
+                  "attempts": 1,
+                  "body": {
+                    "t": "hello"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 2000
+      }
+    },
+    {
+      "name": "sendBatch of two",
+      "request": {
+        "method": "POST",
+        "path": "/send-batch"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "batch delivers as one batch",
+      "request": {
+        "path": "/deliveries"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "count": 2,
+          "deliveries": [
+            {
+              "count": 1
+            },
+            {
+              "queue": "conf-q",
+              "count": 2,
+              "messages": [
+                {
+                  "attempts": 1,
+                  "body": "m1"
+                },
+                {
+                  "attempts": 1,
+                  "body": "m2"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 2000
+      }
+    },
+    {
+      "name": "send with delaySeconds accepted",
+      "request": {
+        "method": "POST",
+        "path": "/send-delay"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "oversize message rejected",
+      "request": {
+        "method": "POST",
+        "path": "/send-err"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true
+        }
+      }
+    }
+  ]
+}

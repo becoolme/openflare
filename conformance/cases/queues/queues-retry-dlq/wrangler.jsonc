@@ -1,0 +1,25 @@
+// Conformance case: retry semantics + dead-letter queue. The main
+// consumer always msg.retry()s — after the maxRetries+1-th delivery
+// the message is dead-lettered into conf-q-dlq, whose own consumer
+// records the landing (attempts history is kept per delivery).
+{
+  "name": "conf-queues-retry-dlq",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-queues-retry-dlq.vrt.local/*"],
+  "queues": {
+    "producers": [{ "binding": "Q", "queue": "conf-q-retry" }],
+    "consumers": [
+      {
+        "queue": "conf-q-retry",
+        "max_retries": 2,
+        "retry_delay": 1,
+        "dead_letter_queue": "conf-q-dlq",
+      },
+      { "queue": "conf-q-dlq" },
+    ],
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "conf-queues-retry-dlq-db", "database_id": "conf-queues-retry-dlq" },
+  ],
+}
