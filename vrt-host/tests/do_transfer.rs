@@ -912,23 +912,28 @@ async fn quarantine_respects_retention_window() {
     let qdir = tenant_dir.join("w1").join(format!("{key}.xfer-quarantine"));
     std::fs::create_dir_all(&qdir).unwrap();
     std::fs::write(qdir.join("payload.bin"), b"fenced-provenance").unwrap();
-    vrt_host::do_transfer::mark_quarantine(
-        &tenant_dir.join("w1"),
-        &format!("{key}.xfer-quarantine"),
-    );
-
     let (store, plc) = placement_pair("cell:test:holder-a");
     let mut deps = deps_with(store, plc, &fx.dir.path().join("snap-tmp"));
     // Tight retention for the test — still inside the [1h,30d] clamp
     // at config level; deps is the raw field so any ms value applies.
+    // 3 s, not sub-second: the mark→sweep gap includes spawn latency,
+    // which a loaded runner can stretch past a smaller window.
     Arc::get_mut(deps.do_snap.as_mut().unwrap())
         .unwrap()
-        .xfer_quarantine_ms = 700;
+        .xfer_quarantine_ms = 3_000;
     let mut spec = fx.stub_spec("t1", &["w1"], &[]);
     spec.do_storage = Some(do_spec(&tenant_dir, &[], &[]));
     let runtime = TenantRuntime::new("t1");
     let handle = vrt_host::supervisor::spawn_supervisor(runtime.clone(), spec, deps, test_params());
     wait_state(&runtime, TenantState::Ready, Duration::from_secs(8)).await;
+
+    // Mark AFTER Ready so the wall-clock window starts where the
+    // asserts measure it — a marker written before spawn ages through
+    // the whole bringup.
+    vrt_host::do_transfer::mark_quarantine(
+        &tenant_dir.join("w1"),
+        &format!("{key}.xfer-quarantine"),
+    );
 
     // Within retention the quarantine must survive the sweep.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -937,9 +942,16 @@ async fn quarantine_respects_retention_window() {
         "in-window quarantine kept"
     );
 
-    // Past the window the sweep may reclaim it.
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    assert!(!qdir.exists(), "expired quarantine reclaimed");
+    // Past the window the sweep must reclaim it — bounded poll, not a
+    // bare sleep, so a slow monitor tick can't fake the outcome.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while qdir.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expired quarantine never reclaimed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     handle.send(SupervisorCmd::Stop).await;
 }
 
