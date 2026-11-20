@@ -62,6 +62,36 @@ const PASSTHROUGH_RESPONSE_HEADERS = new Set([
   "location",
 ]);
 
+/// Internal list of `_headers`-touched names (provider → facade). Only
+/// these names are forwarded in addition to the representation
+/// whitelist; anything else the backend emits stays internal.
+const CUSTOM_HEADER_NAMES = "x-open-compute-asset-header-names";
+const MAX_CUSTOM_HEADER_NAMES = 256;
+const CUSTOM_HEADER_DENY = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+  "content-length",
+  "host",
+]);
+// Built via RegExp so the source contains no backtick (the manifest
+// generator strips comments with a backtick-unaware scanner).
+const CUSTOM_HEADER_NAME_RE = new RegExp("^[a-z0-9!#$%&'*+.^_\\x60|~-]+$");
+
+function isForwardableCustomHeader(name: string): boolean {
+  return (
+    CUSTOM_HEADER_NAME_RE.test(name) &&
+    !name.startsWith("x-open-compute-") &&
+    !name.startsWith("x-vrt-") &&
+    !CUSTOM_HEADER_DENY.has(name)
+  );
+}
+
 function sanitizeErrorCode(value: string | null): string {
   return value && ALLOWED_ERROR_CODES.has(value)
     ? value
@@ -266,6 +296,31 @@ export class AssetTransport extends WorkerEntrypoint {
     for (const name of PASSTHROUGH_RESPONSE_HEADERS) {
       const value = response.headers.get(name);
       if (value !== null) responseHeaders.set(name, value);
+    }
+    // `_headers` output: the provider enumerates the names it touched
+    // (set or detached); forward exactly those, re-validated here so a
+    // compromised backend still cannot inject internal headers.
+    const customNames = response.headers.get(CUSTOM_HEADER_NAMES);
+    if (customNames !== null) {
+      for (const raw of customNames.split(",").slice(0, MAX_CUSTOM_HEADER_NAMES)) {
+        const name = raw.trim().toLowerCase();
+        if (!isForwardableCustomHeader(name)) continue;
+        if (name === "set-cookie") {
+          const getSetCookie = (
+            response.headers as { getSetCookie?: () => string[] }
+          ).getSetCookie;
+          const cookies =
+            typeof getSetCookie === "function"
+              ? getSetCookie.call(response.headers)
+              : [];
+          if (cookies.length > 0) {
+            for (const cookie of cookies) responseHeaders.append("set-cookie", cookie);
+            continue;
+          }
+        }
+        const value = response.headers.get(name);
+        if (value !== null) responseHeaders.set(name, value);
+      }
     }
     // Internal representation-length is read from the BACKEND response
     // and re-emitted explicitly — it is not a passthrough header.

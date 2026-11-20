@@ -90,9 +90,22 @@ that does not match the bytes is never committed.
   one trailing `*` (`:splat`), segment placeholders (`:name`), and
   `200` proxying to a relative path. Query-parameter/country/cookie
   conditions, domain-level rules and rewrites other than 200 are not
-  supported. `_headers` is **not** implemented yet. Both files are
+  supported. `_headers` is supported: rules apply in file order to
+  asset responses (not Worker responses), multiple matches accumulate,
+  `! Name` detaches earlier values, `:splat`/`:name` substitute in
+  values (in one pass, `:name` may be combined with a trailing `*`),
+  and duplicates are comma-joined. `_headers`/`_redirects` are
   configuration and are never served as assets — neither directly nor
-  through a `200` rewrite destination.
+  through a `200` rewrite destination. The assets facade only forwards
+  the names the provider marks as `_headers`-touched, so
+  backend-internal headers can never leak.
+- `_headers`/`_redirects` are validated at pack time
+  (`vrt-local/src/worker_pkg.rs`, both the directory scan and the
+  upload path): ≤ 512 KiB, valid UTF-8, and — for `_headers` — at most
+  256 distinct / 4 KiB of forwarded header names. The provider reads
+  these files with those smaller caps, so shipping an unusable one
+  would otherwise fail closed on every asset request (or silently drop
+  the whole forwarding list) after a successful deploy.
 - `_redirects` matching runs on the raw (still percent-encoded) request
   path, like Cloudflare: capture values are substituted into `Location`
   verbatim, so `/en/%2Fevil.com` rewrites to `/%2Fevil.com` instead of a

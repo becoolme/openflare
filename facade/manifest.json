@@ -156,8 +156,8 @@
           "name": "facade/facade-assets.js",
           "dist": "facade/dist/facade/facade-assets.js",
           "source": "facade/facade-assets.ts",
-          "sourceSha256": "d97cf1937ee4ed7c5f4fa47d24e6096b9408c371bcd00cccda47ce79eebc221d",
-          "sha256": "fdec0a4690220c46620fa5aebc6a1f819a169fd2b30eac34334d7c746b9db1c4"
+          "sourceSha256": "4aeeca80822b2c25f23032ac3f611567002aee1ed0a97f3a390674768179d42d",
+          "sha256": "022859b9f78333db380453fa953d92d9293f2524c2b5c8da8679ae5d21fb8f08"
         },
         {
           "name": "facade/props.js",

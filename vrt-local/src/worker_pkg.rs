@@ -510,10 +510,26 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
             let req_path = format!("/{rel_str}");
             let bytes =
                 std::fs::read(&entry_path).map_err(|_| LocalError::Worker("assets read"))?;
+            validate_config_asset(&req_path, &bytes)?;
             entries.push((req_path, bytes));
         }
     }
     assets_from_entries(entries, &html_handling, &not_found)
+}
+
+/// Validate an asset configuration file (`/_headers`, `/_redirects`)
+/// before it is published. The provider reads these with a smaller cap
+/// than ordinary assets and fails closed at request time, and the facade
+/// forwards `_headers` names under a bounded list — so an accepted
+/// deployment must not ship a file that can 503 every asset request or
+/// silently drop configured headers.
+fn validate_config_asset(path: &str, bytes: &[u8]) -> Result<(), LocalError> {
+    let result = match path {
+        "/_headers" => vrt_provider::assets_headers::validate_file(bytes),
+        "/_redirects" => vrt_provider::assets_redirects::validate_file(bytes),
+        _ => Ok(()),
+    };
+    result.map_err(|e| LocalError::WorkerOwned(format!("{path}: {e}")))
 }
 
 /// Build the canonical manifest + digest-keyed objects from
@@ -1691,6 +1707,7 @@ fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError>
         if total > MAX_ASSET_TOTAL_BYTES {
             return Err(LocalError::Worker("assets total too large"));
         }
+        validate_config_asset(path, &bytes)?;
         declared.insert(sha.to_string());
         objects.push((sha.to_string(), bytes));
     }
@@ -1742,6 +1759,81 @@ mod assets_handling_tests {
             assert_eq!(doc["htmlHandling"], mode);
         }
         assert!(scan_assets_dir(&root, &assets(Some("force"))).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Deploy validation: a `_headers`/`_redirects` file the provider
+    /// would fail closed on (or could not forward whole) must be
+    /// rejected at pack time — for the directory scan and the upload
+    /// path alike.
+    #[test]
+    fn config_assets_are_validated_before_publish() {
+        let root = std::env::temp_dir().join(format!("vrt-assets-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("public");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"x").unwrap();
+
+        // Valid files deploy.
+        std::fs::write(dir.join("_headers"), b"/*\n  X-Frame-Options: DENY\n").unwrap();
+        std::fs::write(dir.join("_redirects"), b"/old /new 301\n").unwrap();
+        let pending = scan_assets_dir(&root, &assets(None)).expect("valid config assets");
+
+        // Non-UTF-8 `_headers` would 503 every asset request.
+        std::fs::write(dir.join("_headers"), b"/*\n  X-A: \xff\n").unwrap();
+        assert!(scan_assets_dir(&root, &assets(None)).is_err());
+        // Over the provider's parse cap, even though the generic asset
+        // cap is larger.
+        let mut big = String::from("/*\n");
+        while big.len() <= vrt_provider::assets_headers::MAX_FILE_BYTES {
+            big.push_str("# padding padding padding padding padding padding\n");
+        }
+        std::fs::write(dir.join("_headers"), big.as_bytes()).unwrap();
+        assert!(scan_assets_dir(&root, &assets(None)).is_err());
+        std::fs::write(dir.join("_headers"), b"/*\n  X-Ok: yes\n").unwrap();
+
+        // The upload path applies the same validation.
+        use base64::Engine;
+        let bad = b"/old /new 301\n\xff\n".to_vec();
+        let sha = hex::encode(sha2::Sha256::digest(&bad));
+        let manifest = serde_json::json!({
+            "files": [{
+                "mime": "text/plain",
+                "path": "/_redirects",
+                "sha256": sha,
+                "size": bad.len(),
+            }],
+            "htmlHandling": "auto-trailing-slash",
+            "notFoundHandling": "none",
+            "schemaVersion": 1,
+        });
+        let mut objects = BTreeMap::new();
+        objects.insert(
+            sha,
+            base64::engine::general_purpose::STANDARD.encode(&bad),
+        );
+        let upload = UploadAssets {
+            manifest: base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&manifest).unwrap()),
+            objects,
+        };
+        assert!(upload_assets_verified(&upload).is_err());
+        // A legitimate deployment still verifies (digest-keyed objects).
+        let pending_ok = upload_assets_verified(&UploadAssets {
+            manifest: base64::engine::general_purpose::STANDARD
+                .encode(&pending.manifest_bytes),
+            objects: pending
+                .objects
+                .iter()
+                .map(|(d, b)| {
+                    (
+                        d.clone(),
+                        base64::engine::general_purpose::STANDARD.encode(b),
+                    )
+                })
+                .collect(),
+        });
+        assert!(pending_ok.is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
