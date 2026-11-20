@@ -1584,10 +1584,10 @@ fn valid_compat_flag(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'.' | b'-'))
 }
 
-/// Cloudflare's 5-field cron expression:
+/// Cloudflare's supported subset of 5-field cron:
 /// `minute hour day-of-month month day-of-week`. Supports `*`, lists,
-/// ranges, steps, and JAN–DEC / SUN–SAT names; numeric weekdays use
-/// 1=Sunday through 7=Saturday.
+/// ranges, steps, JAN–DEC / SUN–SAT names, DOM `L`/`LW`/`nW`, and DOW
+/// `dL`/`d#n` modifiers; numeric weekdays use 1=Sunday through 7=Saturday.
 fn valid_cron_expression(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_CRON_EXPR_LEN {
         return false;
@@ -1612,12 +1612,54 @@ fn valid_cron_expression(value: &str) -> bool {
         .iter()
         .zip(spec.iter())
         .enumerate()
-        .all(|(idx, (field, &(min, max, names)))| {
-            !field.is_empty()
-                && field
-                    .split(',')
-                    .all(|part| valid_cron_part(part, min, max, names, idx == 4))
+        .all(|(idx, (field, &(min, max, names)))| match idx {
+            2 => valid_cron_dom_field(field),
+            4 => valid_cron_dow_field(field, names),
+            _ => {
+                !field.is_empty()
+                    && field
+                        .split(',')
+                        .all(|part| valid_cron_part(part, min, max, names, false))
+            }
         })
+}
+
+fn valid_cron_dom_field(field: &str) -> bool {
+    !field.is_empty()
+        && field.split(',').all(|part| {
+            if part.eq_ignore_ascii_case("L") || part.eq_ignore_ascii_case("LW") {
+                return true;
+            }
+            if let Some(day) = strip_ascii_modifier(part, 'W') {
+                return parse_cron_uint(day).is_some_and(|day| (1..=31).contains(&day));
+            }
+            valid_cron_part(part, 1, 31, &[], false)
+        })
+}
+
+fn valid_cron_dow_field(field: &str, names: &[&str]) -> bool {
+    !field.is_empty()
+        && field.split(',').all(|part| {
+            if let Some((day, occurrence)) = part.split_once('#') {
+                return valid_cron_dow_atom(day, names)
+                    && parse_cron_uint(occurrence).is_some_and(|n| (1..=5).contains(&n));
+            }
+            if let Some(day) = strip_ascii_modifier(part, 'L') {
+                return valid_cron_dow_atom(day, names);
+            }
+            valid_cron_part(part, 1, 7, names, true)
+        })
+}
+
+fn valid_cron_dow_atom(value: &str, names: &[&str]) -> bool {
+    names.iter().any(|name| value.eq_ignore_ascii_case(name))
+        || parse_cron_uint(value).is_some_and(|n| (1..=7).contains(&n))
+}
+
+fn strip_ascii_modifier(value: &str, modifier: char) -> Option<&str> {
+    value
+        .strip_suffix(modifier)
+        .or_else(|| value.strip_suffix(modifier.to_ascii_lowercase()))
 }
 
 /// RV-R69: strict unsigned decimal (`[0-9]+`). `str::parse::<u32>` also
@@ -2415,6 +2457,14 @@ mod tests {
             "0 0 * * 7",
             "0 0 * * SUN",
             "0 9 * * MON-FRI",
+            "0 0 L * *",
+            "0 0 LW * *",
+            "0 0 15W * *",
+            "0 0 1W * *",
+            "0 0 * * 6L",
+            "0 0 * * FRIL",
+            "0 0 * * MON#2",
+            "0 0 * * 5#3",
             "0,30 * * * *",
             "0 0 1 jan *",
             "0 0 * jan-mar *",
@@ -2433,6 +2483,12 @@ mod tests {
             "* * * 13 *",
             "* * * * 0",
             "* * * * 8",
+            "0 0 32W * *",
+            "0 0 1-5W * *",
+            "0 0 * * L",
+            "0 0 * * #2",
+            "0 0 * * MON#0",
+            "0 0 * * 1#6",
             "*/0 * * * *",
             "*/61 * * * *",
             "5-1 * * * *",

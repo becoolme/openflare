@@ -27,15 +27,15 @@
 //!   signed snapshot there is no authority to run tenant work (fail
 //!   closed — same rule as provider lookups).
 //!
-//! Cron matching implements Cloudflare's 5-field cron semantics
-//! (`minute hour dom month dow`), `*`/lists/ranges/steps/name literals,
-//! and the dom-or-dow rule (when both fields are restricted the trigger
-//! fires when EITHER matches) — the same grammar `snapshot-protocol`
-//! validates, so every accepted snapshot's crons parse here too.
+//! Cron matching implements the supported Cloudflare 5-field grammar
+//! (`minute hour dom month dow`), including `*`/lists/ranges/steps/name
+//! literals, DOM `L`/`LW`/`nW`, DOW `dL`/`d#n`, and the dom-or-dow rule
+//! (when both fields are restricted the trigger fires when EITHER matches).
+//! `snapshot-protocol` validates this same subset before dispatch.
 
 use crate::assign::{AssignedWorker, PodAssignment};
 use crate::lease::{LeaseOutcome, LeaseStore};
-use chrono::{DateTime, Datelike, Duration, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc, Weekday};
 use snapshot_protocol::compute_desired::ComputeDesired;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -553,8 +553,8 @@ impl<L: LeaseStore> CronRunner<L> {
     }
 }
 
-/// Does `expression` fire at minute `dt`? Standard 5-field vixie
-/// semantics with the dom-or-dow rule.
+/// Does a supported Cloudflare 5-field expression fire at minute `dt`?
+/// Day-of-month and day-of-week retain the cron dom-or-dow rule.
 pub fn cron_matches(expression: &str, dt: DateTime<Utc>) -> bool {
     let fields: Vec<&str> = expression.split_ascii_whitespace().collect();
     if fields.len() != 5 {
@@ -566,7 +566,7 @@ pub fn cron_matches(expression: &str, dt: DateTime<Utc>) -> bool {
     // "unrestricted" for the dom/dow OR rule; only both-non-star fields OR.
     let dom_restricted = !fields[2].starts_with('*');
     let dow_restricted = !fields[4].starts_with('*');
-    let dom = field_matches(fields[2], dt.day(), 1, 31, &[]);
+    let dom = day_of_month_matches(fields[2], dt);
     let month = field_matches(
         fields[3],
         dt.month(),
@@ -578,16 +578,111 @@ pub fn cron_matches(expression: &str, dt: DateTime<Utc>) -> bool {
     );
     // Cloudflare numeric dow is 1=Sunday .. 7=Saturday. The matcher uses
     // chrono's Sunday=0 .. Saturday=6 internally, as do the name literals.
-    let dow = {
-        let raw = dt.weekday().num_days_from_sunday(); // 0=Sun
-        field_matches_dow(fields[4], raw)
-    };
+    let dow = day_of_week_matches(fields[4], dt);
     if !(minute && hour && month) {
         return false;
     }
     match (dom_restricted, dow_restricted) {
         (true, true) => dom || dow,
         _ => dom && dow,
+    }
+}
+
+fn day_of_month_matches(field: &str, dt: DateTime<Utc>) -> bool {
+    let day = dt.day();
+    let last = days_in_month(dt.year(), dt.month());
+    field.split(',').any(|part| {
+        if part.eq_ignore_ascii_case("L") {
+            return day == last;
+        }
+        if part.eq_ignore_ascii_case("LW") {
+            return day == last_weekday_of_month(dt.year(), dt.month(), last);
+        }
+        if let Some(requested) = strip_ascii_modifier(part, 'W') {
+            return cron_uint(requested)
+                .and_then(|requested| nearest_weekday(dt.year(), dt.month(), requested, last))
+                == Some(day);
+        }
+        field_matches(part, day, 1, 31, &[])
+    })
+}
+
+fn day_of_week_matches(field: &str, dt: DateTime<Utc>) -> bool {
+    let raw_sunday0 = dt.weekday().num_days_from_sunday();
+    let last = days_in_month(dt.year(), dt.month());
+    field.split(',').any(|part| {
+        if let Some(day) = strip_ascii_modifier(part, 'L') {
+            return is_single_dow_atom(day)
+                && field_matches_dow(day, raw_sunday0)
+                && dt.day() + 7 > last;
+        }
+        if let Some((day, occurrence)) = part.split_once('#') {
+            let Some(occurrence) = cron_uint(occurrence).filter(|n| (1..=5).contains(n)) else {
+                return false;
+            };
+            return is_single_dow_atom(day)
+                && field_matches_dow(day, raw_sunday0)
+                && (dt.day() - 1) / 7 + 1 == occurrence;
+        }
+        field_matches_dow(part, raw_sunday0)
+    })
+}
+
+fn is_single_dow_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value != "*"
+        && !value
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'-' | b',' | b'#'))
+}
+
+fn strip_ascii_modifier(value: &str, modifier: char) -> Option<&str> {
+    value
+        .strip_suffix(modifier)
+        .or_else(|| value.strip_suffix(modifier.to_ascii_lowercase()))
+}
+
+fn cron_uint(value: &str) -> Option<u32> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn nearest_weekday(year: i32, month: u32, requested: u32, last: u32) -> Option<u32> {
+    if !(1..=last).contains(&requested) {
+        return None;
+    }
+    let weekday = NaiveDate::from_ymd_opt(year, month, requested)?.weekday();
+    let nearest = match (requested, weekday) {
+        (1, Weekday::Sat) => 3,
+        (1, Weekday::Sun) => 2,
+        (day, Weekday::Sat) if day == last => day - 1,
+        (day, Weekday::Sun) if day == last => day - 2,
+        (day, Weekday::Sat) => day - 1,
+        (day, Weekday::Sun) => day + 1,
+        (day, _) => day,
+    };
+    (1..=last).contains(&nearest).then_some(nearest)
+}
+
+fn last_weekday_of_month(year: i32, month: u32, last: u32) -> u32 {
+    match NaiveDate::from_ymd_opt(year, month, last)
+        .expect("valid month end")
+        .weekday()
+    {
+        Weekday::Sat => last - 1,
+        Weekday::Sun => last - 2,
+        _ => last,
     }
 }
 
@@ -992,6 +1087,34 @@ mod tests {
     }
 
     #[test]
+    fn matcher_cloudflare_extended_day_modifiers() {
+        assert!(cron_matches("0 0 L * *", at("2026-02-28T00:00:00Z")));
+        assert!(!cron_matches("0 0 L * *", at("2026-02-27T00:00:00Z")));
+        assert!(cron_matches("0 0 L * *", at("2028-02-29T00:00:00Z")));
+        assert!(cron_matches("0 0 LW * *", at("2026-05-29T00:00:00Z")));
+        assert!(!cron_matches("0 0 LW * *", at("2026-05-31T00:00:00Z")));
+
+        // Sunday 15th moves to Monday 16th; weekend month edges never
+        // select an adjacent date outside the current month.
+        assert!(cron_matches("0 0 15W * *", at("2026-11-16T00:00:00Z")));
+        assert!(!cron_matches("0 0 15W * *", at("2026-11-15T00:00:00Z")));
+        assert!(cron_matches("0 0 1W * *", at("2021-05-03T00:00:00Z")));
+        assert!(!cron_matches("0 0 1W * *", at("2021-05-01T00:00:00Z")));
+        assert!(cron_matches("0 0 31W * *", at("2026-10-30T00:00:00Z")));
+        assert!(!cron_matches("0 0 31W * *", at("2026-10-31T00:00:00Z")));
+
+        // Cloudflare 6 is Friday. # counts matching weekdays from the
+        // beginning of the month, with the first occurrence numbered 1.
+        assert!(cron_matches("0 0 * * 6L", at("2026-11-27T00:00:00Z")));
+        assert!(!cron_matches("0 0 * * 6L", at("2026-11-20T00:00:00Z")));
+        assert!(cron_matches("0 0 * * FRIL", at("2026-11-27T00:00:00Z")));
+        assert!(cron_matches("0 0 * * MON#2", at("2026-11-09T00:00:00Z")));
+        assert!(!cron_matches("0 0 * * MON#2", at("2026-11-02T00:00:00Z")));
+        assert!(cron_matches("0 0 * * 5#3", at("2026-11-19T00:00:00Z")));
+        assert!(cron_matches("0 0 * * MON#5", at("2026-11-30T00:00:00Z")));
+    }
+
+    #[test]
     fn matcher_month_end_leap_and_utc_edges() {
         // Month-end: a restricted dom fires only when the month HAS
         // that day — no "nearest-day" drift (matches CF/vixie: an
@@ -1060,6 +1183,10 @@ mod tests {
             fired("0 0 * * */2"),
             [true, false, true, false, true, false, true]
         );
+        assert_eq!(
+            fired("0 0 * * */7"),
+            [true, false, false, false, false, false, false]
+        );
         assert_eq!(fired("0 0 * * 1-7"), [true; 7]);
         assert_eq!(
             fired("0 0 * * SUN-SUN"),
@@ -1115,11 +1242,14 @@ mod tests {
         };
         let minute = ["*", "0", "30", "59", "*/15", "5-10", "0,30", "1-59/7"];
         let hour = ["*", "0", "12", "23", "*/6", "9-17", "1,13", "0-23/5"];
-        let dom = ["*", "1", "15", "28", "*/10", "1-7", "1,15", "1-28/3"];
+        let dom = [
+            "*", "1", "15", "28", "L", "LW", "15W", "1W", "1-7", "1,15", "1-28/3",
+        ];
         let month = ["*", "1", "6", "12", "JAN", "dec", "*/3", "JAN-MAR", "2-11/2"];
         let dow = [
             "*", "1", "2", "6", "7", "SUN", "MON", "*/2", "1-5", "MON-FRI", "5-7", "FRI-SUN",
-            "1-7/2", "1-7", "SUN-SUN", "6-7", "SAT-SUN", "1,7", "3-7/3", "*/7",
+            "1-7/2", "1-7", "SUN-SUN", "6-7", "SAT-SUN", "1,7", "3-7/3", "6L", "FRIL",
+            "MON#2", "5#3",
         ];
         let mut accepted = 0;
         let mut seen = std::collections::HashSet::new();
@@ -1165,16 +1295,16 @@ mod tests {
         // the runtime matcher stays fail closed — a rejected
         // expression must evaluate to "no match" on every instant,
         // never error-as-true. Choices: CF-unsupported grammar
-        // (L/W/#/?/@aliases/6-field seconds) is rejected outright
-        // rather than approximated; `*/0` step is invalid (division
+        // (?/@aliases/6-field seconds) is rejected outright rather than
+        // approximated; `*/0` step is invalid (division
         // by zero); out-of-range atoms never match.
         for bad in [
             "0 0 ? * *",     // Quartz day-wildcard — unsupported
-            "0 0 L * *",     // last-day-of-month — unsupported
-            "0 0 LW * *",    // last weekday — unsupported
-            "0 0 15W * *",   // nearest weekday — unsupported
-            "0 0 * * MON#2", // nth weekday — unsupported
-            "0 0 * * 5#3",   // nth weekday numeric — unsupported
+            "0 0 32W * *",   // nearest weekday's day is out of range
+            "0 0 1-5W * *",  // W modifier requires one day-of-month atom
+            "0 0 * * L",     // last weekday requires a day-of-week atom
+            "0 0 * * MON#6", // only first through fifth occurrence exists
+            "0 0 * * #2",    // nth weekday requires a day-of-week atom
             "@daily",        // macro aliases — not 5-field
             "@hourly",
             "0 0 0 * * *",     // 6-field seconds — unsupported
@@ -1184,7 +1314,7 @@ mod tests {
             "0 0 * 13 *",      // month out of range
             "0 24 * * *",      // hour out of range
             "60 * * * *",      // minute out of range
-            "0 0 * * 8",       // dow out of range (0..7)
+            "0 0 * * 8",       // dow out of range (1..7)
             "",                // empty
             "* * *",           // too few fields
             "* * * * * * * *", // too many
