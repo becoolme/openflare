@@ -818,10 +818,28 @@ mod tests {
     }
 
     fn fake_workerd(dir: &Path, script: &str, code: i32) -> PathBuf {
+        // Written by a separate `sh` process, never by this test process:
+        // if this process held the write fd, a sibling test thread forking
+        // at that moment would inherit it (CLOEXEC only drops it at exec),
+        // and our own spawn of the script would fail with ETXTBSY
+        // ("Text file busy"). A child's write fd cannot leak that way.
+        use std::io::Write;
         let bin = dir.join("workerd");
-        std::fs::write(&bin, format!("#!/bin/sh\n{script}\nexit {code}\n")).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat > \"$1\" && chmod 755 \"$1\"")
+            .arg("sh")
+            .arg(&bin)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(format!("#!/bin/sh\n{script}\nexit {code}\n").as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "writing fake workerd failed");
         bin
     }
 
