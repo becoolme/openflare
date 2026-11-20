@@ -107,8 +107,17 @@ pub fn write_mgmt_token(root: &std::path::Path) -> Result<(), LocalError> {
 
 /// Load the management token; missing/insecure/malformed → fail closed.
 pub fn load_mgmt_token(root: &std::path::Path) -> Result<Vec<u8>, LocalError> {
-    let path = mgmt_token_path(root);
-    let meta = std::fs::metadata(&path).map_err(|_| LocalError::Layout("token missing"))?;
+    load_token_file(&mgmt_token_path(root))
+}
+
+/// Load a bearer-token file at an arbitrary path — the TCP
+/// management listener uses a SEPARATE token (`--token-file`) from
+/// the unix socket's `mgmt/token` so an exposed TCP credential never
+/// doubles as the local one. Same rules either way: `0600`,
+/// owner-only, exactly 64 lowercase-or-uppercase hex chars —
+/// anything else fails closed.
+pub fn load_token_file(path: &std::path::Path) -> Result<Vec<u8>, LocalError> {
+    let meta = std::fs::metadata(path).map_err(|_| LocalError::Layout("token missing"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -116,7 +125,7 @@ pub fn load_mgmt_token(root: &std::path::Path) -> Result<Vec<u8>, LocalError> {
             return Err(LocalError::Layout("token mode"));
         }
     }
-    let raw = std::fs::read(&path)?;
+    let raw = std::fs::read(path)?;
     if raw.len() != 64 || !raw.iter().all(|b| b.is_ascii_hexdigit()) {
         return Err(LocalError::Layout("token malformed"));
     }

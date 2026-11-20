@@ -298,7 +298,7 @@ fn build_persister(
                 Ok(false) => {}
                 Ok(true) => tracing::warn!(
                     root = %root.display(),
-                    "persistence fs root shares a device with dbRoot: NO disaster recovery (dev only)"
+                    "persistence.allowSameDeviceDurability is enabled: persistence fs root shares a device with dbRoot; this is dev mode and durability is NOT guaranteed (no disaster recovery)"
                 ),
                 Err(e) => return Err(e.to_string()),
             }

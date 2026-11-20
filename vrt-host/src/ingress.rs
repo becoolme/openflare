@@ -33,11 +33,11 @@ use axum::routing::any;
 use axum::Router;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Limited};
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -443,6 +443,10 @@ pub struct IngressState {
     /// `level=platform` records. Set once after construction; unset =
     /// log collection disabled (zero overhead).
     logs: std::sync::OnceLock<Arc<crate::logs::LogHub>>,
+    /// `vrt dev` only: when set, an unknown Host falls back to the
+    /// route table's single-worker catch-all target. Production
+    /// configs never set it — `RouteTable::lookup` stays exact-match.
+    dev_catch_all: Arc<AtomicBool>,
 }
 
 impl IngressState {
@@ -477,7 +481,15 @@ impl IngressState {
             ws_tenant_active: Arc::new(Mutex::new(HashMap::new())),
             ws_max_per_tenant: WS_DEFAULT_MAX_PER_TENANT,
             logs: std::sync::OnceLock::new(),
+            dev_catch_all: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Attach the dev-mode catch-all switch (once; default off).
+    /// `vrt dev` sets it after construction, like `set_log_hub`.
+    pub fn set_dev_catch_all(&self, on: bool) {
+        self.dev_catch_all
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Attach the worker-log hub (once; later calls are ignored).
@@ -530,6 +542,7 @@ impl IngressState {
                 }
                 None => std::sync::OnceLock::new(),
             },
+            dev_catch_all: self.dev_catch_all.clone(),
         })
     }
 
@@ -563,6 +576,7 @@ impl IngressState {
                 }
                 None => std::sync::OnceLock::new(),
             },
+            dev_catch_all: self.dev_catch_all.clone(),
         })
     }
 
@@ -596,6 +610,7 @@ impl IngressState {
                 }
                 None => std::sync::OnceLock::new(),
             },
+            dev_catch_all: self.dev_catch_all.clone(),
         })
     }
 
@@ -636,6 +651,7 @@ impl IngressState {
                 }
                 None => std::sync::OnceLock::new(),
             },
+            dev_catch_all: self.dev_catch_all.clone(),
         })
     }
 
@@ -858,7 +874,16 @@ async fn proxy_inner(
         .ok_or(IngressError::BadHost)?;
     let host = normalize_host(&host_raw).ok_or(IngressError::BadHost)?;
     let routes = state.routes.load();
-    let target = routes.lookup(&host).ok_or(IngressError::UnknownHost)?;
+    let target = routes
+        .lookup(&host)
+        .or_else(|| {
+            state
+                .dev_catch_all
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then(|| routes.catch_all())
+                .flatten()
+        })
+        .ok_or(IngressError::UnknownHost)?;
 
     // B12: request accounting starts once routing resolves to a
     // concrete platform worker_id — pre-route failures (bad/unknown

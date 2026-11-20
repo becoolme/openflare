@@ -40,8 +40,35 @@ pub struct ServeOptions {
     pub vrt_host_bin: Option<PathBuf>,
     /// vrt-provider binary (PATH lookup when None).
     pub vrt_provider_bin: Option<PathBuf>,
+    /// vrt-sql binary (`vrt dev` / bare-metal). When set,
+    /// `config/vrt-sql.toml` must exist and vrt-sql is supervised as
+    /// a third child; when unset the child set is unchanged.
+    pub vrt_sql_bin: Option<PathBuf>,
     /// Extra args passed to each child after `--config`.
     pub extra_args: Vec<String>,
+    /// External stop channel (`vrt dev`, tests): a `true` send ends
+    /// serve exactly like SIGINT. `None` in production serve.
+    pub stop: Option<tokio::sync::watch::Receiver<bool>>,
+    /// A2: optional TCP management listener (`--mgmt-tcp-listen`).
+    /// Off unless explicitly configured — see `MgmtTcpOptions`.
+    pub mgmt_tcp: Option<MgmtTcpOptions>,
+}
+
+/// A2: the optional TCP management listener — for remote
+/// `vrt deploy --url`. Deliberately flag-only (never a config-file
+/// default): an operator must opt in per process, bind defaults to
+/// loopback, auth uses a SEPARATE 0600 token file from the unix
+/// socket's `mgmt/token`, bodies are capped, and sources are
+/// rate-limited. The unix socket's security is never lowered.
+#[derive(Clone, Debug)]
+pub struct MgmtTcpOptions {
+    /// Bind address — `127.0.0.1:…` unless the operator explicitly
+    /// chooses otherwise (a non-loopback bind warns: remote deploys
+    /// should arrive over an SSH tunnel or TLS-terminating proxy).
+    pub listen: std::net::SocketAddr,
+    /// Bearer token file — `0600`, owner-only, 64 hex chars
+    /// (`keys::load_token_file` enforces all three).
+    pub token_file: PathBuf,
 }
 
 impl Default for ServeOptions {
@@ -50,7 +77,10 @@ impl Default for ServeOptions {
             supervise: false,
             vrt_host_bin: None,
             vrt_provider_bin: None,
+            vrt_sql_bin: None,
             extra_args: Vec::new(),
+            stop: None,
+            mgmt_tcp: None,
         }
     }
 }
@@ -67,11 +97,40 @@ pub async fn run(root: &Path, opts: &ServeOptions) -> Result<(), LocalError> {
     // where `vrt.sock` exists world-accessible.
     let listener = bind_unix(&sock)?;
 
+    // A2: optional TCP management listener — off unless explicitly
+    // configured. A distinct 0600 token file and per-source-IP rate
+    // limiting apply; the unix socket above is unaffected.
+    let mut tcp_task = match &opts.mgmt_tcp {
+        Some(tcp) => {
+            let token = crate::keys::load_token_file(&tcp.token_file)?;
+            if !tcp.listen.ip().is_loopback() {
+                tracing::warn!(
+                    addr = %tcp.listen,
+                    "mgmt TCP listener bound to a non-loopback address —                      remote deploys should reach it over an SSH tunnel                      or a TLS-terminating proxy"
+                );
+            }
+            let tcp_listener = tokio::net::TcpListener::bind(tcp.listen)
+                .await
+                .map_err(|_| LocalError::Layout("mgmt tcp bind"))?;
+            let tcp_router =
+                crate::mgmt::tcp_router(api.clone(), token, crate::mgmt::RateLimit::new());
+            Some(tokio::task::spawn(async move {
+                let _ = axum::serve(
+                    tcp_listener,
+                    tcp_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await;
+            }))
+        }
+        None => None,
+    };
+
     let mut children = if opts.supervise {
         supervise_setup(root, opts)?
     } else {
         Vec::new()
     };
+    let mut ext_stop = opts.stop.clone();
 
     let renewal_root = root.to_path_buf();
     let renewal_api = Arc::clone(&api);
@@ -114,12 +173,33 @@ pub async fn run(root: &Path, opts: &ServeOptions) -> Result<(), LocalError> {
             Err(e) => Err(LocalError::Io(std::io::Error::other(format!("queue dispatch task panicked: {e}")))),
         },
         r = supervise_watch(&mut children), if !children.is_empty() => r,
+        // A TCP management listener that stops serving is a lost
+        // remote-deploy surface — surface it, don't silently run on.
+        r = async {
+            match tcp_task.as_mut() {
+                Some(t) => t.await,
+                None => std::future::pending().await,
+            }
+        } => match r {
+            Ok(()) => Err(LocalError::Layout("mgmt tcp listener stopped")),
+            Err(e) => Err(LocalError::Io(std::io::Error::other(format!("mgmt tcp panicked: {e}")))),
+        },
         _ = shutdown_signal() => Ok(()),
+        // External stop (`vrt dev`, tests) — same effect as SIGINT.
+        _ = async {
+            match ext_stop.as_mut() {
+                Some(rx) => { let _ = rx.changed().await; }
+                None => std::future::pending::<()>().await,
+            }
+        } => Ok(()),
     };
     server.abort();
     renewal.abort();
     cron_task.abort();
     qd_task.abort();
+    if let Some(t) = tcp_task.take() {
+        t.abort();
+    }
     kill_children(&mut children).await;
     outcome
 }
@@ -235,10 +315,16 @@ struct Child {
 
 fn supervise_setup(root: &Path, opts: &ServeOptions) -> Result<Vec<Child>, LocalError> {
     let mut children = Vec::new();
-    for (name, bin, cfg) in [
+    let mut specs: Vec<(&'static str, &Option<PathBuf>, &'static str)> = vec![
         ("vrt-host", &opts.vrt_host_bin, "vrt-host.toml"),
         ("vrt-provider", &opts.vrt_provider_bin, "vrt-provider.toml"),
-    ] {
+    ];
+    // `vrt dev` / bare-metal adds vrt-sql — opt-in so the compose and
+    // bare-metal child sets stay exactly as before when unset.
+    if opts.vrt_sql_bin.is_some() {
+        specs.push(("vrt-sql", &opts.vrt_sql_bin, "vrt-sql.toml"));
+    }
+    for (name, bin, cfg) in specs {
         let bin = bin.clone().unwrap_or_else(|| PathBuf::from(name));
         let config = crate::layout::config_dir(root).join(cfg);
         if !config.is_file() {
@@ -309,10 +395,30 @@ async fn supervise_watch(children: &mut [Child]) -> Result<(), LocalError> {
     }
 }
 
+/// Grace window between SIGTERM and SIGKILL per child — vrt-host
+/// needs a beat to stop its own workerd children so a serve exit
+/// never leaves orphaned runtimes behind.
+const CHILD_TERM_GRACE: Duration = Duration::from_secs(5);
+
 async fn kill_children(children: &mut [Child]) {
+    // Graceful first: SIGTERM lets each service drain and stop its
+    // own children (vrt-host → workerd); SIGKILL only on timeout so
+    // `vrt dev` Ctrl+C never orphans a runtime.
     for c in children.iter_mut() {
-        let _ = c.proc.kill().await;
-        let _ = c.proc.wait().await;
+        if let Some(pid) = c.proc.id() {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+    }
+    for c in children.iter_mut() {
+        if tokio::time::timeout(CHILD_TERM_GRACE, c.proc.wait())
+            .await
+            .is_err()
+        {
+            let _ = c.proc.kill().await;
+            let _ = c.proc.wait().await;
+        }
     }
 }
 

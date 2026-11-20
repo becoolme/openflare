@@ -37,9 +37,13 @@
 //! never a half-state desired document.
 
 mod desired;
+pub mod dev;
+pub mod devvars;
+pub mod doctor;
 pub mod keys;
 pub mod layout;
 mod lock;
+pub mod logtail;
 pub mod mgmt;
 mod oplog;
 mod preflight;
@@ -330,6 +334,86 @@ impl VrtLocal {
             &|target| st_probe.workers.get(target).map(|w| w.worker_id.clone()),
             Some(&do_ctx),
         )?;
+        self.commit_packaged(pkg, &key)
+    }
+
+    /// Deploy a remote-upload body (`vrt deploy --url`): the client
+    /// gathered meta + module bytes + assets; everything trust-bearing
+    /// happens here — secrets land in the tenant store, service
+    /// targets resolve against live state, DO/workflow unique keys
+    /// derive from the signing seed, and the result goes through the
+    /// SAME validate → preflight → sign path as a local deploy.
+    pub fn deploy_upload(
+        &self,
+        upload: &worker_pkg::DeployUpload,
+    ) -> Result<DeployResult, LocalError> {
+        let _lock = lock::StateLock::acquire(&self.root)?;
+        let key = keys::load_signing_key(&self.root)?;
+        // Secrets first — same ordering rule as `put_secret`: inputs
+        // are written before state/envelope so a crash never leaves a
+        // live bundle pointing at a missing ref. Refs are
+        // shape-checked; secret VALUES never enter errors or logs.
+        let mut secrets = state::read_secrets(&self.root)?;
+        let mut secrets_dirty = false;
+        let st_probe = state::read(&self.root)?;
+        for (sref, value) in &upload.secrets {
+            if !valid_secret_ref(sref) {
+                return Err(LocalError::Worker("secretRef"));
+            }
+            secrets
+                .entry(st_probe.tenant_id().to_string())
+                .or_default()
+                .insert(sref.clone(), value.clone());
+            secrets_dirty = true;
+        }
+        if secrets_dirty {
+            state::write_secrets(&self.root, &secrets)?;
+        }
+        let do_ctx = {
+            let pepper = keys::load_signing_seed(&self.root)?;
+            let name = upload
+                .name
+                .clone()
+                .unwrap_or_else(|| upload.meta.name.clone());
+            let prior = st_probe
+                .workers
+                .get(&name)
+                .and_then(|w| {
+                    w.active_version_id
+                        .as_ref()
+                        .and_then(|id| w.versions.iter().find(|v| &v.version_id == id))
+                })
+                .map(|v| v.durable_object_classes.as_slice())
+                .unwrap_or(&[]);
+            worker_pkg::DoPackCtx {
+                pepper,
+                prior_classes: prior,
+            }
+        };
+        let gathered = worker_pkg::gathered_from_upload(upload)?;
+        let pkg = worker_pkg::assemble(
+            gathered,
+            &worker_pkg::DeployOverrides {
+                name: upload.name.clone(),
+                vars: upload.vars.clone(),
+                ..Default::default()
+            },
+            st_probe.tenant_id(),
+            &|target| st_probe.workers.get(target).map(|w| w.worker_id.clone()),
+            Some(&do_ctx),
+        )?;
+        self.commit_packaged(pkg, &key)
+    }
+
+    /// The shared deploy tail — state revision, asset materialization,
+    /// desired validation, workerd preflight, object/state/vars
+    /// writes, signed publish, GC, oplog. `pkg` was produced by
+    /// `pack`/`assemble` under the SAME lock this function assumes.
+    fn commit_packaged(
+        &self,
+        pkg: worker_pkg::PackedWorker,
+        key: &snapshot_protocol::SigningKey,
+    ) -> Result<DeployResult, LocalError> {
         let mut st = state::read(&self.root)?;
         st.revision = st
             .revision
@@ -507,12 +591,7 @@ impl VrtLocal {
         if tenant_id != st.tenant_id() {
             return Err(LocalError::WrongTenant);
         }
-        if secret_ref.is_empty()
-            || secret_ref.len() > 512
-            || !secret_ref
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b":_-.".contains(&b))
-        {
+        if !valid_secret_ref(secret_ref) {
             return Err(LocalError::Worker("secretRef"));
         }
         let mut secrets = state::read_secrets(&self.root)?;
@@ -876,4 +955,15 @@ fn seed_system_modules(
     vrt_securefs::atomic_write(&manifest_out, raw.as_bytes(), 0o644)
         .map_err(|e| LocalError::Op("seed manifest", format!("{}: {e}", manifest_out.display())))?;
     Ok(seeded)
+}
+
+/// The one secretRef shape rule (`put_secret`, remote-upload secrets)
+/// — 1..=512 chars of `[A-Za-z0-9:_-.]`. Validates the NAME only;
+/// values never pass through this or any error path.
+fn valid_secret_ref(secret_ref: &str) -> bool {
+    !secret_ref.is_empty()
+        && secret_ref.len() <= 512
+        && secret_ref
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b":_-.".contains(&b))
 }

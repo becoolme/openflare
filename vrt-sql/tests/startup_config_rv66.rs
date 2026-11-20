@@ -52,3 +52,29 @@ fs = { root = "/tmp/p" }
     .unwrap();
     assert!(!cfg.persistence.allow_same_device_durability);
 }
+
+/// The same-device exemption is dev-only: no shipped deployment config
+/// or example template may carry it (`vrt dev` injects it into the
+/// config it generates; nothing else does, and no env var enables it).
+#[test]
+fn shipped_configs_never_enable_same_device_durability() {
+    fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, hits);
+            } else if let Ok(text) = std::fs::read_to_string(&p) {
+                if text.contains("allowSameDeviceDurability") || text.contains("allow_same_device_durability") {
+                    hits.push(p.display().to_string());
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut hits = Vec::new();
+    for d in ["deploy", "examples"] {
+        walk(&root.join(d), &mut hits);
+    }
+    assert!(hits.is_empty(), "production-facing configs must not enable same-device durability: {hits:?}");
+}

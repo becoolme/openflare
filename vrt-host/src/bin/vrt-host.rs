@@ -521,6 +521,12 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     if let Some(hub) = &log_hub {
         ingress_state.set_log_hub(hub.clone());
     }
+    // `vrt dev` only: unmatched-Host fallback to a single-worker
+    // route table (`ingress.devCatchAll`, default off).
+    if config.ingress.dev_catch_all {
+        ingress_state.set_dev_catch_all(true);
+        tracing::warn!("ingress.devCatchAll enabled — any Host routes to the single dev worker");
+    }
 
     let status = vrt_host::status::new_status();
     // MIG-10: probe the CA trust store tenant-egress TLS relies on
