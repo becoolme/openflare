@@ -172,6 +172,15 @@ workerd there is a test-only exception to the "the image build never
 downloads workerd" rule; Docker build and runtime paths still require an
 operator-supplied binary.
 
+A `github-release` pin is generated from the release manifest, never typed by
+hand:
+
+```sh
+gh release download <vrt-tag> --pattern manifest.json --repo becoolme/workerd -O manifest.json
+node scripts/update-workerd-lock.mjs --manifest manifest.json
+node scripts/update-workerd-lock.mjs --manifest manifest.json --check  # what CI can verify
+```
+
 `conformance/` holds the binding-layer conformance suite: declarative
 golden-behavior cases (worker + HTTP steps + expectations citing
 Cloudflare docs) executed against a running stack — see
