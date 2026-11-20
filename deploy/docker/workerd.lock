@@ -1,4 +1,5 @@
 {
+  "source": "npm",
   "version": "1.20260916.1",
   "artifacts": {
     "linux-x64": {

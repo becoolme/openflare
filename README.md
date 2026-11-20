@@ -51,8 +51,17 @@ The standalone mode runs the whole stack with one `docker compose up`.
 
 ## Quick start (Docker, standalone)
 
-workerd is never downloaded by this repo. You supply a pinned binary and
-its digest is checked against `deploy/docker/workerd.lock`:
+workerd is never downloaded by the image build. You supply a pinned binary
+and its digest is checked against `deploy/docker/workerd.lock`. For Linux
+hosts the lock can also fetch it for you, verifying the same digests CI
+does:
+
+```sh
+scripts/fetch-workerd.sh --out .workerd          # binary + workerd.capnp
+cp .workerd/workerd deploy/standalone/workerd
+```
+
+or supply your own build of the pinned version:
 
 ```sh
 cp /path/to/workerd deploy/standalone/workerd
@@ -149,13 +158,19 @@ against a binary you already verified against `deploy/docker/workerd.lock`:
 scripts/ci-real-workerd.sh /path/to/workerd [/path/to/workerd.capnp]
 ```
 
-CI runs the same script in the `real-workerd` job: it fetches the
-`@cloudflare/workerd-linux-64` npm package at the version pinned in
-`deploy/docker/workerd.lock` and verifies both the tarball integrity
-and the binary SHA-256 against the lock before testing. Fetching
-workerd in that job is a test-only exception to the "workerd is never
-downloaded by this repo" rule — Docker build and runtime paths still
-require an operator-supplied binary.
+CI runs the same script in the `real-workerd` job. Both CI and local runs
+get the binary from `scripts/fetch-workerd.sh`, which is the only code that
+turns `deploy/docker/workerd.lock` into bytes:
+
+| `source` | Where the binary comes from | Digests checked |
+| --- | --- | --- |
+| `npm` (default) | `@cloudflare/workerd-linux-64@<version>` tarball | sha512 tarball `integrity`, `binarySha256` |
+| `github-release` | a GitHub release asset of this project's workerd fork | `archiveSha256`, `binarySha256` |
+
+Both sources also materialize `workerd.capnp` for the schema tests. Fetching
+workerd there is a test-only exception to the "the image build never
+downloads workerd" rule; Docker build and runtime paths still require an
+operator-supplied binary.
 
 `conformance/` holds the binding-layer conformance suite: declarative
 golden-behavior cases (worker + HTTP steps + expectations citing
