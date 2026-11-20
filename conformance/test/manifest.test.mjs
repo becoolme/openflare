@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -89,11 +90,28 @@ test("every shipped case validates and declares evidence", () => {
   }
 });
 
-test("bindings coverage: all seven binding areas present", () => {
+test("bindings coverage: implemented binding areas are represented", () => {
   const entries = loadCases(path.join(CONF, "cases"));
   const bindings = new Set(entries.map((e) => e.binding));
-  for (const b of ["kv", "r2", "d1", "queues", "cache", "cron", "durable-objects"])
+  for (const b of [
+    "kv",
+    "r2",
+    "d1",
+    "queues",
+    "cache",
+    "cron",
+    "durable-objects",
+    "assets",
+    "vars",
+    "ratelimit",
+  ])
     assert.ok(bindings.has(b), `missing binding coverage: ${b}`);
+});
+
+test("review gaps without runnable fixtures stay explicitly unverified", async () => {
+  const unverified = await readFile(path.join(CONF, "UNVERIFIED.md"), "utf8");
+  for (const area of ["Service bindings", "Hyperdrive", "Secrets", "WebSockets", "Workflows"])
+    assert.match(unverified, new RegExp(`\\| ${area} \\|`), `${area} should be tracked`);
 });
 
 test("real-projects.json validates", () => {

@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "vars-basic",
+  "binding": "vars",
+  "title": "Wrangler vars are visible to the Worker without leaking config",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/workers/configuration/environment-variables/",
+    "docs/wrangler-config.md",
+    "vrt-local/src/project_cfg.rs"
+  ],
+  "steps": [
+    {
+      "name": "configured variable is available",
+      "request": {
+        "path": "/value"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": "vars-conformance-ok"
+        }
+      }
+    }
+  ]
+}

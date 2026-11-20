@@ -1,0 +1,9 @@
+{
+  "name": "conf-vars-basic",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "routes": ["conf-vars-basic.vrt.local/*"],
+  "vars": {
+    "CONFORMANCE_VALUE": "vars-conformance-ok"
+  }
+}

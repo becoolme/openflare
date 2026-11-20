@@ -1,0 +1,16 @@
+{
+  "name": "conf-ratelimit-basic",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "routes": ["conf-ratelimit-basic.vrt.local/*"],
+  "ratelimits": [
+    {
+      "name": "LIMITER",
+      "namespace_id": "987654321",
+      "simple": {
+        "limit": 10,
+        "period": 10
+      }
+    }
+  ]
+}
