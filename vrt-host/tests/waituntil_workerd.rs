@@ -36,16 +36,33 @@ const W2: &str = "w2";
 /// never touches the egress gate, so the side effect is observable
 /// while the draining process still lives).
 const MOD_W1: &str = r#"
+let releaseWaitUntil = false;
 export default {
   async fetch(req, env, ctx) {
     const u = new URL(req.url);
     if (u.pathname === "/arm") {
       const ms = parseInt(u.searchParams.get("ms") ?? "1500");
-      ctx.waitUntil((async () => {
-        await new Promise((r) => setTimeout(r, ms));
-        await env.SIDE.fetch("http://side/hit");
-      })());
+      if (u.searchParams.get("gate") === "manual") {
+        releaseWaitUntil = false;
+        ctx.waitUntil((async () => {
+          while (!releaseWaitUntil) {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          releaseWaitUntil = false;
+          await env.SIDE.fetch("http://side/hit");
+        })());
+      } else {
+        ctx.waitUntil((async () => {
+          await new Promise((r) => setTimeout(r, ms));
+          await env.SIDE.fetch("http://side/hit");
+        })());
+      }
       return new Response("armed");
+    }
+    if (u.pathname === "/release") {
+      if (releaseWaitUntil) return new Response("already-released", { status: 409 });
+      releaseWaitUntil = true;
+      return new Response("released");
     }
     if (u.pathname === "/hang") {
       ctx.waitUntil(new Promise(() => {}));
@@ -503,17 +520,18 @@ async fn waituntil_side_effect_survives_generation_switch() {
     let (p1_w1, p1_w2, p1_wu) = (free_port(), free_port(), free_port());
     let r1 = render_spec(&fx, p1_w1, p1_w2, p1_wu, 1, MOD_W1, false);
     let rt = TenantRuntime::new("t1");
-    // The armed waitUntil must outlive any plausible `workerd check`
-    // preflight of gen2 (slow on loaded CI runners), so "gen2 served while
-    // gen1 still had it pending" is an ordering fact, not a wall-clock race.
-    const ARM_MS: u64 = 15_000;
     let mut params = wu_params();
     params.wait_until_grace = Duration::from_secs(40);
+    // The pending work is manually released after gen2 serves, so this
+    // deadline only bounds preflight + launch. It exceeds the actor-side
+    // preflight bound (20 s + 10 s slack) without timing the assertion
+    // against a JavaScript timer or the drain deadline.
+    params.drain_timeout = Duration::from_secs(40);
     let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
-    // Arm the long waitUntil, then immediately switch generations.
-    let (st, body) = get(p1_w1, &format!("/arm?ms={ARM_MS}")).await.expect("arm reply");
+    // Hold waitUntil behind a test-controlled gate, then switch generations.
+    let (st, body) = get(p1_w1, "/arm?gate=manual").await.expect("arm reply");
     assert_eq!((st, body.as_str()), (200, "armed"));
 
     let t_switch = Instant::now();
@@ -524,7 +542,7 @@ async fn waituntil_side_effect_survives_generation_switch() {
     // New generation must serve without waiting out the old waitUntil —
     // the deferral lives only on the already-offline old generation.
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
-    let deadline2 = t_switch + Duration::from_millis(ARM_MS);
+    let deadline2 = t_switch + Duration::from_secs(35);
     loop {
         if let Some((200, _)) = get(p2_w1, "/").await {
             break;
@@ -546,11 +564,27 @@ async fn waituntil_side_effect_survives_generation_switch() {
         "switch must not wait for the old waitUntil ({switch_latency:?}): {body}"
     );
     let (_, early) = get(p1_w2, "/read").await.expect("side counter reachable");
-    assert_eq!(early.trim(), "0", "side effect landed before gen2 served ({switch_latency:?})");
+    assert_eq!(
+        early.trim(),
+        "0",
+        "side effect landed before gen2 served ({switch_latency:?})"
+    );
+
+    // Tenant forgery: its own route cannot move the platform counter.
+    let (fst, _) = get(p1_w1, "/forge").await.unwrap_or((0, String::new()));
+    assert_eq!(fst, 200, "tenant route serves its own code");
+    let (_, body) = get(p1_wu, "/vrt/waituntil").await.unwrap();
+    assert!(
+        body.contains("\"pending\":1") && body.contains("\"failed\":0"),
+        "forged tenant output must not move the platform count: {body}"
+    );
 
     // THE GATE: the deferred SIGTERM lets the waitUntil complete — the
-    // side effect must land on w2 while gen1 is still alive.
-    let deadline = t_switch + Duration::from_millis(ARM_MS) + Duration::from_secs(10);
+    // side effect must land on w2 while gen1 is still alive. Releasing it
+    // directly avoids racing a timer against the drain budget.
+    let (st, body) = get(p1_w1, "/release").await.expect("release reply");
+    assert_eq!((st, body.as_str()), (200, "released"));
+    let deadline = Instant::now() + Duration::from_secs(10);
     let mut hits = String::new();
     while Instant::now() < deadline {
         if let Some((200, b)) = get(p1_w2, "/read").await {
@@ -565,16 +599,6 @@ async fn waituntil_side_effect_survives_generation_switch() {
         tokio::time::sleep(Duration::from_millis(80)).await;
     }
     assert_eq!(hits.trim(), "1", "waitUntil side effect must be delivered");
-
-    // Tenant forgery: the worker's own `/vrt/waituntil`-shaped route is
-    // its own code — it cannot move the platform counter.
-    let (fst, _) = get(p1_w1, "/forge").await.unwrap_or((0, String::new()));
-    assert_eq!(fst, 200, "tenant route serves its own code");
-    let (_, body) = get(p1_wu, "/vrt/waituntil").await.unwrap();
-    assert!(
-        body.contains("\"pending\":0") && body.contains("\"failed\":0"),
-        "forged tenant output must not move the platform count: {body}"
-    );
 
     h.send(SupervisorCmd::Stop).await;
     wait_state(&rt, TenantState::Stopped, Duration::from_secs(20)).await;
