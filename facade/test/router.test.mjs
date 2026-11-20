@@ -189,6 +189,31 @@ test("shadowed canonical forms fall through to the user worker", async () => {
   }
 });
 
+test("_redirects matching uses the raw request path", async () => {
+  // The provider matches `_redirects` against the un-decoded path, so the
+  // router must agree: an encoded path that only matches after decoding
+  // belongs to the worker, and an encoded segment that encodes a `/`
+  // still matches a `:name` rule.
+  const idx = {
+    ...INDEX,
+    paths: ["/app.js"],
+    redirects: [
+      { source: "/old", status: 302 },
+      { source: "/en/:slug", status: 302 },
+    ],
+  };
+  const encodedLiteral = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/%6Fld"));
+  assert.equal(encodedLiteral.headers.get(HDR), null);
+  const plain = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/old"));
+  assert.equal(plain.headers.get(HDR), "assets");
+  // `/en/a%2Fb` is one raw segment → matches `/en/:slug`.
+  const encodedSlash = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/en/a%2Fb"));
+  assert.equal(encodedSlash.headers.get(HDR), "assets");
+  // The decoded form has two segments and does not match.
+  const decodedSlash = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/en/a/b"));
+  assert.equal(decodedSlash.headers.get(HDR), null);
+});
+
 test("exact extensionless /index file routes to assets", async () => {
   const idx = { ...INDEX, paths: ["/api/index"] };
   const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/api/index"));
@@ -205,6 +230,26 @@ test("html_handling none: only exact asset paths route to assets", async () => {
   assert.equal(miss.headers.get(HDR), null);
   const hitExact = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/about.html"));
   assert.equal(hitExact.headers.get(HDR), "assets");
+});
+
+test("_redirects sources route to assets before the worker", async () => {
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/new.html"],
+    redirects: [
+      { source: "/old", status: 301 },
+      { source: "/blog/*", status: 302 },
+      { source: "/m/:id", status: 307 },
+    ],
+  };
+  for (const p of ["/old", "/blog/a/b", "/m/42"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+  // Non-matching paths still fall through.
+  const miss = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/nope"));
+  assert.equal(miss.headers.get(HDR), null);
 });
 
 test("SPA fallback only applies to navigate requests", async () => {
