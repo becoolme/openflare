@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "cron-basic",
   "binding": "cron",
-  "title": "Cron trigger delivers scheduled() with controller.cron/scheduledTime/type",
+  "title": "Cron trigger delivers scheduled() with controller.cron/scheduledTime",
   "requiresWorkerd": true,
   "evidence": [
-    "https://developers.cloudflare.com/workers/configuration/cron-triggers/ (scheduled event: cron string, scheduledTime, type \"scheduled\")",
+    "https://developers.cloudflare.com/workers/runtime-apis/handlers/scheduled/ (ScheduledController: cron, scheduledTime, noRetry(); it has no type field)",
     "examples/standalone-cron/main.js + comments (standalone CronRunner ticks every 30 s; fires via facade-cron \u2192 Fetcher.scheduled)"
   ],
   "readyTimeoutMs": 180000,
@@ -20,8 +20,7 @@
         "json": {
           "fired": true,
           "first": {
-            "cron": "* * * * *",
-            "type": "scheduled"
+            "cron": "* * * * *"
           }
         },
         "bodyMatches": "\"scheduled_ms\":[1-9]"

@@ -2,11 +2,7 @@
 // upstream rule) → complete → get, plus abort.
 const PART = 5 * 1024 * 1024;
 
-function streamOf(u8) {
-  return new ReadableStream({
-    start(c) { c.enqueue(u8); c.close(); },
-  });
-}
+// Parts are passed as bytes: R2 rejects a ReadableStream of unknown length.
 async function readAll(stream) {
   const chunks = [];
   const reader = stream.getReader();
@@ -35,10 +31,10 @@ export default {
           customMetadata: { origin: "conformance" },
         });
         const parts = [];
-        parts.push(await env.BUCKET.uploadPart(key, up.uploadId, 1, streamOf(new Uint8Array(PART).fill(0x61))));
-        parts.push(await env.BUCKET.uploadPart(key, up.uploadId, 2, streamOf(new Uint8Array(PART).fill(0x62))));
-        parts.push(await env.BUCKET.uploadPart(key, up.uploadId, 3, streamOf(new Uint8Array([0x63, 0x63, 0x63]))));
-        const meta = await env.BUCKET.completeMultipartUpload(key, up.uploadId, parts);
+        parts.push(await up.uploadPart(1, new Uint8Array(PART).fill(0x61)));
+        parts.push(await up.uploadPart(2, new Uint8Array(PART).fill(0x62)));
+        parts.push(await up.uploadPart(3, new Uint8Array([0x63, 0x63, 0x63])));
+        const meta = await up.complete(parts);
         const res = await env.BUCKET.get(key, {});
         const body = await readAll(res.body);
         return j({
@@ -48,15 +44,18 @@ export default {
           size: meta.size,
           bytes: body.byteLength,
           head: body[0] === 0x61 && body[PART] === 0x62 && body[body.byteLength - 1] === 0x63,
-          customMetadata: meta.customMetadata ?? null,
+          // Read back from the stored object: metadata set at create time
+          // applies to the completed object (complete() result shape is uncited).
+          customMetadata: res.customMetadata ?? null,
         });
       }
       if (url.pathname === "/abort") {
         const up = await env.BUCKET.createMultipartUpload(key, {
           httpMetadata: {}, customMetadata: {},
         });
-        await env.BUCKET.uploadPart(key, up.uploadId, 1, streamOf(new Uint8Array(PART).fill(0x64)));
-        await env.BUCKET.abortMultipartUpload(key, up.uploadId);
+        await up.uploadPart(1, new Uint8Array(PART).fill(0x64));
+        // Resume by id so resumeMultipartUpload is exercised too.
+        await env.BUCKET.resumeMultipartUpload(key, up.uploadId).abort();
         const res = await env.BUCKET.get(key, {});
         return j({ getAfterAbort: res !== null });
       }
@@ -68,17 +67,17 @@ export default {
         let threw = false;
         let message = "";
         try {
-          await env.BUCKET.uploadPart(key, up.uploadId, 1, streamOf(new Uint8Array(16).fill(0x65)));
+          await up.uploadPart(1, new Uint8Array(16).fill(0x65));
           // completing with only an undersized part also has to fail —
           // final-part leniency applies to the LAST part only.
-          await env.BUCKET.completeMultipartUpload(key, up.uploadId, [
+          await up.complete([
             { partNumber: 1, etag: "x" },
           ]);
         } catch (e) {
           threw = true;
           message = String(e?.message ?? e);
         }
-        await env.BUCKET.abortMultipartUpload(key, up.uploadId).catch(() => {});
+        await up.abort().catch(() => {});
         return j({ threw, message });
       }
       return new Response("nf", { status: 404 });

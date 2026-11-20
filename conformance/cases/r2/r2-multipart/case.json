@@ -5,7 +5,7 @@
   "title": "R2 multipart: create/uploadPart/complete round-trip, abort, min part-size rule",
   "requiresWorkerd": true,
   "evidence": [
-    "https://developers.cloudflare.com/r2/api/workers/workers-api-usage/ (multipart flow; each non-final part >=5MiB)",
+    "https://developers.cloudflare.com/r2/api/workers/workers-multipart-usage/ (createMultipartUpload -> R2MultipartUpload.uploadPart/complete/abort, resumeMultipartUpload; non-final parts >=5MiB)",
     "examples/standalone-r2/main.js (the same chain proven on the standalone stack e2e)",
     "vrt-provider/tests/r2_multipart.rs (part-order, min-size and signed-uploadId rules)"
   ],

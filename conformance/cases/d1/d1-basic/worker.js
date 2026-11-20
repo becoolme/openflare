@@ -7,8 +7,9 @@ export default {
     const j = (v) => Response.json(v);
     try {
       if (url.pathname === "/setup") {
+        // Drop first so a rerun against the same database starts clean.
         const r = await env.DB.exec(
-          "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT);",
+          "DROP TABLE IF EXISTS t;\nCREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);",
         );
         return j({ count: r.count });
       }
@@ -75,8 +76,9 @@ export default {
       if (url.pathname === "/err") {
         const { sql, bind } = await request.json();
         try {
-          const st = env.DB.prepare(sql);
-          if (bind !== undefined) st.bind(...bind);
+          // bind() returns a new statement; the original stays unbound.
+          let st = env.DB.prepare(sql);
+          if (bind !== undefined) st = st.bind(...bind);
           await st.run();
           return j({ threw: false });
         } catch (e) {

@@ -21,3 +21,5 @@ reference is found, promote it to a case.
 | 11 | Cron | `event.retry`/`noRetry` on scheduled() controller | not surfaced by the standalone CronRunner path yet |
 | 12 | DO | `storage.sql` KV↔SQL visibility interplay and alarm persistence across a process restart | restart persistence is proven manually; an automated restart step is not wired into the runner yet |
 | 13 | DO | `blockConcurrencyWhile` reject → surface to waiting fetch (error propagation shape) | needs a failing init fixture; added when a workerd-side citation is found |
+| 14 | R2 | Whether `R2MultipartUpload.complete()` resolves with `httpMetadata`/`customMetadata` populated (the native adapter strips them; `r2-multipart` reads metadata back via `get()` instead) | no CF doc fixes the complete() result fields |
+| 15 | Cron | `ScheduledEvent.type` (`"scheduled"`) on the service-worker syntax; the module `ScheduledController` has no `type` field, so `cron-basic` does not assert it | module syntax only in this suite |

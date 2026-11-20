@@ -5,9 +5,8 @@
   "title": "R2 put/get/head/delete/list, range reads, conditional ops, list delimiter",
   "requiresWorkerd": true,
   "evidence": [
-    "third_party/open-compute/facade/r2/protocol.d.ts (binding contract: miss \u2192 null, precondition-fail \u2192 null, {objects,truncated,cursor,delimitedPrefixes})",
-    "vrt-provider/tests/r2_memory.rs (wildcard/strong etag precondition semantics, 32-char md5 etag + quoted httpEtag)",
-    "https://developers.cloudflare.com/r2/api/workers/workers-api-reference/ (upstream semantics the transport mirrors: onlyIf, range, list shape)"
+    "https://developers.cloudflare.com/r2/api/workers/workers-api-reference/ (R2Bucket head/get/put/delete/list; miss -> null; put precondition failure -> null; onlyIf as R2Conditional or Headers; range; list shape)",
+    "vrt-provider/tests/r2_memory.rs (wildcard/strong etag precondition semantics, 32-char md5 etag + quoted httpEtag)"
   ],
   "steps": [
     {

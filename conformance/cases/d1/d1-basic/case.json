@@ -8,18 +8,19 @@
     "https://developers.cloudflare.com/d1/worker-api/prepared-statements/ (run/all/first/raw shapes)",
     "https://developers.cloudflare.com/d1/worker-api/d1-database/ (exec {count,duration}; batch atomicity)",
     "https://developers.cloudflare.com/d1/worker-api/return-object/ (meta: changes, last_row_id, duration; success flag)",
-    "vrt-host/tests/d1_smoke.rs (same surface proven in-repo: batchErr wraps D1_ERROR, batchRolledBack)"
+    "vrt-host/tests/d1_smoke.rs (same surface proven in-repo: batchErr wraps D1_ERROR, batchRolledBack)",
+    "https://developers.cloudflare.com/d1/observability/debug-d1/ (error messages start with D1_ERROR followed by engine detail)"
   ],
   "steps": [
     {
-      "name": "exec CREATE TABLE",
+      "name": "exec DROP + CREATE TABLE",
       "request": {
         "path": "/setup"
       },
       "expect": {
         "status": 200,
         "json": {
-          "count": 1
+          "count": 2
         }
       }
     },
@@ -140,9 +141,9 @@
       "expect": {
         "status": 200,
         "json": {
-          "threw": true,
-          "message": "D1_ERROR"
-        }
+          "threw": true
+        },
+        "bodyMatches": "\"message\":\"D1_ERROR"
       }
     },
     {
