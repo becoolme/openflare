@@ -279,7 +279,8 @@ pub(crate) struct AssetsToml {
     /// Binding name (`env.<name>.fetch()`) — defaults to `ASSETS`.
     #[serde(default = "default_assets_binding")]
     pub(crate) binding: String,
-    /// Cloudflare-compatible subset: `auto-trailing-slash` | `none`.
+    /// Cloudflare's `html_handling`: `auto-trailing-slash` |
+    /// `force-trailing-slash` | `drop-trailing-slash` | `none`.
     #[serde(default)]
     pub(crate) html_handling: Option<String>,
     /// `none` | `404-page` | `single-page-application`.
@@ -465,7 +466,15 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
             Some(_) => Err(LocalError::Worker("assets handling")),
         }
     };
-    let html_handling = valid_handling(&assets.html_handling, &["auto-trailing-slash", "none"])?;
+    let html_handling = valid_handling(
+        &assets.html_handling,
+        &[
+            "auto-trailing-slash",
+            "force-trailing-slash",
+            "drop-trailing-slash",
+            "none",
+        ],
+    )?;
     let not_found = valid_handling(
         &assets.not_found_handling,
         &["none", "404-page", "single-page-application"],
@@ -1696,4 +1705,43 @@ fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError>
         manifest_digest,
         objects,
     })
+}
+
+#[cfg(test)]
+mod assets_handling_tests {
+    use super::*;
+
+    fn assets(mode: Option<&str>) -> AssetsToml {
+        AssetsToml {
+            dir: "public".to_string(),
+            binding: "ASSETS".to_string(),
+            html_handling: mode.map(str::to_string),
+            not_found_handling: None,
+            assets_first: false,
+            run_worker_first: None,
+        }
+    }
+
+    #[test]
+    fn scan_accepts_every_cloudflare_html_handling_mode() {
+        let root = std::env::temp_dir().join(format!("vrt-assets-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("public");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"x").unwrap();
+        for mode in [
+            "auto-trailing-slash",
+            "force-trailing-slash",
+            "drop-trailing-slash",
+            "none",
+        ] {
+            let pending = scan_assets_dir(&root, &assets(Some(mode)))
+                .unwrap_or_else(|e| panic!("{mode}: {e:?}"));
+            let doc: serde_json::Value =
+                serde_json::from_slice(&pending.manifest_bytes).unwrap();
+            assert_eq!(doc["htmlHandling"], mode);
+        }
+        assert!(scan_assets_dir(&root, &assets(Some("force"))).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -67,12 +67,18 @@ pub struct AssetFile {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 pub enum HtmlHandling {
-    /// `/foo` → exact → `/foo.html` → `/foo/index.html` (308 to
-    /// `/foo/`); `/foo/` → `/foo/index.html`. Cloudflare-compatible
-    /// subset.
+    /// Individual files are served without a trailing slash, folder
+    /// index files with one; every other form redirects to its
+    /// canonical URL (Cloudflare's `auto-trailing-slash`).
     #[default]
     #[serde(rename = "auto-trailing-slash")]
     AutoTrailingSlash,
+    /// Every HTML route is canonical with a trailing slash.
+    #[serde(rename = "force-trailing-slash")]
+    ForceTrailingSlash,
+    /// Every HTML route is canonical without a trailing slash.
+    #[serde(rename = "drop-trailing-slash")]
+    DropTrailingSlash,
     /// Exact path only.
     #[serde(rename = "none")]
     None,
@@ -97,7 +103,7 @@ pub enum NotFoundHandling {
 pub enum Resolved {
     /// Serve this manifest file entry.
     Serve(AssetFile),
-    /// 308 redirect to this path (directory index without trailing
+    /// 307 redirect to this path (non-canonical HTML route)
     /// slash under `auto-trailing-slash`).
     Redirect(String),
     /// SPA fallback hit — serves `/index.html` under
@@ -196,9 +202,6 @@ pub fn resolve(manifest: &AssetManifest, path: &str) -> Resolved {
 /// (Miniflare assets.worker.js canFetch semantics, T31c).
 pub fn resolve_with_nfh(manifest: &AssetManifest, path: &str, nfh: NotFoundHandling) -> Resolved {
     let find = |p: &str| manifest.files.iter().find(|f| f.path == p).cloned();
-    if let Some(f) = find(path) {
-        return Resolved::Serve(f);
-    }
     let not_found = |_manifest: &AssetManifest| -> Resolved {
         match nfh {
             NotFoundHandling::None => Resolved::NotFound,
@@ -210,25 +213,99 @@ pub fn resolve_with_nfh(manifest: &AssetManifest, path: &str, nfh: NotFoundHandl
             }
         }
     };
-    match manifest.html_handling {
-        HtmlHandling::None => not_found(manifest),
-        HtmlHandling::AutoTrailingSlash => {
-            if path.ends_with('/') {
-                // `/foo/` → `/foo/index.html`
-                let index = format!("{path}index.html");
-                return find(&index).map_or_else(|| not_found(manifest), Resolved::Serve);
-            }
-            // `/foo` → `/foo.html` → `/foo/index.html` (redirect)
-            let html = format!("{path}.html");
-            if let Some(f) = find(&html) {
-                return Resolved::Serve(f);
-            }
-            let index = format!("{path}/index.html");
-            if find(&index).is_some() {
-                return Resolved::Redirect(format!("{path}/"));
-            }
-            not_found(manifest)
+    if manifest.html_handling == HtmlHandling::None {
+        return find(path).map_or_else(|| not_found(manifest), Resolved::Serve);
+    }
+    // A non-HTML file served verbatim (`/app.js`, `/LICENSE`): html
+    // handling only rewrites HTML routes and `.html`/`index` forms.
+    if !path.ends_with(".html") && !path.ends_with("/index") {
+        if let Some(f) = find(path) {
+            return Resolved::Serve(f);
         }
+    }
+    let Some(key) = html_key(path) else {
+        return not_found(manifest);
+    };
+    let Some((asset, canonical)) = canonical_for(manifest, &key) else {
+        return not_found(manifest);
+    };
+    // A `.html` / `.../index` request canonicalizes to its stem, with
+    // the mode deciding the trailing slash (`force` adds one, the other
+    // modes drop it). Bare and `<key>/` requests use the mode canonical
+    // computed above.
+    let stripped = path.ends_with(".html") || path.ends_with("/index");
+    let target = if stripped {
+        if key == "/" {
+            "/".to_string()
+        } else if manifest.html_handling == HtmlHandling::ForceTrailingSlash {
+            format!("{key}/")
+        } else {
+            key
+        }
+    } else {
+        canonical
+    };
+    if target == path {
+        Resolved::Serve(asset)
+    } else {
+        Resolved::Redirect(target)
+    }
+}
+
+/// Strip the HTML-route suffix from a request path, returning the
+/// resource key (`/folder`) the asset candidates are built from.
+/// `None` means "not an HTML route" (a non-HTML file with an extension).
+fn html_key(path: &str) -> Option<String> {
+    if path == "/" {
+        return Some("/".to_string());
+    }
+    let key = if let Some(k) = path.strip_suffix("/index.html") {
+        k
+    } else if let Some(k) = path.strip_suffix("/index") {
+        k
+    } else if let Some(k) = path.strip_suffix(".html") {
+        k
+    } else if let Some(k) = path.strip_suffix('/') {
+        k
+    } else {
+        // Last segment with a dot is a concrete asset, not an HTML route.
+        let last = path.rsplit('/').next().unwrap_or("");
+        if last.contains('.') {
+            return None;
+        }
+        path
+    };
+    Some(if key.is_empty() {
+        "/".to_string()
+    } else {
+        key.to_string()
+    })
+}
+
+/// Resolve a resource key to its asset and the mode's canonical URL.
+/// Candidate order matches Cloudflare: `<key>.html` before
+/// `<key>/index.html`.
+fn canonical_for(
+    manifest: &AssetManifest,
+    key: &str,
+) -> Option<(AssetFile, String)> {
+    let find = |p: &str| manifest.files.iter().find(|f| f.path == p).cloned();
+    if key == "/" {
+        return find("/index.html").map(|f| (f, "/".to_string()));
+    }
+    let file = find(&format!("{key}.html"));
+    let index = find(&format!("{key}/index.html"));
+    match manifest.html_handling {
+        HtmlHandling::None => None,
+        HtmlHandling::AutoTrailingSlash => match (file, index) {
+            (Some(f), _) => Some((f, key.to_string())),
+            (None, Some(f)) => Some((f, format!("{key}/"))),
+            (None, None) => None,
+        },
+        HtmlHandling::ForceTrailingSlash => {
+            file.or(index).map(|f| (f, format!("{key}/")))
+        }
+        HtmlHandling::DropTrailingSlash => file.or(index).map(|f| (f, key.to_string())),
     }
 }
 
@@ -597,7 +674,9 @@ pub fn fetch(
     let response = match resolved {
         Resolved::Redirect(to) => {
             let mut r = Response::new(Body::empty());
-            *r.status_mut() = StatusCode::PERMANENT_REDIRECT;
+            // Cloudflare's html-handling redirects are 307 (method and
+            // body preserved), not 308.
+            *r.status_mut() = StatusCode::TEMPORARY_REDIRECT;
             if let Ok(v) = HeaderValue::from_str(&to) {
                 r.headers_mut().insert(header::LOCATION, v);
             }
@@ -690,6 +769,8 @@ fn nfh_wire(nfh: NotFoundHandling) -> &'static str {
 fn html_wire(html: HtmlHandling) -> &'static str {
     match html {
         HtmlHandling::AutoTrailingSlash => "auto-trailing-slash",
+        HtmlHandling::ForceTrailingSlash => "force-trailing-slash",
+        HtmlHandling::DropTrailingSlash => "drop-trailing-slash",
         HtmlHandling::None => "none",
     }
 }
@@ -1053,5 +1134,114 @@ mod gc_sweep_tests {
             "objects kept — poisoned kept manifest fails closed"
         );
         assert_eq!(rep.objects_deleted, 0);
+    }
+}
+
+#[cfg(test)]
+mod html_handling_tests {
+    //! Cloudflare's four `html_handling` modes, row for row from
+    //! `workers/static-assets/routing/advanced/html-handling`.
+    use super::*;
+
+    fn f(path: &str) -> AssetFile {
+        AssetFile {
+            path: path.to_string(),
+            sha256: "0".repeat(64),
+            size: 1,
+            mime: "text/html".to_string(),
+        }
+    }
+
+    fn manifest(html: HtmlHandling) -> AssetManifest {
+        AssetManifest {
+            files: vec![
+                f("/index.html"),
+                f("/file.html"),
+                f("/folder/index.html"),
+                f("/app.js"),
+            ],
+            html_handling: html,
+            not_found_handling: NotFoundHandling::None,
+        }
+    }
+
+    fn serve(path: &str) -> Resolved {
+        Resolved::Serve(f(path))
+    }
+
+    fn redirect(path: &str) -> Resolved {
+        Resolved::Redirect(path.to_string())
+    }
+
+    #[test]
+    fn cloudflare_html_handling_tables() {
+        use HtmlHandling::*;
+        let cases: &[(HtmlHandling, &str, Resolved)] = &[
+            // auto-trailing-slash
+            (AutoTrailingSlash, "/file", serve("/file.html")),
+            (AutoTrailingSlash, "/file.html", redirect("/file")),
+            (AutoTrailingSlash, "/file/", redirect("/file")),
+            (AutoTrailingSlash, "/file/index", redirect("/file")),
+            (AutoTrailingSlash, "/file/index.html", redirect("/file")),
+            (AutoTrailingSlash, "/folder", redirect("/folder/")),
+            (AutoTrailingSlash, "/folder.html", redirect("/folder")),
+            (AutoTrailingSlash, "/folder/", serve("/folder/index.html")),
+            (AutoTrailingSlash, "/folder/index", redirect("/folder")),
+            (AutoTrailingSlash, "/folder/index.html", redirect("/folder")),
+            (AutoTrailingSlash, "/", serve("/index.html")),
+            // force-trailing-slash
+            (ForceTrailingSlash, "/file", redirect("/file/")),
+            (ForceTrailingSlash, "/file.html", redirect("/file/")),
+            (ForceTrailingSlash, "/file/", serve("/file.html")),
+            (ForceTrailingSlash, "/file/index", redirect("/file/")),
+            (ForceTrailingSlash, "/file/index.html", redirect("/file/")),
+            (ForceTrailingSlash, "/folder", redirect("/folder/")),
+            (ForceTrailingSlash, "/folder.html", redirect("/folder/")),
+            (ForceTrailingSlash, "/folder/", serve("/folder/index.html")),
+            (ForceTrailingSlash, "/folder/index", redirect("/folder/")),
+            (ForceTrailingSlash, "/folder/index.html", redirect("/folder/")),
+            (ForceTrailingSlash, "/", serve("/index.html")),
+            // drop-trailing-slash
+            (DropTrailingSlash, "/file", serve("/file.html")),
+            (DropTrailingSlash, "/file.html", redirect("/file")),
+            (DropTrailingSlash, "/file/", redirect("/file")),
+            (DropTrailingSlash, "/file/index", redirect("/file")),
+            (DropTrailingSlash, "/file/index.html", redirect("/file")),
+            (DropTrailingSlash, "/folder", serve("/folder/index.html")),
+            (DropTrailingSlash, "/folder.html", redirect("/folder")),
+            (DropTrailingSlash, "/folder/", redirect("/folder")),
+            (DropTrailingSlash, "/folder/index", redirect("/folder")),
+            (DropTrailingSlash, "/folder/index.html", redirect("/folder")),
+            (DropTrailingSlash, "/", serve("/index.html")),
+            // none: exact only
+            (None, "/file", Resolved::NotFound),
+            (None, "/file.html", serve("/file.html")),
+            (None, "/folder", Resolved::NotFound),
+            (None, "/folder/", Resolved::NotFound),
+            (None, "/", Resolved::NotFound),
+            // non-HTML assets are never rewritten
+            (AutoTrailingSlash, "/app.js", serve("/app.js")),
+            (ForceTrailingSlash, "/app.js", serve("/app.js")),
+            (DropTrailingSlash, "/app.js", serve("/app.js")),
+            // misses
+            (AutoTrailingSlash, "/nope", Resolved::NotFound),
+            (ForceTrailingSlash, "/nope.html", Resolved::NotFound),
+            (DropTrailingSlash, "/nope/", Resolved::NotFound),
+        ];
+        for (mode, req, want) in cases {
+            assert_eq!(
+                resolve_with_nfh(&manifest(*mode), req, NotFoundHandling::None),
+                *want,
+                "{mode:?} {req}"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_names_match_cloudflare() {
+        assert_eq!(html_wire(HtmlHandling::AutoTrailingSlash), "auto-trailing-slash");
+        assert_eq!(html_wire(HtmlHandling::ForceTrailingSlash), "force-trailing-slash");
+        assert_eq!(html_wire(HtmlHandling::DropTrailingSlash), "drop-trailing-slash");
+        assert_eq!(html_wire(HtmlHandling::None), "none");
     }
 }

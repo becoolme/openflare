@@ -255,6 +255,24 @@ export function normalizePath(raw: string): string | null {
 // Mirror of vrt-provider resolve/resolve_with_nfh — existence only.
 // `fetchable` means resolve() would produce Serve | Redirect |
 // SpaFallback (anything except NotFound).
+/// Mirror of vrt-provider `html_key`: strip the HTML-route suffix.
+/// `null` = a concrete asset path (last segment has a dot), never
+/// rewritten by html handling.
+function htmlKey(path: string): string | null {
+  if (path === "/") return "/";
+  let key: string;
+  if (path.endsWith("/index.html")) key = path.slice(0, -"/index.html".length);
+  else if (path.endsWith("/index")) key = path.slice(0, -"/index".length);
+  else if (path.endsWith(".html")) key = path.slice(0, -".html".length);
+  else if (path.endsWith("/")) key = path.slice(0, -1);
+  else {
+    const last = path.slice(path.lastIndexOf("/") + 1);
+    if (last.includes(".")) return null;
+    key = path;
+  }
+  return key === "" ? "/" : key;
+}
+
 export function intentFetchable(
   index: RouteIndex,
   path: string,
@@ -265,12 +283,13 @@ export function intentFetchable(
   if (has(path)) return true;
   const nfh =
     hasStaticRouting || navigate ? index.notFoundHandling : "none";
-  if (index.htmlHandling === "auto-trailing-slash") {
-    if (path.endsWith("/")) {
-      if (has(`${path}index.html`)) return true;
-    } else {
-      if (has(`${path}.html`)) return true;
-      if (has(`${path}/index.html`)) return true; // 308 → fetchable
+  if (index.htmlHandling !== "none") {
+    // Every HTML route resolves to `<key>.html` or `<key>/index.html`;
+    // non-canonical forms are 307 redirects, which are still fetchable.
+    const key = htmlKey(path);
+    if (key !== null) {
+      if (key === "/" ? has("/index.html") : has(`${key}.html`) || has(`${key}/index.html`))
+        return true;
     }
   }
   if (nfh === "single-page-application") return has("/index.html");
@@ -366,7 +385,12 @@ export function compileCfg(raw: string): CompiledCfg | undefined {
 }
 
 // E4: whitelist — mirrors provider html_wire/nfh_wire output.
-const HTML_HANDLINGS = new Set(["auto-trailing-slash", "none"]);
+const HTML_HANDLINGS = new Set([
+  "auto-trailing-slash",
+  "force-trailing-slash",
+  "drop-trailing-slash",
+  "none",
+]);
 const NOT_FOUND_HANDLINGS = new Set(["none", "404-page", "single-page-application"]);
 const DIGEST_HEX = /^[0-9a-f]{64}$/;
 

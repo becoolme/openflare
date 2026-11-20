@@ -15,7 +15,8 @@ From `examples/standalone-wrangler/wrangler.jsonc`:
   "assets": {
     "directory": "public",
     "binding": "ASSETS",
-    "not_found_handling": "404-page"
+    "not_found_handling": "404-page",
+    "html_handling": "drop-trailing-slash"
   }
 }
 ```
@@ -53,9 +54,13 @@ that does not match the bytes is never committed.
 
 ## Known differences from Cloudflare
 
-- `html_handling` accepts only `auto-trailing-slash` and `none`;
-  Cloudflare's `force-trailing-slash` / `drop-trailing-slash` are
-  rejected at pack (`vrt-local/src/worker_pkg.rs`).
+- `html_handling` accepts all four Cloudflare modes
+  (`auto-trailing-slash`, `force-trailing-slash`, `drop-trailing-slash`,
+  `none`) and follows Cloudflare's canonical-URL table: `.html` and
+  `.../index[.html]` requests redirect to their stem, folder indexes are
+  served under `/<dir>/`, and non-canonical forms return **307** with a
+  `Location` header. Non-HTML assets (`/app.js`) are served verbatim and
+  never rewritten.
 - `not_found_handling` accepts `none`, `404-page`,
   `single-page-application`.
 - `run_worker_first`: `true`/`false` or a list of `/`-prefixed globs

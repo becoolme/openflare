@@ -110,11 +110,47 @@ test("html_handling: /about matches /about.html", async () => {
   assert.equal(res.headers.get(HDR), "assets");
 });
 
-test("html_handling: /dir matches /dir/index.html (308 fetchable)", async () => {
+test("html_handling: /dir matches /dir/index.html (307 fetchable)", async () => {
   const a = [];
   const r = new AssetsRouter();
   const res = await hit(env({}, userWorker([]), assetsWorker(a, INDEX)),req("/dir"));
   assert.equal(res.headers.get(HDR), "assets");
+});
+
+test("force-trailing-slash: every HTML form still routes to assets", async () => {
+  const idx = {
+    htmlHandling: "force-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/about.html", "/dir/index.html"],
+  };
+  for (const p of ["/about", "/about.html", "/about/", "/dir", "/dir/", "/dir/index", "/dir/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("drop-trailing-slash: every HTML form still routes to assets", async () => {
+  const idx = {
+    htmlHandling: "drop-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/about.html", "/dir/index.html"],
+  };
+  for (const p of ["/about", "/about.html", "/about/", "/dir", "/dir/", "/dir/index", "/dir/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("html_handling none: only exact asset paths route to assets", async () => {
+  const idx = {
+    htmlHandling: "none",
+    notFoundHandling: "none",
+    paths: ["/about.html", "/app.js"],
+  };
+  const miss = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/about"));
+  assert.equal(miss.headers.get(HDR), null);
+  const hitExact = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/about.html"));
+  assert.equal(hitExact.headers.get(HDR), "assets");
 });
 
 test("SPA fallback only applies to navigate requests", async () => {

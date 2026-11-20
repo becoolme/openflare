@@ -176,14 +176,8 @@ async fn fetch(
 #[tokio::test]
 async fn get_serves_bytes_with_etag_and_mime() {
     let e = env(&[("/index.html", b"<h1>hi</h1>")], "none", TENANT);
-    let res = fetch(
-        &e.app,
-        &e.digest,
-        "GET",
-        "https://site.example/index.html",
-        &[],
-    )
-    .await;
+    // `/` is the canonical form of `/index.html` under html handling.
+    let res = fetch(&e.app, &e.digest, "GET", "https://site.example/", &[]).await;
     assert_eq!(res.status(), StatusCode::OK);
     let etag = res
         .headers()
@@ -226,10 +220,10 @@ async fn if_none_match_returns_304() {
 }
 
 #[tokio::test]
-async fn directory_without_slash_redirects_308() {
+async fn directory_without_slash_redirects_307() {
     let e = env(&[("/docs/index.html", b"d")], "none", TENANT);
     let res = fetch(&e.app, &e.digest, "GET", "https://x/docs", &[]).await;
-    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(res.headers().get("location").unwrap(), "/docs/");
     let res = fetch(&e.app, &e.digest, "GET", "https://x/docs/", &[]).await;
     assert_eq!(res.status(), StatusCode::OK);
@@ -331,7 +325,9 @@ async fn missing_manifest_is_storage_unavailable() {
 async fn listed_object_missing_is_storage_unavailable() {
     let e = env(&[("/index.html", b"i")], "none", TENANT);
     remove_stored(&e.root, &hex64(b"i"));
-    let res = fetch(&e.app, &e.digest, "GET", "https://x/index.html", &[]).await;
+    // Canonical `/` maps to `/index.html`; the manifest-listed object
+    // is the thing that was removed.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/", &[]).await;
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(code_of(&res), "ASSET_STORAGE_UNAVAILABLE");
 }
@@ -639,7 +635,8 @@ async fn percent_encoded_paths_decode_before_match() {
     );
     for url in [
         "http://w.test/my%20file.txt",
-        "http://w.test/%E4%B8%AD%E6%96%87%20page.html",
+        // Canonical stem of `/... page.html` under html handling.
+        "http://w.test/%E4%B8%AD%E6%96%87%20page",
     ] {
         let res = fetch(&e.app, &e.digest, "GET", url, &[]).await;
         assert_eq!(res.status(), StatusCode::OK, "{url}");

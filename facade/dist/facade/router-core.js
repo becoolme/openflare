@@ -145,16 +145,28 @@ export function normalizePath(raw) {
     if (trailing && !out.endsWith("/")) out += "/";
     return out === "" ? "/" : out;
 }
+function htmlKey(path) {
+    if (path === "/") return "/";
+    let key;
+    if (path.endsWith("/index.html")) key = path.slice(0, -"/index.html".length);
+    else if (path.endsWith("/index")) key = path.slice(0, -"/index".length);
+    else if (path.endsWith(".html")) key = path.slice(0, -".html".length);
+    else if (path.endsWith("/")) key = path.slice(0, -1);
+    else {
+        const last = path.slice(path.lastIndexOf("/") + 1);
+        if (last.includes(".")) return null;
+        key = path;
+    }
+    return key === "" ? "/" : key;
+}
 export function intentFetchable(index, path, navigate, hasStaticRouting) {
     const has = (p)=>index.paths.has(p);
     if (has(path)) return true;
     const nfh = hasStaticRouting || navigate ? index.notFoundHandling : "none";
-    if (index.htmlHandling === "auto-trailing-slash") {
-        if (path.endsWith("/")) {
-            if (has(`${path}index.html`)) return true;
-        } else {
-            if (has(`${path}.html`)) return true;
-            if (has(`${path}/index.html`)) return true;
+    if (index.htmlHandling !== "none") {
+        const key = htmlKey(path);
+        if (key !== null) {
+            if (key === "/" ? has("/index.html") : has(`${key}.html`) || has(`${key}/index.html`)) return true;
         }
     }
     if (nfh === "single-page-application") return has("/index.html");
@@ -216,6 +228,8 @@ export function compileCfg(raw) {
 }
 const HTML_HANDLINGS = new Set([
     "auto-trailing-slash",
+    "force-trailing-slash",
+    "drop-trailing-slash",
     "none"
 ]);
 const NOT_FOUND_HANDLINGS = new Set([
