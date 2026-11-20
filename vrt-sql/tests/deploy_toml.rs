@@ -32,11 +32,22 @@ fn deploy_sql_tomls_parse_validate_and_load_secrets() {
     };
     for toml in tomls {
         let root = tmp_root();
-        for d in ["data/db", "data/persistence", "run/secrets"] {
+        for d in ["data/db", "data/persistence", "run/secrets", "keys", "sql/data", "objstore"] {
             std::fs::create_dir_all(root.0.join(d)).unwrap();
         }
         for k in ["vrt-sql-auth-secret", "vrt-sql-bookmark-secret"] {
             let f = root.0.join("run/secrets").join(k);
+            std::fs::write(&f, "0123456789abcdef0123456789abcdef").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        // examples/standalone-vrt-sql.toml points the 0600 secret files at
+        // `__VRT_ROOT__/keys/*` instead of `run/secrets/*`.
+        for k in ["sql-bookmark.secret", "sql-auth.secret"] {
+            let f = root.0.join("keys").join(k);
             std::fs::write(&f, "0123456789abcdef0123456789abcdef").unwrap();
             #[cfg(unix)]
             {
@@ -53,10 +64,16 @@ fn deploy_sql_tomls_parse_validate_and_load_secrets() {
             )
             .unwrap();
         }
-        let text = std::fs::read_to_string(&toml)
-            .unwrap()
-            .replace("/data", &root.0.join("data").to_string_lossy())
-            .replace("/run/vrt", &root.0.join("run").to_string_lossy());
+        let raw = std::fs::read_to_string(&toml).unwrap();
+        let text = if raw.contains("__VRT_ROOT__") {
+            // examples/standalone-vrt-sql.toml.
+            raw.replace("__VRT_SQL_LISTEN__", "127.0.0.1:19494")
+                .replace("__VRT_SQL_METRICS__", "127.0.0.1:19493")
+                .replace("__VRT_ROOT__", &root.0.to_string_lossy())
+        } else {
+            raw.replace("/data", &root.0.join("data").to_string_lossy())
+                .replace("/run/vrt", &root.0.join("run").to_string_lossy())
+        };
         // The binary's own path: serde (deny_unknown_fields) then
         // validate(), then the 0600 secret loads it performs at boot.
         let config: vrt_sql::service::ServiceConfig = toml::from_str(&text)

@@ -48,6 +48,11 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: '0'
           CARGO_PROFILE_TEST_DEBUG: '0'
         run: cargo test --locked --workspace --no-fail-fast
+      # `VRT_DEPLOY_TOML_DIRS` is unset above (a consumer's manifests are
+      # their own gate); this loads openflare's own `examples/` through the
+      # same real loaders, so the documented configs cannot rot.
+      - name: Example deployment TOMLs load
+        run: scripts/ci-deploy-tomls.sh
 
   clippy:
     name: Unsafe blocks are documented

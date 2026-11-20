@@ -35,7 +35,15 @@ fn deploy_controller_tomls_load() {
         // The fs contract the initContainer creates: 0700 pod-delivery
         // and render-inputs dirs, the normalized 0600 token, and the
         // durable cell-state dir (fence + cron claims).
-        for d in ["run/pod-delivery", "run/render-inputs", "run/secrets", "cell-data"] {
+        for d in [
+            "run/pod-delivery",
+            "run/render-inputs",
+            "run/secrets",
+            "cell-data",
+            // examples/platform-cell-controller.toml (`__VRT_ROOT__`).
+            "secrets",
+            "state",
+        ] {
             std::fs::create_dir_all(root.0.join(d)).unwrap();
         }
         let token = root.0.join("run/secrets/cell-token");
@@ -52,10 +60,20 @@ fn deploy_controller_tomls_load() {
                 .unwrap();
             }
         }
+        // examples/: `load_config` reads `token_file` at boot.
+        let example_token = root.0.join("secrets/cell-token");
+        std::fs::write(&example_token, "test-cell-token-32bytes-000000000000").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&example_token, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         let text = std::fs::read_to_string(&toml)
             .unwrap()
             .replace("/run/vrt", &root.0.join("run").to_string_lossy())
             .replace("/cell-data", &root.0.join("cell-data").to_string_lossy())
+            .replace("__VRT_ROOT__", &root.0.to_string_lossy())
             .replace("REPLACE_ME_CELL_ID", "cell-1")
             .replace("REPLACE_ME_CP_HOST", "cp.example.com")
             .replace("REPLACE_ME_KEY_ID", "deploy-key")
