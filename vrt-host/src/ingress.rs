@@ -52,7 +52,8 @@ use tokio::net::TcpListener;
 /// client (or a non-Traefik pod on the ingress port) can never inject
 /// a scheme, client-IP chain, or Cloudflare edge header. `cf-*` is
 /// stripped unconditionally: the front proxy does not sanitize it
-/// and this runtime exposes no `request.cf` surface.
+/// and MIG-10/MIG-31 synthesize `request.cf` only from the verified
+/// Cloudflare chain.
 const STRIP_REQUEST: &[&str] = &[
     "connection",
     "keep-alive",
@@ -66,7 +67,19 @@ const STRIP_REQUEST: &[&str] = &[
     "cf-connecting-ip",
     "cf-ew-via",
     "cf-ipcountry",
+    // MIG-31: visitor-location managed-transform headers. Inbound
+    // copies are always dropped; only the verified CF chain's values
+    // are re-injected below (and mirrored into `request.cf`).
+    "cf-ipcity",
+    "cf-ipcontinent",
+    "cf-iplatitude",
+    "cf-iplongitude",
+    "cf-metro-code",
+    "cf-postal-code",
     "cf-ray",
+    "cf-region",
+    "cf-region-code",
+    "cf-timezone",
     "cf-visitor",
     "true-client-ip",
     "x-forwarded-for",
@@ -345,7 +358,76 @@ struct CfMetadata {
     colo: Option<String>,
     /// Full validated `cf-ray` for header pass-through.
     ray: Option<String>,
+    // MIG-31: visitor location managed transform (`Add visitor location
+    // headers`). Every value is independently validated; CF exposes all
+    // of them as strings in `request.cf` and forwards the headers.
+    city: Option<String>,
+    continent: Option<String>,
+    region: Option<String>,
+    region_code: Option<String>,
+    metro_code: Option<String>,
+    postal_code: Option<String>,
+    timezone: Option<String>,
+    latitude: Option<String>,
+    longitude: Option<String>,
 }
+
+/// MIG-31: bounded, control-free UTF-8 header value (Cloudflare encodes
+/// non-ASCII location names as UTF-8, so `HeaderValue::to_str` — visible
+/// ASCII only — is not enough).
+fn cf_header_text(inbound: &HeaderMap, name: &str, max: usize) -> Option<String> {
+    let raw = inbound.get(name)?.as_bytes();
+    let s = std::str::from_utf8(raw).ok()?.trim();
+    if s.is_empty() || s.len() > max || s.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// `ip.src.continent` is one of the seven continent codes.
+fn valid_cf_continent(s: &str) -> bool {
+    matches!(s, "AF" | "AN" | "AS" | "EU" | "NA" | "OC" | "SA")
+}
+
+/// ISO 3166-2 first-level region code (`13`, `JP-13`, `TX`, ...).
+fn valid_cf_region_code(s: &str) -> bool {
+    s.len() <= 16
+        && s.bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `ip.src.metro_code` (US DMA), digits only.
+fn valid_cf_metro_code(s: &str) -> bool {
+    s.len() <= 8 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Postal codes are alphanumeric with optional spaces/hyphens.
+fn valid_cf_postal_code(s: &str) -> bool {
+    s.len() <= 32
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b' ' || b == b'-')
+}
+
+/// IANA timezone name (`Asia/Tokyo`, `UTC`, `America/Argentina/Buenos_Aires`).
+fn valid_cf_timezone(s: &str) -> bool {
+    s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-' | b'/'))
+}
+
+/// Coordinate string: parses as a finite float inside the axis range.
+fn valid_cf_coord(s: &str, min: f64, max: f64) -> bool {
+    s.len() <= 24
+        && s.parse::<f64>()
+            .map(|v| v.is_finite() && (min..=max).contains(&v))
+            .unwrap_or(false)
+}
+
+/// EU member states (as used for `request.cf.isEUCountry`).
+const EU_COUNTRIES: &[&str] = &[
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT",
+    "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+];
 
 fn cf_metadata(policy: &ClientIpPolicy, peer: &std::net::IpAddr, inbound: &HeaderMap) -> CfMetadata {
     let mut m = CfMetadata::default();
@@ -363,6 +445,20 @@ fn cf_metadata(policy: &ClientIpPolicy, peer: &std::net::IpAddr, inbound: &Heade
             m.colo = Some(colo.to_string());
         }
     }
+    // MIG-31: visitor location managed transform. Only the verified CF
+    // chain is read, so a direct client can never inject any of these.
+    m.city = cf_header_text(inbound, "cf-ipcity", 96);
+    m.continent = cf_header_text(inbound, "cf-ipcontinent", 2).filter(|v| valid_cf_continent(v));
+    m.region = cf_header_text(inbound, "cf-region", 96);
+    m.region_code =
+        cf_header_text(inbound, "cf-region-code", 16).filter(|v| valid_cf_region_code(v));
+    m.metro_code = cf_header_text(inbound, "cf-metro-code", 8).filter(|v| valid_cf_metro_code(v));
+    m.postal_code = cf_header_text(inbound, "cf-postal-code", 32).filter(|v| valid_cf_postal_code(v));
+    m.timezone = cf_header_text(inbound, "cf-timezone", 64).filter(|v| valid_cf_timezone(v));
+    m.latitude =
+        cf_header_text(inbound, "cf-iplatitude", 24).filter(|v| valid_cf_coord(v, -90.0, 90.0));
+    m.longitude =
+        cf_header_text(inbound, "cf-iplongitude", 24).filter(|v| valid_cf_coord(v, -180.0, 180.0));
     m
 }
 
@@ -381,9 +477,33 @@ fn cf_blob_json(meta: &CfMetadata, http_protocol: &str) -> String {
             "country".to_string(),
             serde_json::Value::String(c.clone()),
         );
+        // `isEUCountry` is the string "1" when true (CF omits it
+        // otherwise), never a boolean.
+        if EU_COUNTRIES.contains(&c.as_str()) {
+            map.insert(
+                "isEUCountry".to_string(),
+                serde_json::Value::String("1".to_string()),
+            );
+        }
     }
     if let Some(c) = &meta.colo {
         map.insert("colo".to_string(), serde_json::Value::String(c.clone()));
+    }
+    // MIG-31: visitor location fields are strings in `request.cf`.
+    for (key, value) in [
+        ("city", &meta.city),
+        ("continent", &meta.continent),
+        ("region", &meta.region),
+        ("regionCode", &meta.region_code),
+        ("metroCode", &meta.metro_code),
+        ("postalCode", &meta.postal_code),
+        ("timezone", &meta.timezone),
+        ("latitude", &meta.latitude),
+        ("longitude", &meta.longitude),
+    ] {
+        if let Some(v) = value {
+            map.insert(key.to_string(), serde_json::Value::String(v.clone()));
+        }
     }
     let s = serde_json::to_string(&serde_json::Value::Object(map))
         .unwrap_or_else(|_| "{}".to_string());
@@ -1725,6 +1845,27 @@ fn scrubbed_headers(
             out.insert("cf-ipcountry", v);
         }
     }
+    // MIG-31: the remaining visitor-location headers, re-injected from
+    // the same validated metadata. `from_bytes` (not `from_str`) so a
+    // UTF-8 city/region name survives; every value already passed the
+    // control-char and length checks.
+    for (name, value) in [
+        ("cf-ipcity", &cf.city),
+        ("cf-ipcontinent", &cf.continent),
+        ("cf-region", &cf.region),
+        ("cf-region-code", &cf.region_code),
+        ("cf-metro-code", &cf.metro_code),
+        ("cf-postal-code", &cf.postal_code),
+        ("cf-timezone", &cf.timezone),
+        ("cf-iplatitude", &cf.latitude),
+        ("cf-iplongitude", &cf.longitude),
+    ] {
+        if let Some(v) = value {
+            if let Ok(hv) = HeaderValue::from_bytes(v.as_bytes()) {
+                out.insert(name, hv);
+            }
+        }
+    }
     if upstream_is_cloudflare(client_ip_policy, &peer.ip(), inbound) {
         if let Ok(v) = HeaderValue::from_str(&format!(
             "{{\"scheme\":\"{}\"}}",
@@ -1921,11 +2062,224 @@ mod cf_blob_tests {
         let inbound = headers(&[
             ("cf-ipcountry", "JP"),
             ("cf-ray", "8f1234abcd-NRT"),
+            ("cf-ipcity", "Tokyo"),
+            ("cf-ipcontinent", "AS"),
+            ("cf-region", "Tokyo"),
+            ("cf-region-code", "13"),
+            ("cf-metro-code", "0"),
+            ("cf-postal-code", "100-0001"),
+            ("cf-timezone", "Asia/Tokyo"),
+            ("cf-iplatitude", "35.6895"),
+            ("cf-iplongitude", "139.6917"),
             ("x-forwarded-for", "203.0.113.7, 104.16.1.2"),
         ]);
         let bad_peer = std::net::IpAddr::from_str("192.0.2.55").unwrap();
         let m = cf_metadata(&cf_policy(), &bad_peer, &inbound);
         assert!(m.country.is_none() && m.colo.is_none() && m.ray.is_none());
+        assert!(m.city.is_none() && m.continent.is_none() && m.region.is_none());
+        assert!(m.region_code.is_none() && m.metro_code.is_none());
+        assert!(m.postal_code.is_none() && m.timezone.is_none());
+        assert!(m.latitude.is_none() && m.longitude.is_none());
+    }
+
+    fn cf_inbound(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut all = vec![("x-forwarded-for", "203.0.113.7, 104.16.1.2")];
+        all.extend_from_slice(pairs);
+        headers(&all)
+    }
+
+    #[test]
+    fn cf_metadata_accepts_visitor_location_fields() {
+        let m = cf_metadata(
+            &cf_policy(),
+            &peer(),
+            &cf_inbound(&[
+                ("cf-ipcity", "Sao Paulo"),
+                ("cf-ipcontinent", "SA"),
+                ("cf-region", "Sao Paulo"),
+                ("cf-region-code", "SP"),
+                ("cf-metro-code", "0"),
+                ("cf-postal-code", "01310-100"),
+                ("cf-timezone", "America/Sao_Paulo"),
+                ("cf-iplatitude", "-23.5505"),
+                ("cf-iplongitude", "-46.6333"),
+            ]),
+        );
+        assert_eq!(m.city.as_deref(), Some("Sao Paulo"));
+        assert_eq!(m.continent.as_deref(), Some("SA"));
+        assert_eq!(m.region.as_deref(), Some("Sao Paulo"));
+        assert_eq!(m.region_code.as_deref(), Some("SP"));
+        assert_eq!(m.metro_code.as_deref(), Some("0"));
+        assert_eq!(m.postal_code.as_deref(), Some("01310-100"));
+        assert_eq!(m.timezone.as_deref(), Some("America/Sao_Paulo"));
+        assert_eq!(m.latitude.as_deref(), Some("-23.5505"));
+        assert_eq!(m.longitude.as_deref(), Some("-46.6333"));
+    }
+
+    #[test]
+    fn cf_metadata_rejects_malformed_visitor_location_fields() {
+        // Every field is independently validated: a bad value is
+        // dropped, never echoed, and never affects its neighbours.
+        let cases: &[(&str, &str)] = &[
+            ("cf-ipcontinent", "EUROPE"),
+            ("cf-ipcontinent", "eu"),
+            ("cf-region-code", "lowercase"),
+            ("cf-region-code", "has space"),
+            ("cf-metro-code", "12a"),
+            ("cf-postal-code", "100;DROP"),
+            ("cf-timezone", "Asia/Tokyo\n"),
+            ("cf-timezone", "../etc/passwd"),
+            ("cf-iplatitude", "91"),
+            ("cf-iplatitude", "nan"),
+            ("cf-iplatitude", "inf"),
+            ("cf-iplongitude", "-181"),
+        ];
+        for (name, value) in cases {
+            // CR/LF/NUL cannot even be encoded as a header value —
+            // those are rejected by the HTTP layer, not by us.
+            let Ok(hv) = HeaderValue::from_bytes(value.as_bytes()) else {
+                continue;
+            };
+            let mut h = HeaderMap::new();
+            h.insert(axum::http::HeaderName::from_str(name).unwrap(), hv);
+            h.insert(
+                axum::http::HeaderName::from_static("x-forwarded-for"),
+                HeaderValue::from_static("203.0.113.7, 104.16.1.2"),
+            );
+            let m = cf_metadata(&cf_policy(), &peer(), &h);
+            let field = match *name {
+                "cf-ipcontinent" => m.continent,
+                "cf-region-code" => m.region_code,
+                "cf-metro-code" => m.metro_code,
+                "cf-postal-code" => m.postal_code,
+                "cf-timezone" => m.timezone,
+                "cf-iplatitude" => m.latitude,
+                "cf-iplongitude" => m.longitude,
+                other => panic!("unexpected case {other}"),
+            };
+            assert!(field.is_none(), "{name} accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn cf_blob_never_contains_peer_credentials() {
+        let m = CfMetadata {
+            country: Some("JP".into()),
+            colo: Some("NRT".into()),
+            ray: Some("8f9-NRT".into()),
+            city: Some("Tokyo".into()),
+            continent: Some("AS".into()),
+            region: Some("Tokyo".into()),
+            region_code: Some("13".into()),
+            metro_code: Some("0".into()),
+            postal_code: Some("100-0001".into()),
+            timezone: Some("Asia/Tokyo".into()),
+            latitude: Some("35.6895".into()),
+            longitude: Some("139.6917".into()),
+        };
+        let blob = cf_blob_json(&m, "HTTP/1.1");
+        assert!(!blob.contains("Pid") && !blob.contains("Uid"));
+        let v: serde_json::Value = serde_json::from_str(&blob).unwrap();
+        assert_eq!(v["country"], "JP");
+        assert_eq!(v["colo"], "NRT");
+        assert_eq!(v["httpProtocol"], "HTTP/1.1");
+        assert_eq!(v["city"], "Tokyo");
+        assert_eq!(v["continent"], "AS");
+        assert_eq!(v["region"], "Tokyo");
+        assert_eq!(v["regionCode"], "13");
+        assert_eq!(v["metroCode"], "0");
+        assert_eq!(v["postalCode"], "100-0001");
+        assert_eq!(v["timezone"], "Asia/Tokyo");
+        // Strings, not numbers — CF's request.cf types.
+        assert_eq!(v["latitude"], "35.6895");
+        assert_eq!(v["longitude"], "139.6917");
+        // Japan is not an EU member.
+        assert!(v["isEUCountry"].is_null());
+        // EU member state → "1".
+        let de = CfMetadata {
+            country: Some("DE".into()),
+            ..Default::default()
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&cf_blob_json(&de, "HTTP/2")).unwrap();
+        assert_eq!(v["isEUCountry"], "1");
+        // Untrusted path still yields a host-defined blob.
+        let empty = cf_blob_json(&CfMetadata::default(), "HTTP/1.1");
+        let v: serde_json::Value = serde_json::from_str(&empty).unwrap();
+        assert!(v["country"].is_null() && v["colo"].is_null());
+        assert_eq!(v["httpProtocol"], "HTTP/1.1");
+    }
+
+    #[test]
+    fn strip_list_covers_every_cf_header() {
+        for name in [
+            "cf-ipcountry",
+            "cf-ray",
+            "cf-ipcity",
+            "cf-ipcontinent",
+            "cf-region",
+            "cf-region-code",
+            "cf-metro-code",
+            "cf-postal-code",
+            "cf-timezone",
+            "cf-iplatitude",
+            "cf-iplongitude",
+        ] {
+            assert!(STRIP_REQUEST.contains(&name), "{name} not stripped");
+        }
+    }
+
+    #[test]
+    fn scrubbed_headers_reinject_visitor_location_only_behind_cloudflare() {
+        let target = crate::route::RouteTarget {
+            tenant_id: "t".into(),
+            worker_id: "w".into(),
+            assets_first: false,
+        };
+        let inbound = cf_inbound(&[
+            ("cf-ipcountry", "JP"),
+            ("cf-ipcity", "Tokyo"),
+            ("cf-ipcontinent", "AS"),
+            ("cf-region", "Tokyo"),
+            ("cf-region-code", "13"),
+            ("cf-timezone", "Asia/Tokyo"),
+            ("cf-iplatitude", "35.6895"),
+            ("cf-iplongitude", "139.6917"),
+        ]);
+        let trusted = scrubbed_headers(
+            &inbound,
+            "app.example.com",
+            &target,
+            "10.42.0.1:4000".parse().unwrap(),
+            &ForwardedProto::FixedHttp,
+            &cf_policy(),
+            axum::http::Version::HTTP_11,
+            false,
+        );
+        assert_eq!(trusted.get("cf-ipcity").unwrap(), "Tokyo");
+        assert_eq!(trusted.get("cf-ipcontinent").unwrap(), "AS");
+        assert_eq!(trusted.get("cf-region").unwrap(), "Tokyo");
+        assert_eq!(trusted.get("cf-region-code").unwrap(), "13");
+        assert_eq!(trusted.get("cf-timezone").unwrap(), "Asia/Tokyo");
+        assert_eq!(trusted.get("cf-iplatitude").unwrap(), "35.6895");
+        assert_eq!(trusted.get("cf-iplongitude").unwrap(), "139.6917");
+
+        // Same inbound headers on an untrusted peer are dropped.
+        let untrusted = scrubbed_headers(
+            &inbound,
+            "app.example.com",
+            &target,
+            "192.0.2.55:4000".parse().unwrap(),
+            &ForwardedProto::FixedHttp,
+            &cf_policy(),
+            axum::http::Version::HTTP_11,
+            false,
+        );
+        assert!(untrusted.get("cf-ipcity").is_none());
+        assert!(untrusted.get("cf-ipcontinent").is_none());
+        assert!(untrusted.get("cf-region").is_none());
+        assert!(untrusted.get("cf-timezone").is_none());
+        assert!(untrusted.get("cf-iplatitude").is_none());
     }
 
     #[test]
@@ -1965,26 +2319,6 @@ mod cf_blob_tests {
             let m = cf_metadata(&p, &peer(), &h);
             assert!(m.colo.is_none() && m.ray.is_none(), "{bad:?}");
         }
-    }
-
-    #[test]
-    fn cf_blob_never_contains_peer_credentials() {
-        let m = CfMetadata {
-            country: Some("JP".into()),
-            colo: Some("NRT".into()),
-            ray: Some("8f9-NRT".into()),
-        };
-        let blob = cf_blob_json(&m, "HTTP/1.1");
-        assert!(!blob.contains("Pid") && !blob.contains("Uid"));
-        let v: serde_json::Value = serde_json::from_str(&blob).unwrap();
-        assert_eq!(v["country"], "JP");
-        assert_eq!(v["colo"], "NRT");
-        assert_eq!(v["httpProtocol"], "HTTP/1.1");
-        // Untrusted path still yields a host-defined blob.
-        let empty = cf_blob_json(&CfMetadata::default(), "HTTP/1.1");
-        let v: serde_json::Value = serde_json::from_str(&empty).unwrap();
-        assert!(v["country"].is_null() && v["colo"].is_null());
-        assert_eq!(v["httpProtocol"], "HTTP/1.1");
     }
 
     #[test]

@@ -54,6 +54,16 @@ These are not tied to one binding.
 - **No edge network.** One `vrt-host` is one ingress — no Cloudflare
   global anycast, no edge cache tier for `cacheTtl`, no Smart Placement
   (`placement` is ignored).
+- **`request.cf` is a whitelist, synthesized from the verified Cloudflare
+  chain.** Inbound `cf-*` headers are stripped and re-injected only when
+  the request arrived through the trusted proxy → Cloudflare edge. Today:
+  `country`, `colo`, `httpProtocol`, plus the visitor-location set
+  `city`, `continent`, `region`, `regionCode`, `metroCode`,
+  `postalCode`, `timezone`, `latitude`, `longitude`, `isEUCountry`
+  (the location fields require the zone's **Add visitor location
+  headers** managed transform). `asn`, `asOrganization`, `botManagement`
+  and the `tls*` fields have no header source on this ingress and stay
+  absent rather than being guessed.
 
 ## Known limitations
 
