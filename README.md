@@ -73,14 +73,14 @@ bindings) is in [`docs/bindings/README.md`](docs/bindings/README.md).
 | Service / binding | Status | Notes |
 | --- | --- | --- |
 | [KV](docs/bindings/kv.md) | ✅ Drop-in | Full `KVNamespace` on filesystem or Kvrocks; `cacheTtl` is validated but there is no edge-cache tier. |
-| [R2](docs/bindings/r2.md) | 🟡 Partial | Objects, ranges, multipart, checksums; conditional writes depend on the S3 backend. `jurisdiction`/`storage_class` rejected; no SSE-C. |
+| [R2](docs/bindings/r2.md) | 🟡 Partial | Objects, ranges, multipart, checksums; conditional writes depend on the S3 backend. `jurisdiction`/`storage_class` rejected; SSE-C on the S3 backend only (fs/memory fail closed). |
 | [D1](docs/bindings/d1.md) | 🟡 Partial | workerd's `d1-api` on `vrt-sql` (single-writer SQLite, fs/S3 persistence); no Time Travel. |
 | [Durable Objects](docs/bindings/durable-objects.md) | 🟡 Partial | SQLite + KV storage, alarms, RPC, WebSockets, same-tenant `script_name`; no hibernation, `transferred_classes` rejected. |
 | [Queues](docs/bindings/queues.md) | 🟡 Partial | Producers/consumers, retries, delay (including queue-level defaults), concurrency, DLQ; no pull consumer. |
 | [Cron Triggers](docs/bindings/cron-triggers.md) | ✅ Drop-in | 5-field `triggers.crons` → `scheduled()`, at-most-once per `(worker, version, scheduledTime)`; wakes hibernated tenants. |
 | [Workflows](docs/bindings/workflows.md) | 🟡 Partial | Cloudflare engine (miniflare lineage) as a DO; `limits.steps` capped at 100,000. |
 | [Cache API](docs/bindings/cache-api.md) | 🟡 Partial | Per-tenant in-memory `caches.default`/`caches.open`; not persistent, requires `[cache]` in host config. |
-| [Service bindings](docs/bindings/service-bindings.md) | 🟡 Partial | Worker-to-worker fetch/RPC plus named `WorkerEntrypoint` (`services[].entrypoint`), same tenant. |
+| [Service bindings](docs/bindings/service-bindings.md) | 🟡 Partial | Worker-to-worker fetch/RPC plus named `WorkerEntrypoint` (`services[].entrypoint`) and JSON `props` (`ctx.props`, max 8 KiB), same tenant. |
 | [Hyperdrive](docs/bindings/hyperdrive.md) | 🟡 Partial | Postgres wire protocol through the egress layer; credentials never enter the isolate. PostgreSQL only. |
 | [Rate limiting](docs/bindings/rate-limiting.md) | 🟡 Partial | `[[ratelimits]]` fixed-window counter in the per-tenant process; approximate, not shared across hosts. |
 | [Static assets](docs/bindings/static-assets.md) | 🟡 Partial | All four `html_handling` modes, `not_found_handling`, `run_worker_first`; content-addressed store; Cloudflare-aligned 20,000 files / 25 MiB each, plus a configurable total guard. |

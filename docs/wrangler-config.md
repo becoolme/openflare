@@ -64,7 +64,7 @@ environment blocks.
 | `hyperdrive` | supported — see [Hyperdrive](bindings/hyperdrive.md); per-entry keys `binding`, `id`, `database_tenant`, `localConnectionString`, `remote` | `project_cfg.rs:639` |
 | `ratelimits` | supported — see [Rate limiting](bindings/rate-limiting.md); `name` + `namespace_id` + `simple.{limit,period}` | `project_cfg.rs:693` |
 | `r2_buckets` | supported — see [R2](bindings/r2.md); per-entry keys `binding`, `bucket_name` | `project_cfg.rs:761` |
-| `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint, validated at pack) | `project_cfg.rs:788` |
+| `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint), `props` (JSON object for `ctx.props`, max 8 KiB); validated at pack | `project_cfg.rs:788` |
 | `worker_loaders` | supported — see [Worker loaders](bindings/worker-loaders.md); per-entry key `binding` only | `project_cfg.rs:820` |
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:846` |
 | `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`, `delivery_delay`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
@@ -101,6 +101,9 @@ Also type-checked then dropped inside supported blocks:
 - `services[].entrypoint` — becomes the `{ service, entrypoint }` table
   form of `[bindings.service]`; the name is validated at pack
   (`worker_pkg.rs`; see [Service bindings](bindings/service-bindings.md)).
+- `services[].props` — becomes the `{ service, props }` table form
+  (or joins `entrypoint`); must be a JSON object of at most 8 KiB and is
+  rendered into the signed workerd service designator as `ctx.props`.
 
 ## Rejected
 

@@ -34,13 +34,14 @@ use reqwest::Client;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use super::wire::{
     canonical_custom_metadata, check_min_part_sizes, etag_matches, hash_bytes, multipart_etag,
     resolve_range, validate_complete_parts, MultipartCreateResult, R2Condition, R2HttpMetadata,
     R2ListEntry, R2ListPage, R2MultipartCreateOptions, R2ObjectMetadata, R2PutOptions, R2Range,
-    R2UploadedPart,
+    R2SsecKey, R2UploadedPart,
 };
 use super::{R2GetResult, R2Provider};
 use vrt_objstore::sigv4::{self, SignedRequest, Signer};
@@ -105,6 +106,40 @@ pub struct S3R2Provider {
     config: S3Config,
     /// T36: shared SigV4 signer (vrt-objstore).
     signer: Signer,
+    /// SSE-C keys for in-flight multipart uploads. The Workers API has no
+    /// key on `complete()`, so the backend remembers the key supplied at
+    /// create (same model as workerd/R2, where the upload session owns
+    /// it). Keys are never written to object metadata.
+    multipart_ssec: Mutex<BTreeMap<String, R2SsecKey>>,
+}
+
+/// S3 SSE-C headers for a request that must present the customer key.
+/// Empty for plain requests — never emitted speculatively.
+fn ssec_headers(key: Option<&R2SsecKey>) -> Vec<(String, String)> {
+    let Some(key) = key else {
+        return Vec::new();
+    };
+    vec![
+        (
+            "x-amz-server-side-encryption-customer-algorithm".to_string(),
+            "AES256".to_string(),
+        ),
+        (
+            "x-amz-server-side-encryption-customer-key".to_string(),
+            key.s3_key_b64(),
+        ),
+        (
+            "x-amz-server-side-encryption-customer-key-MD5".to_string(),
+            key.s3_key_md5_b64(),
+        ),
+    ]
+}
+
+/// S3 reports SSE-C trouble as a 400/403 on the object request. When the
+/// request carried a key that is the typed SSE-C failure; without one it
+/// stays a generic backend failure.
+fn classify_ssec_failure(status: u16, ssec: Option<&R2SsecKey>) -> Option<ProviderError> {
+    (ssec.is_some() && matches!(status, 400 | 403)).then_some(ProviderError::R2SsecInvalid)
 }
 
 fn now_ms() -> i64 {
@@ -128,7 +163,16 @@ impl S3R2Provider {
             client,
             config,
             signer,
+            multipart_ssec: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// Drop the remembered SSE-C key for a consumed/aborted upload.
+    fn forget_upload_key(&self, upload_id: &str) {
+        self.multipart_ssec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(upload_id);
     }
 
     fn physical_key(&self, ctx: &BindingContext, logical: &str) -> String {
@@ -190,10 +234,12 @@ impl S3R2Provider {
             .map_err(|_| ProviderError::R2ProviderUnavailable)
     }
 
-    /// HEAD the physical key; returns raw headers + status.
+    /// HEAD the physical key; returns raw headers + status. `ssec` adds
+    /// the customer-key headers required by an encrypted object.
     async fn s3_head(
         &self,
         physical: &str,
+        ssec: Option<&R2SsecKey>,
         deadline: Duration,
     ) -> Result<Option<HeaderMap>, ProviderError> {
         let req = SignedRequest {
@@ -204,14 +250,17 @@ impl S3R2Provider {
                 sigv4::uri_escape(physical, false)
             ),
             query: Vec::new(),
-            headers: Vec::new(),
+            headers: ssec_headers(ssec),
             body: Vec::new(),
         };
         let response = self.send(req, deadline).await?;
         match response.status().as_u16() {
             200 => Ok(Some(response.headers().clone())),
             404 => Ok(None),
-            _ => Err(ProviderError::R2ProviderUnavailable),
+            status => {
+                Err(classify_ssec_failure(status, ssec)
+                    .unwrap_or(ProviderError::R2ProviderUnavailable))
+            }
         }
     }
 
@@ -311,7 +360,7 @@ impl S3R2Provider {
             range,
             checksums,
             storage_class: meta("class").unwrap_or_else(|| "Standard".to_string()),
-            ssec_key_md5: None,
+            ssec_key_md5: meta("ssec-md5"),
         })
     }
 
@@ -459,8 +508,9 @@ impl S3R2Provider {
         physical: &str,
         key: &str,
         expected_etag: &str,
+        ssec: Option<&R2SsecKey>,
     ) -> Result<Option<R2ObjectMetadata>, ProviderError> {
-        match self.s3_head(physical, ctx.remaining()).await {
+        match self.s3_head(physical, ssec, ctx.remaining()).await {
             Ok(Some(headers)) => {
                 let head_etag = headers
                     .get(reqwest::header::ETAG)
@@ -500,8 +550,9 @@ impl S3R2Provider {
         physical: &str,
         key: &str,
         expected_etag: &str,
+        ssec: Option<&R2SsecKey>,
     ) -> Result<Option<R2ObjectMetadata>, ProviderError> {
-        match self.s3_head(physical, ctx.remaining()).await {
+        match self.s3_head(physical, ssec, ctx.remaining()).await {
             Ok(Some(headers)) => {
                 let head_etag = headers
                     .get(reqwest::header::ETAG)
@@ -558,7 +609,7 @@ impl R2Provider for S3R2Provider {
         key: &str,
     ) -> Result<Option<R2ObjectMetadata>, ProviderError> {
         let physical = self.checked_physical_key(ctx, key)?;
-        let headers = self.s3_head(&physical, ctx.remaining()).await?;
+        let headers = self.s3_head(&physical, None, ctx.remaining()).await?;
         headers
             .map(|headers| self.decode_head(key, &headers, None))
             .transpose()
@@ -570,10 +621,11 @@ impl R2Provider for S3R2Provider {
         key: &str,
         range: Option<R2Range>,
         only_if: Option<&R2Condition>,
+        ssec_key: Option<&R2SsecKey>,
     ) -> Result<R2GetResult, ProviderError> {
         let physical = self.checked_physical_key(ctx, key)?;
         for attempt in 0..2 {
-            let headers = match self.s3_head(&physical, ctx.remaining()).await? {
+            let headers = match self.s3_head(&physical, ssec_key, ctx.remaining()).await? {
                 Some(headers) => headers,
                 None => return Ok(R2GetResult::Missing),
             };
@@ -586,7 +638,7 @@ impl R2Provider for S3R2Provider {
             let resolved = range
                 .map(|r| resolve_range(r, head_meta.size))
                 .transpose()?;
-            let mut request_headers = vec![];
+            let mut request_headers = ssec_headers(ssec_key);
             if let Some((start, end)) = resolved {
                 request_headers.push(("range".to_string(), format!("bytes={start}-{end}")));
             }
@@ -644,7 +696,10 @@ impl R2Provider for S3R2Provider {
                 }
                 404 => return Ok(R2GetResult::Missing),
                 412 if only_if.is_some() && attempt == 0 => continue,
-                _ => return Err(ProviderError::R2ProviderUnavailable),
+                status => {
+                    return Err(classify_ssec_failure(status, ssec_key)
+                        .unwrap_or(ProviderError::R2ProviderUnavailable))
+                }
             }
         }
         Err(ProviderError::R2ProviderUnavailable)
@@ -683,7 +738,10 @@ impl R2Provider for S3R2Provider {
         // Bounded conditional-write attempts: evaluate on HEAD, write
         // atomically via the etag anchor, retry once on a 412 race.
         for attempt in 0..2u8 {
-            let current = match self.s3_head(&physical, ctx.remaining()).await? {
+            let current = match self
+                .s3_head(&physical, options.ssec_key.as_ref(), ctx.remaining())
+                .await?
+            {
                 Some(headers) => Some(self.decode_head(key, &headers, None)?),
                 None => None,
             };
@@ -724,6 +782,11 @@ impl R2Provider for S3R2Provider {
             if let Some(expiry) = options.http_metadata.cache_expiry {
                 extra.push(("x-amz-meta-vrt-cxp".to_string(), expiry.to_string()));
             }
+            if let Some(ssec) = &options.ssec_key {
+                // Stored for metadata reads; the key itself never is.
+                extra.push(("x-amz-meta-vrt-ssec-md5".to_string(), ssec.md5_hex()));
+                extra.extend(ssec_headers(Some(ssec)));
+            }
             if options.only_if.is_some() {
                 // Atomic anchor: object must still be exactly what HEAD
                 // saw (or still absent).
@@ -760,12 +823,16 @@ impl R2Provider for S3R2Provider {
             if !response.status().is_success() {
                 // S3 PutObject is atomic — a rejection is a known failure,
                 // never an ambiguous commit.
-                return Err(ProviderError::R2ProviderUnavailable);
+                return Err(classify_ssec_failure(
+                    response.status().as_u16(),
+                    options.ssec_key.as_ref(),
+                )
+                .unwrap_or(ProviderError::R2ProviderUnavailable));
             }
             // Verify the committed object like upstream's verify_put:
             // head and compare version/size/checksum integrity.
             let headers = self
-                .s3_head(&physical, ctx.remaining())
+                .s3_head(&physical, options.ssec_key.as_ref(), ctx.remaining())
                 .await?
                 .ok_or(ProviderError::R2ProviderUnavailable)?;
             let committed = self.decode_head(key, &headers, None)?;
@@ -995,7 +1062,7 @@ impl R2Provider for S3R2Provider {
                 R2ListEntry::Object(meta) => {
                     let physical = self.checked_physical_key(ctx, &meta.key)?;
                     let headers = self
-                        .s3_head(&physical, ctx.remaining())
+                        .s3_head(&physical, None, ctx.remaining())
                         .await?
                         .ok_or(ProviderError::R2ProviderUnavailable)?;
                     objects.push(self.decode_head(&meta.key, &headers, None)?);
@@ -1054,6 +1121,12 @@ impl R2Provider for S3R2Provider {
         if let Some(expiry) = options.http_metadata.cache_expiry {
             headers.push(("x-amz-meta-vrt-cxp".to_string(), expiry.to_string()));
         }
+        if let Some(ssec) = &options.ssec_key {
+            // Persist only the key hash; the key is remembered in memory
+            // for complete() (the Workers API has no key there).
+            headers.push(("x-amz-meta-vrt-ssec-md5".to_string(), ssec.md5_hex()));
+            headers.extend(ssec_headers(Some(ssec)));
+        }
         #[derive(Deserialize)]
         struct InitiateResult {
             #[serde(rename = "UploadId")]
@@ -1072,6 +1145,10 @@ impl R2Provider for S3R2Provider {
         };
         let response = self.send(req, ctx.remaining()).await?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            if let Some(err) = classify_ssec_failure(status, options.ssec_key.as_ref()) {
+                return Err(err);
+            }
             return Err(self.s3_error(response, ctx.remaining()).await);
         }
         let bytes = tokio::time::timeout(ctx.remaining(), response.bytes())
@@ -1084,6 +1161,12 @@ impl R2Provider for S3R2Provider {
         .map_err(|_| ProviderError::R2ProviderUnavailable)?;
         if parsed.upload_id.is_empty() {
             return Err(ProviderError::R2ProviderUnavailable);
+        }
+        if let Some(ssec) = &options.ssec_key {
+            self.multipart_ssec
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(parsed.upload_id.clone(), ssec.clone());
         }
         Ok(MultipartCreateResult {
             upload_id: parsed.upload_id,
@@ -1098,6 +1181,7 @@ impl R2Provider for S3R2Provider {
         upload_id: &str,
         part_number: i32,
         body: &[u8],
+        ssec_key: Option<&R2SsecKey>,
     ) -> Result<R2UploadedPart, ProviderError> {
         super::wire::validate_part_number(part_number as i64)?;
         if body.len() as u64 > self.config.max_object_bytes {
@@ -1118,7 +1202,7 @@ impl R2Provider for S3R2Provider {
                     ("partNumber".to_string(), part_number.to_string()),
                     ("uploadId".to_string(), upload_id.to_string()),
                 ],
-                headers: Vec::new(),
+                headers: ssec_headers(ssec_key),
                 body: body.to_vec(),
             };
             let response = match self.send(req, ctx.remaining()).await {
@@ -1138,7 +1222,10 @@ impl R2Provider for S3R2Provider {
                         .ok_or(ProviderError::R2ProviderUnavailable)?;
                     return Ok(R2UploadedPart { part_number, etag });
                 }
-                _ => {
+                status => {
+                    if let Some(err) = classify_ssec_failure(status, ssec_key) {
+                        return Err(err);
+                    }
                     let err = self.s3_error(response, ctx.remaining()).await;
                     if err == ProviderError::R2ProviderUnavailable && attempt == 0 {
                         continue;
@@ -1168,6 +1255,15 @@ impl R2Provider for S3R2Provider {
                 .collect::<Vec<_>>(),
         )?;
         let physical = self.checked_physical_key(ctx, key)?;
+        // The Workers API supplies no key on complete(); reuse the key
+        // remembered at create for this upload session.
+        let ssec = self
+            .multipart_ssec
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(upload_id)
+            .cloned();
+        let ssec = ssec.as_ref();
         // Upstream parity: every listed part must EXIST and its etag
         // must match the etag S3 recorded at UploadPart (S3 itself does
         // not check supplied etags — we verify via ListParts so the
@@ -1182,9 +1278,11 @@ impl R2Provider for S3R2Provider {
             // NoSuchUpload — HEAD may prove this request's exact
             // content is already the committed object.
             Err(ProviderError::R2MultipartInvalid) => {
-                return self
-                    .confirm_committed_retry(ctx, &physical, key, &expected_etag)
+                let out = self
+                    .confirm_committed_retry(ctx, &physical, key, &expected_etag, ssec)
                     .await;
+                self.forget_upload_key(upload_id);
+                return out;
             }
             Err(e) => return Err(e),
         };
@@ -1233,7 +1331,11 @@ impl R2Provider for S3R2Provider {
                 sigv4::uri_escape(&physical, false)
             ),
             query: vec![("uploadId".to_string(), upload_id.to_string())],
-            headers: vec![("content-type".to_string(), "application/xml".to_string())],
+            headers: {
+                let mut headers = vec![("content-type".to_string(), "application/xml".to_string())];
+                headers.extend(ssec_headers(ssec));
+                headers
+            },
             body: xml.into_bytes(),
         };
         // Reserve the tail of the request budget for the ambiguous
@@ -1249,7 +1351,7 @@ impl R2Provider for S3R2Provider {
             Err(e) => {
                 return match e {
                     ProviderError::R2ProviderUnavailable => {
-                        self.confirm_ambiguous_complete(ctx, &physical, key, &expected_etag)
+                        self.confirm_ambiguous_complete(ctx, &physical, key, &expected_etag, ssec)
                             .await
                     }
                     _ => Err(e),
@@ -1270,20 +1372,26 @@ impl R2Provider for S3R2Provider {
         // codes, unparseable body, empty ETag) routes through the
         // confirmation HEAD before we answer anything.
         if !(200..300).contains(&status) || text.contains("<Error") {
+            if let Some(err) = classify_ssec_failure(status, ssec) {
+                return Err(err);
+            }
             let code = Self::xml_error_code(text);
             return if code == "NoSuchUpload" {
                 // W5-r4: on a retry the consumed upload is the sign of a
                 // prior successful commit — verify via HEAD against the
                 // request-derived composite etag before answering.
-                self.confirm_committed_retry(ctx, &physical, key, &expected_etag)
-                    .await
+                let out = self
+                    .confirm_committed_retry(ctx, &physical, key, &expected_etag, ssec)
+                    .await;
+                self.forget_upload_key(upload_id);
+                out
             } else if matches!(
                 Self::classify_s3_error_code(&code),
                 ProviderError::R2MultipartInvalid
             ) {
                 Err(ProviderError::R2MultipartInvalid)
             } else {
-                self.confirm_ambiguous_complete(ctx, &physical, key, &expected_etag)
+                self.confirm_ambiguous_complete(ctx, &physical, key, &expected_etag, ssec)
                     .await
             };
         }
@@ -1300,12 +1408,12 @@ impl R2Provider for S3R2Provider {
             .filter(|e| !e.is_empty());
         let Some(result_etag) = result_etag else {
             return self
-                .confirm_ambiguous_complete(ctx, &physical, key, &expected_etag)
+                .confirm_ambiguous_complete(ctx, &physical, key, &expected_etag, ssec)
                 .await;
         };
         // Verify commit: HEAD must show the object with the etag the
         // complete response reported. Anything else is unconfirmed.
-        match self.s3_head(&physical, ctx.remaining()).await? {
+        match self.s3_head(&physical, ssec, ctx.remaining()).await? {
             Some(headers) => {
                 let head_etag = headers
                     .get(reqwest::header::ETAG)
@@ -1315,9 +1423,9 @@ impl R2Provider for S3R2Provider {
                 if !etag_matches(&head_etag, &result_etag) {
                     return Err(ProviderError::R2ResultUnknown);
                 }
-                Ok(Some(
-                    self.decode_head(key, &headers, None)?.completed_multipart(),
-                ))
+                let committed = self.decode_head(key, &headers, None)?.completed_multipart();
+                self.forget_upload_key(upload_id);
+                Ok(Some(committed))
             }
             None => Err(ProviderError::R2ResultUnknown),
         }
@@ -1343,8 +1451,14 @@ impl R2Provider for S3R2Provider {
         };
         let response = self.send(req, ctx.remaining()).await?;
         match response.status().as_u16() {
-            204 => Ok(()),
-            404 => Err(ProviderError::R2MultipartInvalid),
+            204 => {
+                self.forget_upload_key(upload_id);
+                Ok(())
+            }
+            404 => {
+                self.forget_upload_key(upload_id);
+                Err(ProviderError::R2MultipartInvalid)
+            }
             _ => Err(self.s3_error(response, ctx.remaining()).await),
         }
     }
@@ -1615,6 +1729,7 @@ impl S3R2Provider {
                 if !(response.status().is_success() || response.status().as_u16() == 404) {
                     return Err(ProviderError::R2ProviderUnavailable);
                 }
+                self.forget_upload_key(&upload.upload_id);
                 aborted += 1;
             }
             if !page.truncated {
@@ -1628,5 +1743,51 @@ impl S3R2Provider {
                 return Err(ProviderError::R2ProviderUnavailable);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod ssec_tests {
+    use super::*;
+
+    #[test]
+    fn customer_key_headers_use_s3_base64_form() {
+        let key = R2SsecKey::parse(&"ab".repeat(32)).unwrap();
+        let headers = ssec_headers(Some(&key));
+        assert_eq!(
+            headers,
+            vec![
+                (
+                    "x-amz-server-side-encryption-customer-algorithm".to_string(),
+                    "AES256".to_string(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key".to_string(),
+                    B64.encode([0xabu8; 32]),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-MD5".to_string(),
+                    B64.encode(md5::compute([0xabu8; 32]).0),
+                ),
+            ]
+        );
+        // Tenant-visible form is hex, not base64 (Workers API docs).
+        assert_eq!(key.md5_hex(), hex::encode(md5::compute([0xabu8; 32]).0));
+        assert!(ssec_headers(None).is_empty());
+    }
+
+    #[test]
+    fn ssec_failure_classification_requires_a_supplied_key() {
+        let key = R2SsecKey::parse(&"cd".repeat(32)).unwrap();
+        assert_eq!(
+            classify_ssec_failure(400, Some(&key)),
+            Some(ProviderError::R2SsecInvalid)
+        );
+        assert_eq!(
+            classify_ssec_failure(403, Some(&key)),
+            Some(ProviderError::R2SsecInvalid)
+        );
+        assert_eq!(classify_ssec_failure(500, Some(&key)), None);
+        assert_eq!(classify_ssec_failure(400, None), None);
     }
 }

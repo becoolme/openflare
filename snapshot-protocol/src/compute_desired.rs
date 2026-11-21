@@ -20,7 +20,8 @@ use crate::envelope::{verify, ExpectedScope, RevisionGuard, TrustedKey, Verified
 use crate::error::SnapshotError;
 use crate::strict::MAX_SAFE_INTEGER;
 use chrono::{DateTime, NaiveDate, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 
 /// Snapshot kind this payload is carried under.
@@ -76,6 +77,8 @@ pub const MAX_REF_LEN: usize = 256;
 pub const MAX_WORKER_NAME_LEN: usize = 63;
 /// Maximum binding name length (JS identifier).
 pub const MAX_BINDING_NAME_LEN: usize = 64;
+/// Maximum compact-JSON size of a service binding's `props` object.
+pub const MAX_SERVICE_PROPS_BYTES: usize = 8 * 1024;
 /// Maximum route hostname length (DNS).
 pub const MAX_HOSTNAME_LEN: usize = 253;
 /// Maximum compatibility-flag token length.
@@ -451,6 +454,38 @@ pub struct ServiceBinding {
     /// and no tenant binding onto a platform-injected entrypoint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
+    /// Cloudflare `services[].props`: a JSON object surfaced as
+    /// `ctx.props` by the target `WorkerEntrypoint`. Absent is omitted on
+    /// the wire, so legacy snapshots keep their bytes. Only objects are
+    /// accepted ([`valid_service_props`]); an explicit `null` is not the
+    /// same as absent and fails closed.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_service_props",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub props: Option<Value>,
+}
+
+/// Decode `props` so an explicit JSON `null` stays `Some(Value::Null)` and
+/// is rejected by [`valid_service_props`], instead of being conflated with
+/// an absent field by `Option`'s default null handling.
+fn deserialize_service_props<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+/// Whether `props` is an acceptable service-binding `ctx.props` payload:
+/// a JSON object whose compact serialization is at most
+/// [`MAX_SERVICE_PROPS_BYTES`]. Cloudflare surfaces `props` as an object;
+/// scalars, arrays and `null` carry no documented shape and fail closed.
+pub fn valid_service_props(props: &Value) -> bool {
+    props.is_object()
+        && serde_json::to_vec(props)
+            .map(|bytes| bytes.len() <= MAX_SERVICE_PROPS_BYTES)
+            .unwrap_or(false)
 }
 
 /// Prefix of entrypoint names the platform injects into tenant workers
@@ -899,6 +934,12 @@ pub enum DesiredError {
     /// A service binding targets a worker outside the same tenant.
     #[error("service binding target is not in the same tenant")]
     ServiceTarget,
+    /// A service binding's `props` is not a JSON object, or its compact
+    /// serialization exceeds [`MAX_SERVICE_PROPS_BYTES`]. Cloudflare
+    /// surfaces `props` as `ctx.props`; malformed/oversized payloads fail
+    /// closed before they reach the signed render.
+    #[error("invalid service binding props")]
+    ServiceProps,
     /// T21/F4: service bindings form a directed cycle (A→B→A) — the
     /// runtime cannot bound such recursion inside workerd, so cyclic
     /// graphs are rejected outright (fail closed, never served).
@@ -962,6 +1003,7 @@ impl DesiredError {
             Self::CompatibilityDate => "DESIRED_INVALID_COMPATIBILITY_DATE",
             Self::CompatibilityFlag => "DESIRED_INVALID_COMPATIBILITY_FLAG",
             Self::ServiceTarget => "DESIRED_SERVICE_TARGET_SCOPE",
+            Self::ServiceProps => "DESIRED_SERVICE_PROPS",
             Self::CronExpression => "DESIRED_INVALID_CRON_EXPRESSION",
             Self::QuotaBounds(_) => "DESIRED_QUOTA_BOUNDS",
             Self::EnvelopeBinding => "DESIRED_ENVELOPE_BINDING",
@@ -1370,6 +1412,11 @@ impl WorkerDesired {
                     if let Some(ep) = &s.entrypoint {
                         if !valid_service_entrypoint(ep) {
                             return Err(DesiredError::Identifier("bindings.entrypoint"));
+                        }
+                    }
+                    if let Some(props) = &s.props {
+                        if !valid_service_props(props) {
+                            return Err(DesiredError::ServiceProps);
                         }
                     }
                 }
@@ -2170,6 +2217,42 @@ mod tests {
             ),
             ("service-ok-same-tenant", Box::new(|_| {}), ""),
             (
+                "service-props-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["props"] =
+                        json!({"region": "eu", "nested": {"n": 1}})
+                }),
+                "",
+            ),
+            (
+                "service-props-with-entrypoint-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("Greeter");
+                    v["tenants"][0]["workers"][0]["bindings"][5]["props"] = json!({"a": true});
+                }),
+                "",
+            ),
+            (
+                "service-props-not-object",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["props"] = json!([1, 2])
+                }),
+                "DESIRED_SERVICE_PROPS",
+            ),
+            (
+                "service-props-null",
+                Box::new(|v| v["tenants"][0]["workers"][0]["bindings"][5]["props"] = json!(null)),
+                "DESIRED_SERVICE_PROPS",
+            ),
+            (
+                "service-props-too-large",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["props"] =
+                        json!({"padding": "x".repeat(MAX_SERVICE_PROPS_BYTES)})
+                }),
+                "DESIRED_SERVICE_PROPS",
+            ),
+            (
                 "tail-consumer-ok-same-tenant",
                 Box::new(|v| {
                     v["tenants"][0]["workers"][0]["tailConsumers"] =
@@ -2870,6 +2953,64 @@ mod tests {
             {"type": "service", "name": "AUTH", "workerId": "w-2", "ns": "other"}
         );
         assert!(serde_json::from_value::<BindingDesired>(unknown).is_err());
+    }
+
+    #[test]
+    fn service_props_wire_shape() {
+        let legacy = serde_json::json!({"type": "service", "name": "AUTH", "workerId": "w-2"});
+        let b: BindingDesired = serde_json::from_value(legacy.clone()).unwrap();
+        let BindingDesired::Service(s) = &b else { panic!() };
+        assert_eq!(s.props, None);
+        // Absent stays absent: byte-identical to the pre-props wire form.
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"type":"service","name":"AUTH","workerId":"w-2"}"#
+        );
+
+        let with_props = serde_json::json!({
+            "type": "service", "name": "AUTH", "workerId": "w-2",
+            "props": {"b": true, "a": {"n": 1}}
+        });
+        let b: BindingDesired = serde_json::from_value(with_props).unwrap();
+        let BindingDesired::Service(s) = &b else { panic!() };
+        assert_eq!(s.props, Some(serde_json::json!({"b": true, "a": {"n": 1}})));
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"type":"service","name":"AUTH","workerId":"w-2","props":{"a":{"n":1},"b":true}}"#
+        );
+
+        // A sibling unknown field still fails closed even with props.
+        let unknown = serde_json::json!(
+            {"type": "service", "name": "AUTH", "workerId": "w-2", "props": {}, "ns": "other"}
+        );
+        assert!(serde_json::from_value::<BindingDesired>(unknown).is_err());
+
+        // An explicit `null` decodes as a present value so validation can
+        // reject it — it never silently degrades to "absent".
+        let null_props =
+            serde_json::json!({"type": "service", "name": "AUTH", "workerId": "w-2", "props": null});
+        let b: BindingDesired = serde_json::from_value(null_props).unwrap();
+        let BindingDesired::Service(s) = &b else { panic!() };
+        assert_eq!(s.props, Some(serde_json::Value::Null));
+    }
+
+    #[test]
+    fn service_props_rules() {
+        assert!(valid_service_props(&serde_json::json!({})));
+        assert!(valid_service_props(&serde_json::json!({
+            "a": [1, "x", null, {"b": true}]
+        })));
+        let at_limit = serde_json::json!({"padding": "x".repeat(MAX_SERVICE_PROPS_BYTES - 32)});
+        assert!(valid_service_props(&at_limit));
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!("s"),
+            serde_json::json!(1),
+            serde_json::json!({"padding": "x".repeat(MAX_SERVICE_PROPS_BYTES)}),
+        ] {
+            assert!(!valid_service_props(&bad), "{bad}");
+        }
     }
 
     #[test]

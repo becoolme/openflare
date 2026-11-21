@@ -282,15 +282,48 @@ fn checksum_parse_and_verify() {
         <PutWireOptions as TryInto<vrt_provider::r2::R2PutOptions>>::try_into(options),
         Err(ProviderError::R2InvalidOptions)
     ));
-    // ssec → R2SsecInvalid
+    // ssec: workerd forwards a 32-byte key as 64 lowercase hex chars —
+    // accepted and carried into the backend (never silently dropped).
+    let ssec_hex = "ab".repeat(32);
     let options: PutWireOptions = serde_json::from_value(json!({
-        "ssecKey": "ab".repeat(32)
+        "ssecKey": ssec_hex
     }))
     .unwrap();
-    assert!(matches!(
-        <PutWireOptions as TryInto<vrt_provider::r2::R2PutOptions>>::try_into(options),
-        Err(ProviderError::R2SsecInvalid)
-    ));
+    let parsed: vrt_provider::r2::R2PutOptions = options.try_into().unwrap();
+    assert_eq!(
+        parsed.ssec_key,
+        Some(vrt_provider::r2::R2SsecKey::parse(&ssec_hex).unwrap())
+    );
+    // Malformed key material (wrong length, non-hex/base64 input) is
+    // rejected at the typed boundary.
+    let base64_form =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0xabu8; 32]);
+    for bad in [
+        "ab".repeat(31), // 62 chars
+        "ab".repeat(33), // 66 chars
+        "zz".repeat(32), // not hex
+        "A".repeat(64),  // workerd only forwards lowercase hex
+        "a".repeat(63),  // odd length
+        base64_form,     // 44-char base64, not the wire form
+    ] {
+        let options: PutWireOptions = serde_json::from_value(json!({
+            "ssecKey": bad
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                <PutWireOptions as TryInto<vrt_provider::r2::R2PutOptions>>::try_into(options),
+                Err(ProviderError::R2SsecInvalid)
+            ),
+            "accepted malformed SSE-C key {bad:?}"
+        );
+    }
+    // Get options decode the same wire form.
+    let get: wire::GetOptions = serde_json::from_value(json!({
+        "ssecKey": ssec_hex
+    }))
+    .unwrap();
+    assert_eq!(get.ssec_key.as_deref(), Some(ssec_hex.as_str()));
     // storage class parse
     let options: PutWireOptions = serde_json::from_value(json!({
         "storageClass": "InfrequentAccess"

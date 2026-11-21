@@ -195,9 +195,10 @@ impl QueueTargetToml {
 }
 
 /// `[bindings.service]` value: either the target worker name (default
-/// entrypoint, the original wire shape) or `{ service, entrypoint }` for a
-/// named `WorkerEntrypoint` export. The plain-string form serializes exactly
-/// as before, so existing packages keep their bytes.
+/// entrypoint, the original wire shape) or a table with the target plus an
+/// optional named `WorkerEntrypoint` export and/or `props` object. The
+/// plain-string form serializes exactly as before, so existing packages
+/// keep their bytes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub(crate) enum ServiceTargetToml {
@@ -209,7 +210,12 @@ pub(crate) enum ServiceTargetToml {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NamedServiceTargetToml {
     pub(crate) service: String,
-    pub(crate) entrypoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) entrypoint: Option<String>,
+    /// Cloudflare `services[].props` — a JSON object surfaced as
+    /// `ctx.props` on the target entrypoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) props: Option<serde_json::Value>,
 }
 
 impl ServiceTargetToml {
@@ -223,7 +229,14 @@ impl ServiceTargetToml {
     pub(crate) fn entrypoint(&self) -> Option<&str> {
         match self {
             Self::Worker(_) => None,
-            Self::Named(n) => Some(&n.entrypoint),
+            Self::Named(n) => n.entrypoint.as_deref(),
+        }
+    }
+
+    pub(crate) fn props(&self) -> Option<&serde_json::Value> {
+        match self {
+            Self::Worker(_) => None,
+            Self::Named(n) => n.props.as_ref(),
         }
     }
 }
@@ -1039,10 +1052,17 @@ pub fn assemble(
                     return Err(LocalError::Worker("service entrypoint"));
                 }
             }
+            let props = target.props().cloned();
+            if let Some(props) = &props {
+                if !snapshot_protocol::compute_desired::valid_service_props(props) {
+                    return Err(LocalError::Worker("service props"));
+                }
+            }
             bindings.push(BindingDesired::Service(ServiceBinding {
                 name: binding.clone(),
                 worker_id,
                 entrypoint,
+                props,
             }));
         }
         for (binding, digest) in &b.assets {
