@@ -1048,6 +1048,20 @@ pub const CUSTOM_HEADER_NAMES: &str = "x-open-compute-asset-header-names";
 const MAX_CUSTOM_HEADER_NAMES: usize = assets_headers::MAX_FORWARDED_NAMES;
 const MAX_CUSTOM_HEADER_NAME_BYTES: usize = assets_headers::MAX_FORWARDED_NAME_BYTES;
 
+/// Apply the manifest's `_headers` to one response, then advertise the
+/// touched names for the facade.
+///
+/// Cloudflare applies `_headers` to *every* response its asset handler
+/// produces — `attachCustomHeaders` is the single return of
+/// `handleRequest` (`asset-worker/src/handler.ts:324-364`), so served
+/// assets, 304s, html-handling 307s and authored `_redirects` 3xx are
+/// all covered. "Redirects are applied before headers" describes the
+/// routing order, not the set of responses the header rules reach.
+fn apply_header_rules(response: &mut Response<Body>, rules: &[HeaderRule], path: &str) {
+    let names = assets_headers::apply_headers(rules, path, response.headers_mut());
+    attach_custom_header_names(response, names);
+}
+
 fn attach_custom_header_names(response: &mut Response<Body>, names: Vec<String>) {
     if names.is_empty() {
         return;
@@ -1185,6 +1199,11 @@ pub fn fetch(
             let mut r = Response::new(Body::empty());
             *r.status_mut() = code;
             r.headers_mut().insert(header::LOCATION, location);
+            // Cloudflare routes the authored redirect through the same
+            // `attachCustomHeaders` tail, so `_headers` applies here too.
+            if let Some(rules) = header_rules.as_deref() {
+                apply_header_rules(&mut r, rules, &path);
+            }
             crate::metrics::assets_outcome(&worker_id, "redirect");
             return r;
         }
@@ -1249,10 +1268,11 @@ pub fn fetch(
         }
     };
     let is_404_page = matches!(resolved, Resolved::NotFoundPage(_));
-    let header_applicable = matches!(
-        resolved,
-        Resolved::Serve(_) | Resolved::SpaFallback(_) | Resolved::NotFoundPage(_)
-    );
+    // Cloudflare's `attachCustomHeaders` tail covers every asset response,
+    // including html-handling 307s (`handler.test.ts` "Custom headers are
+    // applied even to redirect responses"). Only the typed protocol 404 —
+    // an internal error surface, not an asset response — bypasses it.
+    let header_applicable = !matches!(resolved, Resolved::NotFound);
     let mut response = match resolved {
         Resolved::Redirect(to) => redirect_location(&encode_path(&to)),
         Resolved::NotFound => typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND),
@@ -1296,8 +1316,7 @@ pub fn fetch(
                     r.headers_mut().insert(header::ETAG, v);
                 }
                 if let Some(rules) = header_rules.as_deref() {
-                    let names = assets_headers::apply_headers(rules, &path, r.headers_mut());
-                    attach_custom_header_names(&mut r, names);
+                    apply_header_rules(&mut r, rules, &path);
                 }
                 crate::metrics::assets_outcome(&worker_id, "not_modified");
                 return r;
@@ -1322,8 +1341,7 @@ pub fn fetch(
     };
     if header_applicable {
         if let Some(rules) = header_rules.as_deref() {
-            let names = assets_headers::apply_headers(rules, &path, response.headers_mut());
-            attach_custom_header_names(&mut response, names);
+            apply_header_rules(&mut response, rules, &path);
         }
     }
     if matches!(response.status(), StatusCode::NOT_FOUND) && outcome == "not_found" {
