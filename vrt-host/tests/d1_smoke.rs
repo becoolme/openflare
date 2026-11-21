@@ -474,6 +474,7 @@ fn render_cfg(dir: &Path, port: u16, sql_port: u16, db_id: &str) -> (PathBuf, Ve
                 .iter()
                 .any(|w| !w.durable_object_classes.is_empty()),
             false,
+            false,
         ),
     )
 }
@@ -1390,6 +1391,7 @@ fn render_queue_cfg_full(
                 .iter()
                 .any(|w| !w.durable_object_classes.is_empty()),
             false,
+            false,
         ),
     )
 }
@@ -2092,6 +2094,7 @@ fn render_do_cfg(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf, Strin
             .workers
             .iter()
             .any(|w| !w.durable_object_classes.is_empty()),
+        false,
         false,
     );
     assert!(argv.iter().any(|a| a == "--experimental"), "{argv:?}");

@@ -132,6 +132,10 @@ pub(crate) struct BindingsToml {
     pub(crate) service: BTreeMap<String, ServiceTargetToml>,
     #[serde(default)]
     pub(crate) assets: BTreeMap<String, String>,
+    /// Dynamic Workers loader bindings — binding names only; a loader
+    /// points at no resource (the tenant supplies the code at runtime).
+    #[serde(default)]
+    pub(crate) worker_loaders: Vec<String>,
 }
 
 /// `[bindings].ratelimit.<name>` normalized shape.
@@ -886,6 +890,13 @@ pub fn assemble(
                 assets_first: None,
                 run_worker_first: None,
             }));
+        }
+        for binding in &b.worker_loaders {
+            bindings.push(BindingDesired::WorkerLoader(
+                snapshot_protocol::compute_desired::WorkerLoaderBinding {
+                    name: binding.clone(),
+                },
+            ));
         }
     }
     for b in &overrides.bindings {

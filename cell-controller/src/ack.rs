@@ -133,6 +133,13 @@ pub struct AckCapabilities {
     /// cells that claim it. Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub service_entrypoint: bool,
+    /// `workerLoader` bindings render to the pinned fork's
+    /// `workerLoader = (maxWorkers=N)` capnp — a cell on an older
+    /// workerd pin would fail to parse the whole worker config, so the
+    /// control plane only admits loader bindings onto cells that claim
+    /// it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worker_loader: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

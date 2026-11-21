@@ -286,6 +286,7 @@ fn render_do(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf) {
             .iter()
             .any(|w| !w.durable_object_classes.is_empty()),
         false,
+        false,
     );
     argv.extend(vrt_host::launch::external_addr_args(&out.external_addrs));
     (cfg, argv, do_root)

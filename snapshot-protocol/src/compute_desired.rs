@@ -275,6 +275,11 @@ pub enum BindingDesired {
     /// stub factory (`idFromName`/`get`); the namespace's SQLite
     /// storage lives under the declaring worker's `localDisk` dir.
     DurableObject(DoBindingDesired),
+    /// `{"type":"workerLoader"}` — Dynamic Workers loader (`env.<name>`
+    /// is a `WorkerLoader`: `.get(name, () => code)` / `.load(code)`).
+    /// Points at no provider resource; the tenant supplies code at
+    /// runtime. Rendered as workerd `workerLoader` (experimental).
+    WorkerLoader(WorkerLoaderBinding),
 }
 
 /// `{"type":"var"}` — see [`BindingDesired::Var`].
@@ -487,6 +492,18 @@ pub struct DoBindingDesired {
     /// (never a client-supplied storage id). `None` = own worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_worker_id: Option<String>,
+}
+
+/// `{"type":"workerLoader"}` — a Dynamic Workers `WorkerLoader`
+/// binding. The worker supplies dynamic code at runtime through the
+/// binding's `get()`/`load()` callbacks; the binding itself carries no
+/// resource reference — the loader's live-worker bound is a platform
+/// constant emitted at capnp render time.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerLoaderBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
 }
 
 /// P3c-1 `durableObjectClasses[]`: one DO class declared by this worker.
@@ -1276,6 +1293,10 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.queueName"));
                     }
                 }
+                // WorkerLoader carries no resource reference — `name`
+                // (validated as a binding name at the match head) is
+                // the only field.
+                BindingDesired::WorkerLoader(_) => {}
             }
         }
         Ok(())
@@ -1445,6 +1466,7 @@ impl BindingDesired {
             Self::D1(b) => &b.name,
             Self::Queue(b) => &b.name,
             Self::DurableObject(b) => &b.name,
+            Self::WorkerLoader(b) => &b.name,
         }
     }
 
@@ -1464,7 +1486,8 @@ impl BindingDesired {
             | Self::Secret(_)
             | Self::Service(_)
             | Self::DurableObject(_)
-            | Self::Ratelimit(_) => None,
+            | Self::Ratelimit(_)
+            | Self::WorkerLoader(_) => None,
         }
     }
 }

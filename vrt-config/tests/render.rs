@@ -1162,3 +1162,27 @@ fn route_error_reasons_match_across_languages() {
         "reason enum drift between router-wire.ts and ingress.rs"
     );
 }
+
+/// Dynamic Workers (`worker_loader` bindings) render the native
+/// workerd `workerLoader` group with the platform quota — and nothing
+/// else: a loader carries no resource reference, so no service/socket
+/// may be wired for it.
+#[test]
+fn worker_loader_binding_renders_native_loader() {
+    let mut tenant = tenant();
+    tenant.workers[0].bindings = serde_json::from_value(serde_json::json!([
+        {"type": "workerLoader", "name": "LOADER"}
+    ]))
+    .unwrap();
+    let bs = bundles();
+    let out = render_tenant_config(&input(&tenant, &bs, &runtime_params()))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains("(name = \"LOADER\", workerLoader = (maxWorkers = 32))"),
+        "workerLoader group with platform quota must render:\n{out}"
+    );
+    // The only LOADER occurrence is the binding line itself — a loader
+    // wires no service, socket, or facade reference.
+    assert_eq!(out.matches("\"LOADER\"").count(), 1, "{out}");
+}

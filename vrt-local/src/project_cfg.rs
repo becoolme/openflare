@@ -76,6 +76,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "tail_consumers",
     "secrets",
     "secrets_store_secrets",
+    "worker_loaders",
 ];
 /// Mirrors @wdl-dev/cli TOP_LEVEL_ONLY_ENV_KEYS.
 const TOP_LEVEL_ONLY_ENV_KEYS: &[&str] = &["name", "keep_vars", "send_metrics"];
@@ -813,6 +814,32 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     {
                         b.insert("entrypoint".into(), Value::from(ep));
                     }
+                    bindings.push(Value::Object(b));
+                }
+            }
+            "worker_loaders" => {
+                // Dynamic Workers (CF `[[worker_loaders]]`): a loader
+                // carries only a binding name — the tenant supplies code
+                // at runtime via `env.<binding>.get()/.load()`. Any
+                // other key fails closed.
+                for (i, e) in table_list(value, "worker_loaders")?.iter().enumerate() {
+                    for k in e.keys() {
+                        if k != "binding" {
+                            return Err(unsupported(
+                                &format!("worker_loaders[{i}].{k}"),
+                                None,
+                            ));
+                        }
+                    }
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("workerLoader"));
+                    b.insert(
+                        "name".into(),
+                        Value::from(req_str(
+                            e.get("binding").unwrap_or(&Value::Null),
+                            &format!("worker_loaders[{i}].binding"),
+                        )?),
+                    );
                     bindings.push(Value::Object(b));
                 }
             }
@@ -1594,6 +1621,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut pg = Map::new();
         let mut hyperdrive = Map::new();
         let mut ratelimit = Map::new();
+        let mut worker_loaders = Vec::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1668,6 +1696,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     }
                     ratelimit.insert(name.into(), Value::Object(config));
                 }
+                "workerLoader" => {
+                    worker_loaders.push(Value::from(name));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -1709,6 +1740,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !ratelimit.is_empty() {
             bind.insert("ratelimit".into(), Value::Object(ratelimit));
+        }
+        if !worker_loaders.is_empty() {
+            bind.insert("workerLoaders".into(), Value::Array(worker_loaders));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));
@@ -1978,6 +2012,45 @@ mod tests {
         // Plain string serializes exactly as before.
         let json = serde_json::to_string(&b.service.get("A").unwrap()).unwrap();
         assert_eq!(json, "\"t\"");
+    }
+
+    fn wrangler_loader_body(extra: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.toml"),
+            format!(
+                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn worker_loaders_into_pack_shape() {
+        let dir = wrangler_loader_body("[[worker_loaders]]\nbinding=\"LOADER\"\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(
+            meta.bindings.unwrap().worker_loaders,
+            vec!["LOADER".to_string()]
+        );
+    }
+
+    #[test]
+    fn worker_loaders_fail_closed() {
+        // Unknown field under the array table.
+        let dir = wrangler_loader_body("[[worker_loaders]]\nbinding=\"L\"\nid=\"x\"\n");
+        let err = load_worker_meta(dir.path()).expect_err("unknown key must fail");
+        assert!(format!("{err:?}").contains("worker_loaders[0].id"), "{err:?}");
+        // Missing binding.
+        let dir = wrangler_loader_body("[[worker_loaders]]\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // Non-string binding.
+        let dir = wrangler_loader_body("[[worker_loaders]]\nbinding=1\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // Not an array of tables.
+        let dir = wrangler_loader_body("worker_loaders=\"L\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
     }
 }
 

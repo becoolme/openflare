@@ -1453,9 +1453,31 @@ fn emit_binding(
                 &pg.name,
             )?;
         }
+        BindingDesired::WorkerLoader(loader) => {
+            // workerLoader is `$experimental`-gated upstream — assemble
+            // adds `--experimental` to argv when a tenant declares one.
+            // `maxWorkers` is the fork's quota field: bounds how many
+            // dynamic workers this loader may hold live at once (named
+            // cache entries and one-shot `load()` alike). Absent on a
+            // stock binary the config would not parse — the platform
+            // pins the fork release that defines it.
+            out.push_str(&format!(
+                "        (name = {}, workerLoader = (maxWorkers = {})),\n",
+                capnp_text(&loader.name),
+                WORKER_LOADER_MAX_WORKERS,
+            ));
+        }
     }
     Ok(())
 }
+
+/// Platform cap on live workers one `workerLoader` binding may hold —
+/// the binding carries no tenant knob (Cloudflare exposes none), so a
+/// single platform constant guards a tenant workerd's memory: each
+/// live worker holds a compiled isolate. Cloudflare documents no
+/// public bound; 32 leaves room for per-user plugin/dispatch use cases
+/// while still bounding a runaway `get()` loop.
+const WORKER_LOADER_MAX_WORKERS: u32 = 32;
 
 /// MIG-15: synthetic internal TCP targets derived from this tenant's
 /// hyperdrive bindings — the ONLY producer of

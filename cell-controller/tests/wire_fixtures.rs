@@ -179,6 +179,7 @@ fn desired_ack_fixture() {
             kv: false,
             r2: false,
             service_entrypoint: true,
+            worker_loader: true,
         }),
     };
     check(
@@ -282,8 +283,17 @@ fn kv_capability_wire_shape() {
     })
     .unwrap();
     assert_eq!(ep_on["serviceEntrypoint"], serde_json::json!(true));
+    // WorkerLoader bindings: same omit-while-false shape.
+    assert!(off.get("workerLoader").is_none());
+    let wl_on = serde_json::to_value(AckCapabilities {
+        worker_loader: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(wl_on["workerLoader"], serde_json::json!(true));
     let back: AckCapabilities =
         serde_json::from_value(serde_json::json!({"cron": true, "assets": true})).unwrap();
     assert!(!back.kv);
     assert!(!back.service_entrypoint);
+    assert!(!back.worker_loader);
 }

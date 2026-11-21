@@ -728,6 +728,14 @@ impl Assembler {
                 .iter()
                 .any(|w| !w.durable_object_classes.is_empty() || !w.workflows.is_empty()),
             tenant.workers.iter().any(|w| !w.crons.is_empty()),
+            tenant.workers.iter().any(|w| {
+                w.bindings.iter().any(|b| {
+                    matches!(
+                        b,
+                        snapshot_protocol::compute_desired::BindingDesired::WorkerLoader(_)
+                    )
+                })
+            }),
         ) {
             if !extra_args.iter().any(|e| e == &a) {
                 extra_args.push(a);
@@ -948,6 +956,14 @@ impl Assembler {
                 .iter()
                 .any(|w| !w.durable_object_classes.is_empty() || !w.workflows.is_empty()),
             tenant.workers.iter().any(|w| !w.crons.is_empty()),
+            tenant.workers.iter().any(|w| {
+                w.bindings.iter().any(|b| {
+                    matches!(
+                        b,
+                        snapshot_protocol::compute_desired::BindingDesired::WorkerLoader(_)
+                    )
+                })
+            }),
         ) {
             if !extra_args.iter().any(|e| e == &a) {
                 extra_args.push(a);
@@ -1248,10 +1264,12 @@ pub fn experimental_extra_args(
     tenant_has_queue_consumers: bool,
     tenant_has_durable_objects: bool,
     tenant_has_crons: bool,
+    tenant_has_worker_loaders: bool,
 ) -> Vec<String> {
     let needs = tenant_has_queue_consumers
         || tenant_has_durable_objects
         || tenant_has_crons
+        || tenant_has_worker_loaders
         || system_compat_flags
             .iter()
             .any(|f| f != "experimental" && vrt_config::is_experimental_compat_flag(f));

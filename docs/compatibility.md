@@ -95,6 +95,13 @@ These are not tied to one binding.
   `html_handling` limited to `auto-trailing-slash` | `none`.
 - **`vars` non-string values arrive as JSON-encoded strings**, not
   typed JSON values.
+- **Worker loaders** (`[[worker_loaders]]`): native `WorkerLoader`
+  (`get`/`load`) on the pinned workerd fork. The loading worker
+  supplies all dynamic code at runtime; `WorkerCode.limits` and
+  per-entrypoint `{limits}` are enforced (lower-of-two, bounded by the
+  loading worker's own limits group). Live workers per loader are
+  bounded by a platform quota (32); there is no per-tenant
+  `dispatch_namespaces` counterpart.
 - **No D1 migrations runner** — `migrations_dir` is an unsupported key.
 - **Routes**: only plain hostnames and `<fqdn>/*` patterns; no zone
   management, no `custom_domain`.
@@ -108,8 +115,8 @@ Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 (`ai`), Vectorize (`vectorize`), AI Search (`ai_search`,
 `ai_search_namespaces`), Analytics Engine (`analytics_engine_datasets`),
 Tail Workers (`tail_consumers`), Secrets Store
-(`secrets_store_secrets`), Pipelines, Workers for Platforms
-(`dispatch_namespaces`, `worker_loaders`), `send_email`,
+(`secrets_store_secrets`), Pipelines, dispatch namespaces
+(`dispatch_namespaces`), `send_email`,
 `mtls_certificates`, `browser`, `containers`, `unsafe`, raw
 `wasm_modules`/`text_blobs`/`data_blobs`/`version_metadata` upload keys.
 
@@ -126,6 +133,11 @@ Runtime failures visible at ingress carry platform codes documented in
 [`docs/log-codes.md`](log-codes.md).
 
 ## Changelog
+
+- 2026-11-20: Worker loaders (`[[worker_loaders]]` → native `WorkerLoader`
+  bindings, `get`/`load`, named cache, dynamic entrypoints and DO facets)
+  are now supported on the pinned forked workerd; the platform bounds live
+  dynamic workers per loader.
 
 - 2026-11-20: Re-vendored the compatibility flag schema
   (`vrt-config/compat/compatibility-date.capnp`) from the pinned workerd

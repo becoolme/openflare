@@ -40,7 +40,8 @@ host/provider configuration, not per-binding provider plug-ins.
 | `ai_search` / `ai_search_namespaces` | Unsupported | Same typed deploy error. |
 | Tail Workers (`tail_consumers`) | Unsupported | Same typed deploy error. (OpenFlare uses an internal tail worker per tenant for logs; it is not user-configurable.) |
 | Analytics Engine (`analytics_engine_datasets`) | Unsupported | Same typed deploy error. |
-| `send_email`, `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`, `containers`, `wasm_modules`, `text_blobs`, `data_blobs`, `version_metadata`, `unsafe`, `placement.mode`, `secrets_store_secrets`, `worker_loaders` | Unsupported | Same typed deploy error — the key names the field, e.g. `[VRT_CONFIG_UNSUPPORTED_FIELD] ai is not supported by the VRT runtime`. |
+| [Worker loaders](worker-loaders.md) | Partial | `[[worker_loaders]]` → a native `WorkerLoader` binding (`get`/`load`, named cache, dynamic entrypoints and Durable Object facets, `WorkerCode.limits` honoured). The tenant supplies all code at runtime; a platform quota bounds live workers per loader. |
+| `send_email`, `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`, `containers`, `wasm_modules`, `text_blobs`, `data_blobs`, `version_metadata`, `unsafe`, `placement.mode`, `secrets_store_secrets` | Unsupported | Same typed deploy error — the key names the field, e.g. `[VRT_CONFIG_UNSUPPORTED_FIELD] ai is not supported by the VRT runtime`. |
 
 The definitive list of accepted wrangler keys lives in
 [`docs/wrangler-config.md`](../wrangler-config.md); the platform-level
