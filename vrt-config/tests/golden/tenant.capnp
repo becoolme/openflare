@@ -54,7 +54,7 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-assets.js", esModule = embed "sys/fdec0a4690220c46620fa5aebc6a1f819a169fd2b30eac34334d7c746b9db1c4"),
+        (name = "facade/facade-assets.js", esModule = embed "sys/022859b9f78333db380453fa953d92d9293f2524c2b5c8da8679ae5d21fb8f08"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
         (name = "facade/router-wire.js", esModule = embed "sys/e6dda1dd32f372b5ef8d1d092691a7dc9b6fb60e30cd71a9ab713c979e957ee9"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
