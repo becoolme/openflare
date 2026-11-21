@@ -54,7 +54,9 @@ None — no data plane. The claim log lives under the state root
   names `JAN`-`DEC` / `SUN`-`SAT`, `*`, lists, ranges, and steps), at minute
   granularity — validated at deploy in `snapshot-protocol`'s
   `compute_desired`. Numeric weekdays follow Cloudflare's mapping: `1` is
-  Sunday through `7` Saturday; `0` is invalid. There is no seconds field.
+  Sunday through `7` Saturday; `0` is invalid. Cloudflare's day modifiers
+  `L`, `LW`, `nW`, `dL`, and `d#n` are supported. There is no seconds field.
+  Other syntax such as `?` or a year field is rejected during validation.
 - Standalone derives `scheduleId` deterministically (`cfg:{name}:{i}`)
   from the wrangler `triggers.crons` array index.
 - `scheduledTime` is the canonical minute the cron fires on; the worker
@@ -72,6 +74,9 @@ None — no data plane. The claim log lives under the state root
 
 ## Examples and tests
 
+- Supported modifiers: `0 0 L * *` (last day), `0 0 LW * *` (last
+  weekday), `0 0 15W * *` (weekday nearest the 15th), `0 18 * * 6L`
+  (last Friday), and `0 0 * * MON#2` (second Monday).
 - `examples/standalone-cron` — `* * * * *` trigger writing to D1 as a
   durable side effect.
 - `vrt-host/tests/cron_smoke.rs` — cron end-to-end smoke test (skips
@@ -82,3 +87,4 @@ None — no data plane. The claim log lives under the state root
 ## Changelog
 
 - 2026-11-20: Align numeric weekday matching and validation with Cloudflare (`1` = Sunday, `7` = Saturday).
+- 2026-11-20: Add Cloudflare cron day modifiers `L`, `LW`, `nW`, `dL`, and `d#n` to validation and scheduling.
