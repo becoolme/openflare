@@ -1062,6 +1062,9 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         "must be in [0,1]",
                     ));
                 }
+                // PPM integer — the signed wire's canonical JSON is
+                // safe-integer-only (deterministic across Rust/TS).
+                let ppm = (rate * 1_000_000.0).round() as u64;
                 let mut o = Map::new();
                 o.insert("enabled".into(), Value::from(enabled.unwrap_or(true)));
                 o.insert(
@@ -1072,7 +1075,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     "invocationLogs".into(),
                     Value::from(invocation_logs.unwrap_or(true)),
                 );
-                o.insert("headSamplingRate".into(), Value::from(rate));
+                o.insert("headSamplingRatePpm".into(), Value::from(ppm));
                 out.insert("observability".into(), Value::Object(o));
             }
             "unsafe" => {
@@ -2539,13 +2542,13 @@ mod tests {
         assert!(obs.enabled);
         assert!(obs.logs_enabled);
         assert!(!obs.invocation_logs);
-        assert_eq!(obs.head_sampling_rate, 0.3);
+        assert_eq!(obs.head_sampling_rate_ppm, 300_000);
         // `logs.head_sampling_rate` is the modern slot; folded the same.
         let dir =
             wrangler_loader_body("[observability.logs]\nhead_sampling_rate=0.5\nenabled=false\n");
         let (meta, _) = load_worker_meta(dir.path()).unwrap();
         let obs = meta.observability.unwrap();
-        assert_eq!(obs.head_sampling_rate, 0.5);
+        assert_eq!(obs.head_sampling_rate_ppm, 500_000);
         assert!(!obs.logs_enabled);
     }
 
@@ -2555,7 +2558,7 @@ mod tests {
         let dir = wrangler_loader_body("[observability]\n");
         let (meta, _) = load_worker_meta(dir.path()).unwrap();
         let obs = meta.observability.unwrap();
-        assert_eq!(obs.head_sampling_rate, 1.0);
+        assert_eq!(obs.head_sampling_rate_ppm, 1_000_000);
         assert!(obs.enabled && obs.logs_enabled && obs.invocation_logs);
         // Deprecated alias AND `logs.head_sampling_rate` together is
         // ambiguous — fail closed rather than guess precedence.

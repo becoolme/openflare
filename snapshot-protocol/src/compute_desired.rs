@@ -259,7 +259,7 @@ pub struct WorkerDesired {
 /// and the deprecated top-level `head_sampling_rate` alias are folded
 /// at parse). `traces`/`persist`/`destinations` have no counterpart
 /// and are rejected upstream.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObservabilityDesired {
     /// Master gate (`observability.enabled`, default true).
@@ -268,23 +268,18 @@ pub struct ObservabilityDesired {
     /// `enabled && logsEnabled == false` => no collection at all —
     /// the cell emits no `vrt-tail` collector for the worker.
     pub logs_enabled: bool,
-    /// Head sampling rate in [0,1] (`logs.headSamplingRate`, with
-    /// the deprecated top-level alias folded in): fraction of
-    /// INVOCATIONS whose records are kept, decided per-invocation —
-    /// a dropped invocation keeps none of its log/exception/outcome
-    /// records.
-    pub head_sampling_rate: f64,
+    /// Head sampling rate in parts-per-million [0,1_000_000]
+    /// (`logs.headSamplingRate`, with the deprecated top-level alias
+    /// folded in): fraction of INVOCATIONS whose records are kept,
+    /// decided per-invocation — a dropped invocation keeps none of
+    /// its log/exception/outcome records. Integer ppm because the
+    /// signed wire's canonical JSON carries safe integers only.
+    pub head_sampling_rate_ppm: u32,
     /// `observability.logs.invocation_logs` (default true) — false
     /// drops only the `outcome` (invocation) record; console and
     /// exception records still collect.
     pub invocation_logs: bool,
 }
-
-// f64 has no derived Eq, but `WorkerDesired` is Eq — safe here: JSON
-// cannot carry NaN (serde_json serializes it as `null`, which the
-// parser rejects), and `validate` bounds the rate to [0,1], so every
-// reachable value is reflexive.
-impl Eq for ObservabilityDesired {}
 
 /// One `tail_consumers[]` entry — the CONSUMER of this worker's tail
 /// events. Points at a worker of the same tenant by `workerId`.
@@ -1209,9 +1204,7 @@ impl ComputeDesired {
                     }
                 }
                 if let Some(obs) = &worker.observability {
-                    if !obs.head_sampling_rate.is_finite()
-                        || !(0.0..=1.0).contains(&obs.head_sampling_rate)
-                    {
+                    if obs.head_sampling_rate_ppm > 1_000_000 {
                         return Err(DesiredError::ObservabilityBounds);
                     }
                 }
@@ -2421,7 +2414,7 @@ mod tests {
                         "enabled": true,
                         "logsEnabled": true,
                         "invocationLogs": false,
-                        "headSamplingRate": 0.25
+                        "headSamplingRatePpm": 250000
                     })
                 }),
                 "",
@@ -2433,7 +2426,7 @@ mod tests {
                         "enabled": true,
                         "logsEnabled": true,
                         "invocationLogs": true,
-                        "headSamplingRate": 1.5
+                        "headSamplingRatePpm": 1500000
                     })
                 }),
                 "DESIRED_OBSERVABILITY_BOUNDS",
@@ -2445,7 +2438,7 @@ mod tests {
                         "enabled": true,
                         "logsEnabled": true,
                         "invocationLogs": true,
-                        "headSamplingRate": -0.1
+                        "headSamplingRatePpm": 1000001
                     })
                 }),
                 "DESIRED_OBSERVABILITY_BOUNDS",

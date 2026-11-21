@@ -49,10 +49,10 @@ fn assets_binding_props_carry_tenant_namespaced_key() {
 #[test]
 fn observability_gates_tail_collector() {
     use snapshot_protocol::compute_desired::ObservabilityDesired;
-    let obs = |enabled, logs_enabled, rate, il| ObservabilityDesired {
+    let obs = |enabled, logs_enabled, rate_ppm, il| ObservabilityDesired {
         enabled,
         logs_enabled,
-        head_sampling_rate: rate,
+        head_sampling_rate_ppm: rate_ppm,
         invocation_logs: il,
     };
     let mut params = runtime_params();
@@ -61,7 +61,10 @@ fn observability_gates_tail_collector() {
     let bs = bundles();
 
     // `enabled = false` / `logs.enabled = false` — no collector at all.
-    for o in [obs(false, true, 1.0, true), obs(true, false, 1.0, true)] {
+    for o in [
+        obs(false, true, 1_000_000, true),
+        obs(true, false, 1_000_000, true),
+    ] {
         let mut t = tenant();
         t.workers[0].observability = Some(o.clone());
         let out = render_tenant_config(&input(&t, &bs, &params)).unwrap().text;
@@ -73,7 +76,7 @@ fn observability_gates_tail_collector() {
 
     // Enabled with sampling: collector emits with the OBS settings.
     let mut t = tenant();
-    t.workers[0].observability = Some(obs(true, true, 0.3, false));
+    t.workers[0].observability = Some(obs(true, true, 300_000, false));
     let out = render_tenant_config(&input(&t, &bs, &params)).unwrap().text;
     assert!(out.contains("vrt-tail-w-alpha-1"));
     assert!(

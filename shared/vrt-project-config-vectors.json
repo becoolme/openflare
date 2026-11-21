@@ -1,6 +1,6 @@
 {
  "version": 1,
- "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here — that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
+ "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here \u2014 that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
  "vectors": [
   {
    "name": "toml full mapping",
@@ -925,6 +925,72 @@
     "ok": false,
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "version_metadata.scope"
+   }
+  },
+  {
+   "name": "observability gates and head sampling normalize to effective config",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability]\nenabled = true\nhead_sampling_rate = 0.3\n\n[observability.logs]\ninvocation_logs = false\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "observability": {
+      "enabled": true,
+      "logsEnabled": true,
+      "invocationLogs": false,
+      "headSamplingRatePpm": 300000
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "observability logs.head_sampling_rate wins over absent alias; unsupported keys fail",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability.logs]\nenabled = false\nhead_sampling_rate = 0.5\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "observability": {
+      "enabled": true,
+      "logsEnabled": false,
+      "invocationLogs": true,
+      "headSamplingRatePpm": 500000
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "observability.traces has no counterpart and fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability.traces]\nenabled = true\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "observability.traces"
+   }
+  },
+  {
+   "name": "observability rate alias + logs rate conflict fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability]\nhead_sampling_rate = 0.5\n\n[observability.logs]\nhead_sampling_rate = 0.5\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "observability.head_sampling_rate"
    }
   }
  ]

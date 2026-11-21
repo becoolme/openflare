@@ -59,7 +59,17 @@ export default {
 There is no platform-side queue: events flow producer isolate → consumer
 isolate inside the tenant's workerd process. The platform's internal
 per-worker log tail (`vrt-tail-<worker>`) is just another entry in the same
-`tails` list and is unaffected by user consumers.
+`tails` list and is unaffected by user consumers. The platform collector
+honours `[observability]`: when the worker's `enabled` or
+`logs.enabled` is `false` no collector is rendered at all (nothing is
+collected); otherwise an `OBS` text binding carries
+`{"headSamplingRate":<float>, "invocationLogs":<bool>}` and the embedded
+collector samples per invocation — a dropped invocation keeps none of its
+log/exception/outcome records (deterministic FNV-1a over `traceId`/`spanId`
+when present, `Math.random()` otherwise), and `invocation_logs=false` drops
+only the outcome record. The wire carries the rate as integer ppm
+(`headSamplingRatePpm`, 0..1_000_000) because the signed snapshot's
+canonical JSON accepts safe integers only.
 
 ## Known differences from Cloudflare
 

@@ -1413,7 +1413,7 @@ fn emit_tail_worker(
                 "        (name = \"OBS\", text = {}),\n",
                 capnp_text(
                     &json!({
-                        "headSamplingRate": o.head_sampling_rate,
+                        "headSamplingRate": o.head_sampling_rate_ppm as f64 / 1e6,
                         "invocationLogs": o.invocation_logs,
                     })
                     .to_string()
