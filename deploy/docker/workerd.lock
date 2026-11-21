@@ -1,23 +1,23 @@
 {
   "source": "github-release",
-  "version": "vrt-20261120-2d52b58",
+  "version": "vrt-20261120-e699fea",
   "upstream": {
     "version": "1.20261120.1",
     "commit": "7545be644952d71d76b904b37ae71b10c0ba8cad"
   },
   "artifacts": {
     "linux-x64": {
-      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd-linux-x64.gz",
-      "archiveSha256": "8fe2120c38545cc2fd3541cf58e0feac989742391d79c0681314cf3a54d9ea30",
-      "binarySha256": "01b8597769f3450ff86d9192c5cfe3db4f6f182b63dd95a2686dc735e364a5ed",
-      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd.capnp",
+      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-e699fea/workerd-linux-x64.gz",
+      "archiveSha256": "52b64f457d83b239ff4f8837e9ef02b54ecaf671a017ba4d1baa58a55f6f721f",
+      "binarySha256": "f9ba95ccfb59d45523533ed6ef9d55ebe8da2521f602999505f8e98c8664d2a8",
+      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-e699fea/workerd.capnp",
       "capnpSha256": "a306f21d42a8f3a6372bd8a442d9a93509537fcd83d70c4a7c711f28620b5ffa"
     },
     "linux-arm64": {
-      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd-linux-arm64.gz",
-      "archiveSha256": "887d58ea56347bce62bbb6bf350b128d9591a8618b58d60042c3bcdafcffc456",
-      "binarySha256": "2bdafaec686070a88403ba929fb8dfdbe4d038808ead7e888d1a02aaeb7c6eed",
-      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd.capnp",
+      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-e699fea/workerd-linux-arm64.gz",
+      "archiveSha256": "610615187c05391974c0ca432b9da759cf64e488461ee319ec37f2f716087c4b",
+      "binarySha256": "c3024097c4f33badfc390daa90c99c25a95572aeb1551a6e11c5afd3f4c01e0e",
+      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-e699fea/workerd.capnp",
       "capnpSha256": "a306f21d42a8f3a6372bd8a442d9a93509537fcd83d70c4a7c711f28620b5ffa"
     }
   }
