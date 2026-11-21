@@ -69,6 +69,7 @@ environment blocks.
 | `analytics_engine_datasets` | supported — see [Analytics Engine](bindings/analytics-engine.md); per-entry keys `binding`, `dataset`, `remote` | `project_cfg.rs:821` |
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:846` |
 | `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
+| `unsafe` | partial — `[[unsafe.bindings]]` with `type = "unsafe_eval"` only: `env.<name>` is workerd's `UnsafeEval` object (`.eval`, `.newFunction`, `.newAsyncFunction`, `.newWasmModule`); global `eval`/`new Function` stay blocked in request handlers. Other `type` values fail closed (every other binding kind has a first-class key or no runtime support); other `[unsafe]` keys (`capnp`, `metadata`, …) inject raw workerd/upload structures and are refused | `project_cfg.rs:972` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
 | `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1179` |
@@ -119,7 +120,7 @@ That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
 `version_metadata`, `secrets_store_secrets`,
-`unsafe`, `migrations_dir`, `observability`,
+`migrations_dir`, `observability`,
 `logpush`, `site`, `preview_id` (top level),
 `node_compat`, `route`-shaped `custom_domain` fields inside routes
 objects (`zone_name`, `zone_id`, `custom_domain` on `routes[]` entries

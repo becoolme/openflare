@@ -140,6 +140,10 @@ pub(crate) struct BindingsToml {
     /// points at no resource (the tenant supplies the code at runtime).
     #[serde(default)]
     pub(crate) worker_loaders: Vec<String>,
+    /// CF `[[unsafe.bindings]] type="unsafe_eval"` — binding names only;
+    /// each renders as workerd's native `unsafeEval` capability.
+    #[serde(default)]
+    pub(crate) unsafe_evals: Vec<String>,
 }
 
 /// `[bindings].ratelimit.<name>` normalized shape.
@@ -960,6 +964,13 @@ pub fn assemble(
         for binding in &b.worker_loaders {
             bindings.push(BindingDesired::WorkerLoader(
                 snapshot_protocol::compute_desired::WorkerLoaderBinding {
+                    name: binding.clone(),
+                },
+            ));
+        }
+        for binding in &b.unsafe_evals {
+            bindings.push(BindingDesired::UnsafeEval(
+                snapshot_protocol::compute_desired::UnsafeEvalBinding {
                     name: binding.clone(),
                 },
             ));

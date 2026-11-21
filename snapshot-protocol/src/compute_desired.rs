@@ -314,6 +314,14 @@ pub enum BindingDesired {
     /// emitted service designator name IS the dataset name — workerd
     /// derives the event's `dataset` field from it.
     AnalyticsEngine(AnalyticsEngineBinding),
+    /// `{"type":"unsafeEval"}` — CF `[[unsafe.bindings]]
+    /// {type="unsafe_eval"}`: workerd's native `unsafeEval` binding —
+    /// `env.<name>` is the `UnsafeEval` object (`.eval`/`.newFunction`/
+    /// `.newWasmModule`) the worker can call; the global `eval()`/`new
+    /// Function()` stay blocked in request handlers. It is the one raw
+    /// binding type with no proper wrangler key that workerd runs;
+    /// every other `unsafe.bindings` entry fails closed at parse.
+    UnsafeEval(UnsafeEvalBinding),
 }
 
 /// `{"type":"var"}` — see [`BindingDesired::Var`].
@@ -554,6 +562,15 @@ pub struct AnalyticsEngineBinding {
     /// Dataset name — wrangler `dataset`, defaults to the binding name
     /// at project-config parse (mirrors CF).
     pub dataset: String,
+}
+
+/// `{"type":"unsafeEval"}` — see [`BindingDesired::UnsafeEval`].
+/// Carries no resource reference; the binding name is the only field.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnsafeEvalBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
 }
 
 /// P3c-1 `durableObjectClasses[]`: one DO class declared by this worker.
@@ -1469,6 +1486,10 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.dataset"));
                     }
                 }
+                // UnsafeEval carries no resource reference — `name`
+                // (validated as a binding name at the match head) is
+                // the only field.
+                BindingDesired::UnsafeEval(_) => {}
             }
         }
         Ok(())
@@ -1640,6 +1661,7 @@ impl BindingDesired {
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
             Self::AnalyticsEngine(b) => &b.name,
+            Self::UnsafeEval(b) => &b.name,
         }
     }
 
@@ -1661,7 +1683,8 @@ impl BindingDesired {
             | Self::DurableObject(_)
             | Self::Ratelimit(_)
             | Self::WorkerLoader(_)
-            | Self::AnalyticsEngine(_) => None,
+            | Self::AnalyticsEngine(_)
+            | Self::UnsafeEval(_) => None,
         }
     }
 }
@@ -2957,7 +2980,53 @@ mod tests {
             desired(&dup).unwrap().validate(),
             Err(DesiredError::Duplicate("bindingName"))
         );
-        let ok = payload_with_binding(serde_json::json!({"type": "workerLoader", "name": "LOADER"}));
+        let ok =
+            payload_with_binding(serde_json::json!({"type": "workerLoader", "name": "LOADER"}));
+        assert!(desired(&ok).unwrap().validate().is_ok());
+    }
+
+    #[test]
+    fn unsafe_eval_wire_shape_and_validation() {
+        // `{"type":"unsafeEval","name":...}` is the signed desired
+        // snapshot shape emitted by the control plane (CF
+        // `[[unsafe.bindings]] type="unsafe_eval"`).
+        let doc = serde_json::json!({"type": "unsafeEval", "name": "UNSAFE_EVAL"});
+        let b: BindingDesired = serde_json::from_value(doc.clone()).unwrap();
+        let BindingDesired::UnsafeEval(u) = &b else {
+            panic!()
+        };
+        assert_eq!(u.name, "UNSAFE_EVAL");
+        assert_eq!(serde_json::to_value(&b).unwrap(), doc);
+
+        // deny_unknown_fields: extra keys must not be silently
+        // accepted — raw binding entries carry only a name.
+        let with_extra = serde_json::json!({"type": "unsafeEval", "name": "E", "level": "full"});
+        assert!(serde_json::from_value::<BindingDesired>(with_extra).is_err());
+
+        // The binding name flows through the shared binding-name
+        // checks: JS identifier required, duplicates rejected.
+        for (name, err) in [
+            ("1bad", DesiredError::BindingName),
+            ("has-dash", DesiredError::BindingName),
+        ] {
+            let p = payload_with_binding(serde_json::json!({"type": "unsafeEval", "name": name}));
+            assert_eq!(desired(&p).unwrap().validate(), Err(err));
+        }
+        let dup = {
+            let mut p = valid_payload();
+            let workers = p["tenants"][0]["workers"].as_array_mut().unwrap();
+            workers[0]["bindings"] = serde_json::json!([
+                {"type": "unsafeEval", "name": "E"},
+                {"type": "unsafeEval", "name": "E"},
+            ]);
+            p
+        };
+        assert_eq!(
+            desired(&dup).unwrap().validate(),
+            Err(DesiredError::Duplicate("bindingName"))
+        );
+        let ok =
+            payload_with_binding(serde_json::json!({"type": "unsafeEval", "name": "UNSAFE_EVAL"}));
         assert!(desired(&ok).unwrap().validate().is_ok());
     }
 }

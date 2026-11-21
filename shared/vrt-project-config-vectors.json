@@ -987,6 +987,61 @@
     "code": "VRT_CONFIG_INVALID",
     "field": "limits.cpu_ms"
    }
+  },
+  {
+   "name": "unsafe.bindings unsafe_eval accepted",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[unsafe.bindings]]\nname = \"E\"\ntype = \"unsafe_eval\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "name": "E",
+       "type": "unsafeEval"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "unsafe.bindings non-eval type rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[unsafe.bindings]]\nname = \"Q\"\ntype = \"queue\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "unsafe.bindings[0].type"
+   }
+  },
+  {
+   "name": "unsafe raw injection key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[unsafe]\ncapnp = \"x\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "unsafe.capnp"
+   }
+  },
+  {
+   "name": "unsafe.bindings unknown per-entry key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[unsafe.bindings]]\nname = \"E\"\ntype = \"unsafe_eval\"\nbogus = 1\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "unsafe.bindings[0].bogus"
+   }
   }
  ]
 }
