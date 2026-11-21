@@ -311,20 +311,29 @@ async fn query_handler(
     let Some(generation) = state.follower.current_db_path().ok().flatten() else {
         return NotServable::NotReady.response();
     };
-    let engine = match RusqliteEngine::open_immutable(
-        &generation,
-        &db,
-        applied.epoch,
-        applied.lsn,
-    ) {
-        Ok(e) => Arc::new(e),
-        Err(e) => {
+    let open_db = db.clone();
+    let epoch = applied.epoch;
+    let lsn = applied.lsn;
+    let opened = tokio::task::spawn_blocking(move || {
+        RusqliteEngine::open_immutable(&generation, &open_db, epoch, lsn)
+    })
+    .await;
+    let engine = match opened {
+        Ok(Ok(e)) => Arc::new(e),
+        Ok(Err(e)) => {
             tracing::warn!(db = %db, error = %e, "replica generation open failed");
             return routing_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 CODE_NOT_READY,
                 "replica generation unavailable",
             );
+        }
+        Err(_) => {
+            return routing_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                CODE_NOT_READY,
+                "replica generation open task failed",
+            )
         }
     };
     let budget = wire::clamp_budget(
@@ -403,7 +412,18 @@ async fn status_handler(
             return json_response(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
         }
     }
-    match state.follower.status() {
+    let follower = state.follower.clone();
+    let status = tokio::task::spawn_blocking(move || follower.status()).await;
+    let status = match status {
+        Ok(s) => s,
+        Err(_) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "replica status task failed"}),
+            )
+        }
+    };
+    match status {
         Ok(s) => {
             let bookmark = state
                 .signer
