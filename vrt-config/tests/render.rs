@@ -384,11 +384,11 @@ fn render_produces_expected_structure() {
     let denied = out
         .matches("globalOutbound = (name = \"vrt-no-network\", entrypoint = \"DenyAll\")")
         .count();
-    // 7 facades (kv/r2/assets/pg/d1/queue/ratelimit) + facade-cron-w-alpha-1
+    // 8 facades (kv/r2/assets/pg/d1/queue/ratelimit/k2) + facade-cron-w-alpha-1
     // (CR1: the cron dispatcher is also deny-routed — it reaches the
     // tenant worker only through the TARGET service binding, never
     // the network) + vrt-no-network itself.
-    assert_eq!(denied, 9, "all non-egress system workers are deny-routed");
+    assert_eq!(denied, 10, "all non-egress system workers are deny-routed");
     // No worker emits any other globalOutbound spelling.
     assert_eq!(
         out.matches("globalOutbound =").count(),

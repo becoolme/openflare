@@ -71,6 +71,7 @@ fn parses_generated_manifest_into_system_workers() {
         "facade-d1",
         "facade-queue",
         "facade-ratelimit",
+        "facade-k2",
         "vrt-egress",
         "vrt-no-network",
     ] {
@@ -185,6 +186,7 @@ fn minimal() -> serde_json::Value {
         "facade-d1",
         "facade-queue",
         "facade-ratelimit",
+        "facade-k2",
         "vrt-egress",
         "vrt-no-network",
     ] {
