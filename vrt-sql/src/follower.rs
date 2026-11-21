@@ -1019,6 +1019,7 @@ databaseId = "abcdefghijklmnopqrstuvwxyz"
                 self_check_initial_backoff_ms: 500,
                 self_check_max_backoff_ms: 8_000,
                 allow_same_device_durability: false,
+                time_travel_retention_ms: 0,
             },
             follower: cfg().clone(),
             unix_dir: None,

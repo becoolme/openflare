@@ -236,6 +236,21 @@ pub fn snap_key(
     )
 }
 
+/// Snapshot metadata sidecar key (Time Travel): `.../snap-{lsn:016x}.json`.
+/// The snapshot itself remains `snap-{lsn:016x}.snap`; the sidecar is additive and ignored by
+/// restore paths that do not need a timestamp.
+pub fn snap_meta_key(
+    kind: crate::paths::ResourceKind,
+    database_id: &str,
+    epoch: u64,
+    lsn: u64,
+) -> String {
+    format!(
+        "{}/{database_id}/{epoch:016x}/snap-{lsn:016x}.json",
+        kind.object_prefix()
+    )
+}
+
 /// Manifest object key.
 pub fn manifest_key(kind: crate::paths::ResourceKind, database_id: &str) -> String {
     format!("{}/{database_id}/manifest", kind.object_prefix())

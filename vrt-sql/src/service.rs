@@ -122,6 +122,10 @@ pub struct PersistenceConfig {
     /// MIG-9: backoff cap (ms); grows x2 up to this ceiling.
     #[serde(default = "default_self_check_max_backoff_ms")]
     pub self_check_max_backoff_ms: u64,
+    /// Time Travel retention window (ms): snapshots/segments inside the window are kept and the
+    /// commit timeline resolves restore targets. 0 = disabled (bounded two-snapshot GC only).
+    #[serde(default)]
+    pub time_travel_retention_ms: u64,
 }
 
 impl PersistenceConfig {
@@ -179,6 +183,9 @@ impl PersistenceConfig {
         }
         if self.self_check_budget_ms == 0 || self.self_check_budget_ms > 600_000 {
             return Err("persistence.selfCheckBudgetMs out of range (0, 600000]");
+        }
+        if self.time_travel_retention_ms > 366 * 24 * 60 * 60 * 1000 {
+            return Err("persistence.timeTravelRetentionMs out of range (<= 366 days)");
         }
         Ok(())
     }

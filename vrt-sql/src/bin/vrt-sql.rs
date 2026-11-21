@@ -28,18 +28,24 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!("usage: vrt-sql serve --config <path>");
     eprintln!("       vrt-sql follower --config <path>");
+    eprintln!("       vrt-sql time-travel --config <path> --db <id> (--at <unix-ms> | --bookmark <bm>) [--dry-run] [--json]");
     ExitCode::FAILURE
 }
 
 async fn run() -> ExitCode {
     tracing_subscriber::fmt()
         .json()
+        // Keep stdout machine-readable for `time-travel --json`.
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "vrt_sql=info".into()),
         )
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("time-travel") {
+        return run_time_travel(&args[1..]).await;
+    }
     if args.first().map(String::as_str) == Some("follower") {
         let path = match args.as_slice() {
             [_, flag, path] if flag == "--config" => Some(PathBuf::from(path)),
@@ -246,6 +252,167 @@ async fn run() -> ExitCode {
         })
         .await;
     ExitCode::SUCCESS
+}
+
+fn arg_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
+}
+
+/// `vrt-sql time-travel`: offline restore to a time or bookmark.
+async fn run_time_travel(args: &[String]) -> ExitCode {
+    use std::sync::Arc;
+    use vrt_sql::paths::ResourceKind;
+    use vrt_sql::time_travel::{restore, TimeTravelConfig};
+
+    let config_path = arg_value(args, "--config")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("VRT_SQL_TIME_TRAVEL_CONFIG").map(PathBuf::from));
+    let Some(config_path) = config_path else {
+        eprintln!("usage: vrt-sql time-travel --config <path> --db <id> (--at <unix-ms> | --bookmark <bm>) [--dry-run] [--json]");
+        return ExitCode::FAILURE;
+    };
+    let Some(database_id) = arg_value(args, "--db") else {
+        eprintln!("time-travel: --db <id> is required");
+        return ExitCode::FAILURE;
+    };
+    let at = arg_value(args, "--at");
+    let bookmark = arg_value(args, "--bookmark");
+    let at_ms = match at {
+        Some(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                eprintln!("time-travel: --at must be unix milliseconds");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    if at_ms.is_some() == bookmark.is_some() {
+        eprintln!("time-travel: exactly one of --at or --bookmark is required");
+        return ExitCode::FAILURE;
+    }
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let json_out = args.iter().any(|a| a == "--json");
+
+    let raw = match std::fs::read(&config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, path = %config_path.display(),
+                "failed to read time-travel config");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config: TimeTravelConfig = match serde_json::from_slice(&raw).or_else(|_| {
+        toml::from_str::<TimeTravelConfig>(std::str::from_utf8(&raw).unwrap_or(""))
+    }) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "time-travel config parse failed (JSON or TOML expected)");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(field) = config.validate() {
+        tracing::error!(field, "invalid time-travel config");
+        return ExitCode::FAILURE;
+    }
+    let store = match vrt_sql::service::open_object_store(&config.persistence) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::error!("time travel requires persistence.backend fs|s3");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "persistence init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let signer = match &config.bookmark_secret_file {
+        Some(path) => match load_secret_0600(path, SecretPurpose::ServiceHmac) {
+            Ok(raw) if raw.len() >= 32 => {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&raw[..32]);
+                Some(vrt_sql::bookmark::BookmarkSigner::new(key))
+            }
+            Ok(_) => {
+                tracing::error!(path = %path.display(), "bookmark secret shorter than 32 bytes");
+                return ExitCode::FAILURE;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %path.display(),
+                    "bookmark secret unusable");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let mut cfg = config.persistence.persist_config();
+    cfg.holder = "vrt-sql-time-travel".into();
+    let db_root = config.db_root.clone();
+    let retention = config.persistence.time_travel_retention_ms;
+    let persister = std::sync::Arc::new(
+        vrt_sql::persist::Persister::new(
+            store,
+            cfg,
+            Arc::new(vrt_sql::clock::SystemClock),
+            db_root,
+            ResourceKind::D1,
+        )
+        .with_time_travel_retention(retention),
+    );
+    let db = database_id.to_string();
+    let bookmark = bookmark.map(str::to_string);
+    let outcome = tokio::task::spawn_blocking(move || {
+        restore(
+            &persister,
+            &db,
+            at_ms,
+            bookmark.as_deref(),
+            signer.as_ref(),
+            dry_run,
+        )
+    })
+    .await;
+    match outcome {
+        Ok(Ok(o)) => {
+            if json_out {
+                match serde_json::to_string_pretty(&o) {
+                    Ok(s) => println!("{s}"),
+                    Err(_) => return ExitCode::FAILURE,
+                }
+            } else {
+                println!(
+                    "{} {} -> epoch {} lsn {} (at {} ms), snapshot {}, segments {}",
+                    if o.dry_run { "would restore" } else { "restored" },
+                    o.database_id,
+                    o.new_epoch,
+                    o.new_lsn,
+                    o.resolved_at_ms,
+                    o.snapshot_lsn
+                        .map(|n| n.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    o.segments_replayed
+                );
+                if let Some(bm) = &o.previous_bookmark {
+                    println!("previous bookmark: {bm}");
+                }
+                if let Some(bm) = &o.new_bookmark {
+                    println!("new bookmark: {bm}");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Err(e)) => {
+            tracing::error!(db = %database_id, error = %e, "time travel failed");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "time travel task panicked/join failed");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// `vrt-sql follower`: tail the object-store chain into immutable local generations.
@@ -526,13 +693,16 @@ fn build_persister(
     };
     // T37r: one Persister per resource -- D1 writes `db/{id}`/`dbs/`,
     // Queue writes `q/{id}`/`queues/` (structural namespace separation).
-    let persister = Arc::new(vrt_sql::persist::Persister::new(
-        store.clone(),
-        cfg.clone(),
-        clock.clone(),
-        config.db_root.clone(),
-        vrt_sql::paths::ResourceKind::D1,
-    ));
+    let persister = Arc::new(
+        vrt_sql::persist::Persister::new(
+            store.clone(),
+            cfg.clone(),
+            clock.clone(),
+            config.db_root.clone(),
+            vrt_sql::paths::ResourceKind::D1,
+        )
+        .with_time_travel_retention(config.persistence.time_travel_retention_ms),
+    );
     let queue_persister = Arc::new(vrt_sql::persist::Persister::new(
         store,
         cfg,
