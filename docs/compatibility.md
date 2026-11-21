@@ -32,6 +32,7 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | Vars / secrets | Partial | [bindings/vars-and-secrets.md](bindings/vars-and-secrets.md) |
 | Tail Workers (`tail_consumers`, `streaming_tail_consumers`) | Partial | [wrangler-config.md](wrangler-config.md), [bindings/tail-workers.md](bindings/tail-workers.md) |
 | Version metadata (`version_metadata`) | Partial | [wrangler-config.md](wrangler-config.md) |
+| Flagship (`[[flagship]]` feature flags) | Partial | [wrangler-config.md](wrangler-config.md), [bindings/flagship.md](bindings/flagship.md) |
 | Observability (`[observability]` Worker Logs gates + head sampling) | Partial | [wrangler-config.md](wrangler-config.md) |
 | Workers AI, Vectorize, AI Search, Pipelines, e-mail, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
 

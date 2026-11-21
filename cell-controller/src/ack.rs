@@ -202,6 +202,14 @@ pub struct AckCapabilities {
     /// cells that claim it. Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub streaming_tail_consumers: bool,
+    /// `{"type":"flagship"}` bindings + `flagshipApps` tenant entries
+    /// render to a `wrapped` binding over the
+    /// `cloudflare-internal:flagship` module — a cell whose workerd
+    /// predates that module would fail the whole config load, so the
+    /// control plane only admits flagship bindings onto cells that
+    /// claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flagship: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

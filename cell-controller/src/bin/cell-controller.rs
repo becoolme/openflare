@@ -144,6 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `streamingTailConsumers` renders with this generation --
         // unconditionally on (same reasoning).
         streaming_tail_consumers: true,
+        // `flagship` bindings + `flagshipApps` render with this
+        // generation (the pinned workerd ships
+        // `cloudflare-internal:flagship`) -- unconditionally on.
+        flagship: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,
