@@ -465,13 +465,27 @@ fn cf_metadata(policy: &ClientIpPolicy, peer: &std::net::IpAddr, inbound: &Heade
 /// The `request.cf` JSON injected via [`CF_BLOB_HEADER`]. Whitelist
 /// fields only — `clientPid`/`clientUid` (the unix-peer credentials)
 /// can never appear here; workerd replaces cf wholesale with this
-/// blob. Bounded by [`MAX_CF_BLOB_BYTES`].
-fn cf_blob_json(meta: &CfMetadata, http_protocol: &str) -> String {
+/// blob. Bounded by [`MAX_CF_BLOB_BYTES`]. `client_accept_encoding` is
+/// the inbound `Accept-Encoding` verbatim — CF semantics store the
+/// client's original value in `request.cf.clientAcceptEncoding`
+/// (unlike the CF-chain fields it is per-request client data, so it is
+/// emitted on every path, not only behind the verified chain).
+fn cf_blob_json(
+    meta: &CfMetadata,
+    http_protocol: &str,
+    client_accept_encoding: Option<&str>,
+) -> String {
     let mut map = serde_json::Map::new();
     map.insert(
         "httpProtocol".to_string(),
         serde_json::Value::String(http_protocol.to_string()),
     );
+    if let Some(v) = client_accept_encoding {
+        map.insert(
+            "clientAcceptEncoding".to_string(),
+            serde_json::Value::String(v.to_string()),
+        );
+    }
     if let Some(c) = &meta.country {
         map.insert(
             "country".to_string(),
@@ -1877,8 +1891,16 @@ fn scrubbed_headers(
     // MIG-10: cfBlob — ALWAYS emitted so `request.cf` is host-defined:
     // a minimal blob on untrusted paths still overrides workerd's
     // unix-socket peer credentials (clientPid/clientUid), which must
-    // never reach tenant code.
-    if let Ok(v) = HeaderValue::from_str(&cf_blob_json(&cf, http_protocol(version))) {
+    // never reach tenant code. `clientAcceptEncoding` mirrors the
+    // inbound `Accept-Encoding` header verbatim (bounded/control-free
+    // via `cf_header_text`) — it is the client's own per-request data,
+    // not CF-chain metadata, so no trust gate applies.
+    let client_accept_encoding = cf_header_text(inbound, "accept-encoding", 128);
+    if let Ok(v) = HeaderValue::from_str(&cf_blob_json(
+        &cf,
+        http_protocol(version),
+        client_accept_encoding.as_deref(),
+    )) {
         out.insert(CF_BLOB_HEADER, v);
     }
     // WebSocket: the two hop-by-hop headers were stripped above like any
@@ -2177,7 +2199,7 @@ mod cf_blob_tests {
             latitude: Some("35.6895".into()),
             longitude: Some("139.6917".into()),
         };
-        let blob = cf_blob_json(&m, "HTTP/1.1");
+        let blob = cf_blob_json(&m, "HTTP/1.1", None);
         assert!(!blob.contains("Pid") && !blob.contains("Uid"));
         let v: serde_json::Value = serde_json::from_str(&blob).unwrap();
         assert_eq!(v["country"], "JP");
@@ -2201,13 +2223,27 @@ mod cf_blob_tests {
             ..Default::default()
         };
         let v: serde_json::Value =
-            serde_json::from_str(&cf_blob_json(&de, "HTTP/2")).unwrap();
+            serde_json::from_str(&cf_blob_json(&de, "HTTP/2", None)).unwrap();
         assert_eq!(v["isEUCountry"], "1");
         // Untrusted path still yields a host-defined blob.
-        let empty = cf_blob_json(&CfMetadata::default(), "HTTP/1.1");
+        let empty = cf_blob_json(&CfMetadata::default(), "HTTP/1.1", None);
         let v: serde_json::Value = serde_json::from_str(&empty).unwrap();
         assert!(v["country"].is_null() && v["colo"].is_null());
         assert_eq!(v["httpProtocol"], "HTTP/1.1");
+    }
+
+    #[test]
+    fn cf_blob_mirrors_client_accept_encoding() {
+        // CF semantics: the client's original `Accept-Encoding` lives
+        // in `request.cf.clientAcceptEncoding`. Absent header → key
+        // absent (workerd's optional string), present → verbatim.
+        let m = CfMetadata::default();
+        let v: serde_json::Value =
+            serde_json::from_str(&cf_blob_json(&m, "HTTP/1.1", None)).unwrap();
+        assert!(v["clientAcceptEncoding"].is_null());
+        let v: serde_json::Value =
+            serde_json::from_str(&cf_blob_json(&m, "HTTP/1.1", Some("gzip, deflate, br"))).unwrap();
+        assert_eq!(v["clientAcceptEncoding"], "gzip, deflate, br");
     }
 
     #[test]

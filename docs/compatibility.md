@@ -63,9 +63,14 @@ These are not tied to one binding.
   `city`, `continent`, `region`, `regionCode`, `metroCode`,
   `postalCode`, `timezone`, `latitude`, `longitude`, `isEUCountry`
   (the location fields require the zone's **Add visitor location
-  headers** managed transform). `asn`, `asOrganization`, `botManagement`
-  and the `tls*` fields have no header source on this ingress and stay
-  absent rather than being guessed.
+  headers** managed transform). `clientAcceptEncoding` mirrors the
+  inbound `Accept-Encoding` header on every path — it is the client's
+  own per-request value, not edge-verified metadata (on Cloudflare the
+  field stores the pre-rewrite original; OpenFlare does not rewrite the
+  header, so the mirrored value is always the client's own). `asn`,
+  `asOrganization`, `botManagement` and the `tls*` fields have no
+  header source on this ingress and stay absent rather than being
+  guessed.
 
 ## Known limitations
 
