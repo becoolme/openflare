@@ -36,17 +36,21 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
     "send_metrics",
     "keep_vars",
     "build",
-    "rules",
     "alias",
     "tsconfig",
     "jsx_factory",
     "jsx_fragment",
+    // `no_bundle`/`find_additional_modules`/`preserve_file_names` are
+    // wrangler bundler knobs: the VRT pack always ships the project
+    // module table unbundled (CF `no_bundle` + additional-modules
+    // semantics already), so they are accepted and ignored —
+    // `rules`/`base_dir` DO carry over (module typing + rule-eval
+    // root) and are normalized below.
     "no_bundle",
     "minify",
     "keep_names",
     "find_additional_modules",
     "preserve_file_names",
-    "base_dir",
     "define",
     "upload_source_maps",
     "cwd",
@@ -579,6 +583,107 @@ fn validate_custom_domain(pattern: &str, field: &str) -> Result<String, ProjectC
         ));
     }
     Ok(h)
+}
+
+/// wrangler `base_dir` — the directory rule globs are evaluated
+/// against (CF `moduleRoot`; the pack defaults it to the `main`
+/// directory). A tenant-controlled path: fail closed unless it is a
+/// clean relative directory inside the project — no absolute/drive
+/// roots, `\`, NUL, `:` or `.`/`..`/empty segments.
+fn validate_base_dir(value: &str, field: &str) -> Result<String, ProjectConfigError> {
+    let bad = || {
+        invalid(
+            field,
+            "must be a clean relative directory inside the project",
+        )
+    };
+    if value.is_empty()
+        || value.len() > 1024
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.contains('\0')
+        || value.contains(':')
+        || value.ends_with('/')
+    {
+        return Err(bad());
+    }
+    if value
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(bad());
+    }
+    Ok(value.to_string())
+}
+
+/// CF `rules` — ordered `{type, globs, fallthrough?}` module-typing
+/// rules (wrangler `Rule` shape, `additionalProperties: false`). The
+/// five supported types map onto wire module types at pack time;
+/// `PythonModule`/`PythonRequirement` exist in the wrangler schema but
+/// VRT has no Python runtime, so they fail closed.
+fn normalize_module_rules(value: &Value) -> Result<Value, ProjectConfigError> {
+    const MODULE_RULE_TYPES: [&str; 5] = ["ESModule", "CommonJS", "CompiledWasm", "Text", "Data"];
+    const PYTHON_RULE_TYPES: [&str; 2] = ["PythonModule", "PythonRequirement"];
+    let arr = value
+        .as_array()
+        .ok_or_else(|| invalid("rules", "must be an array"))?;
+    if arr.len() > 64 {
+        return Err(invalid("rules", "must declare at most 64 rules"));
+    }
+    let mut out_arr = Vec::with_capacity(arr.len());
+    for (i, e) in arr.iter().enumerate() {
+        let field = format!("rules[{i}]");
+        let o = e
+            .as_object()
+            .ok_or_else(|| invalid(&field, "must be a { type, globs, fallthrough? } object"))?;
+        for k in o.keys() {
+            match k.as_str() {
+                "type" | "globs" | "fallthrough" => {}
+                _ => return Err(unsupported(&format!("{field}.{k}"), None)),
+            }
+        }
+        let ty = req_str(
+            o.get("type").unwrap_or(&Value::Null),
+            &format!("{field}.type"),
+        )?;
+        if PYTHON_RULE_TYPES.contains(&ty) {
+            return Err(unsupported(
+                &format!("{field}.type"),
+                Some(&format!(
+                    "'{ty}' requires the Python runtime — not supported on VRT"
+                )),
+            ));
+        }
+        if !MODULE_RULE_TYPES.contains(&ty) {
+            return Err(invalid(
+                &format!("{field}.type"),
+                &format!("must be one of {}", MODULE_RULE_TYPES.join(", ")),
+            ));
+        }
+        let globs_arr = o
+            .get("globs")
+            .ok_or_else(|| invalid(&format!("{field}.globs"), "is required"))?
+            .as_array()
+            .ok_or_else(|| invalid(&format!("{field}.globs"), "must be an array"))?;
+        let mut globs = Vec::with_capacity(globs_arr.len());
+        for (j, g) in globs_arr.iter().enumerate() {
+            globs.push(Value::from(req_str(g, &format!("{field}.globs[{j}]"))?));
+        }
+        let mut m = Map::new();
+        m.insert("type".into(), Value::from(ty));
+        m.insert("globs".into(), Value::Array(globs));
+        if let Some(ft) = o.get("fallthrough") {
+            if !ft.is_boolean() {
+                return Err(invalid(
+                    &format!("{field}.fallthrough"),
+                    "must be a boolean",
+                ));
+            }
+            m.insert("fallthrough".into(), ft.clone());
+        }
+        out_arr.push(Value::Object(m));
+    }
+    Ok(Value::Array(out_arr))
 }
 
 fn route_to_hostname(pattern: &str, field: &str) -> Result<String, ProjectConfigError> {
@@ -1835,6 +1940,16 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     out.insert("tailConsumers".into(), Value::Array(out_arr));
                 }
             }
+            "rules" => {
+                out.insert("moduleRules".into(), normalize_module_rules(value)?);
+            }
+            "base_dir" => {
+                let d = req_str(value, "base_dir")?;
+                out.insert(
+                    "baseDir".into(),
+                    Value::from(validate_base_dir(d, "base_dir")?),
+                );
+            }
             "env" => {
                 return Err(invalid(
                     "env",
@@ -2162,6 +2277,19 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("quotas") {
         wire.insert("quotas".into(), v.clone());
     }
+    // `[dev]` — dev-server settings, verbatim (consumed by `vrt dev`,
+    // never by the desired-state path).
+    if let Some(v) = obj.get("dev") {
+        wire.insert("dev".into(), v.clone());
+    }
+    // `rules`/`base_dir` — module-typing rules + the rule-eval root,
+    // consumed by `build_pack_json` (already shape-proven above).
+    if let Some(v) = obj.get("moduleRules") {
+        wire.insert("moduleRules".into(), v.clone());
+    }
+    if let Some(v) = obj.get("baseDir") {
+        wire.insert("baseDir".into(), v.clone());
+    }
     if let Some(Value::Object(vars)) = obj.get("vars") {
         let mut out_vars = Map::new();
         for (k, v) in vars {
@@ -2277,6 +2405,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "workflows",
         "tailConsumers",
         "quotas",
+        "dev",
+        "moduleRules",
+        "baseDir",
         "bindings",
     ];
     // Normalized-internal keys that legitimately do not carry to the
@@ -2808,6 +2939,105 @@ mod tests {
             assert!(
                 format!("{err:?}").contains(code),
                 "{routes} → {err:?}, want {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_rules_and_base_dir_normalize() {
+        // `{type, globs, fallthrough?}` — CF Rule shape; `base_dir`
+        // carries verbatim as the pack-time rule-eval root.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.toml"),
+            "name=\"w\"\nmain=\"src/index.mjs\"\ncompatibility_date=\"2025-01-01\"\n\
+             base_dir=\"src\"\n\
+             rules=[{type=\"Text\",globs=[\"**/*.md\"],fallthrough=true},\n\
+             {type=\"Data\",globs=[\"**/*.bin\"]}]\n",
+        )
+        .unwrap();
+        let (cfg, _, _) = load_wrangler_project_config(dir.path(), None, None).unwrap();
+        assert_eq!(cfg["baseDir"], serde_json::json!("src"));
+        assert_eq!(
+            cfg["moduleRules"],
+            serde_json::json!([
+                {"type": "Text", "globs": ["**/*.md"], "fallthrough": true},
+                {"type": "Data", "globs": ["**/*.bin"]},
+            ])
+        );
+        // The pack-time meta carries them through the wire shape.
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.base_dir.as_deref(), Some("src"));
+        assert_eq!(meta.module_rules.len(), 2);
+        assert_eq!(meta.module_rules[0].ty, "Text");
+        assert_eq!(meta.module_rules[0].fallthrough, Some(true));
+    }
+
+    #[test]
+    fn module_rules_fail_closed() {
+        let bad = [
+            // unknown type (CF enum)
+            (
+                "rules=[{type=\"Text2\",globs=[\"a\"]}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // Python types are schema-valid but runtime-less here
+            (
+                "rules=[{type=\"PythonModule\",globs=[\"**/*.py\"]}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // missing globs
+            ("rules=[{type=\"Text\"}]", "VRT_CONFIG_INVALID"),
+            // non-array globs / non-string entries
+            (
+                "rules=[{type=\"Text\",globs=\"*.txt\"}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            ("rules=[{type=\"Text\",globs=[42]}]", "VRT_CONFIG_INVALID"),
+            // unknown key — CF additionalProperties:false
+            (
+                "rules=[{type=\"Text\",globs=[\"a\"],x=1}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // non-boolean fallthrough
+            (
+                "rules=[{type=\"Text\",globs=[\"a\"],fallthrough=\"yes\"}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // not an array
+            ("rules={type=\"Text\"}", "VRT_CONFIG_INVALID"),
+        ];
+        for (rules, code) in bad {
+            let err = wrangler_meta(&format!(
+                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{rules}\n"
+            ))
+            .expect_err(&format!("{rules} must fail"));
+            assert!(
+                format!("{err:?}").contains(code),
+                "{rules} → {err:?}, want {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_dir_fail_closed() {
+        for (dir_value, code) in [
+            // escapes the project
+            ("base_dir=\"../x\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"/abs\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"a\\\\b\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"a/../b\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"./x\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"x/\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=42", "VRT_CONFIG_INVALID"),
+        ] {
+            let err = wrangler_meta(&format!(
+                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{dir_value}\n"
+            ))
+            .expect_err(&format!("{dir_value} must fail"));
+            assert!(
+                format!("{err:?}").contains(code),
+                "{dir_value} → {err:?}, want {code}"
             );
         }
     }

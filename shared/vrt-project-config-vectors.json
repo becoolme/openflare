@@ -1519,6 +1519,126 @@
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "routes[0].enabled"
    }
+  },
+  {
+   "name": "rules module-typing rules normalize",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nbase_dir = \"src\"\nrules = [{type = \"Text\", globs = [\"**/*.md\"], fallthrough = true}, {type = \"Data\", globs = [\"**/*.bin\"]}]\n"
+   },
+   "expect": {
+    "ok": true,
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "baseDir": "src",
+     "moduleRules": [
+      {
+       "type": "Text",
+       "globs": [
+        "**/*.md"
+       ],
+       "fallthrough": true
+      },
+      {
+       "type": "Data",
+       "globs": [
+        "**/*.bin"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "rules minimal entry",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nrules = [{type = \"CompiledWasm\", globs = [\"**/*.wasm\"]}]\n"
+   },
+   "expect": {
+    "ok": true,
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "moduleRules": [
+      {
+       "type": "CompiledWasm",
+       "globs": [
+        "**/*.wasm"
+       ]
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "rules unknown type fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nrules = [{type = \"Text2\", globs = [\"a\"]}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "rules[0].type"
+   }
+  },
+  {
+   "name": "rules PythonModule type fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nrules = [{type = \"PythonModule\", globs = [\"**/*.py\"]}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "rules[0].type"
+   }
+  },
+  {
+   "name": "rules missing globs fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nrules = [{type = \"Text\"}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "rules[0].globs"
+   }
+  },
+  {
+   "name": "rules unknown key fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nrules = [{type = \"Text\", globs = [\"a\"], extra = 1}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "rules[0].extra"
+   }
+  },
+  {
+   "name": "rules non-boolean fallthrough fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nrules = [{type = \"Text\", globs = [\"a\"], fallthrough = \"yes\"}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "rules[0].fallthrough"
+   }
+  },
+  {
+   "name": "base_dir traversal fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nbase_dir = \"../x\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "base_dir"
+   }
   }
  ]
 }

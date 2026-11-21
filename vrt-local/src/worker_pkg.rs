@@ -59,6 +59,21 @@ use snapshot_protocol::compute_desired::{
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// One `rules[]` entry — `{type, globs, fallthrough?}`. `type` holds
+/// the wrangler `ConfigModuleRuleType` spelling (`ESModule`, ...);
+/// validated against the supported set at pack time (vrt.toml authors
+/// it natively, wrangler sources arrive already normalized).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModuleRuleToml {
+    #[serde(rename = "type")]
+    pub(crate) ty: String,
+    #[serde(default)]
+    pub(crate) globs: Vec<String>,
+    #[serde(default)]
+    pub(crate) fallthrough: Option<bool>,
+}
+
 /// vrt.toml document (deny_unknown_fields — a typo must fail closed).
 /// pub(crate) — `project_cfg` synthesizes this shape from wrangler
 /// sources through the identical deserialize path.
@@ -73,6 +88,15 @@ pub struct WorkerToml {
     /// Explicit `path → type` overrides/additions.
     #[serde(default)]
     pub(crate) modules: BTreeMap<String, String>,
+    /// CF `rules` — ordered `{type, globs, fallthrough?}` module-typing
+    /// rules (wrangler sources; native `vrt.toml` may declare the same
+    /// shape). Evaluated per file before the extension table.
+    #[serde(default)]
+    pub(crate) module_rules: Vec<ModuleRuleToml>,
+    /// CF `base_dir` — the directory rule globs are evaluated against
+    /// (CF `moduleRoot`). Default = the `main` directory at pack time.
+    #[serde(default)]
+    pub(crate) base_dir: Option<String>,
     #[serde(default)]
     pub(crate) vars: BTreeMap<String, String>,
     #[serde(default)]
@@ -1597,6 +1621,203 @@ fn type_for_extension(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// CF `ConfigModuleRuleType` → wire module type. `PythonModule` /
+/// `PythonRequirement` have no mapping (rejected at normalize; a
+/// native `moduleRules` carrying them fails here too).
+fn rule_type_to_module(ty: &str) -> Option<&'static str> {
+    match ty {
+        "ESModule" => Some("esModule"),
+        "CommonJS" => Some("commonJs"),
+        "CompiledWasm" => Some("wasm"),
+        "Text" => Some("text"),
+        "Data" => Some("data"),
+        _ => None,
+    }
+}
+
+/// CF wrangler implicit rules — appended AFTER user rules
+/// (`DEFAULT_MODULE_RULES` in `deployment-bundle/rules.ts`; JS types
+/// are intentionally absent — bundling is a wrangler-side concern and
+/// our extension table classifies them).
+const DEFAULT_MODULE_RULES: [(&str, &[&str]); 3] = [
+    ("Text", &["**/*.txt", "**/*.html", "**/*.sql"]),
+    ("Data", &["**/*.bin"]),
+    ("CompiledWasm", &["**/*.wasm", "**/*.wasm?module"]),
+];
+
+/// CF `parseRules`: user rules + implicit defaults, then per-type
+/// pruning — the first rule of a type without `fallthrough: true`
+/// completes that type; every later rule of the same type is dead and
+/// dropped (wrangler warns "does not have a fallback"; pruning keeps
+/// the semantics identical). Returns `(wire module type, globs)` in
+/// evaluation order.
+fn effective_module_rules(
+    rules: &[ModuleRuleToml],
+) -> Result<Vec<(&'static str, Vec<String>)>, LocalError> {
+    struct R {
+        module_ty: &'static str,
+        globs: Vec<String>,
+        fallthrough: bool,
+    }
+    let mut all: Vec<R> = Vec::with_capacity(rules.len() + DEFAULT_MODULE_RULES.len());
+    for r in rules {
+        let module_ty = rule_type_to_module(&r.ty).ok_or(LocalError::Worker("moduleRules type"))?;
+        for g in &r.globs {
+            if g.is_empty() || g.len() > 1024 || g.contains('\0') {
+                return Err(LocalError::Worker("moduleRules globs"));
+            }
+        }
+        all.push(R {
+            module_ty,
+            globs: r.globs.clone(),
+            fallthrough: r.fallthrough == Some(true),
+        });
+    }
+    for (ty, globs) in DEFAULT_MODULE_RULES {
+        all.push(R {
+            module_ty: rule_type_to_module(ty).unwrap(),
+            globs: globs.iter().map(|s| (*s).to_string()).collect(),
+            fallthrough: false,
+        });
+    }
+    let mut completed: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(all.len());
+    for r in all {
+        if completed.contains(r.module_ty) {
+            continue;
+        }
+        if !r.fallthrough {
+            completed.insert(r.module_ty);
+        }
+        out.push((r.module_ty, r.globs));
+    }
+    Ok(out)
+}
+
+/// Rule-eval root (CF `moduleRoot`): `base_dir` when declared, else
+/// the `main` directory — globs see paths relative to it, so an
+/// anchored `*.txt` only matches siblings of `main`.
+fn module_root(meta: &WorkerToml) -> Result<String, LocalError> {
+    if let Some(b) = &meta.base_dir {
+        // Re-prove at the pack boundary — a native vrt.toml can carry
+        // `baseDir` without normalize having seen it.
+        if b.is_empty()
+            || b.len() > 1024
+            || b.starts_with('/')
+            || b.contains('\\')
+            || b.contains('\0')
+            || b.contains(':')
+            || b.ends_with('/')
+            || b.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(LocalError::Worker("baseDir"));
+        }
+        return Ok(b.clone());
+    }
+    Ok(match meta.main_module.rfind('/') {
+        Some(i) => meta.main_module[..i].to_string(),
+        None => String::new(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GlobTok {
+    Lit(char),
+    /// `*` — any run of non-`/` chars.
+    Star,
+    /// `**` between `/`s or string ends — any run incl. `/`, but it may
+    /// only stop at a segment boundary (mirrors
+    /// `((?:[^/]*(?:/|$))*)`).
+    Globstar,
+}
+
+/// Mirror of wrangler's `glob-to-regexp` ({globstar:true}, no
+/// `extended`): `*`/`**` are the only wildcards — `?`, `[...]`,
+/// `{a,b}` are LITERAL characters; `\` escapes the next char into a
+/// literal. Whole-string anchored match, memoized so `**` chains
+/// cannot backtrack exponentially.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let mut toks: Vec<GlobTok> = Vec::with_capacity(p.len());
+    let mut i = 0usize;
+    while i < p.len() {
+        match p[i] {
+            '*' => {
+                let start = i;
+                while p.get(i + 1) == Some(&'*') {
+                    i += 1;
+                }
+                let prev = if start == 0 { None } else { Some(p[start - 1]) };
+                let next = p.get(i + 1).copied();
+                if i + 1 - start > 1
+                    && (prev.is_none() || prev == Some('/'))
+                    && (next.is_none() || next == Some('/'))
+                {
+                    toks.push(GlobTok::Globstar);
+                    if next == Some('/') {
+                        i += 1;
+                    }
+                } else {
+                    toks.push(GlobTok::Star);
+                }
+            }
+            '\\' => {
+                i += 1;
+                toks.push(GlobTok::Lit(p.get(i).copied().unwrap_or('\\')));
+            }
+            c => toks.push(GlobTok::Lit(c)),
+        }
+        i += 1;
+    }
+    let s: Vec<char> = path.chars().collect();
+    let mut memo: std::collections::HashMap<(usize, usize), bool> =
+        std::collections::HashMap::new();
+    fn m(
+        toks: &[GlobTok],
+        ti: usize,
+        s: &[char],
+        si: usize,
+        memo: &mut std::collections::HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(&v) = memo.get(&(ti, si)) {
+            return v;
+        }
+        let v = match toks.get(ti) {
+            None => si == s.len(),
+            Some(GlobTok::Lit(c)) => s.get(si) == Some(c) && m(toks, ti + 1, s, si + 1, memo),
+            Some(GlobTok::Star) => {
+                let mut k = si;
+                let mut ok = false;
+                loop {
+                    if m(toks, ti + 1, s, k, memo) {
+                        ok = true;
+                        break;
+                    }
+                    match s.get(k) {
+                        Some(&ch) if ch != '/' => k += 1,
+                        _ => break,
+                    }
+                }
+                ok
+            }
+            Some(GlobTok::Globstar) => {
+                let mut ok = m(toks, ti + 1, s, si, memo);
+                let mut k = si + 1;
+                while !ok && k <= s.len() {
+                    if k == s.len() || s[k - 1] == '/' {
+                        ok = m(toks, ti + 1, s, k, memo);
+                    }
+                    k += 1;
+                }
+                ok
+            }
+        };
+        memo.insert((ti, si), v);
+        v
+    }
+    m(&toks, 0, &s, 0, &mut memo)
+}
+
 /// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`
 /// (reported via `skipped` so `--dry-run` can list them).
 /// Symlinks are rejected — a worker dir must be self-contained.
@@ -1782,6 +2003,18 @@ fn build_pack_json(
     let mut declared = meta.modules.clone();
     let mut typed: BTreeMap<String, String> = BTreeMap::new();
     let mut total: u64 = 0;
+    // CF `rules`: effective ordered rules (user + implicit defaults,
+    // per-type pruning) classify each gathered file by glob against
+    // the module root (`base_dir` ?? `main` dir). The entry is never
+    // rule-typed — on CF it is the bundle itself, not an external
+    // module. Files under no rule keep the extension table.
+    let rules = effective_module_rules(&meta.module_rules)?;
+    let root = module_root(meta)?;
+    let root_prefix = if root.is_empty() {
+        String::new()
+    } else {
+        format!("{root}/")
+    };
     for (rel, bytes) in files {
         total += bytes.len() as u64;
         if total > MAX_WORKER_DIR_BYTES {
@@ -1789,6 +2022,18 @@ fn build_pack_json(
         }
         let ty = declared
             .remove(rel)
+            .or_else(|| {
+                if rel == &meta.main_module {
+                    return None;
+                }
+                let eval = rel.strip_prefix(&root_prefix)?;
+                rules.iter().find_map(|(ty, globs)| {
+                    globs
+                        .iter()
+                        .any(|g| glob_match(g, eval))
+                        .then(|| (*ty).to_string())
+                })
+            })
             .or_else(|| type_for_extension(Path::new(rel)).map(str::to_string))
             .ok_or(LocalError::Worker("module type"))?;
         typed.insert(rel.clone(), ty);
@@ -2385,5 +2630,235 @@ mod tail_consumer_tests {
         let err =
             resolve_tail_consumers(&many, "producer", "streaming tail", &resolve).unwrap_err();
         assert!(format!("{err:?}").contains("16"), "{err:?}");
+    }
+}
+
+mod module_rules_tests {
+    use super::*;
+
+    /// Mirrors `glob-to-regexp` ({globstar:true}) behavior — the
+    /// oracle for every case below is wrangler's own regex.
+    #[test]
+    fn glob_match_semantics() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            // `**/*.txt` — globstar crosses dirs AND matches root.
+            (
+                "**/*.txt",
+                &["a.txt", "d/a.txt", "d/e/a.txt"],
+                &["a.txt2", "a.md", "d/a.txt.bak"],
+            ),
+            // `*.txt` — single star never crosses `/`.
+            ("*.txt", &["a.txt"], &["d/a.txt", "a.txt2"]),
+            (
+                "lang/*.mjs",
+                &["lang/a.mjs"],
+                &["lang/d/a.mjs", "xlang/a.mjs"],
+            ),
+            // `?` is a LITERAL char (no `extended`) — `*.wasm?module`
+            // matches the query-suffixed name only.
+            (
+                "**/*.wasm?module",
+                &["a.wasm?module", "d/a.wasm?module"],
+                &["a.wasmXmodule", "a.wasm"],
+            ),
+            // `[...]`/`{a,b}` are literal too.
+            ("a[0-9].txt", &["a[0-9].txt"], &["a5.txt"]),
+            ("{a,b}.txt", &["{a,b}.txt"], &["a.txt", "b.txt"]),
+            // `a/**/b` — globstar consumes whole segments only; it may
+            // not stop mid-segment.
+            ("a/**/b", &["a/b", "a/x/b", "a/x/y/b"], &["a/xb", "a/bc"]),
+            // `a/**/x` cannot stop mid-segment (`a/xyz` has no stop
+            // where `x` aligns at a boundary).
+            ("a/**/x", &["a/x", "a/d/x"], &["a/xyz", "a/xy/xz"]),
+            // trailing `**` eats the rest including `/`.
+            ("a/**", &["a/b", "a/x/y"], &["a", "ab"]),
+            // `**` mid-segment collapses to a single `*`.
+            ("a**b", &["axb", "ab"], &["a/x/b"]),
+            // `.`/`+`/`(`... are literal.
+            ("a+.txt", &["a+.txt"], &["aa.txt", "ax.txt"]),
+            // `\.` escapes to a literal dot.
+            ("a\\.txt", &["a.txt"], &["axtxt"]),
+        ];
+        for (pat, yes, no) in cases {
+            for p in *yes {
+                assert!(glob_match(pat, p), "{pat} should match {p}");
+            }
+            for p in *no {
+                assert!(!glob_match(pat, p), "{pat} should NOT match {p}");
+            }
+        }
+    }
+
+    fn rules(src: &str) -> Vec<ModuleRuleToml> {
+        let doc: toml::Value = toml::from_str(src).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        serde_json::from_value(json["moduleRules"].clone()).unwrap()
+    }
+
+    /// CF `parseRules`: a non-fallthrough rule completes its type —
+    /// later same-type rules (incl. the implicit defaults) are dead.
+    #[test]
+    fn per_type_pruning() {
+        let user = rules(
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"] },
+            ]"#,
+        );
+        let eff = effective_module_rules(&user).unwrap();
+        // User Text rule completed `text` — the implicit Text default
+        // is gone; Data/Wasm defaults remain.
+        assert_eq!(
+            eff.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            ["text", "data", "wasm"]
+        );
+        // With fallthrough the default survives and .txt still types.
+        let user_ft = rules(
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"], fallthrough = true },
+            ]"#,
+        );
+        let eff = effective_module_rules(&user_ft).unwrap();
+        assert_eq!(
+            eff.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            ["text", "text", "data", "wasm"]
+        );
+        // `fallthrough = false` completes the type exactly like unset.
+        let user_ff = rules(
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"], fallthrough = false },
+            ]"#,
+        );
+        assert_eq!(effective_module_rules(&user_ff).unwrap().len(), 3);
+    }
+
+    fn meta(src: &str) -> WorkerToml {
+        toml::from_str(&format!(
+            "name = \"w\"\nmainModule = \"index.mjs\"\ncompatibilityDate = \"2025-01-01\"\n{src}"
+        ))
+        .unwrap()
+    }
+
+    fn pack_modules(meta: &WorkerToml, files: &[(&str, &[u8])]) -> serde_json::Value {
+        let files: BTreeMap<String, Vec<u8>> = files
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.to_vec()))
+            .collect();
+        build_pack_json(meta, &files).unwrap().0["modules"].clone()
+    }
+
+    #[test]
+    fn rules_classify_gathered_files() {
+        let m = meta(
+            // `fallthrough = true` keeps the implicit Text default
+            // alive so `.html` still classifies (pruning semantics
+            // are covered separately in `per_type_pruning`).
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"], fallthrough = true },
+                { type = "Data", globs = ["**/*.js"], fallthrough = true },
+            ]"#,
+        );
+        let mods = pack_modules(
+            &m,
+            &[
+                ("index.mjs", b"export default {}".as_slice()),
+                ("readme.md", b"# hi".as_slice()),
+                ("data.js", b"1".as_slice()),
+                ("page.html", b"<p/>".as_slice()), // implicit Text default
+                ("raw.bin", b"\x01".as_slice()),   // implicit Data default
+                ("lib.mjs", b"export {}".as_slice()),
+            ],
+        );
+        assert_eq!(mods["readme.md"], serde_json::json!({"text": "# hi"}));
+        assert_eq!(mods["data.js"], serde_json::json!({"data_b64": "MQ=="}));
+        assert_eq!(mods["page.html"], serde_json::json!({"text": "<p/>"}));
+        assert_eq!(mods["raw.bin"], serde_json::json!({"data_b64": "AQ=="}));
+        // Extension table still covers unmatched files; the entry is
+        // never rule-typed even though `**/*.js`-style globs exist.
+        assert_eq!(mods["lib.mjs"], serde_json::json!("export {}"));
+        assert_eq!(mods["index.mjs"], serde_json::json!("export default {}"));
+    }
+
+    /// The entry is never retyped by rules — `{ Data: ["**/*.mjs"] }`
+    /// cannot turn the main module into a data blob (CF: the entry is
+    /// the bundle, not an external module).
+    #[test]
+    fn entry_skips_rule_typing() {
+        let m = meta(r#"moduleRules = [{ type = "Data", globs = ["**/*.mjs"] }]"#);
+        let mods = pack_modules(
+            &m,
+            &[
+                ("index.mjs", b"export default {}".as_slice()),
+                ("lib.mjs", b"export {}".as_slice()),
+            ],
+        );
+        assert_eq!(mods["index.mjs"], serde_json::json!("export default {}"));
+        assert_eq!(
+            mods["lib.mjs"],
+            serde_json::json!({"data_b64": "ZXhwb3J0IHt9"})
+        );
+    }
+
+    /// `base_dir` scopes rule evaluation (CF `moduleRoot`): a file
+    /// outside the root is not a candidate and falls back to the
+    /// extension table.
+    #[test]
+    fn base_dir_scopes_rule_evaluation() {
+        let m = toml::from_str::<WorkerToml>(
+            "name = \"w\"\nmainModule = \"src/index.mjs\"\ncompatibilityDate = \"d\"\nbaseDir = \"src\"\nmoduleRules = [{ type = \"Data\", globs = [\"*.mjs\"] }]",
+        )
+        .unwrap();
+        let mods = pack_modules(
+            &m,
+            &[
+                ("src/index.mjs", b"export default {}".as_slice()),
+                ("src/lib.mjs", b"export {}".as_slice()),
+                ("lib.mjs", b"export {}".as_slice()),
+            ],
+        );
+        // `src/lib.mjs` evaluates as `lib.mjs` — `*.mjs` matches.
+        assert_eq!(
+            mods["src/lib.mjs"],
+            serde_json::json!({"data_b64": "ZXhwb3J0IHt9"})
+        );
+        // `lib.mjs` at the project root is outside `src/` — not a
+        // candidate, extension table types it.
+        assert_eq!(mods["lib.mjs"], serde_json::json!("export {}"));
+        assert_eq!(
+            mods["src/index.mjs"],
+            serde_json::json!("export default {}")
+        );
+    }
+
+    /// Without `base_dir`, the `main` directory is the rule root.
+    #[test]
+    fn main_dir_is_the_default_rule_root() {
+        let m = toml::from_str::<WorkerToml>(
+            "name = \"w\"\nmainModule = \"src/index.mjs\"\ncompatibilityDate = \"d\"\nmoduleRules = [{ type = \"Data\", globs = [\"*.txt\"] }]",
+        )
+        .unwrap();
+        let mods = pack_modules(
+            &m,
+            &[
+                ("src/index.mjs", b"export default {}".as_slice()),
+                ("src/a.txt", b"x".as_slice()),
+                ("b.txt", b"x".as_slice()),
+            ],
+        );
+        // `src/a.txt` → `a.txt` matches `*.txt`; root `b.txt` is
+        // outside `src/` but the implicit Text default still types it
+        // (its `**/*.txt` crosses the boundary? no — `b.txt` is
+        // outside the root, so NO rule sees it → extension table).
+        assert_eq!(mods["src/a.txt"], serde_json::json!({"data_b64": "eA=="}));
+        assert_eq!(mods["b.txt"], serde_json::json!({"text": "x"}));
+    }
+
+    /// Invalid rule types in a native `moduleRules` fail closed at the
+    /// pack boundary even without normalize having run.
+    #[test]
+    fn bad_rule_types_fail_closed() {
+        let m = meta(r#"moduleRules = [{ type = "PythonModule", globs = ["**/*.py"] }]"#);
+        let files: BTreeMap<String, Vec<u8>> =
+            [("index.mjs".to_string(), b"export default {}".to_vec())].into();
+        assert!(build_pack_json(&m, &files).is_err());
     }
 }
