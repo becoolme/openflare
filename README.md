@@ -83,7 +83,7 @@ bindings) is in [`docs/bindings/README.md`](docs/bindings/README.md).
 | [Service bindings](docs/bindings/service-bindings.md) | 🟡 Partial | Worker-to-worker fetch/RPC plus named `WorkerEntrypoint` (`services[].entrypoint`), same tenant. |
 | [Hyperdrive](docs/bindings/hyperdrive.md) | 🟡 Partial | Postgres wire protocol through the egress layer; credentials never enter the isolate. PostgreSQL only. |
 | [Rate limiting](docs/bindings/rate-limiting.md) | 🟡 Partial | `[[ratelimits]]` fixed-window counter in the per-tenant process; approximate, not shared across hosts. |
-| [Static assets](docs/bindings/static-assets.md) | 🟡 Partial | All four `html_handling` modes, `not_found_handling`, `run_worker_first`; content-addressed store, 512 files / 1 MiB each / 8 MiB per deploy. |
+| [Static assets](docs/bindings/static-assets.md) | 🟡 Partial | All four `html_handling` modes, `not_found_handling`, `run_worker_first`; content-addressed store; Cloudflare-aligned 20,000 files / 25 MiB each, plus a configurable total guard. |
 | [WebSockets](docs/bindings/websockets.md) | 🟡 Partial | HTTP/1.1 upgrades to workers and DOs; 300 s idle, 4 h max, 4096 per ingress, 256 per tenant. |
 | [Vars and secrets](docs/bindings/vars-and-secrets.md) | 🟡 Partial | Vars are `text` bindings (non-strings arrive JSON-encoded); secrets are `vrt secret put` name→ref maps. |
 | [Tail Workers](docs/bindings/tail-workers.md) | 🟡 Partial | `tail_consumers` render as native workerd `tails`; same-tenant, best effort, no streaming tails. |
