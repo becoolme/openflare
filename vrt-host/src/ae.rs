@@ -349,7 +349,7 @@ impl AeEvent {
         let obj = v.as_object()?;
         let mut ev = AeEvent {
             dataset: bytes_field(obj, "dataset")?,
-            timestamp_ns: obj.get("timestamp")?.as_i64()?,
+            timestamp_ns: int64_field(obj, "timestamp")?,
             index1: opt_bytes_field(obj, "index1")?,
             ..Default::default()
         };
@@ -373,6 +373,18 @@ impl AeEvent {
     /// for a hand-crafted socket peer.
     fn lossy(b: &[u8]) -> String {
         String::from_utf8_lossy(b).into_owned()
+    }
+}
+
+/// capnp JSON encodes Int64 (`timestamp`, `accountId`,
+/// `schemaVersion`) as a decimal STRING — the wire carries
+/// `"timestamp":"1795237029144"`. Accept the number form too for
+/// forward tolerance, reject everything else.
+fn int64_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<i64> {
+    match obj.get(key)? {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.as_i64(),
+        _ => None,
     }
 }
 
@@ -745,12 +757,15 @@ mod tests {
     use super::*;
 
     fn event_json() -> serde_json::Value {
+        // The real workerd wire shape: Int64 fields (`accountId`,
+        // `schemaVersion`, `timestamp`) are decimal STRINGS in capnp
+        // JSON; `Data` fields are byte arrays.
         serde_json::json!({
-            "accountId": 1,
+            "accountId": "1",
             "dataset": [119,101,97,116,104,101,114],
-            "schemaVersion": 0,
+            "schemaVersion": "0",
             "index1": [97],
-            "timestamp": 1_700_000_000_000_000_000i64,
+            "timestamp": "1700000000000000000",
             "double1": 25.5,
             "double3": -1,
             "blob1": [84,101,115,116],

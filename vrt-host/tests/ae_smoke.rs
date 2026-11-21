@@ -86,13 +86,17 @@ fn tenant_json(worker_id: &str, tenant_id: &str) -> TenantDesired {
             ],
             "routes": [{"hostname": format!("{worker_id}--{tenant_id}.vibeploy.app")}],
             "crons": [],
-            "quotas": {"cpuMs": 50, "memoryMb": 128, "subrequests": 100, "outboundConnections": 16}
+            // Defaults — the emit omits the fork `limits` block for
+            // default quotas, so this config ALSO parses on an
+            // upstream binary (local dev machines have no fork
+            // darwin build); CI exercises it with the pinned fork.
+            "quotas": {"cpuMs": 50, "memoryMb": 128, "subrequests": 50, "outboundConnections": 16}
         }]
     }))
     .unwrap()
 }
 
-fn emit_config(dir: &Path, tenant: &TenantDesired, ae_addr: &str) -> PathBuf {
+fn emit_config(dir: &Path, tenant: &TenantDesired, ae_addr: &str, port: u16) -> PathBuf {
     let manifest_raw = std::fs::read_to_string(facade_root().join("manifest.json")).unwrap();
     let manifest = parse_facade_manifest(&manifest_raw).unwrap();
     let bundle = mk_bundle();
@@ -135,8 +139,45 @@ fn emit_config(dir: &Path, tenant: &TenantDesired, ae_addr: &str) -> PathBuf {
         "{}",
         out.text
     );
+    // Materialize embeds — workerd resolves `embed "..."` relative to
+    // the config file's directory, so every declared embed must exist
+    // under `dir` before spawn (same contract as cache_smoke).
+    for embed in &out.embeds {
+        let dst = dir.join(&embed.path);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        match &embed.kind {
+            EmbedKind::SystemModule {
+                service_name,
+                module_name,
+            } => {
+                let manifest_doc: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+                let modules = manifest_doc["workers"][service_name]["modules"]
+                    .as_array()
+                    .unwrap();
+                let m = modules
+                    .iter()
+                    .find(|m| m["name"].as_str().unwrap() == module_name)
+                    .unwrap();
+                let src = facade_root().join("..").join(m["dist"].as_str().unwrap());
+                std::fs::write(&dst, std::fs::read(&src).unwrap()).unwrap();
+            }
+            EmbedKind::BundleModule { .. } => {
+                std::fs::write(&dst, USER_MODULE).unwrap();
+            }
+            EmbedKind::VendoredModule { name } => {
+                std::fs::write(&dst, vrt_config::workflows::vendored_bytes(name).unwrap()).unwrap();
+            }
+        }
+    }
+    // Dev sandboxes may deny unix binds — serve the worker's socket
+    // on TCP loopback instead (same contract as cache_smoke).
+    let worker_id = tenant.workers[0].worker_id.clone();
+    let text = out.text.replace(
+        &format!("unix:sock/{worker_id}.sock"),
+        &format!("127.0.0.1:{port}"),
+    );
     let path = dir.join("workerd.capnp");
-    std::fs::write(&path, &out.text).unwrap();
+    std::fs::write(&path, text).unwrap();
     path
 }
 
@@ -274,6 +315,7 @@ fn part_files(root: &Path, tenant: &str, dataset: &str) -> Vec<PathBuf> {
 /// fast flush cadence materializes the canonical part file whose
 /// columns decode the exact event fields.
 #[test]
+#[ignore = "requires VRT_WORKERD_BIN pointing at a real workerd binary"]
 fn real_workerd_ae_write_to_parquet() {
     let Some(bin) = workerd_bin() else { return };
     let _serial = SMOKE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -303,10 +345,12 @@ fn real_workerd_ae_write_to_parquet() {
         .block_on(svc.serve_tenant_tcp("team-ae1", format!("127.0.0.1:{ae_port}").parse().unwrap()))
         .unwrap();
     let (_tx, rx) = tokio::sync::watch::channel(false);
-    let _flush_task = svc.spawn_flush(rx);
+    // `spawn_flush` internally `tokio::spawn`s — needs the runtime's
+    // context; `block_on` enters it for the call.
+    let _flush_task = rt.block_on(async { svc.spawn_flush(rx) });
 
     let tenant = tenant_json("w-ae-1", "team-ae1");
-    let cfg = emit_config(&dir, &tenant, &format!("127.0.0.1:{ae_port}"));
+    let cfg = emit_config(&dir, &tenant, &format!("127.0.0.1:{ae_port}"), port);
     let proc = spawn(
         &bin,
         &cfg,
