@@ -17,6 +17,7 @@ service = "other-worker"   # worker name in the same tenant
 binding = "GREETER"
 service = "other-worker"
 entrypoint = "Greeter"     # named WorkerEntrypoint export (optional)
+props = { tier = "gold" }  # static props for ctx.props (optional)
 ```
 
 Native `vrt.toml` equivalent:
@@ -24,12 +25,14 @@ Native `vrt.toml` equivalent:
 ```toml
 [bindings.service]
 SVC = "other-worker"
-GREETER = { service = "other-worker", entrypoint = "Greeter" }
+GREETER = { service = "other-worker", entrypoint = "Greeter", props = '{"tier":"gold"}' }
 ```
 
 The plain-string form is the default entrypoint and keeps its original
-wire bytes; the table form accepts exactly `service` and `entrypoint`
-(unknown keys fail closed).
+wire bytes; the table form accepts `service` plus optional `entrypoint`
+and `props` (unknown keys fail closed). `props` is a JSON object —
+every invocation through the binding, RPC and `fetch()` alike, sees it
+as `ctx.props` in the target, matching Cloudflare.
 
 ## Where it runs
 
@@ -83,13 +86,21 @@ inside the tenant's process.
 - The target must be deployed before the referencing worker (deploy
   order matters); there is no Cloudflare-style account-wide registry —
   only the tenant's own workers.
-- `props` on service bindings are not supported.
+- `props` accepts a JSON object only (CF types it
+  `Record<string, unknown>`) up to 16 KiB serialized; Cloudflare
+  additionally allows per-call props on JS RPC arguments, which is a
+  runtime API surface not modelled here.
 
 ## Unsupported keys and error shape
 
-- `services[]` accepts only `binding`, `service`, `entrypoint` —
-  anything else → `VRT_CONFIG_UNSUPPORTED_FIELD`
+- `services[]` accepts only `binding`, `service`, `entrypoint`, `props`
+  — anything else → `VRT_CONFIG_UNSUPPORTED_FIELD`
   (`services[0].<key>`).
+- `props` that is not a JSON object, or serializes past 16 KiB →
+  `VRT_CONFIG_UNSUPPORTED_FIELD` (`services[0].props` /
+  `bindings.<name>.props`), `DESIRED_INVALID_IDENTIFIER`
+  (`bindings.serviceProps`) or `DESIRED_CAPACITY`
+  (`servicePropsBytes`) at the snapshot boundary.
 - An `entrypoint` that breaks the rules above →
   `VRT_CONFIG_UNSUPPORTED_FIELD` (`bindings.<name>.entrypoint`), or
   `VRT_CONFIG_INVALID` for an empty string.
@@ -103,9 +114,13 @@ inside the tenant's process.
 - `vrt-local/src/project_cfg.rs` — normalization tests (golden vector
   harness `golden_vectors_match_typescript`) and the standalone
   entrypoint tests (`service_entrypoint_into_pack_shape`,
-  `service_entrypoint_rules_fail_closed`, `vrt_toml_service_table_shape`).
+  `service_entrypoint_rules_fail_closed`, `vrt_toml_service_table_shape`,
+  `service_props_into_pack_shape`, `service_props_must_be_object`).
 - `snapshot-protocol/src/compute_desired.rs` —
-  `service_entrypoint_wire_shape`, `service_entrypoint_rules`.
+  `service_entrypoint_wire_shape`, `service_entrypoint_rules`, plus the
+  `service-props-*` validation vectors.
 - `vrt-config/tests/render.rs` —
   `service_binding_named_entrypoint_renders`,
-  `service_binding_reserved_entrypoint_is_refused`.
+  `service_binding_reserved_entrypoint_is_refused`,
+  `service_binding_props_renders`,
+  `service_binding_props_without_entrypoint_renders`.

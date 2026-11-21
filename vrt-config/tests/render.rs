@@ -74,6 +74,54 @@ fn service_binding_named_entrypoint_renders() {
 }
 
 #[test]
+fn service_binding_props_renders() {
+    let mut tenant = with_auth_entrypoint("Greeter");
+    let auth = tenant.workers[0]
+        .bindings
+        .iter_mut()
+        .find_map(|b| match b {
+            snapshot_protocol::compute_desired::BindingDesired::Service(s) => Some(s),
+            _ => None,
+        })
+        .expect("fixture has a service binding");
+    auth.props = Some(r#"{"tier":"gold","n":7}"#.to_string());
+    let bs = bundles();
+    let params = runtime_params();
+    let out = render_tenant_config(&input(&tenant, &bs, &params))
+        .unwrap()
+        .text;
+    // CF `services[].props` → designator `props = (json = "...")`;
+    // JSON quotes are capnp-escaped inside the designator text.
+    assert!(out.contains(
+        "(name = \"AUTH\", service = (name = \"worker-w-alpha-2\", \
+         entrypoint = \"Greeter\", props = (json = \"{\\\"tier\\\":\\\"gold\\\",\\\"n\\\":7}\")))"
+    ));
+}
+
+#[test]
+fn service_binding_props_without_entrypoint_renders() {
+    let mut tenant = tenant();
+    let auth = tenant.workers[0]
+        .bindings
+        .iter_mut()
+        .find_map(|b| match b {
+            snapshot_protocol::compute_desired::BindingDesired::Service(s) => Some(s),
+            _ => None,
+        })
+        .expect("fixture has a service binding");
+    auth.props = Some(r#"{"mode":"fast"}"#.to_string());
+    let bs = bundles();
+    let params = runtime_params();
+    let out = render_tenant_config(&input(&tenant, &bs, &params))
+        .unwrap()
+        .text;
+    assert!(out.contains(
+        "(name = \"AUTH\", service = (name = \"worker-w-alpha-2\", \
+         props = (json = \"{\\\"mode\\\":\\\"fast\\\"}\")))"
+    ));
+}
+
+#[test]
 fn service_binding_reserved_entrypoint_is_refused() {
     let bs = bundles();
     let params = runtime_params();

@@ -172,6 +172,13 @@ pub struct AckCapabilities {
     /// (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub version_metadata: bool,
+    /// `services[].props` renders to the designator's `props.json` —
+    /// a pre-props cell rejects the `props` wire field via
+    /// `deny_unknown_fields`, so the control plane only admits
+    /// props-bearing service bindings onto cells that claim it.
+    /// Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_binding_props: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

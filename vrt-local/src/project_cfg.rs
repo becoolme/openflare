@@ -793,7 +793,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 for (i, e) in table_list(value, "services")?.iter().enumerate() {
                     for k in e.keys() {
                         match k.as_str() {
-                            "binding" | "service" | "entrypoint" => {}
+                            "binding" | "service" | "entrypoint" | "props" => {}
                             _ => return Err(unsupported(&format!("services[{i}].{k}"), None)),
                         }
                     }
@@ -817,6 +817,20 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         opt_str(e.get("entrypoint"), &format!("services[{i}].entrypoint"))?
                     {
                         b.insert("entrypoint".into(), Value::from(ep));
+                    }
+                    // CF `props` is `Record<string, unknown>` for
+                    // `ctx.props` — an object, not a scalar/array.
+                    match e.get("props") {
+                        None | Some(Value::Null) => {}
+                        Some(v @ Value::Object(_)) if is_json_value(v) => {
+                            b.insert("props".into(), v.clone());
+                        }
+                        Some(_) => {
+                            return Err(unsupported(
+                                &format!("services[{i}].props"),
+                                Some("props must be a JSON object"),
+                            ));
+                        }
                     }
                     bindings.push(Value::Object(b));
                 }
@@ -1829,24 +1843,45 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                         .get("service")
                         .and_then(|s| s.as_str())
                         .unwrap_or_default();
-                    match b.get("entrypoint") {
-                        None => {
+                    // `props` (if present) is a validated JSON object —
+                    // serialized to TEXT for the wire's `Eq` bound.
+                    let props = match b.get("props") {
+                        None | Some(Value::Null) => None,
+                        Some(v @ Value::Object(_)) => {
+                            Some(serde_json::to_string(v).unwrap_or_else(|_| "{}".into()))
+                        }
+                        Some(_) => {
+                            return Err(unsupported(
+                                &format!("bindings.{name}.props"),
+                                Some("props must be a JSON object"),
+                            ));
+                        }
+                    };
+                    match (b.get("entrypoint"), props) {
+                        (None, None) => {
                             service.insert(name.into(), Value::from(target));
                         }
-                        Some(ep) => {
-                            let ep = ep.as_str().unwrap_or_default();
-                            if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep) {
-                                return Err(unsupported(
-                                    &format!("bindings.{name}.entrypoint"),
-                                    Some(
-                                        "entrypoint must be a JS identifier of at most 64 chars, \
-                                         not `default` and not starting with `Vrt`/`vrt`",
-                                    ),
-                                ));
-                            }
+                        (ep_raw, props) => {
                             let mut t = Map::new();
                             t.insert("service".into(), Value::from(target));
-                            t.insert("entrypoint".into(), Value::from(ep));
+                            if let Some(ep) = ep_raw {
+                                let ep = ep.as_str().unwrap_or_default();
+                                if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep)
+                                {
+                                    return Err(unsupported(
+                                        &format!("bindings.{name}.entrypoint"),
+                                        Some(
+                                            "entrypoint must be a JS identifier of at most 64 \
+                                             chars, not `default` and not starting with \
+                                             `Vrt`/`vrt`",
+                                        ),
+                                    ));
+                                }
+                                t.insert("entrypoint".into(), Value::from(ep));
+                            }
+                            if let Some(props) = props {
+                                t.insert("props".into(), Value::from(props));
+                            }
                             service.insert(name.into(), Value::Object(t));
                         }
                     }
@@ -2178,6 +2213,39 @@ mod tests {
             ))
             .expect_err(ep);
             assert!(format!("{err:?}").contains("entrypoint"), "{ep}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn service_props_into_pack_shape() {
+        // CF `services[].props` (object) → `ctx.props` — serialized to
+        // JSON text on the wire; props works with or without entrypoint.
+        let meta = wrangler_services(
+            r#"[{"binding":"A","service":"t","props":{"tier":"gold","n":7}},
+                {"binding":"B","service":"t","entrypoint":"Greeter","props":{"m":"x"}}]"#,
+        )
+        .unwrap();
+        let svc = meta.bindings.unwrap().service;
+        let a = svc.get("A").unwrap();
+        assert_eq!(a.service(), "t");
+        assert_eq!(a.entrypoint(), None);
+        // serde_json::Map orders keys (BTreeMap) — canonical bytes.
+        assert_eq!(a.props(), Some(r#"{"n":7,"tier":"gold"}"#));
+        let b = svc.get("B").unwrap();
+        assert_eq!(b.entrypoint(), Some("Greeter"));
+        assert_eq!(b.props(), Some(r#"{"m":"x"}"#));
+    }
+
+    #[test]
+    fn service_props_must_be_object() {
+        // CF types props `Record<string, unknown>` — scalars/arrays
+        // fail closed rather than landing an unexpected `ctx.props`.
+        for bad in [r#""str""#, "42", "[1,2]", "true"] {
+            let err = wrangler_services(&format!(
+                r#"[{{"binding":"B","service":"t","props":{bad}}}]"#
+            ))
+            .expect_err(bad);
+            assert!(format!("{err:?}").contains("props"), "{bad}: {err:?}");
         }
     }
 

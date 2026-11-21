@@ -132,6 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `{"type":"json"}` bindings (version_metadata, typed vars)
         // render ships with this generation -- unconditionally on.
         version_metadata: true,
+        // `services[].props` render ships with this generation --
+        // unconditionally on (same reasoning).
+        service_binding_props: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

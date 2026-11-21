@@ -55,6 +55,7 @@ use snapshot_protocol::compute_desired::{
     AssetsBinding, BindingDesired, BindingPermissions, CronDesired, DoBindingDesired,
     DoClassDesired, HyperdriveBinding, JsonBinding, KvBinding, PgBinding, R2Binding,
     RatelimitBinding, RunWorkerFirst, SecretBinding, ServiceBinding, VarBinding, WorkerQuotas,
+    MAX_JSON_BINDING_BYTES,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -180,7 +181,16 @@ pub(crate) enum ServiceTargetToml {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct NamedServiceTargetToml {
     pub(crate) service: String,
-    pub(crate) entrypoint: String,
+    /// Optional so `{service, props}` (wrangler props without a named
+    /// entrypoint) round-trips; `{service}` alone normalizes to this
+    /// shape too — `entrypoint()` treats absent as the default export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) entrypoint: Option<String>,
+    /// JSON-serialized object for `ctx.props` (CF `services[].props` —
+    /// wrangler accepts any JSON value; CF types it `Record<string, _>`
+    /// so the object shape is enforced at pack time). TEXT for `Eq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) props: Option<String>,
 }
 
 impl ServiceTargetToml {
@@ -194,7 +204,14 @@ impl ServiceTargetToml {
     pub(crate) fn entrypoint(&self) -> Option<&str> {
         match self {
             Self::Worker(_) => None,
-            Self::Named(n) => Some(&n.entrypoint),
+            Self::Named(n) => n.entrypoint.as_deref(),
+        }
+    }
+
+    pub(crate) fn props(&self) -> Option<&str> {
+        match self {
+            Self::Worker(_) => None,
+            Self::Named(n) => n.props.as_deref(),
         }
     }
 }
@@ -976,10 +993,25 @@ pub fn assemble(
                     return Err(LocalError::Worker("service entrypoint"));
                 }
             }
+            let props = target.props().map(str::to_string);
+            if let Some(p) = &props {
+                // CF `props` is `Record<string, _>` on `ctx.props` —
+                // require a parseable JSON object inside the byte
+                // bound (desired re-checks at the snapshot boundary).
+                let ok = p.len() <= MAX_JSON_BINDING_BYTES
+                    && matches!(
+                        serde_json::from_str::<serde_json::Value>(p),
+                        Ok(serde_json::Value::Object(_))
+                    );
+                if !ok {
+                    return Err(LocalError::Worker("service props"));
+                }
+            }
             bindings.push(BindingDesired::Service(ServiceBinding {
                 name: binding.clone(),
                 worker_id,
                 entrypoint,
+                props,
             }));
         }
         for (binding, digest) in &b.assets {

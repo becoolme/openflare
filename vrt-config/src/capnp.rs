@@ -1477,28 +1477,43 @@ fn emit_binding(
             {
                 return Err(ConfigError::ServiceTarget);
             }
-            match service.entrypoint.as_deref() {
+            match (service.entrypoint.as_deref(), service.props.as_deref()) {
                 // Legacy bytes: a default-export binding renders exactly
                 // as before the field existed.
-                None => out.push_str(&format!(
+                (None, None) => out.push_str(&format!(
                     "        (name = {}, service = (name = {})),\n",
                     capnp_text(&service.name),
                     capnp_text(&worker_service_name(&service.worker_id)),
                 )),
-                Some(ep) => {
-                    // Re-checked here (the render is the last trusted
-                    // boundary): never route a tenant onto a
-                    // platform-injected entrypoint such as the probe.
-                    if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep)
-                        || ep == crate::waituntil::PROBE_ENTRYPOINT
-                    {
-                        return Err(ConfigError::ServiceTarget);
+                (ep, props) => {
+                    if let Some(ep) = ep {
+                        // Re-checked here (the render is the last trusted
+                        // boundary): never route a tenant onto a
+                        // platform-injected entrypoint such as the probe.
+                        if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep)
+                            || ep == crate::waituntil::PROBE_ENTRYPOINT
+                        {
+                            return Err(ConfigError::ServiceTarget);
+                        }
                     }
+                    // `props = (json = "...")` — workerd hands it to the
+                    // target worker as `ctx.props` on every invocation.
+                    // Desired-state validation has already proven the
+                    // object shape + byte bound.
+                    let mut designator =
+                        format!("(name = {}", capnp_text(&worker_service_name(&service.worker_id)));
+                    if let Some(ep) = ep {
+                        designator.push_str(&format!(", entrypoint = {}", capnp_text(ep)));
+                    }
+                    if let Some(props) = props {
+                        designator
+                            .push_str(&format!(", props = (json = {})", capnp_text(props)));
+                    }
+                    designator.push(')');
                     out.push_str(&format!(
-                        "        (name = {}, service = (name = {}, entrypoint = {})),\n",
+                        "        (name = {}, service = {}),\n",
                         capnp_text(&service.name),
-                        capnp_text(&worker_service_name(&service.worker_id)),
-                        capnp_text(ep),
+                        designator,
                     ));
                 }
             }

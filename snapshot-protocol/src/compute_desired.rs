@@ -473,6 +473,13 @@ pub struct ServiceBinding {
     /// and no tenant binding onto a platform-injected entrypoint).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
+    /// Wrangler `services[].props` — JSON-serialized object delivered
+    /// as `ctx.props` on every invocation through the binding (workerd
+    /// `ServiceBindingDesignator.props.json`). Kept as TEXT (not
+    /// `serde_json::Value`) for `Eq` + byte-stable round-trip; absent
+    /// is omitted on the wire so legacy snapshots keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub props: Option<String>,
 }
 
 /// Prefix of entrypoint names the platform injects into tenant workers
@@ -1385,6 +1392,19 @@ impl WorkerDesired {
                             return Err(DesiredError::Identifier("bindings.entrypoint"));
                         }
                     }
+                    if let Some(props) = &s.props {
+                        // CF `props` is an object (`Record<string, _>`)
+                        // that lands on `ctx.props` — bound the bytes
+                        // like a `json` binding and require the object
+                        // shape, never an arbitrary scalar/array.
+                        if props.len() > MAX_JSON_BINDING_BYTES {
+                            return Err(DesiredError::Capacity("servicePropsBytes"));
+                        }
+                        match serde_json::from_str::<serde_json::Value>(props) {
+                            Ok(serde_json::Value::Object(_)) => {}
+                            _ => return Err(DesiredError::Identifier("bindings.serviceProps")),
+                        }
+                    }
                 }
                 BindingDesired::DurableObject(d) => {
                     // class_name is a JS identifier too (it exports a
@@ -2249,6 +2269,30 @@ mod tests {
                 Box::new(|v| {
                     v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] =
                         json!("E".repeat(MAX_BINDING_NAME_LEN + 1))
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            // CF `services[].props` — a JSON object only, inside the
+            // 16 KiB json-binding bound.
+            (
+                "service-props-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["props"] =
+                        json!(r#"{"tier":"gold"}"#)
+                }),
+                "",
+            ),
+            (
+                "service-props-not-object",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["props"] = json!("[1,2]")
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
+                "service-props-unparseable",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["props"] = json!("{bad")
                 }),
                 "DESIRED_INVALID_IDENTIFIER",
             ),
