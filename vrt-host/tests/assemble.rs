@@ -291,6 +291,7 @@ fn assemble_test_params(sys_digest: String) -> vrt_config::RuntimeParams {
         wfop_pepper: "assemble-test-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -572,6 +573,7 @@ fn assets_first_tenant_assembles_with_real_manifest() {
         wfop_pepper: "assemble-test-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -706,6 +708,7 @@ fn experimental_params(sys_digest: &str) -> vrt_config::RuntimeParams {
         wfop_pepper: "assemble-test-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -950,6 +953,7 @@ fn binding_backend_dir_derives_per_tenant_socket() {
         wfop_pepper: "assemble-test-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -1044,6 +1048,7 @@ fn binding_backend_dir_rekeys_fingerprint() {
                     wfop_pepper: "x".into(),
                     wf_delete_addr: String::new(),
                     cache_addr: String::new(),
+                    ae_addr: String::new(),
                     heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
                     log_tail: vrt_config::LogTailParams::default(),
@@ -1079,7 +1084,22 @@ fn binding_backend_dir_rekeys_fingerprint() {
 #[test]
 fn worker_loaders_enable_experimental_extra_arg() {
     let args = |loaders: bool| {
-        vrt_host::assemble::experimental_extra_args(&[], false, false, false, loaders)
+        vrt_host::assemble::experimental_extra_args(&[], false, false, false, loaders,
+            false,
+        )
+    };
+    assert!(args(true).iter().any(|a| a == "--experimental"));
+    assert!(args(false).is_empty());
+}
+
+/// `analyticsEngine` bindings are `$experimental`-gated upstream too
+/// (`experimental_feature("AnalyticsEngine")` in workerd's
+/// bindings.rs) — a tenant declaring `[[analytics_engine_datasets]]`
+/// must get `--experimental` in argv or workerd refuses the config.
+#[test]
+fn analytics_engine_enable_experimental_extra_arg() {
+    let args = |ae: bool| {
+        vrt_host::assemble::experimental_extra_args(&[], false, false, false, false, ae)
     };
     assert!(args(true).iter().any(|a| a == "--experimental"));
     assert!(args(false).is_empty());

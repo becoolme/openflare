@@ -142,6 +142,7 @@ fn params(dir: &Path) -> RuntimeParams {
         wfop_pepper: "wu-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: "sock/vrt-wu.sock".into(),
         log_tail: vrt_config::LogTailParams::default(),

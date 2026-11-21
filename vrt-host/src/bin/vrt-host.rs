@@ -359,6 +359,31 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         }
         None => None,
     };
+    // [analyticsEngine] — per-tenant AE ingest sockets under
+    // `<workDir>/ae/sock/`; spool + Parquet output under
+    // `<workDir>/ae/`. Same degrade rule as cache: an init failure
+    // downgrades the capability (tenants declaring AE bindings then
+    // fail the render closed — never a fake ingest), observable via
+    // log + `vrt_host_ae_degraded`.
+    let ae_service = if config.analytics_engine.enabled {
+        let ae_dir = config.work_dir.join("ae");
+        let sock_root = ae_dir.join("sock");
+        let built = vrt_host::ae::AeService::new(
+            Some(sock_root.clone()),
+            ae_dir,
+            config.analytics_engine.limits(),
+        );
+        vrt_host::ae::record_ae_init(&built);
+        match built {
+            Ok(svc) => {
+                assembler = assembler.with_ae_root(sock_root);
+                Some(Arc::new(svc))
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     let assembler: Arc<dyn vrt_host::supervisor::TenantAssembler> = Arc::new(assembler);
 
     // P3c-2: DO placement authority — object-store backends build a
@@ -375,6 +400,7 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     };
     let mut deps = SupervisorDeps::default();
     deps.cache = cache_service;
+    deps.ae = ae_service.clone();
     deps.placement = placement.clone();
     // P3c-2: snapshot surface (same store + concrete manifest impl)
     // + migration coordinator shared with the control listener.
@@ -664,6 +690,11 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         1.0,
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // [analyticsEngine]: spool→Parquet flush — exits on the shutdown
+    // watch (one final flush before exit).
+    if let Some(svc) = ae_service.clone() {
+        svc.spawn_flush(shutdown_tx.subscribe());
+    }
     let ingress_task = {
         let ingress_state = ingress_state.clone();
         tokio::spawn(ingress::serve(listener, ingress_state, async move {

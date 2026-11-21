@@ -369,6 +369,7 @@ fn render_cfg(dir: &Path, port: u16, sql_port: u16, db_id: &str) -> (PathBuf, Ve
         wfop_pepper: "d1-smoke-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -473,6 +474,7 @@ fn render_cfg(dir: &Path, port: u16, sql_port: u16, db_id: &str) -> (PathBuf, Ve
                 .workers
                 .iter()
                 .any(|w| !w.durable_object_classes.is_empty()),
+            false,
             false,
             false,
         ),
@@ -1277,6 +1279,7 @@ fn render_queue_cfg_full(
         wfop_pepper: "d1-smoke-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -1390,6 +1393,7 @@ fn render_queue_cfg_full(
                 .workers
                 .iter()
                 .any(|w| !w.durable_object_classes.is_empty()),
+            false,
             false,
             false,
         ),
@@ -2015,6 +2019,7 @@ fn render_do_cfg(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf, Strin
         wfop_pepper: "d1-smoke-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -2096,7 +2101,8 @@ fn render_do_cfg(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf, Strin
             .any(|w| !w.durable_object_classes.is_empty()),
         false,
         false,
-    );
+            false,
+        );
     assert!(argv.iter().any(|a| a == "--experimental"), "{argv:?}");
     // P3c-1-r2: `--external-addr` comes from the SAME production
     // derivation the supervisor uses — `assemble` copies

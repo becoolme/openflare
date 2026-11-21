@@ -109,6 +109,7 @@ fn params(do_dir: &Path, sock_dir: &Path) -> RuntimeParams {
         wfop_pepper: "m13r5-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: sock_dir.join("vrt-wu.sock").to_string_lossy().into_owned(),
         log_tail: vrt_config::LogTailParams::default(),

@@ -354,7 +354,7 @@ impl CacheService {
     pub fn new(root: Option<PathBuf>, limits: CacheLimits) -> io::Result<Self> {
         limits.validate()?;
         if let Some(r) = &root {
-            Self::ensure_cache_root(r)?;
+            ensure_traverse_dir(r, "cache root")?;
         }
         Ok(Self {
             store: Arc::new(Mutex::new(Store::default())),
@@ -362,85 +362,87 @@ impl CacheService {
             root,
         })
     }
+}
 
-    /// C1-r2 P0: idempotent secure-root contract for the cache socket
-    /// dir. `ensure_secure_dir` demands exactly 0700 — correct for
-    /// host-only dirs, wrong here: tenant uids must TRAVERSE the dir
-    /// (connect to their socket) while never listing or writing it,
-    /// hence 0711. Re-validating that mode on every start keeps the
-    /// check restart-idempotent; `ensure_secure_dir` stays untouched
-    /// for its real 0700 callers.
-    ///
-    /// Contract — exactly one of:
-    ///   - path absent → create the leaf atomically at 0711 (no
-    ///     permissive mkdir/chmod window), then validate;
-    ///   - path present → must be a NON-SYMLINK directory owned by our
-    ///     euid with mode EXACTLY 0711.
-    /// Every other shape (symlink, file, foreign owner, group/world
-    /// writable, 0700/0755/0777) is refused — fail closed, never
-    /// silently chmod someone else's directory.
-    fn ensure_cache_root(dir: &Path) -> io::Result<()> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        match std::fs::symlink_metadata(dir) {
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if let Some(parent) = dir.parent() {
-                    std::fs::create_dir_all(parent)?;
+/// C1-r2 P0: idempotent traverse-only root contract for per-tenant
+/// unix-socket dirs (cache, AE). `ensure_secure_dir` demands exactly
+/// 0700 — correct for host-only dirs, wrong here: tenant uids must
+/// TRAVERSE the dir (connect to their socket) while never listing or
+/// writing it, hence 0711. Re-validating that mode on every start
+/// keeps the check restart-idempotent; `ensure_secure_dir` stays
+/// untouched for its real 0700 callers.
+///
+/// Contract — exactly one of:
+///   - path absent → create the leaf atomically at 0711 (no
+///     permissive mkdir/chmod window), then validate;
+///   - path present → must be a NON-SYMLINK directory owned by our
+///     euid with mode EXACTLY 0711.
+/// Every other shape (symlink, file, foreign owner, group/world
+/// writable, 0700/0755/0777) is refused — fail closed, never
+/// silently chmod someone else's directory. `label` only names the
+/// caller in error text.
+pub fn ensure_traverse_dir(dir: &Path, label: &str) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = dir.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, format!("{label} path nul"))
+            })?;
+            // SAFETY: the path is a valid NUL-terminated CString and mode 0o711 is a valid mode_t.
+            if unsafe { libc::mkdir(c.as_ptr(), 0o711) } != 0 {
+                let e = io::Error::last_os_error();
+                // A concurrent creator is fine — fall through to the
+                // shared validation and judge the result, not the race.
+                if e.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(e);
                 }
-                let c =
-                    std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "cache root path nul")
-                    })?;
-// SAFETY: the path is a valid NUL-terminated CString and mode 0o711 is a valid mode_t.
-                if unsafe { libc::mkdir(c.as_ptr(), 0o711) } != 0 {
-                    let e = io::Error::last_os_error();
-                    // A concurrent creator is fine — fall through to the
-                    // shared validation and judge the result, not the race.
-                    if e.raw_os_error() != Some(libc::EEXIST) {
-                        return Err(e);
-                    }
-                } else {
-                    // mkdir honors umask — a restrictive one (e.g. 077)
-                    // would land the dir at 0700 and fail validation.
-                    // The dir is provably fresh and ours, so an explicit
-                    // chmod here carries no foreign-dir risk.
-// SAFETY: the path is a valid NUL-terminated CString and 0o711 is a valid mode_t.
-                    if unsafe { libc::chmod(c.as_ptr(), 0o711) } != 0 {
-                        return Err(io::Error::last_os_error());
-                    }
+            } else {
+                // mkdir honors umask — a restrictive one (e.g. 077)
+                // would land the dir at 0700 and fail validation.
+                // The dir is provably fresh and ours, so an explicit
+                // chmod here carries no foreign-dir risk.
+                // SAFETY: the path is a valid NUL-terminated CString and 0o711 is a valid mode_t.
+                if unsafe { libc::chmod(c.as_ptr(), 0o711) } != 0 {
+                    return Err(io::Error::last_os_error());
                 }
             }
-            Err(e) => return Err(e),
         }
-        let meta = std::fs::symlink_metadata(dir)?;
-        if meta.file_type().is_symlink() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "cache root is a symlink",
-            ));
-        }
-        if !meta.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cache root is not a directory",
-            ));
-        }
-// SAFETY: geteuid(2) has no preconditions and cannot fail.
-        if meta.uid() != unsafe { libc::geteuid() } {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "cache root is owned by another uid",
-            ));
-        }
-        if meta.permissions().mode() & 0o777 != 0o711 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "cache root mode must be 0711",
-            ));
-        }
-        Ok(())
+        Err(e) => return Err(e),
     }
+    let meta = std::fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{label} is a symlink"),
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{label} is not a directory"),
+        ));
+    }
+    // SAFETY: geteuid(2) has no preconditions and cannot fail.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{label} is owned by another uid"),
+        ));
+    }
+    if meta.permissions().mode() & 0o777 != 0o711 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{label} mode must be 0711"),
+        ));
+    }
+    Ok(())
+}
 
+impl CacheService {
     /// Limits snapshot — supervisor/tests may introspect.
     pub fn limits(&self) -> CacheLimits {
         self.limits

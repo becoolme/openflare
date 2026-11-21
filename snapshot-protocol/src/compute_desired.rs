@@ -293,6 +293,13 @@ pub enum BindingDesired {
     /// Points at no provider resource; the tenant supplies code at
     /// runtime. Rendered as workerd `workerLoader` (experimental).
     WorkerLoader(WorkerLoaderBinding),
+    /// `{"type":"analyticsEngine"}` — Analytics Engine dataset
+    /// (`env.<name>` is a `AnalyticsEngineDataset` with
+    /// `writeDataPoint()`). Rendered as workerd `analyticsEngine`
+    /// (experimental) targeting the tenant's AE ingest socket; the
+    /// emitted service designator name IS the dataset name — workerd
+    /// derives the event's `dataset` field from it.
+    AnalyticsEngine(AnalyticsEngineBinding),
 }
 
 /// `{"type":"var"}` — see [`BindingDesired::Var`].
@@ -517,6 +524,22 @@ pub struct DoBindingDesired {
 pub struct WorkerLoaderBinding {
     /// Binding name (`env.<name>`), JS identifier.
     pub name: String,
+}
+
+/// `{"type":"analyticsEngine"}` — an Analytics Engine dataset binding.
+/// `dataset` becomes both the workerd service-designator name (the
+/// event's `dataset` field) and the per-tenant spool/parquet
+/// partition, so it is charset-bound at validation
+/// (`[A-Za-z0-9_]{1,256}`) — safe as a capnp service name, an
+/// `--external-addr` token, and a filesystem path segment.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnalyticsEngineBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// Dataset name — wrangler `dataset`, defaults to the binding name
+    /// at project-config parse (mirrors CF).
+    pub dataset: String,
 }
 
 /// P3c-1 `durableObjectClasses[]`: one DO class declared by this worker.
@@ -1375,6 +1398,21 @@ impl WorkerDesired {
                 // (validated as a binding name at the match head) is
                 // the only field.
                 BindingDesired::WorkerLoader(_) => {}
+                BindingDesired::AnalyticsEngine(ae) => {
+                    // `dataset` is emitted as a workerd service name
+                    // AND used as a spool/parquet path segment —
+                    // `[A-Za-z0-9_]{1,256}` keeps both uses safe
+                    // (no `=` for --external-addr, no `/` for paths).
+                    if ae.dataset.is_empty()
+                        || ae.dataset.len() > 256
+                        || !ae
+                            .dataset
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return Err(DesiredError::Identifier("bindings.dataset"));
+                    }
+                }
             }
         }
         Ok(())
@@ -1545,6 +1583,7 @@ impl BindingDesired {
             Self::Queue(b) => &b.name,
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
+            Self::AnalyticsEngine(b) => &b.name,
         }
     }
 
@@ -1565,7 +1604,8 @@ impl BindingDesired {
             | Self::Service(_)
             | Self::DurableObject(_)
             | Self::Ratelimit(_)
-            | Self::WorkerLoader(_) => None,
+            | Self::WorkerLoader(_)
+            | Self::AnalyticsEngine(_) => None,
         }
     }
 }

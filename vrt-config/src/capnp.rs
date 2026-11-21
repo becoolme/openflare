@@ -279,6 +279,12 @@ pub struct RuntimeParams {
     /// emitted and `caches.*` throws `No Cache was configured`
     /// (explicit failure, never silent success).
     pub cache_addr: String,
+    /// AE: this tenant's Analytics Engine ingest socket
+    /// `--external-addr` target (`unix:<path>`). Empty ⇒ a tenant
+    /// declaring `analyticsEngine` bindings fails the whole render
+    /// closed — an unbound dataset external would resolve to nothing
+    /// and `writeDataPoint()` would fail silently inside workerd.
+    pub ae_addr: String,
     /// PT1: watchdog heartbeat unix socket path INSIDE `socket_dir`.
     /// Non-empty ⇒ emit the `vrt-heartbeat` service + its private
     /// socket; empty ⇒ byte-identical legacy render (no heartbeat).
@@ -496,6 +502,14 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         && input.params.do_storage_dir.is_empty()
     {
         return Err(ConfigError::Identifier("doStorageDir"));
+    }
+
+    // AE: `analyticsEngine` bindings need the tenant ingest socket —
+    // without it the dataset-named `external` service would have no
+    // `--external-addr` and workerd could not resolve the designator
+    // (fail closed at assemble depth, same as `doStorageDir`).
+    if !ae_datasets(input.tenant).is_empty() && input.params.ae_addr.is_empty() {
+        return Err(ConfigError::Identifier("aeAddr"));
     }
 
     // W3-r2 P0: per-worker fault isolation. Every worker in a tenant
@@ -777,6 +791,19 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
             capnp_text(CACHE_SERVICE)
         ));
     }
+    // AE: one `external` service per DISTINCT dataset name — workerd
+    // copies the designator's service name into the event's `dataset`
+    // field (server/bindings.rs `engine.set_dataset(name)`), so the
+    // service must be named verbatim after the dataset. All of them
+    // resolve to this tenant's single AE ingest socket. Dataset
+    // charset `[A-Za-z0-9_]` can never collide with platform service
+    // names, which are all hyphenated (`worker-*`, `vrt-*`, `facade-*`).
+    for ds in ae_datasets(input.tenant) {
+        out.push_str(&format!(
+            "    (name = {}, external = (http = ())),\n",
+            capnp_text(ds)
+        ));
+    }
     out.push_str(&format!(
         "    (name = {}, network = (\n      allow = [\"public\"],\n      deny = [\"private\", \"local\", \"unix\", \"unix-abstract\"],\n      tlsOptions = (trustBrowserCas = true),\n    )),\n    (name = {}, network = (\n      allow = [\"local\"],\n      deny = [\"unix\", \"unix-abstract\"],\n    )),\n",
         capnp_text(OUTBOUND_NETWORK_SERVICE),
@@ -912,6 +939,12 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
                 v.push(ExternalAddr {
                     service: CACHE_SERVICE.into(),
                     address: input.params.cache_addr.clone(),
+                });
+            }
+            for ds in ae_datasets(input.tenant) {
+                v.push(ExternalAddr {
+                    service: ds.to_string(),
+                    address: input.params.ae_addr.clone(),
                 });
             }
             v
@@ -1512,6 +1545,19 @@ fn emit_binding(
                 &pg.name,
             )?;
         }
+        BindingDesired::AnalyticsEngine(ae) => {
+            // `analyticsEngine` (@17 :ServiceDesignator) — the
+            // designator NAME becomes the event's `dataset` field
+            // (workerd `engine.set_dataset(designator.get_name())`),
+            // so the dataset-named `external` service emitted above is
+            // the verbatim target. `$experimental`-gated upstream —
+            // assemble derives `--experimental` from the binding.
+            out.push_str(&format!(
+                "        (name = {}, analyticsEngine = {}),\n",
+                capnp_text(&ae.name),
+                capnp_text(&ae.dataset),
+            ));
+        }
         BindingDesired::WorkerLoader(loader) => {
             // workerLoader is `$experimental`-gated upstream — assemble
             // adds `--experimental` to argv when a tenant declares one.
@@ -1880,6 +1926,23 @@ fn emit_system_worker(
 /// `worker-<workerId>` capnp service name.
 fn worker_service_name(worker_id: &str) -> String {
     format!("worker-{worker_id}")
+}
+
+/// Sorted unique dataset names across a tenant's `analyticsEngine`
+/// bindings — one `external` service + one `--external-addr` entry per
+/// distinct name (the designator name doubles as the event `dataset`).
+fn ae_datasets(tenant: &TenantDesired) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for worker in &tenant.workers {
+        for binding in &worker.bindings {
+            if let BindingDesired::AnalyticsEngine(ae) = binding {
+                out.push(ae.dataset.as_str());
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// P3c-1: `do-storage-<workerId>` capnp service name — the worker's
@@ -2553,6 +2616,21 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
         for binding in &worker.bindings {
             if !valid_binding_name(binding.name()) || !names.insert(binding.name()) {
                 return Err(ConfigError::Identifier("bindingName"));
+            }
+            // AE: `dataset` becomes an `--external-addr` service token
+            // AND a spool/parquet path segment — the `[A-Za-z0-9_]`
+            // bound must hold at emit depth too (defense-in-depth
+            // behind compute.desired validation).
+            if let BindingDesired::AnalyticsEngine(ae) = binding {
+                if ae.dataset.is_empty()
+                    || ae.dataset.len() > 256
+                    || !ae
+                        .dataset
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(ConfigError::Identifier("bindings.dataset"));
+                }
             }
         }
         // P3c-1: DO class declarations — format + uniqueness at emit
