@@ -235,6 +235,17 @@ fn valid_database_id(id: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
+/// K2 stream ids are server-minted `^[0-9a-f]{32}$` (the vrt-sql
+/// storage identity) — NOT the 26-char ULID shape D1/queue ids use.
+/// A DROP whose payload kind is `k2` must be validated against this
+/// shape or it can never reach `/streams/{id}/drop`.
+fn valid_k2_stream_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Engine seq derivation: op_seq << 12 | call_idx. One dedup key is
 /// consumed per HTTP call (the engine dedups per REQUEST — a batch of
 /// statements inside one request shares one key). Call indexes are
@@ -474,8 +485,19 @@ impl D1OpsExecutor {
     /// Execute one op end-to-end. Never panics — the result is always
     /// a terminal ack (DONE/FAILED/EXPIRED).
     pub async fn execute(&self, op: &D1Op) -> D1OpAck {
-        if !valid_database_id(&op.database_id) {
-            return fail(op, "invalid databaseId");
+        // Id shape is kind-scoped for DROP: `{"kind":"k2"}` carries a
+        // 32-hex streamId; D1/queue ids keep the 26-char ULID shape.
+        // Unknown/malformed kinds keep the D1 check here and fail
+        // closed inside drop_path (never guess a namespace).
+        let id_ok = match op.kind {
+            D1OpKind::Drop => match op.payload.get("kind").and_then(|v| v.as_str()) {
+                Some("k2") => valid_k2_stream_id(&op.database_id),
+                _ => valid_database_id(&op.database_id),
+            },
+            _ => valid_database_id(&op.database_id),
+        };
+        if !id_ok {
+            return fail(op, "invalid resourceId");
         }
         // T35b: an op past its dispatch deadline is never executed —
         // the caller already saw a failure for it. Report EXPIRED so the
@@ -969,7 +991,7 @@ mod tests {
             ))
             .await;
         assert_eq!(ack.status, "FAILED");
-        assert_eq!(ack.error.as_deref(), Some("invalid databaseId"));
+        assert_eq!(ack.error.as_deref(), Some("invalid resourceId"));
     }
 
     #[tokio::test]
@@ -1164,6 +1186,41 @@ mod tests {
             .await;
         assert_eq!(ack.status, "FAILED");
         assert!(ack.error.unwrap().contains("transport"));
+    }
+
+    #[tokio::test]
+    async fn k2_drop_op_reaches_transport_with_32hex_id() {
+        // Regression: execute() used to run valid_database_id (26-char
+        // ULID) before kind dispatch — a K2 streamId (32-hex) was
+        // rejected as "invalid databaseId" and could never reach
+        // /streams/{id}/drop. Transport-level failure proves the op
+        // passed the kind-scoped id gate into drop_db.
+        let dir = tempfile::tempdir().unwrap();
+        let exec = exec_at_unused_port(&dir);
+        let sid = "a".repeat(32);
+        let ack = exec
+            .execute(&op(
+                7,
+                D1OpKind::Drop,
+                &sid,
+                serde_json::json!({"kind":"k2"}),
+            ))
+            .await;
+        assert_eq!(ack.status, "FAILED");
+        let err = ack.error.unwrap();
+        assert!(err.contains("transport"), "unexpected error: {err}");
+        // And a malformed k2 id still fails closed at the id gate
+        // ('g' is outside [0-9a-f]).
+        let ack = exec
+            .execute(&op(
+                8,
+                D1OpKind::Drop,
+                &"g".repeat(32),
+                serde_json::json!({"kind":"k2"}),
+            ))
+            .await;
+        assert_eq!(ack.status, "FAILED");
+        assert_eq!(ack.error.as_deref(), Some("invalid resourceId"));
     }
 
     #[test]
