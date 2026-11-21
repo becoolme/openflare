@@ -1533,15 +1533,26 @@ fn emit_binding(
             {
                 return Err(ConfigError::ServiceTarget);
             }
-            match service.entrypoint.as_deref() {
+            // Last trusted boundary for tenant-supplied props: a non-object
+            // or over-bound payload must never reach the capnp document.
+            if let Some(props) = &service.props {
+                if !snapshot_protocol::compute_desired::valid_service_props(props) {
+                    return Err(ConfigError::Capacity("serviceProps"));
+                }
+            }
+            let props = service
+                .props
+                .as_ref()
+                .map(|p| String::from_utf8(canonical_bytes(p)).expect("canonical props are utf8"));
+            match (service.entrypoint.as_deref(), props.as_deref()) {
                 // Legacy bytes: a default-export binding renders exactly
                 // as before the field existed.
-                None => out.push_str(&format!(
+                (None, None) => out.push_str(&format!(
                     "        (name = {}, service = (name = {})),\n",
                     capnp_text(&service.name),
                     capnp_text(&worker_service_name(&service.worker_id)),
                 )),
-                Some(ep) => {
+                (Some(ep), None) => {
                     // Re-checked here (the render is the last trusted
                     // boundary): never route a tenant onto a
                     // platform-injected entrypoint such as the probe.
@@ -1555,6 +1566,26 @@ fn emit_binding(
                         capnp_text(&service.name),
                         capnp_text(&worker_service_name(&service.worker_id)),
                         capnp_text(ep),
+                    ));
+                }
+                (None, Some(props)) => out.push_str(&format!(
+                    "        (name = {}, service = (name = {}, props = (json = {}))),\n",
+                    capnp_text(&service.name),
+                    capnp_text(&worker_service_name(&service.worker_id)),
+                    capnp_text(props),
+                )),
+                (Some(ep), Some(props)) => {
+                    if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep)
+                        || ep == crate::waituntil::PROBE_ENTRYPOINT
+                    {
+                        return Err(ConfigError::ServiceTarget);
+                    }
+                    out.push_str(&format!(
+                        "        (name = {}, service = (name = {}, entrypoint = {}, props = (json = {}))),\n",
+                        capnp_text(&service.name),
+                        capnp_text(&worker_service_name(&service.worker_id)),
+                        capnp_text(ep),
+                        capnp_text(props),
                     ));
                 }
             }
