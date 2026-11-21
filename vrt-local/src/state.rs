@@ -48,6 +48,12 @@ pub struct LocalState {
     pub system_objects: BTreeSet<String>,
     /// `worker name → record`. BTreeMap = deterministic desired order.
     pub workers: BTreeMap<String, WorkerRecord>,
+    /// Tenant-level Flagship app store — flag definitions ride the
+    /// desired doc's tenant section so edits propagate without a
+    /// redeploy (CF ≤30s propagation analog). `#[serde(default)]`
+    /// keeps pre-feature state files loadable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flagship_apps: Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>,
 }
 
 fn default_max_versions() -> u32 {
@@ -136,6 +142,7 @@ impl LocalState {
             max_versions_per_worker: DEFAULT_MAX_VERSIONS,
             system_objects: BTreeSet::new(),
             workers: BTreeMap::new(),
+            flagship_apps: Vec::new(),
         }
     }
 
@@ -359,6 +366,7 @@ impl LocalState {
             tenants: vec![TenantDesired {
                 tenant_id: self.tenant_id.clone(),
                 workers,
+                flagship_apps: self.flagship_apps.clone(),
             }],
             deletions: vec![],
         })

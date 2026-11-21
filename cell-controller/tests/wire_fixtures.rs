@@ -187,6 +187,7 @@ fn desired_ack_fixture() {
             unsafe_eval: true,
             observability: true,
             streaming_tail_consumers: true,
+            flagship: true,
         }),
     };
     check(

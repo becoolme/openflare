@@ -12443,6 +12443,7 @@ sleep 10
         do_tainted_workers(&snapshot_protocol::compute_desired::TenantDesired {
             tenant_id: "t".into(),
             workers,
+            flagship_apps: Vec::new(),
         })
     }
 
@@ -12758,6 +12759,7 @@ sleep 10
             tenant: snapshot_protocol::compute_desired::TenantDesired {
                 tenant_id: "t".into(),
                 workers: vec![taint_worker("w0", vec![], true)],
+                flagship_apps: vec![],
             },
             revision: 9,
         });
@@ -13265,6 +13267,7 @@ sleep 10
             tenant: snapshot_protocol::compute_desired::TenantDesired {
                 tenant_id: "t".into(),
                 workers: vec![taint_worker("w0", vec![], true)],
+                flagship_apps: vec![],
             },
             revision: 9,
         });

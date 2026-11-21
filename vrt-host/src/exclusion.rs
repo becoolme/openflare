@@ -269,6 +269,7 @@ mod tests {
         TenantDesired {
             tenant_id: "team-a".to_string(),
             workers: ids.iter().map(|id| w(id)).collect(),
+            flagship_apps: Vec::new(),
         }
     }
 

@@ -221,6 +221,7 @@ mod tests {
                         outbound_connections: 0,
                     },
                 }],
+                flagship_apps: vec![],
             }],
             deletions: vec![],
 };

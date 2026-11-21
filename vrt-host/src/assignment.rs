@@ -148,6 +148,7 @@ pub fn filter_to_assignment(desired: &ComputeDesired, a: &PodAssignment) -> Comp
             (!workers.is_empty()).then(|| TenantDesired {
                 tenant_id: t.tenant_id.clone(),
                 workers,
+                flagship_apps: t.flagship_apps.clone(),
             })
         })
         .collect();

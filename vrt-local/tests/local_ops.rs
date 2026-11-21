@@ -1346,3 +1346,116 @@ fn streaming_tail_consumers_change_mints_new_version() {
         "{v}"
     );
 }
+
+/// CF `[[flagship]]` + `flagship.json` — the standalone flag store
+/// gathers into tenant-level `flagshipApps` on the signed desired doc;
+/// the binding itself is version-scoped. A bound-but-undeclared app
+/// synthesizes an empty store (CF local-dev semantics); a redeploy
+/// that drops the file keeps previously merged apps (tenant-level
+/// data is not version data).
+#[test]
+fn flagship_bindings_and_flag_store_deploy() {
+    let root = root();
+    let local = init(&root);
+    // `[[flagship]]` is wrangler surface and vrt.toml shadows
+    // wrangler.toml — build the dir by hand with wrangler.toml only.
+    let dir = root.join("worker-flags-svc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("main.js"), "export default {}\n").unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"flags-svc\"\nmain = \"main.js\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         [[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-01\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("flagship.json"),
+        r#"{"app-01":{"flags":{"new-checkout":{"enabled":true,"type":"boolean","variants":{"on":true,"off":false},"defaultVariant":"off"}}},"#
+            .to_string()
+                + r#""app-extra":{"flags":{"p":{"enabled":false,"type":"string","variants":{"a":"x"},"defaultVariant":"a"}}}}"#,
+    )
+    .unwrap();
+    local.deploy(&dir, &DeployOverrides::default()).unwrap();
+
+    let raw = std::fs::read(vrt_local::layout::desired_dir(&root).join("envelope.json")).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let tenant = &doc["payload"]["tenants"][0];
+    // The binding rides the worker version.
+    let bindings = tenant["workers"][0]["bindings"].as_array().unwrap();
+    let f = bindings
+        .iter()
+        .find(|b| b["type"] == "flagship")
+        .expect("flagship binding");
+    assert_eq!(f["name"], "FLAGS");
+    assert_eq!(f["appId"], "app-01");
+    // Apps are tenant-level: both the declared app and the extra one
+    // ship; the declared flag content is verbatim.
+    let apps = tenant["flagshipApps"].as_array().unwrap();
+    assert_eq!(apps.len(), 2, "{apps:?}");
+    assert_eq!(apps[0]["appId"], "app-01");
+    assert!(apps[0]["config"].as_str().unwrap().contains("new-checkout"));
+    assert_eq!(apps[1]["appId"], "app-extra");
+
+    // Update the store: app-01's flags flip, app-extra removed —
+    // merge semantics overwrite app-01 only (tenant-level updates are
+    // per-app, like the CF flag store).
+    std::fs::write(
+        dir.join("flagship.json"),
+        r#"{"app-01":{"flags":{"new-checkout":{"enabled":false,"type":"boolean","variants":{"on":true,"off":false},"defaultVariant":"on"}}}}"#,
+    )
+    .unwrap();
+    local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    let st_raw = std::fs::read_to_string(root.join("state/state.json")).unwrap();
+    assert!(st_raw.contains("\"appId\": \"app-01\""));
+    assert!(st_raw.contains("app-extra"), "prior app survives: {st_raw}");
+    // `config` is a serialized-JSON string field — quotes escape in
+    // state.json.
+    assert!(
+        st_raw.contains("defaultVariant\\\":\\\"on"),
+        "updated config landed: {st_raw}"
+    );
+
+    // A bound app absent from the file AND from prior state still
+    // resolves — the synthesized empty config ships the local-store
+    // contract (evaluations return call-site defaults).
+    let dir2 = root.join("worker-flags-two");
+    std::fs::create_dir_all(&dir2).unwrap();
+    std::fs::write(dir2.join("main.js"), "export default {}\n").unwrap();
+    std::fs::write(
+        dir2.join("wrangler.toml"),
+        "name = \"flags-two\"\nmain = \"main.js\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         [[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-missing\"\n",
+    )
+    .unwrap();
+    local.deploy(&dir2, &DeployOverrides::default()).unwrap();
+    let raw = std::fs::read(vrt_local::layout::desired_dir(&root).join("envelope.json")).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let apps = doc["payload"]["tenants"][0]["flagshipApps"]
+        .as_array()
+        .unwrap();
+    let missing = apps.iter().find(|a| a["appId"] == "app-missing").unwrap();
+    assert_eq!(
+        missing["config"].as_str().unwrap(),
+        r#"{"appId":"app-missing","flags":{}}"#
+    );
+
+    // Malformed flag content fails closed before anything publishes.
+    let dir3 = root.join("worker-flags-bad");
+    std::fs::create_dir_all(&dir3).unwrap();
+    std::fs::write(dir3.join("main.js"), "export default {}\n").unwrap();
+    std::fs::write(
+        dir3.join("wrangler.toml"),
+        "name = \"flags-bad\"\nmain = \"main.js\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         [[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-x\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir3.join("flagship.json"),
+        r#"{"app-x":{"flags":{"bad":{"enabled":true,"type":"nope","variants":{},"defaultVariant":"x"}}}}"#,
+    )
+    .unwrap();
+    assert!(local.deploy(&dir3, &DeployOverrides::default()).is_err());
+}
