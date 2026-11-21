@@ -92,7 +92,8 @@ These are not tied to one binding.
 - **R2 `onlyIf`** depends on the backend (`s3.conditionalWrites`);
   `jurisdiction`/`storage_class` rejected.
 - **Static assets** caps: 512 files / 1 MiB each / 8 MiB per deploy;
-  `html_handling` limited to `auto-trailing-slash` | `none`.
+  all four `html_handling` modes, with Cloudflare's per-request-form
+  candidate order and 307 canonical redirects.
 - **`vars` non-string values arrive as JSON-encoded strings**, not
   typed JSON values.
 - **Worker loaders** (`[[worker_loaders]]`): native `WorkerLoader`

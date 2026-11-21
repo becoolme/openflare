@@ -20,6 +20,18 @@ From `examples/standalone-wrangler/wrangler.jsonc`:
 }
 ```
 
+Any of Cloudflare's four `html_handling` modes can be added to that
+block (the example keeps the default `auto-trailing-slash`):
+
+```jsonc
+{
+  "assets": {
+    "directory": "public",
+    "html_handling": "drop-trailing-slash" // auto-trailing-slash (default) | force-trailing-slash | drop-trailing-slash | none
+  }
+}
+```
+
 Native `vrt.toml` equivalent (`examples/standalone-kv-assets/vrt.toml`):
 
 ```toml
@@ -27,6 +39,7 @@ Native `vrt.toml` equivalent (`examples/standalone-kv-assets/vrt.toml`):
 dir = "public"
 binding = "ASSETS"                    # optional — defaults to ASSETS
 notFoundHandling = "single-page-application"
+htmlHandling = "auto-trailing-slash"  # optional — same four modes
 # assetsFirst = true                  # opt into Cloudflare assets-first routing
 ```
 
@@ -53,9 +66,23 @@ that does not match the bytes is never committed.
 
 ## Known differences from Cloudflare
 
-- `html_handling` accepts only `auto-trailing-slash` and `none`;
-  Cloudflare's `force-trailing-slash` / `drop-trailing-slash` are
-  rejected at pack (`vrt-local/src/worker_pkg.rs`).
+- `html_handling` accepts all four Cloudflare modes
+  (`auto-trailing-slash`, `force-trailing-slash`, `drop-trailing-slash`,
+  `none`) and follows Cloudflare's resolver
+  (`asset-worker/src/handler.ts`) row for row: the request *form*
+  (`.html`, `/index`, trailing slash, bare path) picks the candidate
+  order, overlapping `/foo.html` + `/foo/index.html` keep their own
+  URLs, and a canonical rewrite is only emitted when its destination
+  resolves back to the same asset (`safeRedirect`) — otherwise the
+  exact URL is served. Non-canonical forms return **307** with a
+  `Location` header built from the percent-encoded path plus the
+  original query string; dotted stems (`/release-1.2` →
+  `/release-1.2.html`) and exact extensionless files (`/api/index`) are
+  served normally. Non-HTML assets (`/app.js`) are served verbatim and
+  never rewritten. Redirect targets are always origin-relative:
+  repeated slashes are collapsed like Cloudflare's `decodePath`, so
+  `/%2Fevil.com` redirects to `/evil.com` and never to a
+  protocol-relative `//evil.com`.
 - `not_found_handling` accepts `none`, `404-page`,
   `single-page-application`.
 - `run_worker_first`: `true`/`false` or a list of `/`-prefixed globs

@@ -176,14 +176,8 @@ async fn fetch(
 #[tokio::test]
 async fn get_serves_bytes_with_etag_and_mime() {
     let e = env(&[("/index.html", b"<h1>hi</h1>")], "none", TENANT);
-    let res = fetch(
-        &e.app,
-        &e.digest,
-        "GET",
-        "https://site.example/index.html",
-        &[],
-    )
-    .await;
+    // `/` is the canonical form of `/index.html` under html handling.
+    let res = fetch(&e.app, &e.digest, "GET", "https://site.example/", &[]).await;
     assert_eq!(res.status(), StatusCode::OK);
     let etag = res
         .headers()
@@ -226,13 +220,105 @@ async fn if_none_match_returns_304() {
 }
 
 #[tokio::test]
-async fn directory_without_slash_redirects_308() {
+async fn directory_without_slash_redirects_307() {
     let e = env(&[("/docs/index.html", b"d")], "none", TENANT);
     let res = fetch(&e.app, &e.digest, "GET", "https://x/docs", &[]).await;
-    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(res.headers().get("location").unwrap(), "/docs/");
     let res = fetch(&e.app, &e.digest, "GET", "https://x/docs/", &[]).await;
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn canonical_redirects_preserve_query_and_encode_reserved_chars() {
+    // `.html` canonicalization keeps the query string (Cloudflare
+    // appends `url.search`) and percent-encodes the destination so a
+    // reserved filename character never turns into a query/fragment.
+    let e = env(
+        &[("/page.html", b"p"), ("/a?b.html", b"q"), ("/a#b.html", b"h")],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/page.html?id=5", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/page?id=5");
+
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%3Fb.html?q=1", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/a%3Fb?q=1");
+    // Following the redirect lands on the same asset.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%3Fb", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"q");
+
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%23b.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/a%23b");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%23b", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"h");
+}
+
+/// A decoded `%2F` must never produce a protocol-relative `Location` —
+/// the encoding redirect stays on the application origin, including for
+/// SPA/404 fallback responses.
+#[tokio::test]
+async fn encoded_slashes_never_produce_protocol_relative_redirects() {
+    for nfh in ["single-page-application", "404-page"] {
+        let files: &[(&str, &[u8])] = match nfh {
+            "404-page" => &[("/404.html", b"<h1>nope</h1>")],
+            _ => &[("/index.html", b"spa")],
+        };
+        let e = env(files, nfh, TENANT);
+        let res = fetch(&e.app, &e.digest, "GET", "https://x/%2Fevil.com", &[]).await;
+        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT, "{nfh}");
+        assert_eq!(res.headers().get("location").unwrap(), "/evil.com", "{nfh}");
+        let res = fetch(&e.app, &e.digest, "GET", "https://x//evil.com", &[]).await;
+        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT, "{nfh}");
+        assert_eq!(res.headers().get("location").unwrap(), "/evil.com", "{nfh}");
+    }
+}
+
+#[tokio::test]
+async fn dotted_html_stems_stay_reachable() {
+    // `/release-1.2.html` canonicalizes to `/release-1.2`, which must
+    // resolve back to the same file (Cloudflare's `safeRedirect`).
+    let e = env(&[("/release-1.2.html", b"r")], "none", TENANT);
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/release-1.2.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/release-1.2");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/release-1.2", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"r");
+}
+
+#[tokio::test]
+async fn overlapping_page_and_directory_routes_keep_both_reachable() {
+    // `/foo.html` and `/foo/index.html` are different pages: each URL
+    // form must keep serving its own content instead of collapsing
+    // onto the `.html` sibling.
+    let e = env(
+        &[("/foo.html", b"page"), ("/foo/index.html", b"index")],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"page");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo/", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"index");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo/index.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/foo/");
+}
+
+#[tokio::test]
+async fn exact_extensionless_index_file_is_served() {
+    let e = env(&[("/api/index", b"bin")], "none", TENANT);
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/api/index", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"bin");
 }
 
 #[tokio::test]
@@ -331,7 +417,9 @@ async fn missing_manifest_is_storage_unavailable() {
 async fn listed_object_missing_is_storage_unavailable() {
     let e = env(&[("/index.html", b"i")], "none", TENANT);
     remove_stored(&e.root, &hex64(b"i"));
-    let res = fetch(&e.app, &e.digest, "GET", "https://x/index.html", &[]).await;
+    // Canonical `/` maps to `/index.html`; the manifest-listed object
+    // is the thing that was removed.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/", &[]).await;
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(code_of(&res), "ASSET_STORAGE_UNAVAILABLE");
 }
@@ -639,7 +727,8 @@ async fn percent_encoded_paths_decode_before_match() {
     );
     for url in [
         "http://w.test/my%20file.txt",
-        "http://w.test/%E4%B8%AD%E6%96%87%20page.html",
+        // Canonical stem of `/... page.html` under html handling.
+        "http://w.test/%E4%B8%AD%E6%96%87%20page",
     ] {
         let res = fetch(&e.app, &e.digest, "GET", url, &[]).await;
         assert_eq!(res.status(), StatusCode::OK, "{url}");
