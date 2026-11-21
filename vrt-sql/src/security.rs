@@ -266,6 +266,7 @@ pub fn authorize(ctx: AuthContext) -> Authorization {
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(table_name))
                 || table_name.to_ascii_lowercase().starts_with("_vrt_q_")
+                || table_name.to_ascii_lowercase().starts_with("_vrt_k2_")
             {
                 Authorization::Deny
             } else {
@@ -279,6 +280,7 @@ pub fn authorize(ctx: AuthContext) -> Authorization {
             // T37: user writes to the `_vrt_q_*` queue internal tables are likewise rejected.
             if deny_table_write(table_name)
                 || table_name.to_ascii_lowercase().starts_with("_vrt_q_")
+                || table_name.to_ascii_lowercase().starts_with("_vrt_k2_")
             {
                 Authorization::Deny
             } else {
@@ -420,9 +422,12 @@ pub fn configure(conn: &Connection) -> Result<InternalFlag, EngineError> {
     Ok(internal)
 }
 
-/// Engine internal tables: the `_vrt_dedup` ledger + `_vrt_q_*` queue objects (T37).
+/// Engine internal tables: the `_vrt_dedup` ledger + `_vrt_q_*` queue objects (T37)
+/// + `_vrt_k2_*` K2 stream objects.
 fn is_internal_table(name: &str) -> bool {
-    name.eq_ignore_ascii_case("_vrt_dedup") || name.to_ascii_lowercase().starts_with("_vrt_q_")
+    name.eq_ignore_ascii_case("_vrt_dedup")
+        || name.to_ascii_lowercase().starts_with("_vrt_q_")
+        || name.to_ascii_lowercase().starts_with("_vrt_k2_")
 }
 
 /// Full set of expected actions for internal statements: init PRAGMA, _vrt_dedup table creation,
@@ -451,11 +456,14 @@ fn authorize_internal(ctx: AuthContext) -> Authorization {
             }
         }
         AuthAction::CreateTable { table_name } | AuthAction::CreateIndex { table_name, .. }
-            if is_internal_table(table_name) =>
+            if is_internal_table(table_name) || table_name == "sqlite_sequence" =>
         {
             // The PK auto-index sqlite_autoindex__vrt_dedup_N also goes through here.
             // T37: the `_vrt_q_*` queue tables (messages/dead/meta + the _vrt_q_visible
             // index) are also engine-internal objects, and the user surface still rejects them via the reserved `_vrt_` prefix.
+            // sqlite_sequence is the AUTOINCREMENT ledger SQLite nests inside the first
+            // AUTOINCREMENT CREATE TABLE (same exception the user surface grants at the
+            // `CreateTable{sqlite_sequence}` arm above).
             Authorization::Allow
         }
         AuthAction::Select | AuthAction::Transaction { .. } | AuthAction::Recursive => {
@@ -477,6 +485,7 @@ fn authorize_internal(ctx: AuthContext) -> Authorization {
         | AuthAction::Delete { table_name } => {
             if is_internal_table(table_name)
                 || table_name.eq_ignore_ascii_case("sqlite_master")
+                || table_name.eq_ignore_ascii_case("sqlite_sequence")
                 || table_name.to_ascii_lowercase().starts_with("pragma_")
             {
                 // Read of the table-valued functions pragma_page_count/pragma_page_size

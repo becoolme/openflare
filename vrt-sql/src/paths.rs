@@ -24,14 +24,17 @@ pub enum PathError {
 pub enum ResourceKind {
     D1,
     Queue,
+    K2,
 }
 
 impl ResourceKind {
-    /// Object-key prefix: D1 `db/{id}/...` (T36 layout, must not change), Queue `q/{id}/...`.
+    /// Object-key prefix: D1 `db/{id}/...` (T36 layout, must not change), Queue `q/{id}/...`,
+    /// K2 stream `s/{id}/...`.
     pub fn object_prefix(self) -> &'static str {
         match self {
             Self::D1 => "db",
             Self::Queue => "q",
+            Self::K2 => "s",
         }
     }
 }
@@ -45,9 +48,42 @@ pub fn queue_root_for(db_root: &Path) -> PathBuf {
     }
 }
 
-/// databaseId only allows the ULID shape (26 lowercase alphanumerics).
+/// K2 stream local root = `k2/` sibling of the D1 db_root (same rule as `queue_root_for`).
+pub fn k2_root_for(db_root: &Path) -> PathBuf {
+    match db_root.parent() {
+        Some(p) => p.join("k2"),
+        None => db_root.join("k2"),
+    }
+}
+
+/// K2 stream id only allows the CF shape (32 lowercase hex).
+pub fn validate_stream_id(id: &str) -> Result<(), PathError> {
+    if id.len() != 32
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(PathError::InvalidId);
+    }
+    Ok(())
+}
+
+/// Kind-aware id validation: D1/Queue take the ULID shape, K2 the 32-hex stream id.
+pub fn validate_id_for_kind(kind: ResourceKind, id: &str) -> Result<(), PathError> {
+    match kind {
+        ResourceKind::D1 | ResourceKind::Queue => validate_database_id(id),
+        ResourceKind::K2 => validate_stream_id(id),
+    }
+}
+
+/// databaseId only allows the ULID shape (26 lowercase alphanumerics) or the
+/// K2 stream-id shape (32 lowercase hex). The path layer's job is traversal
+/// safety — strict per-kind shape policy is enforced at the API layer
+/// (`validate_id_for_kind`); both accepted shapes are safe path components.
 pub fn validate_database_id(id: &str) -> Result<(), PathError> {
-    if id.len() != 26
+    let ulid = id.len() == 26;
+    let k2 = id.len() == 32 && !id.bytes().any(|b| (b'g'..=b'z').contains(&b));
+    if !(ulid || k2)
         || !id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())

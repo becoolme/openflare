@@ -206,13 +206,20 @@ fn registry(
         D1,
     ));
     let queue = Arc::new(Persister::new(
-        store,
-        cfg,
-        clock,
+        store.clone(),
+        cfg.clone(),
+        clock.clone(),
         queue_root_for(&root),
         ResourceKind::Queue,
     ));
-    EngineRegistry::new(root).with_persisters(vrt_sql::engine::PersisterPair { d1, queue })
+    let k2 = Arc::new(Persister::new(
+        store,
+        cfg,
+        clock,
+        vrt_sql::paths::k2_root_for(&root),
+        ResourceKind::K2,
+    ));
+    EngineRegistry::new(root).with_persisters(vrt_sql::engine::PersisterPair { d1, queue, k2 })
 }
 
 fn exec(

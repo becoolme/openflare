@@ -84,13 +84,20 @@ fn registry(root: PathBuf, store: Arc<StallStore>) -> Arc<EngineRegistry> {
         D1,
     ));
     let queue = Arc::new(Persister::new(
-        store,
-        cfg,
-        clock,
+        store.clone(),
+        cfg.clone(),
+        clock.clone(),
         queue_root_for(&root),
         ResourceKind::Queue,
     ));
-    Arc::new(EngineRegistry::new(root).with_persisters(PersisterPair { d1, queue }))
+    let k2 = Arc::new(Persister::new(
+        store,
+        cfg,
+        clock,
+        vrt_sql::paths::k2_root_for(&root),
+        ResourceKind::K2,
+    ));
+    Arc::new(EngineRegistry::new(root).with_persisters(PersisterPair { d1, queue, k2 }))
 }
 
 fn setup() -> (tempfile::TempDir, Arc<StallStore>, Arc<AppState>) {

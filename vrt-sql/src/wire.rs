@@ -1138,6 +1138,346 @@ async fn stats_handler(State(state): State<AppState>, request: axum::extract::Re
         .unwrap()
 }
 
+/// ---------- K2 streams internal wire. Same ServiceAuth + body-cap + op-from-path
+/// model as `/queues/*`; streamId is the CF `^[0-9a-f]{32}$` shape, validated
+/// at the entry by `StreamId::parse` before any state is touched.
+///
+/// `/streams/{id}/drop` deletes only the K2 namespace (kind-scoped tombstone).
+const K2_BODY_MAX: usize = crate::k2::BATCH_MAX_BYTES * 2 + crate::k2::HEADERS_MAX * 2_048 + 256;
+
+fn k2_fail(
+    op: &'static str,
+    outcome: &'static str,
+    started: Instant,
+    e: &crate::k2::K2Error,
+) -> Response {
+    crate::metrics::query(op, outcome, started.elapsed().as_secs_f64());
+    Response::builder()
+        .status(e.status())
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({
+                "success": false,
+                "error": e.to_string(),
+                "code": e.code(),
+                "retryable": e.retryable(),
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+fn k2_bad(
+    op: &'static str,
+    outcome: &'static str,
+    started: Instant,
+    status: StatusCode,
+    msg: &str,
+) -> Response {
+    crate::metrics::query(op, outcome, started.elapsed().as_secs_f64());
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"success": false, "error": msg, "code": "VRT_K2_INVALID",
+                   "retryable": false})
+            .to_string(),
+        ))
+        .unwrap()
+}
+
+/// Headers arrive as a JSON object `map<string,string>`; the storage layer
+/// keeps them opaque, so the shape + count/byte caps are enforced here.
+fn k2_parse_headers(v: Option<&serde_json::Value>) -> Result<String, crate::k2::K2Error> {
+    use crate::k2::K2Error;
+    match v {
+        None | Some(serde_json::Value::Null) => Ok("{}".into()),
+        Some(serde_json::Value::Object(map)) => {
+            if map.len() > crate::k2::HEADERS_MAX {
+                return Err(K2Error::InvalidInput(format!(
+                    "headers: max {} entries",
+                    crate::k2::HEADERS_MAX
+                )));
+            }
+            for (k, val) in map {
+                let Some(s) = val.as_str() else {
+                    return Err(K2Error::InvalidInput(
+                        "headers values must be strings".into(),
+                    ));
+                };
+                if k.len() + s.len() > crate::k2::HEADER_KV_MAX_BYTES {
+                    return Err(K2Error::InvalidInput("headers entry too large".into()));
+                }
+            }
+            Ok(serde_json::to_string(map)
+                .map_err(|e| K2Error::InvalidInput(format!("headers json: {e}")))?)
+        }
+        _ => Err(K2Error::InvalidInput("headers must be an object".into())),
+    }
+}
+
+fn k2_record_json(r: &crate::k2::ConsumedRecord) -> serde_json::Value {
+    json!({
+        "seq": r.seq,
+        "timestampMs": r.timestamp_ms,
+        "content": hex::encode(&r.content),
+        "headers": serde_json::from_str::<serde_json::Value>(&r.headers)
+            .unwrap_or_else(|_| json!({})),
+    })
+}
+
+async fn k2_drop_handler(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> Response {
+    drop_impl(state, request, crate::paths::ResourceKind::K2, "/streams/").await
+}
+
+async fn k2_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    let started = Instant::now();
+    let op: &'static str = match request.uri().path().rsplit('/').next() {
+        Some("produce") => "produce",
+        Some("consume") => "consume",
+        Some("ack") => "ack",
+        Some("nack") => "nack",
+        Some("extend") => "extend",
+        Some("subscribe") => "subscribe",
+        Some("subscriptions") => "subscriptions",
+        Some("unsubscribe") => "unsubscribe",
+        Some("configure") => "configure",
+        Some("config") => "config",
+        Some("reap") => "reap",
+        _ => "bad_op",
+    };
+    let label: &'static str = op;
+    let _permit = match state.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return k2_bad(
+                label,
+                "rate_limited",
+                started,
+                StatusCode::TOO_MANY_REQUESTS,
+                "vrt-sql overloaded",
+            )
+        }
+    };
+    let _inflight = match state.inflight.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return k2_bad(
+                label,
+                "unavailable",
+                started,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "vrt-sql draining",
+            )
+        }
+    };
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > K2_BODY_MAX.min(state.body_max))
+    {
+        return k2_bad(
+            label,
+            "protocol_error",
+            started,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        );
+    }
+    let id_raw = request
+        .uri()
+        .path()
+        .strip_prefix("/streams/")
+        .and_then(|rest| rest.rsplit_once('/'))
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_default();
+    let method = request.method().clone();
+    let path_query = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let headers = request.headers().clone();
+    let body =
+        match axum::body::to_bytes(request.into_body(), K2_BODY_MAX.min(state.body_max)).await {
+            Ok(b) => b,
+            Err(_) => {
+                return k2_bad(
+                    label,
+                    "protocol_error",
+                    started,
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body too large",
+                )
+            }
+        };
+    if let Some(auth) = &state.auth {
+        if !auth.verify(&headers, &method, &path_query, &body) {
+            return k2_bad(
+                label,
+                "unauthorized",
+                started,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            );
+        }
+    }
+    let stream = match crate::k2::StreamId::parse(&id_raw) {
+        Ok(s) => s,
+        Err(e) => return k2_fail(label, "invalid_id", started, &e),
+    };
+    let backend = crate::k2::SqliteK2Backend::new(state.registry.clone());
+    let body_json: serde_json::Value = if body.is_empty() {
+        serde_json::Value::Null
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                return k2_fail(
+                    label,
+                    "invalid_body",
+                    started,
+                    &crate::k2::K2Error::InvalidInput(format!("body json: {e}")),
+                )
+            }
+        }
+    };
+    let need = |key: &str| -> Result<serde_json::Value, crate::k2::K2Error> {
+        body_json
+            .get(key)
+            .cloned()
+            .ok_or_else(|| crate::k2::K2Error::InvalidInput(format!("missing {key}")))
+    };
+    let need_str = |key: &str| -> Result<String, crate::k2::K2Error> {
+        need(key)?
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| crate::k2::K2Error::InvalidInput(format!("{key} must be a string")))
+    };
+    let result: Result<serde_json::Value, crate::k2::K2Error> = (|| async {
+        match op {
+            "produce" => {
+                let arr = need("records")?;
+                let arr = arr.as_array().ok_or_else(|| {
+                    crate::k2::K2Error::InvalidInput("records must be an array".into())
+                })?;
+                let mut records = Vec::with_capacity(arr.len());
+                for r in arr {
+                    let content_hex =
+                        r.get("content").and_then(|c| c.as_str()).ok_or_else(|| {
+                            crate::k2::K2Error::InvalidInput("record content must be hex".into())
+                        })?;
+                    let content = hex::decode(content_hex).map_err(|_| {
+                        crate::k2::K2Error::InvalidInput("record content must be hex".into())
+                    })?;
+                    records.push(crate::k2::K2Record {
+                        content,
+                        headers: k2_parse_headers(r.get("headers"))?,
+                    });
+                }
+                let n = backend.produce(&stream, &records).await?;
+                Ok(json!({"success": true, "produced": n}))
+            }
+            "consume" => {
+                let sub_id = need_str("subscriptionId")?;
+                let worker_id = need_str("workerId")?;
+                let max = body_json
+                    .get("maxRecords")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(100);
+                let max = u32::try_from(max).unwrap_or(u32::MAX);
+                let batch = backend.consume(&stream, &sub_id, &worker_id, max).await?;
+                let records: Vec<_> = batch.records.iter().map(k2_record_json).collect();
+                Ok(json!({
+                    "success": true,
+                    "batch": {
+                        "batchId": batch.batch_id,
+                        "leasedUntilMs": batch.leased_until_ms,
+                        "records": records,
+                    }
+                }))
+            }
+            "ack" => {
+                let sub_id = need_str("subscriptionId")?;
+                let batch_id = need_str("batchId")?;
+                backend.ack(&stream, &sub_id, &batch_id).await?;
+                Ok(json!({"success": true}))
+            }
+            "nack" => {
+                let sub_id = need_str("subscriptionId")?;
+                let batch_id = need_str("batchId")?;
+                backend.nack(&stream, &sub_id, &batch_id).await?;
+                Ok(json!({"success": true}))
+            }
+            "extend" => {
+                let sub_id = need_str("subscriptionId")?;
+                let batch_id = need_str("batchId")?;
+                let worker_id = need_str("workerId")?;
+                let until = backend
+                    .extend(&stream, &sub_id, &batch_id, &worker_id)
+                    .await?;
+                Ok(json!({"success": true, "leasedUntilMs": until}))
+            }
+            "subscribe" => {
+                let name = need_str("name")?;
+                let start_at = need_str("startAt")?;
+                let sub = backend
+                    .create_subscription(&stream, &name, &start_at)
+                    .await?;
+                Ok(json!({"success": true, "subscription": sub}))
+            }
+            "subscriptions" => {
+                let subs = backend.list_subscriptions(&stream).await?;
+                Ok(json!({"success": true, "subscriptions": subs}))
+            }
+            "unsubscribe" => {
+                let sub_id = need_str("subscriptionId")?;
+                let deleted = backend.delete_subscription(&stream, &sub_id).await?;
+                Ok(json!({"success": true, "deleted": deleted}))
+            }
+            "configure" => {
+                let name = need_str("name")?;
+                let retention_s = need("retentionSeconds")?.as_i64().ok_or_else(|| {
+                    crate::k2::K2Error::InvalidInput("retentionSeconds must be an integer".into())
+                })?;
+                backend
+                    .configure(&stream, &name, retention_s.saturating_mul(1_000))
+                    .await?;
+                Ok(json!({"success": true}))
+            }
+            "config" => {
+                let cfg = backend.stream_config(&stream).await?;
+                let out = cfg.map(|(name, retention_ms)| {
+                    json!({"name": name, "retentionSeconds": retention_ms / 1_000})
+                });
+                Ok(json!({"success": true, "config": out}))
+            }
+            "reap" => {
+                let (records, coverage) = backend.reap(&stream).await?;
+                Ok(json!({"success": true, "records": records, "coverage": coverage}))
+            }
+            _ => Err(crate::k2::K2Error::InvalidInput(format!("unknown op {op}"))),
+        }
+    })()
+    .await;
+    match result {
+        Ok(v) => {
+            crate::metrics::query(label, "ok", started.elapsed().as_secs_f64());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(v.to_string()))
+                .unwrap()
+        }
+        Err(e) => k2_fail(label, "op_error", started, &e),
+    }
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/dbs/{id}/query", post(query_handler))
@@ -1145,6 +1485,18 @@ pub fn app(state: AppState) -> Router {
         .route("/dbs/{id}/dump", post(dump_handler))
         .route("/dbs/{id}/drop", post(drop_handler))
         .route("/queues/{id}/drop", post(queue_drop_handler))
+        .route("/streams/{id}/drop", post(k2_drop_handler))
+        .route("/streams/{id}/produce", post(k2_handler))
+        .route("/streams/{id}/consume", post(k2_handler))
+        .route("/streams/{id}/ack", post(k2_handler))
+        .route("/streams/{id}/nack", post(k2_handler))
+        .route("/streams/{id}/extend", post(k2_handler))
+        .route("/streams/{id}/subscribe", post(k2_handler))
+        .route("/streams/{id}/subscriptions", post(k2_handler))
+        .route("/streams/{id}/unsubscribe", post(k2_handler))
+        .route("/streams/{id}/configure", post(k2_handler))
+        .route("/streams/{id}/config", post(k2_handler))
+        .route("/streams/{id}/reap", post(k2_handler))
         .route("/queues/{id}/send", post(queue_handler))
         .route("/queues/{id}/claim", post(queue_handler))
         .route("/queues/{id}/ack", post(queue_handler))
