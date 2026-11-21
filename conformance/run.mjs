@@ -445,16 +445,37 @@ async function runStepWithRetry(baseUrl, host, step, timeoutMs, retry) {
   }
 }
 
-function stageCaseDir(entry) {
-  // Stage a deployable worker dir: everything except case.json (which
-  // would deploy as a stray json module) and docs (which `vrt deploy`
-  // rejects — unknown module extension).
+function copyTree(src, dest) {
+  for (const f of fs.readdirSync(src)) {
+    const from = path.join(src, f);
+    const to = path.join(dest, f);
+    const st = fs.statSync(from);
+    if (st.isDirectory()) {
+      fs.mkdirSync(to);
+      copyTree(from, to);
+    } else if (st.isFile()) {
+      fs.copyFileSync(from, to);
+    }
+  }
+}
+
+export function stageCaseDir(entry) {
+  // Stage a deployable worker dir: every module and asset subtree, minus
+  // the top-level case metadata and docs (case.json would deploy as a
+  // stray json module; `vrt deploy` rejects markdown extensions). Nested
+  // directories are copied recursively — `assets-basic` deploys its
+  // `assets.directory = "public"`, which must reach CASE_DIR.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), `conformance-${entry.id}-`));
   for (const f of fs.readdirSync(entry.dir)) {
     if (f === "case.json" || f.endsWith(".md")) continue;
     const src = path.join(entry.dir, f);
     const st = fs.statSync(src);
-    if (st.isFile()) fs.copyFileSync(src, path.join(tmp, f));
+    if (st.isDirectory()) {
+      fs.mkdirSync(path.join(tmp, f));
+      copyTree(src, path.join(tmp, f));
+    } else if (st.isFile()) {
+      fs.copyFileSync(src, path.join(tmp, f));
+    }
   }
   return tmp;
 }

@@ -1,5 +1,14 @@
 # Binding-layer conformance
 
+## Current coverage
+
+Executable cases cover KV, R2, D1, Queues, Cache, Cron, Durable Objects,
+static Assets, plain Vars, and the basic Rate Limiting binding result.
+The areas that need infrastructure or protocols the runner cannot yet
+exercise are listed in [`UNVERIFIED.md`](UNVERIFIED.md), including service
+bindings, Hyperdrive, Secrets, WebSockets, and Workflows. A listed case
+does not claim the entire binding API is covered.
+
 OpenFlare runs unmodified workerd, so the workerd runtime itself does
 not need re-testing. What this suite proves is the **binding layer**:
 facade (vendored `KVNamespace` / `R2Transport` / d1-api / queue-broker
@@ -106,6 +115,12 @@ step, `2` on usage/manifest errors.
 `results/latest.md` — the same as a Markdown table plus a failure
 detail section. `skipped` means the case could not run here (stub
 stack), not that it passed.
+
+## Changelog
+
+- 2026-11-20: Added basic Assets, Vars, and Rate Limiting fixtures; listed
+  unsupported multi-worker, database, secret, WebSocket, workflow, and
+  advanced asset behaviors as unverified.
 
 ## real-projects.json
 
