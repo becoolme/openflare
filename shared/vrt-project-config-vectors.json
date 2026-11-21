@@ -778,6 +778,215 @@
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "analytics_engine_datasets[0].version"
    }
+  },
+  {
+   "name": "limits cpu_ms and subrequests merge over defaults",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\ncpu_ms = 200\nsubrequests = 80\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "quotas": {
+      "cpuMs": 200,
+      "memoryMb": 128,
+      "subrequests": 80,
+      "outboundConnections": 16
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "limits empty table yields default quotas",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "quotas": {
+      "cpuMs": 50,
+      "memoryMb": 128,
+      "subrequests": 50,
+      "outboundConnections": 16
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "limits cpu_ms out of bounds fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\ncpu_ms = 999999\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.cpu_ms"
+   }
+  },
+  {
+   "name": "limits subrequests above platform cap fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\nsubrequests = 50000\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.subrequests"
+   }
+  },
+  {
+   "name": "limits unknown key fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\nmemory_mb = 256\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "limits.memory_mb"
+   }
+  },
+  {
+   "name": "limits subrequests zero keeps explicit zero",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\nsubrequests = 0\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "quotas": {
+      "cpuMs": 50,
+      "memoryMb": 128,
+      "subrequests": 0,
+      "outboundConnections": 16
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "limits cpu_ms only leaves other dimensions at defaults",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\ncpu_ms = 200\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "quotas": {
+      "cpuMs": 200,
+      "memoryMb": 128,
+      "subrequests": 50,
+      "outboundConnections": 16
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "limits cpu_ms zero below minimum fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\ncpu_ms = 0\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.cpu_ms"
+   }
+  },
+  {
+   "name": "limits non-table fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\nlimits = \"x\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits"
+   }
+  },
+  {
+   "name": "limits cpu_ms negative fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\ncpu_ms = -1\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.cpu_ms"
+   }
+  },
+  {
+   "name": "limits cpu_ms non-integer fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\ncpu_ms = 1.5\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.cpu_ms"
+   }
+  },
+  {
+   "name": "limits subrequests string fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\nsubrequests = \"80\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.subrequests"
+   }
+  },
+  {
+   "name": "limits subrequests negative fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\nsubrequests = -1\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.subrequests"
+   }
+  },
+  {
+   "name": "limits subrequests non-integer fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\nsubrequests = 1.5\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.subrequests"
+   }
+  },
+  {
+   "name": "limits cpu_ms string fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[limits]\ncpu_ms = \"200\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "limits.cpu_ms"
+   }
   }
  ]
 }
