@@ -673,6 +673,10 @@ fn ae_schema() -> Arc<arrow::datatypes::Schema> {
         false,
     ));
     fields.push(Field::new("index1", DataType::Utf8, true));
+    // CF's query schema carries `_sample_interval` (rows-represented).
+    // Storage is full-fidelity, so it is constant 1 — emitting it keeps
+    // CF-shaped queries (`SELECT _sample_interval ...`) runnable verbatim.
+    fields.push(Field::new("_sample_interval", DataType::Int64, false));
     for i in 1..=20 {
         fields.push(Field::new(format!("double{i}"), DataType::Float64, true));
     }
@@ -705,11 +709,17 @@ fn write_parquet(
             None => ix_b.append_null(),
         }
     }
+    use arrow::array::Int64Builder;
+    let mut si_b = Int64Builder::with_capacity(n);
+    for _ in events {
+        si_b.append_value(1);
+    }
     let mut cols: Vec<ArrayRef> = vec![
         Arc::new(tenant_b.finish()),
         Arc::new(ds_b.finish()),
         Arc::new(ts_b.finish().with_timezone("UTC")),
         Arc::new(ix_b.finish()),
+        Arc::new(si_b.finish()),
     ];
     for i in 0..20 {
         let mut b = Float64Builder::with_capacity(n);
@@ -856,7 +866,7 @@ mod tests {
                 .unwrap();
         let batch = reader.next().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(batch.num_columns(), 44);
+        assert_eq!(batch.num_columns(), 45);
         use arrow::array::Array;
         let ds = batch
             .column(1)
@@ -864,15 +874,22 @@ mod tests {
             .downcast_ref::<arrow::array::StringArray>()
             .unwrap();
         assert_eq!(ds.value(0), "weather");
-        let d1 = batch
+        let si = batch
             .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(si.value(0), 1);
+        assert_eq!(si.value(1), 1);
+        let d1 = batch
+            .column(5)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
             .unwrap();
         assert_eq!(d1.value(0), 1.5);
         assert!(d1.is_null(1));
         let b1 = batch
-            .column(24)
+            .column(25)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
             .unwrap();
