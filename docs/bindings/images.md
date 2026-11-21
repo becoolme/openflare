@@ -48,19 +48,27 @@ export default {
 ## Where it runs
 
 The binding renders as a workerd `wrapped` binding over
-`cloudflare-internal:images-api` — the same internal module name
-upstream Miniflare uses — whose inner `fetcher` service binding points
-at the `facade-images` system worker (`vrt-config/src/capnp.rs`,
+`cloudflare-internal:images-api` — the upstream workerd shim, shipped
+unmodified in the pinned fork — whose inner `fetcher` service binding
+points at the `facade-images` system worker (`vrt-config/src/capnp.rs`,
 `facade/facade-images.ts`). The facade is deny-routed (no network
 egress): it only receives the image bytes the tenant worker streams
 in.
+
+The facade speaks the shim's own upstream protocol verbatim —
+multipart/form-data POSTs to `/info` and `/transform` (the `image`
+file field carries the bytes, `transforms` a JSON op array), and
+errors ride the `cf-images-binding: err=<code>` response header that
+the shim translates into a thrown `ImagesError`. No shim fork, no
+parallel protocol.
 
 ## How the ops map
 
 | op | implementation |
 | --- | --- |
-| `info(stream)` | Pure-TS container sniffer (`facade/images-wire.ts`) — reads PNG IHDR, JPEG SOFn, WebP VP8/VP8L/VP8X, GIF and BMP headers. Returns `{fileSize, format, width, height}`; the pixel engine never runs. |
-| `input().transform().output()` | Routes `POST /transform` to the facade with params on `x-vrt-images-params`. Returns 501 `9490` ("transform engine not vendored in this build") until the jSquash WASM engine is vendored. |
+| `info(stream)` | Pure-TS container sniffer (`facade/images-wire.ts`) — reads PNG IHDR, JPEG SOFn, WebP VP8/VP8L/VP8X, GIF and BMP headers; SVG markup returns the dim-less `{format: "image/svg+xml"}` shape. Returns the wire `{file_size, format, width, height}` the shim maps to `fileSize`/`width`/`height`/`format`; the pixel engine never runs. |
+| `input().transform()/.draw().output()` | The upstream shim serializes the op chain into the `transforms` multipart field (plus `output_format`/`output_quality`/`background`/`anim`/`text_input`/`draw_*`). The facade validates the field then returns 501 `err=9490` until the jSquash WASM engine is vendored. `input()`'s `encoding: "base64"` decode and `text()` sources are handled inside the shim already. |
+| `hosted.*` (`env.IMAGES.hosted.image()/.upload()/.list()/.createDirectUpload()`) | Cloudflare Images **product** RPC surface — not implemented; the facade exposes no such methods so calls reject. |
 
 ## Backends
 
@@ -79,10 +87,10 @@ resource-identifying keys besides `binding`.
   `VRT_CONFIG_INVALID` (`images`, `images.remote`).
 - A binding name colliding with another binding on the same worker →
   `DESIRED_DUPLICATE` (`bindingName`) at snapshot validation.
-- At runtime the facade answers the Images error envelope
-  `{error: {code, message}}` with an HTTP status; the
+- At runtime the facade answers non-2xx with the
+  `cf-images-binding: err=<code>` header; the upstream
   `cloudflare-internal:images-api` shim turns it into a thrown
-  `Error` carrying `.code`.
+  `ImagesError` (`IMAGES_<OP> <body>`) carrying numeric `.code`.
 
 ## Bounds
 
@@ -101,14 +109,14 @@ resource-identifying keys besides `binding`.
   Encoding quality, AVIF output, animated/multi-frame images and some
   transform options will differ from production Cloudflare even after
   vendoring; this section will carry the op-coverage matrix then.
-- **`info()` format coverage**: PNG, JPEG, WebP, GIF and BMP are
-  recognized; `avif`/`svg` names exist in the type but no sniffer yet
-  (returns 9420 unsupported).
-- **Error codes**: the facade returns the Images error envelope
-  `{error: {code, message}}`; codes reuse Cloudflare's numbering where
-  a documented equivalent exists (9401 oversized source, 9420
-  unsupported/corrupt, 9423 malformed params) and reserved `94xx`
-  values where it does not (9490 engine-not-vendored).
+- **`info()` format coverage**: PNG, JPEG, WebP, GIF, BMP and SVG are
+  recognized (SVG returns the dim-less shape like CF); AVIF and other
+  containers return `err=9420` unsupported.
+- **Error codes**: errors ride the upstream
+  `cf-images-binding: err=<code>` header. Codes reuse Cloudflare's
+  numbering where a documented equivalent exists (9401 oversized
+  source, 9420 unsupported/corrupt, 9423 malformed request) and
+  reserved `94xx` values where it does not (9490 engine-not-vendored).
 - **`cf.image` fetch options and `/cdn-cgi/image/` URL resizing** are
   separate surfaces and remain unimplemented — this binding only
   covers the in-Worker `env.IMAGES` API.

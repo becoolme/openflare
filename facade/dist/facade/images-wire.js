@@ -1,19 +1,13 @@
 export function imagesError(code, message, status = 400) {
-    return new Response(JSON.stringify({
-        error: {
-            code,
-            message
-        }
-    }), {
+    return new Response(message, {
         status,
         headers: {
-            "content-type": "application/json"
+            "cf-images-binding": `err=${code}`
         }
     });
 }
 export const IMAGES_BODY_MAX_BYTES = 64 * 1024 * 1024;
 export const IMAGES_MAX_PIXELS = 70_000_000;
-export const IMAGES_PARAMS_HEADER = "x-vrt-images-params";
 export function sniffImage(buf) {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     if (buf.length >= 24 && dv.getUint32(0) === 0x89504e47 && dv.getUint32(4) === 0x0d0a1a0a) {
@@ -91,4 +85,9 @@ export function sniffImage(buf) {
         };
     }
     return null;
+}
+export function sniffSvg(buf) {
+    const head = new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 4096)));
+    const trimmed = head.trimStart();
+    return trimmed.startsWith("<svg") || trimmed.startsWith("<?xml");
 }

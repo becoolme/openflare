@@ -4,9 +4,7 @@ import assert from "node:assert/strict";
 import { facadeModule } from "./helpers.mjs";
 
 const { ImagesFacade } = await import(facadeModule("facade-images.js"));
-const { sniffImage, IMAGES_PARAMS_HEADER } = await import(
-  facadeModule("images-wire.js")
-);
+const { sniffImage, sniffSvg } = await import(facadeModule("images-wire.js"));
 
 const facade = new ImagesFacade({}, {});
 
@@ -55,14 +53,26 @@ function webpVp8x({ width = 300, height = 200 } = {}) {
   return buf;
 }
 
-async function post(pathname, body, headers = {}) {
+function post(pathname, fields) {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(fields)) {
+    form.append(k, v);
+  }
   return facade.fetch(
-    new Request(`http://images${pathname}`, { method: "POST", headers, body }),
+    new Request(`https://js.images.cloudflare.com${pathname}`, {
+      method: "POST",
+      body: form,
+    }),
   );
 }
 
-async function errorCode(resp) {
-  return (await resp.json()).error.code;
+function imageField(bytes) {
+  return new File([bytes], "img", { type: "application/octet-stream" });
+}
+
+function errCode(resp) {
+  const m = /err=(\d+)/.exec(resp.headers.get("cf-images-binding") ?? "");
+  return m ? Number(m[1]) : null;
 }
 
 test("sniffImage parses PNG/GIF/JPEG/WebP dimensions", () => {
@@ -83,51 +93,74 @@ test("sniffImage parses PNG/GIF/JPEG/WebP dimensions", () => {
 test("sniffImage rejects truncated and unrecognized buffers", () => {
   assert.equal(sniffImage(new Uint8Array(0)), null);
   assert.equal(sniffImage(png().subarray(0, 12)), null);
-  assert.equal(sniffImage(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26])), null);
+  assert.equal(
+    sniffImage(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26])),
+    null,
+  );
 });
 
-test("POST /info returns CF info() shape for a PNG", async () => {
-  const resp = await post("/info", png({ width: 640, height: 480 }));
+test("sniffSvg matches the upstream dim-less shape condition", () => {
+  assert.ok(sniffSvg(new TextEncoder().encode('  <svg xmlns="x"/>')));
+  assert.ok(sniffSvg(new TextEncoder().encode('<?xml version="1.0"?><svg/>')));
+  assert.ok(!sniffSvg(png()));
+});
+
+test("POST /info returns the upstream snake_case shape for a PNG", async () => {
+  const resp = await post("/info", { image: imageField(png({ width: 640, height: 480 })) });
   assert.equal(resp.status, 200);
   const info = await resp.json();
+  // Wire shape is snake_case — the upstream shim maps file_size → fileSize.
   assert.equal(info.format, "image/png");
   assert.equal(info.width, 640);
   assert.equal(info.height, 480);
-  assert.equal(info.fileSize, 33);
+  assert.equal(info.file_size, 33);
 });
 
-test("non-POST methods fail closed", async () => {
-  const resp = await facade.fetch(new Request("http://images/info"));
+test("POST /info on SVG markup returns the dim-less shape", async () => {
+  const resp = await post("/info", {
+    image: imageField(new TextEncoder().encode("<svg xmlns='x'><rect/></svg>")),
+  });
+  assert.equal(resp.status, 200);
+  assert.deepEqual(await resp.json(), { format: "image/svg+xml" });
+});
+
+test("non-POST methods fail closed with the upstream error header", async () => {
+  const resp = await facade.fetch(new Request("https://js.images.cloudflare.com/info"));
   assert.equal(resp.status, 405);
-  assert.equal(await errorCode(resp), "9406");
+  assert.equal(errCode(resp), 9406);
 });
 
-test("corrupt body → 415 9420; unknown op → 404", async () => {
-  const resp = await post("/info", new Uint8Array([1, 2, 3]));
+test("corrupt body → 415 err=9420; unknown op → 404", async () => {
+  const resp = await post("/info", { image: imageField(new Uint8Array([1, 2, 3])) });
   assert.equal(resp.status, 415);
-  assert.equal(await errorCode(resp), "9420");
-  const unknown = await post("/bogus", png());
+  assert.equal(errCode(resp), 9420);
+  const unknown = await post("/bogus", { image: imageField(png()) });
   assert.equal(unknown.status, 404);
+  assert.equal(errCode(unknown), 9404);
 });
 
-test("empty body is rejected before sniffing", async () => {
-  const resp = await post("/info", new Uint8Array(0));
-  assert.equal(resp.status, 413);
-  assert.equal(await errorCode(resp), "9409");
+test("missing image field → 400 err=9423", async () => {
+  const resp = await post("/info", { transforms: "[]" });
+  assert.equal(resp.status, 400);
+  assert.equal(errCode(resp), 9423);
 });
 
-test("transform fails closed 501 until the engine is vendored", async () => {
-  const resp = await post("/transform", png(), {
-    [IMAGES_PARAMS_HEADER]: JSON.stringify({ width: 10 }),
+test("transform validates the upstream `transforms` field then fails closed 501", async () => {
+  const resp = await post("/transform", {
+    image: imageField(png()),
+    transforms: JSON.stringify([{ imageIndex: 0, width: 10 }]),
+    output_format: "image/webp",
   });
   assert.equal(resp.status, 501);
-  assert.equal(await errorCode(resp), "9490");
+  assert.equal(errCode(resp), 9490);
 });
 
-test("malformed transform params → 400 9423", async () => {
-  const resp = await post("/transform", png(), {
-    [IMAGES_PARAMS_HEADER]: "{not json",
-  });
-  assert.equal(resp.status, 400);
-  assert.equal(await errorCode(resp), "9423");
+test("malformed/missing transforms JSON → 400 err=9423", async () => {
+  for (const transforms of ["{not json", "{}", undefined]) {
+    const fields = { image: imageField(png()) };
+    if (transforms !== undefined) fields.transforms = transforms;
+    const resp = await post("/transform", fields);
+    assert.equal(resp.status, 400, `transforms=${transforms}`);
+    assert.equal(errCode(resp), 9423);
+  }
 });

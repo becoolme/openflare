@@ -1,13 +1,17 @@
 // facade-images wire constants + shared helpers — inner `fetcher` of
-// the `cloudflare-internal:images-api` wrapped binding.
+// the `cloudflare-internal:images-api` wrapped binding. Speaks the
+// upstream shim's own protocol: multipart/form-data POSTs to /info and
+// /transform, errors signalled via the `cf-images-binding: err=<code>`
+// response header (the shim reads that header and throws an
+// ImagesError with the numeric code).
 
-/** Images error surface: `{error: {code, message}}` — the shim turns
- * this into a thrown `Error` whose `.code` matches CF's images
- * error numbering where applicable. */
-export function imagesError(code: string, message: string, status = 400): Response {
-  return new Response(JSON.stringify({ error: { code, message } }), {
+/** Images error surface per the upstream shim contract: non-2xx plus
+ * `cf-images-binding: err=<code>`; the body text lands inside the
+ * thrown `IMAGES_<OP> <body>` message. */
+export function imagesError(code: number, message: string, status = 400): Response {
+  return new Response(message, {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "cf-images-binding": `err=${code}` },
   });
 }
 
@@ -18,12 +22,9 @@ export const IMAGES_BODY_MAX_BYTES = 64 * 1024 * 1024;
 /** Pixel bound across decode/transform (CF ~70MP). */
 export const IMAGES_MAX_PIXELS = 70_000_000;
 
-/** Transform params arrive on this header (request body stays the raw
- * image bytes so no base64 round-trip is needed). */
-export const IMAGES_PARAMS_HEADER = "x-vrt-images-params";
-
-/** Recognized container signatures → CF `info()` format names. */
-export type ImageFormat = "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif" | "svg";
+/** Recognized container signatures → `image/*` format names on the
+ * `info()` wire. */
+export type ImageFormat = "jpeg" | "png" | "webp" | "gif" | "bmp";
 
 /** Parse container magic + dimensions without decoding pixels —
  * `info()` never runs the transform engine. Returns `null` on an
@@ -78,4 +79,13 @@ export function sniffImage(buf: Uint8Array): { format: ImageFormat; width: numbe
     return { format: "jpeg", width: 0, height: 0 };
   }
   return null;
+}
+
+/** SVG has no binary magic — the upstream mock and CF both report it
+ * as a dim-less `{format}`-only info response; sniff the leading
+ * markup instead. */
+export function sniffSvg(buf: Uint8Array): boolean {
+  const head = new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 4096)));
+  const trimmed = head.trimStart();
+  return trimmed.startsWith("<svg") || trimmed.startsWith("<?xml");
 }
