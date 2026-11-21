@@ -1,6 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { bindingError } from "../third_party/open-compute/facade/loader/shared.js";
 import { resourceProps, wrapBindingBackend } from "./props.js";
-import { QUEUE_PROVIDER_PREFIX, QUEUE_OPS, QUEUE_STRIP_HEADER_PREFIX, OPEN_COMPUTE_PREFIX, QUEUE_BODY_MAX_BYTES, QUEUE_DRAIN_MAX_BYTES, QUEUE_BACKEND_TIMEOUT_MS, BACKEND_TIMEOUT, drainToBuffer, backendCallWithTimeout } from "./queue-wire.js";
+import { QUEUE_PROVIDER_PREFIX, QUEUE_OPS, QUEUE_STRIP_HEADER_PREFIX, QUEUE_HDR_MSG_DELAY, OPEN_COMPUTE_PREFIX, QUEUE_BODY_MAX_BYTES, QUEUE_DRAIN_MAX_BYTES, QUEUE_BACKEND_TIMEOUT_MS, BACKEND_TIMEOUT, drainToBuffer, backendCallWithTimeout } from "./queue-wire.js";
 function queueError(message, status = 400) {
     return new Response(JSON.stringify({
         error: message
@@ -10,6 +11,16 @@ function queueError(message, status = 400) {
             "content-type": "application/json"
         }
     });
+}
+const MAX_DELIVERY_DELAY_SECS = 86_400;
+function queueDefaultDelay(rawProps) {
+    if (rawProps === null || typeof rawProps !== "object") return null;
+    const value = rawProps.deliveryDelaySeconds;
+    if (value === undefined) return null;
+    if (!Number.isSafeInteger(value) || value < 0 || value > MAX_DELIVERY_DELAY_SECS) {
+        throw bindingError("BINDING_PROTOCOL_ERROR");
+    }
+    return value;
 }
 export class QueueFacade extends WorkerEntrypoint {
     async fetch(request) {
@@ -35,6 +46,10 @@ export class QueueFacade extends WorkerEntrypoint {
                 if (k.startsWith(QUEUE_STRIP_HEADER_PREFIX) || k.startsWith(OPEN_COMPUTE_PREFIX)) {
                     headers.delete(key);
                 }
+            }
+            const defaultDelay = queueDefaultDelay(this.ctx.props);
+            if (defaultDelay !== null && (op === "message" || op === "batch") && !headers.has(QUEUE_HDR_MSG_DELAY)) {
+                headers.set(QUEUE_HDR_MSG_DELAY, String(defaultDelay));
             }
             headers.set("x-open-compute-request-id", crypto.randomUUID());
             const target = new URL(`${QUEUE_PROVIDER_PREFIX}${props.bindingId}/${op}${url.search}`, request.url).href;

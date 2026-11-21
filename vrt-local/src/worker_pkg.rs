@@ -119,10 +119,14 @@ pub(crate) struct BindingsToml {
     /// `name -> user-side database_id` (the server derives the real id at pack time).
     #[serde(default)]
     pub(crate) d1: BTreeMap<String, String>,
-    /// T37: `name -> user-side queue name` (queueId is derived at pack time from
-    /// `vrt-q:{tenant}:{name}` -- standalone has no control-plane provisioning).
+    /// T37: queue producer bindings. The value is the user-side queue
+    /// name (queueId is derived at pack time from
+    /// `vrt-q:{tenant}:{name}` -- standalone has no control-plane
+    /// provisioning), either as the legacy plain-string form or the
+    /// `{ queue, deliveryDelaySeconds }` table form carrying a
+    /// queue-level default send delay.
     #[serde(default)]
-    pub(crate) queue: BTreeMap<String, String>,
+    pub(crate) queue: BTreeMap<String, QueueTargetToml>,
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
     /// `binding name -> vrt database tenant name`; credentials are resolved
@@ -149,6 +153,45 @@ pub(crate) struct RatelimitToml {
     pub(crate) namespace_id: String,
     pub(crate) limit: u64,
     pub(crate) period: u64,
+}
+
+/// `[bindings.queue]` value: either the legacy plain queue name or
+/// `{ queue, deliveryDelaySeconds }`. The string form serializes exactly
+/// as before, so existing packages keep their bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum QueueTargetToml {
+    /// Legacy `NAME = "queue-name"`.
+    Name(String),
+    /// `NAME = { queue = "queue-name", deliveryDelaySeconds = 5 }`.
+    Options(QueueOptionsToml),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct QueueOptionsToml {
+    /// User-side queue name (id derived at pack time).
+    pub(crate) queue: String,
+    /// Queue-level default send delay, 0..=86,400 seconds. Absent = no
+    /// default (Cloudflare's own default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery_delay_seconds: Option<u32>,
+}
+
+impl QueueTargetToml {
+    pub(crate) fn queue(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Options(options) => &options.queue,
+        }
+    }
+
+    pub(crate) fn delivery_delay_seconds(&self) -> Option<u32> {
+        match self {
+            Self::Name(_) => None,
+            Self::Options(options) => options.delivery_delay_seconds,
+        }
+    }
 }
 
 /// `[bindings.service]` value: either the target worker name (default
@@ -928,18 +971,29 @@ pub fn assemble(
                 },
             ));
         }
-        for (binding, queue_name) in &b.queue {
+        for (binding, target) in &b.queue {
             // T37: queueId derivation -- the first 26 hex chars of sha256("vrt-q:{tenant}:{name}")
             // (hex is a subset of [a-z0-9], same rule as database_id).
             // Multiple producers with the same name in the same instance share the same queue (CF semantics);
             // a worker never gets an arbitrary id -- the signed snapshot covers the derived value.
-            let digest = derive_queue_id(tenant_id, queue_name)?;
+            let digest = derive_queue_id(tenant_id, target.queue())?;
+            if let Some(delay) = target.delivery_delay_seconds() {
+                // Cloudflare `delivery_delay` bound; also enforced by
+                // snapshot-protocol, but rejected here with a config-side
+                // error before a deploy document is built.
+                if delay > snapshot_protocol::compute_desired::MAX_QUEUE_DELIVERY_DELAY_SECS {
+                    return Err(LocalError::Worker(
+                        "queue delivery delay must be 0..=86400 seconds",
+                    ));
+                }
+            }
             bindings.push(BindingDesired::Queue(
                 snapshot_protocol::compute_desired::QueueBinding {
                     name: binding.clone(),
                     queue_id: digest,
                     queue_name: binding.clone(),
                     permissions: read_write.clone(),
+                    delivery_delay_seconds: target.delivery_delay_seconds(),
                 },
             ));
         }

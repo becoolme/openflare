@@ -13,6 +13,7 @@
 // provider, which revalidates them; no queue name/id is ever taken from
 // the request (§8).
 import { WorkerEntrypoint } from "cloudflare:workers";
+import { bindingError } from "../third_party/open-compute/facade/loader/shared.js";
 import {
   resourceProps,
   wrapBindingBackend,
@@ -21,6 +22,7 @@ import {
   QUEUE_PROVIDER_PREFIX,
   QUEUE_OPS,
   QUEUE_STRIP_HEADER_PREFIX,
+  QUEUE_HDR_MSG_DELAY,
   OPEN_COMPUTE_PREFIX,
   QUEUE_BODY_MAX_BYTES,
   QUEUE_DRAIN_MAX_BYTES,
@@ -42,6 +44,33 @@ function queueError(message: string, status = 400): Response {
 
 interface FetchLike {
   fetch(input: unknown, init?: { headers?: unknown; [key: string]: unknown }): unknown;
+}
+
+/// Cloudflare `delivery_delay` bound (seconds).
+const MAX_DELIVERY_DELAY_SECS = 86_400;
+
+/**
+ * Queue-level default send delay from host-injected props
+ * (`deliveryDelaySeconds`, rendered only when the queue declares
+ * `delivery_delay`). `null` = no queue-level default.
+ *
+ * The value is part of the signed snapshot and rendered by vrt-config; a
+ * malformed value means the props contract is broken, so it fails closed
+ * with a typed binding error instead of silently changing delivery
+ * semantics.
+ */
+function queueDefaultDelay(rawProps: unknown): number | null {
+  if (rawProps === null || typeof rawProps !== "object") return null;
+  const value = (rawProps as Record<string, unknown>).deliveryDelaySeconds;
+  if (value === undefined) return null;
+  if (
+    !Number.isSafeInteger(value) ||
+    (value as number) < 0 ||
+    (value as number) > MAX_DELIVERY_DELAY_SECS
+  ) {
+    throw bindingError("BINDING_PROTOCOL_ERROR");
+  }
+  return value as number;
 }
 
 export class QueueFacade extends WorkerEntrypoint {
@@ -93,6 +122,21 @@ export class QueueFacade extends WorkerEntrypoint {
         if (k.startsWith(QUEUE_STRIP_HEADER_PREFIX) || k.startsWith(OPEN_COMPUTE_PREFIX)) {
           headers.delete(key);
         }
+      }
+      // Queue-level default delivery delay (wrangler `delivery_delay`):
+      // workerd sets `X-Msg-Delay-Secs` ONLY when the caller passed a
+      // delay (including an explicit 0), so an absent header means "no
+      // per-send delay" — fill it with the queue default. An explicit
+      // per-message `delaySeconds` therefore always wins; for
+      // `/batch` the header is the batch-wide default and each item's
+      // explicit `delaySecs` still overrides it in the provider.
+      const defaultDelay = queueDefaultDelay(this.ctx.props);
+      if (
+        defaultDelay !== null &&
+        (op === "message" || op === "batch") &&
+        !headers.has(QUEUE_HDR_MSG_DELAY)
+      ) {
+        headers.set(QUEUE_HDR_MSG_DELAY, String(defaultDelay));
       }
       // Provider's identity parse REQUIRES a per-request RFC4122
       // x-open-compute-request-id (identity.rs); mint it here.

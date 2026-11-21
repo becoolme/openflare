@@ -1782,7 +1782,7 @@ fn emit_queue_binding(
     worker: &WorkerDesired,
     input: &TenantRenderInput<'_>,
 ) -> Result<(), ConfigError> {
-    let props = String::from_utf8(canonical_bytes(&json!({
+    let mut props = json!({
         "bindingId": format!("{}~{}", worker.worker_id, q.name),
         "descriptorSha256": worker.active_version.artifact_digest,
         "instanceId": input.tenant.tenant_id,
@@ -1792,8 +1792,18 @@ fn emit_queue_binding(
         "resourceSpecGeneration": input.revision,
         "versionId": worker.active_version.version_id,
         "workerId": worker.worker_id,
-    })))
-    .expect("canonical props are utf8");
+    });
+    // Queue-level default send delay: emitted only when declared, so a
+    // queue without `delivery_delay` keeps the exact props bytes it had
+    // before the field existed. The facade treats an absent value as
+    // "no default"; an explicit per-message delay always wins.
+    if let Some(delay) = q.delivery_delay_seconds {
+        props
+            .as_object_mut()
+            .expect("queue props are an object")
+            .insert("deliveryDelaySeconds".into(), json!(delay));
+    }
+    let props = String::from_utf8(canonical_bytes(&props)).expect("canonical props are utf8");
     let facade = &input.params.facades.queue;
     out.push_str(&format!(
         "        (name = {}, queue = (name = {}, entrypoint = {}, props = (json = {}))),
