@@ -151,7 +151,7 @@ that does not match the bytes is never committed.
   behaves like Cloudflare (assets-first, `run_worker_first` overrides);
   native `vrt.toml` defaults to worker-first unless `assetsFirst = true`
   — preserving pre-T31c standalone behavior.
-- Pack-time caps: ≤ 512 files, ≤ 1 MiB per file, ≤ 8 MiB total
+- Pack-time caps: ≤ 20,000 files and ≤ 25 MiB per file (Cloudflare's free-plan limits). Cloudflare documents no total-size limit; the packer keeps a 512 MiB total guard for memory safety. Override any dimension with `VRT_ASSET_MAX_FILES`, `VRT_ASSET_MAX_FILE_BYTES`, `VRT_ASSET_MAX_TOTAL_BYTES` (invalid or zero values fall back to the default).
   (`vrt-local/src/worker_pkg.rs`). Symlinks are rejected; dotfiles are
   skipped.
 - MIME types come from a fixed extension table; unknown extensions map
