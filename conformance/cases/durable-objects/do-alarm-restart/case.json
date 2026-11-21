@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "id": "do-alarm-restart",
+  "binding": "durable-objects",
+  "title": "DO alarms survive a runtime restart: the armed alarm fires in the new process and pre-restart storage is intact",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/durable-objects/api/alarms/ (an alarm is persisted: setAlarm stores it durably and it is delivered even after the object/process restarts; getAlarm reports the armed time)",
+    "https://developers.cloudflare.com/durable-objects/api/storage-api/ (storage is durable and outlives the runtime process)",
+    "deploy/standalone/e2e.sh (arms an alarm, restarts vrt/vrt-host, asserts the alarm still fires and storage survives on the standalone stack)",
+    "examples/standalone-do/main.js (alarm handler + localDisk storage on the standalone stack)"
+  ],
+  "notes": "The restart step restarts vrt-host (which supervises workerd) in place via docker compose restart: no volume is recreated and no worker is redeployed, so the only variable is a fresh runtime process. The worker normalizes volatile ids/timestamps into booleans; the alarm chain re-arms itself every 200 ms, so 'fired in the current process' proves the persisted alarm was delivered after the restart.",
+  "steps": [
+    {
+      "name": "reset leftover DO state",
+      "request": {
+        "method": "POST",
+        "path": "/reset"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "storage write before restart (1)",
+      "request": {
+        "method": "POST",
+        "path": "/value/inc"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": 1
+        }
+      }
+    },
+    {
+      "name": "storage write before restart (2)",
+      "request": {
+        "method": "POST",
+        "path": "/value/inc"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": 2
+        }
+      }
+    },
+    {
+      "name": "start a self re-arming alarm chain",
+      "request": {
+        "method": "POST",
+        "path": "/chain/start"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "chain": true
+        }
+      }
+    },
+    {
+      "name": "alarm() fires before the restart in this process",
+      "request": {
+        "path": "/state"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "chain": true,
+          "firedRecordPersisted": true,
+          "firedInCurrentProcess": true
+        }
+      },
+      "retry": {
+        "timeoutMs": 20000,
+        "intervalMs": 200
+      }
+    },
+    {
+      "name": "mark pre-restart observations in storage",
+      "request": {
+        "method": "POST",
+        "path": "/mark"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "marked": true
+        }
+      }
+    },
+    {
+      "name": "restart the runtime process (vrt-host supervises workerd)",
+      "restart": {
+        "services": ["vrt-host", "vrt"],
+        "waitReady": {
+          "request": {
+            "path": "/state"
+          },
+          "expect": {
+            "status": 200
+          },
+          "timeoutMs": 90000,
+          "intervalMs": 500
+        }
+      }
+    },
+    {
+      "name": "new process: pending alarm fired, storage survived",
+      "request": {
+        "path": "/state"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "value": 2,
+          "firedRecordPersisted": true,
+          "restartedSinceMark": true,
+          "chainAliveAfterRestart": true
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 500
+      }
+    },
+    {
+      "name": "stop the alarm chain",
+      "request": {
+        "method": "POST",
+        "path": "/chain/stop"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "chain": false
+        }
+      }
+    }
+  ]
+}

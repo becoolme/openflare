@@ -47,6 +47,10 @@ export const KNOWN_BINDINGS = [
 ];
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;
+// Compose service names (the restart hook's vocabulary). The runner
+// never interprets them — it only forwards them to --restart-cmd — so
+// this is a shape check, not a topology allowlist.
+const SERVICE_RE = /^[a-z0-9][a-z0-9_.-]{0,63}$/;
 const MANIFEST_FILES = [
   "vrt.toml",
   "wrangler.json",
@@ -133,13 +137,56 @@ function validateExpect(exp, errors, where) {
     err(errors, `${where}.json`, "must be an object (subset match)");
 }
 
+/** Validate a restart action: an ordered service list plus the probe
+ * that must pass before the next step runs. The probe is required so a
+ * restart step can never "succeed" against a runtime that never came
+ * back (fail closed). */
+function validateRestart(restart, errors, where) {
+  if (!isRecord(restart)) return err(errors, where, "restart must be an object");
+  for (const k of Object.keys(restart))
+    if (!["services", "waitReady"].includes(k))
+      err(errors, `${where}.${k}`, "unknown restart field");
+  if (!Array.isArray(restart.services) || restart.services.length === 0)
+    err(errors, `${where}.services`, "required: non-empty array of service names");
+  else {
+    const seen = new Set();
+    restart.services.forEach((s, i) => {
+      if (typeof s !== "string" || !SERVICE_RE.test(s))
+        err(errors, `${where}.services[${i}]`, `must match ${SERVICE_RE}`);
+      else if (seen.has(s)) err(errors, `${where}.services[${i}]`, `duplicate service "${s}"`);
+      else seen.add(s);
+    });
+  }
+  const wr = restart.waitReady;
+  if (!isRecord(wr)) return err(errors, `${where}.waitReady`, "required: {request, expect, timeoutMs?}");
+  for (const k of Object.keys(wr))
+    if (!["request", "expect", "timeoutMs", "intervalMs"].includes(k))
+      err(errors, `${where}.waitReady.${k}`, "unknown waitReady field");
+  if (!isRecord(wr.request)) err(errors, `${where}.waitReady.request`, "required object");
+  else validateRequest(wr.request, errors, `${where}.waitReady.request`);
+  validateExpect(wr.expect ?? {}, errors, `${where}.waitReady.expect`);
+  if (wr.timeoutMs !== undefined && (!Number.isFinite(wr.timeoutMs) || wr.timeoutMs <= 0))
+    err(errors, `${where}.waitReady.timeoutMs`, "must be a positive number");
+  if (wr.intervalMs !== undefined && (!Number.isFinite(wr.intervalMs) || wr.intervalMs <= 0))
+    err(errors, `${where}.waitReady.intervalMs`, "must be a positive number");
+}
+
 function validateStep(step, errors, where) {
   if (!isRecord(step)) return err(errors, where, "step must be an object");
   for (const k of Object.keys(step))
-    if (!["name", "request", "expect", "retry"].includes(k))
+    if (!["name", "request", "expect", "retry", "restart"].includes(k))
       err(errors, `${where}.${k}`, "unknown step field");
   if (typeof step.name !== "string" || !step.name)
     err(errors, `${where}.name`, "required, non-empty string");
+  if (step.restart !== undefined) {
+    // A step is either an HTTP assertion or a lifecycle action, never
+    // both: mixing them would make "which expect failed" ambiguous.
+    for (const k of ["request", "expect", "retry"])
+      if (step[k] !== undefined)
+        err(errors, `${where}.${k}`, "not allowed on a restart step");
+    return validateRestart(step.restart, errors, `${where}.restart`);
+  }
+  if (step.request === undefined) return err(errors, `${where}.request`, "required (or add a restart action)");
   validateRequest(step.request, errors, `${where}.request`);
   validateExpect(step.expect ?? {}, errors, `${where}.expect`);
   if (step.retry !== undefined) {
@@ -510,6 +557,69 @@ async function deployCase(entry, deployCmd, timeoutMs, log) {
   return dir;
 }
 
+/** Run the caller-provided restart hook for an ordered service list.
+ * The hook owns the stack-specific mechanics (compose restart, k8s
+ * rollout, ...); the runner only forwards RESTART_SERVICES and treats
+ * any non-zero exit as a hard failure — a restart that did not happen
+ * must never be reported as passed. */
+function runRestartCmd(cmd, services, { caseId, timeoutMs }, log) {
+  const env = {
+    ...process.env,
+    RESTART_SERVICES: services.join(" "),
+    CASE_ID: caseId,
+  };
+  return new Promise((resolve, reject) => {
+    execFile(
+      "sh",
+      ["-c", cmd],
+      { env, timeout: timeoutMs, maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error)
+          reject(
+            new Error(
+              `restart-cmd failed (${error.message})\n${String(stderr).slice(-2000)}`,
+            ),
+          );
+        else {
+          if (stdout.trim()) log(`  restart: ${stdout.trim().split("\n").pop()}`);
+          resolve();
+        }
+      },
+    );
+  });
+}
+
+/** Execute one restart step: hook first, then poll the readiness probe
+ * until it matches. No fixed sleeps: the probe decides when the runtime
+ * is back, and its budget is the step's timeout. */
+async function runRestartStep(step, opts, host) {
+  const { services, waitReady } = step.restart;
+  try {
+    await runRestartCmd(opts.restartCmd, services, {
+      caseId: opts.caseId,
+      timeoutMs: opts.restartTimeoutMs ?? 120_000,
+    }, opts.log);
+  } catch (e) {
+    return { ok: false, diffs: [e.message] };
+  }
+  const probe = { request: waitReady.request, expect: waitReady.expect ?? {} };
+  const retry = {
+    timeoutMs: waitReady.timeoutMs ?? opts.readyTimeoutMs ?? 60_000,
+    intervalMs: waitReady.intervalMs ?? 500,
+  };
+  const r = await runStepWithRetry(opts.url, host, probe, opts.timeoutMs ?? 15_000, retry);
+  if (!r.ok)
+    return {
+      ok: false,
+      diffs: [
+        `restart readiness (${services.join(", ")}) did not pass within ${retry.timeoutMs}ms:`,
+        ...r.diffs,
+      ],
+      actual: r.actual,
+    };
+  return { ok: true };
+}
+
 /** Run one case end-to-end. Returns the case result record. */
 export async function runCase(entry, opts) {
   const c = entry.case;
@@ -524,6 +634,14 @@ export async function runCase(entry, opts) {
   if (opts.stub && c.requiresWorkerd !== false) {
     result.status = "skipped";
     result.reason = "requires workerd (stack is --stub)";
+    return result;
+  }
+  if (c.steps.some((s) => s.restart) && !opts.restartCmd) {
+    // Explicit, reported skip — never a silent pass. The release gate
+    // (`--fail-on-skip`) still turns this into a red run, so a stack
+    // that cannot be restarted cannot claim the restart behavior.
+    result.status = "skipped";
+    result.reason = "case restarts the runtime; pass --restart-cmd (or omit --no-restart)";
     return result;
   }
   const host = opts.host ?? resolveHostname(entry);
@@ -543,6 +661,23 @@ export async function runCase(entry, opts) {
   }
   const readyTimeout = c.readyTimeoutMs ?? opts.readyTimeoutMs;
   for (const [i, step] of c.steps.entries()) {
+    if (step.restart) {
+      const r = await runRestartStep(step, { ...opts, caseId: entry.id }, host);
+      const rec = {
+        name: step.name,
+        status: r.ok ? "passed" : "failed",
+        restart: step.restart.services,
+      };
+      if (!r.ok) {
+        rec.failures = r.diffs;
+        if (r.actual)
+          rec.actual = { status: r.actual.status, body: truncate(r.actual.bodyText) };
+        result.status = "failed";
+      }
+      result.steps.push(rec);
+      if (!r.ok && !opts.keepGoing) break;
+      continue;
+    }
     // Step 0 doubles as the readiness gate: after a deploy the worker
     // takes a moment to converge, so it retries for the case's
     // readiness budget. Later steps only retry when they say so.
@@ -713,6 +848,11 @@ Run the binding-conformance cases against a running OpenFlare stack.
   --deploy-cmd <shell>  command that deploys "$CASE_DIR" (the staged case
                         dir); env CASE_ID / CASE_HOSTNAME are also set
   --no-deploy           skip deploys; assert cases are already live
+  --restart-cmd <shell> command that restarts "$RESTART_SERVICES" in place
+                        (default: conformance/restart-standalone.sh)
+  --no-restart          never restart; cases with a restart step report
+                        "skipped" (fatal under --fail-on-skip)
+  --restart-timeout <ms> restart hook budget (120000)
   --host <hostname>     Host header override for every request
   --stub                stack runs the stub runtime: requiresWorkerd
                         cases report "skipped"
@@ -732,6 +872,7 @@ Run the binding-conformance cases against a running OpenFlare stack.
 function parseArgs(argv) {
   const o = {
     deployTimeoutMs: 180_000,
+    restartTimeoutMs: 120_000,
     readyTimeoutMs: 90_000,
     timeoutMs: 15_000,
     keepGoing: true,
@@ -743,6 +884,9 @@ function parseArgs(argv) {
       case "--url": o.url = val(); break;
       case "--deploy-cmd": o.deployCmd = val(); break;
       case "--no-deploy": o.noDeploy = true; break;
+      case "--restart-cmd": o.restartCmd = val(); break;
+      case "--no-restart": o.noRestart = true; break;
+      case "--restart-timeout": o.restartTimeoutMs = Number(val()); break;
       case "--host": o.host = val(); break;
       case "--stub": o.stub = true; break;
       case "--only": o.only = new RegExp(val()); break;
@@ -802,6 +946,15 @@ export async function main(argv, { log = console.log, errlog = console.error } =
     errlog("pass --deploy-cmd <cmd> or --no-deploy (cases already live)\n" + USAGE);
     return 2;
   }
+  // Cases that restart the runtime must either run or report a visible
+  // skip — they must never pass without proving the restart. The suite
+  // ships the standalone hook, so use it by default (and log the
+  // choice); other stacks pass --restart-cmd or --no-restart.
+  const bundledRestart = path.join(here, "restart-standalone.sh");
+  const restartCmd = opts.noRestart
+    ? null
+    : opts.restartCmd ??
+      (fs.existsSync(bundledRestart) ? bundledRestart : null);
   const wanted = opts.only ? entries.filter((e) => opts.only.test(e.id)) : entries;
   if (wanted.length === 0) {
     errlog("no cases matched --only");
@@ -809,6 +962,7 @@ export async function main(argv, { log = console.log, errlog = console.error } =
   }
   const stack = opts.stub ? "stub" : "workerd";
   log(`conformance: ${wanted.length} case(s), stack=${stack}, url=${opts.url}`);
+  log(`restart hook: ${restartCmd ?? "disabled (restart cases will skip)"}`);
   const results = [];
   for (const entry of wanted) {
     const r = await runCase(entry, {
@@ -817,6 +971,8 @@ export async function main(argv, { log = console.log, errlog = console.error } =
       stub: opts.stub,
       deployCmd: opts.deployCmd,
       deployTimeoutMs: opts.deployTimeoutMs,
+      restartCmd,
+      restartTimeoutMs: opts.restartTimeoutMs,
       readyTimeoutMs: opts.readyTimeoutMs,
       timeoutMs: opts.timeoutMs,
       keepGoing: opts.keepGoing,

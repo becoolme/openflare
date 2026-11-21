@@ -156,3 +156,58 @@ test("resolveHostname prefers explicit case.hostname", () => {
   const e = { dir: "/nonexistent", case: { hostname: "h.example" } };
   assert.equal(resolveHostname(e), "h.example");
 });
+
+test("validateCase: restart steps carry services + a required readiness probe", () => {
+  const ok = goodCase();
+  ok.steps = [
+    {
+      name: "restart",
+      restart: {
+        services: ["vrt-host", "vrt"],
+        waitReady: { request: { path: "/state" }, expect: { status: 200 }, timeoutMs: 30000 },
+      },
+    },
+  ];
+  assert.deepEqual(validateCase(ok, "x-case").errors, []);
+
+  const noProbe = goodCase();
+  noProbe.steps = [{ name: "restart", restart: { services: ["vrt-host"] } }];
+  assert.match(validateCase(noProbe, "x-case").errors.join("\n"), /waitReady/);
+
+  const noServices = goodCase();
+  noServices.steps = [
+    { name: "restart", restart: { services: [], waitReady: { request: { path: "/" } } } },
+  ];
+  assert.match(validateCase(noServices, "x-case").errors.join("\n"), /services/);
+
+  const badService = goodCase();
+  badService.steps = [
+    { name: "restart", restart: { services: ["vrt host"], waitReady: { request: { path: "/" } } } },
+  ];
+  assert.match(validateCase(badService, "x-case").errors.join("\n"), /services\[0\]/);
+
+  const mixed = goodCase();
+  mixed.steps = [
+    {
+      name: "restart",
+      request: { path: "/" },
+      expect: { status: 200 },
+      restart: { services: ["vrt-host"], waitReady: { request: { path: "/" } } },
+    },
+  ];
+  assert.match(validateCase(mixed, "x-case").errors.join("\n"), /not allowed on a restart step/);
+
+  const neither = goodCase();
+  neither.steps = [{ name: "nothing" }];
+  assert.match(validateCase(neither, "x-case").errors.join("\n"), /required \(or add a restart action\)/);
+});
+
+test("the shipped restart case declares its restart service and readiness probe", () => {
+  const entries = loadCases(path.join(CONF, "cases"));
+  const c = entries.find((e) => e.id === "do-alarm-restart");
+  assert.ok(c && c.ok, "do-alarm-restart must load");
+  const restart = c.case.steps.filter((s) => s.restart);
+  assert.equal(restart.length, 1);
+  assert.deepEqual(restart[0].restart.services, ["vrt-host", "vrt"]);
+  assert.equal(restart[0].restart.waitReady.request.path, "/state");
+});

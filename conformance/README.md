@@ -28,6 +28,7 @@ file) in the case's `evidence` list. Behavior with no citation goes in
 conformance/
   run.mjs                 the runner (pure Node, importable lib + CLI)
   deploy-standalone.sh    deploy hook for the docker compose stack
+  restart-standalone.sh   restart hook for the docker compose stack
   cases/<binding>/<id>/   one deployable worker project per case
     case.json             declarative steps + expected responses + evidence
     worker.js             the probe worker
@@ -67,6 +68,9 @@ Options (`node conformance/run.mjs --help`):
 | `--url <base>` | ingress base URL (required) |
 | `--deploy-cmd <shell>` | deploy hook; `$CASE_DIR` is the staged dir |
 | `--no-deploy` | skip deploys; cases assumed already live |
+| `--restart-cmd <shell>` | restart hook; `$RESTART_SERVICES` is the ordered service list (default `conformance/restart-standalone.sh`) |
+| `--no-restart` | never restart; cases with a restart step report `skipped` (fatal under `--fail-on-skip`) |
+| `--restart-timeout <ms>` | restart hook budget (default 120 s) |
 | `--host <name>` | override the Host header for every request |
 | `--stub` | the stack runs the stub runtime; `requiresWorkerd` cases report `skipped` (validates the runner itself without workerd) |
 | `--only <regex>` | run a subset of case ids |
@@ -115,11 +119,57 @@ that workflow (attach the `conformance-report` artifact); the per-PR
      expect passes — use it for eventually-consistent effects (queue
      delivery, cron ticks, alarms). Step 0 always retries up to the
      case's readiness budget after a deploy.
+   - A step may instead be a restart action — see
+     [Restart steps](#restart-steps).
 4. Prefer **normalized responses**: the worker maps volatile values
    (etags, epochs, durations) onto stable booleans/shapes so the JSON
    expectation stays deterministic.
 5. `node conformance/run.mjs --validate` must pass; `npm test` checks
    every manifest.
+
+## Restart steps
+
+A step is either an HTTP assertion (`request` + `expect`) or a restart
+action. A restart step restarts the runtime processes that host workerd
+**in place** — the compose hook uses `docker compose restart`, so no
+volume is recreated and nothing is redeployed — and then polls a
+readiness probe until it matches:
+
+```json
+{
+  "name": "restart the runtime process",
+  "restart": {
+    "services": ["vrt-host", "vrt"],
+    "waitReady": {
+      "request": { "path": "/state" },
+      "expect": { "status": 200 },
+      "timeoutMs": 90000,
+      "intervalMs": 500
+    }
+  }
+}
+```
+
+- `services` is an ordered list handed to the hook verbatim. On the
+  standalone stack the order matters: `vrt-host` supervises workerd and
+  `vrt` joins its network namespace, so `vrt` is restarted after
+  `vrt-host`.
+- `waitReady` is **required**. The runner probes it after the hook
+  returns, with no fixed sleeps; a probe that never matches within
+  `timeoutMs` fails the step.
+- The hook (`--restart-cmd`) receives `RESTART_SERVICES` and `CASE_ID`
+  and must exit non-zero when the restart did not happen. Any hook
+  failure fails the case: a restart case can never pass without the
+  restart.
+- With `--no-restart` (or no hook at all) a case that declares a restart
+  step is reported `skipped`; `--fail-on-skip` makes that fatal for a
+  release gate.
+- The default hook is `conformance/restart-standalone.sh` (logged at
+  start-up); stacks without that compose topology pass their own
+  `--restart-cmd` or `--no-restart`.
+
+`do-alarm-restart` uses this to prove that an armed DO alarm fires in
+the new process and that pre-restart storage is still present.
 
 ## Reading the report
 
@@ -131,6 +181,11 @@ stack), not that it passed.
 
 ## Changelog
 
+- 2026-11-20: Added restart steps (`restart: {services, waitReady}`)
+  and the `restart-standalone.sh` hook, so a case can restart the runtime
+  in place and gate the next step on a readiness probe. `do-alarm-restart`
+  proves DO alarm persistence across a process restart; the alarm-restart
+  clause is gone from `UNVERIFIED.md`.
 - 2026-11-20: Added the `d1-dump-raw` fixture: `dump()` SQL export
   (empty database, exact quoting/escaping, restore round-trip),
   `raw({columnNames:true|false})`, duplicate/empty result shapes, and the

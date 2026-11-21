@@ -14,7 +14,7 @@ reference is found, promote it to a case.
 | 4 | R2 | `uploadedBefore`/`uploadedAfter`/`secondsGranularity`/`httpHeaders` condition branches | covered partially by `r2_s3_conditional.rs` for puts; `get` side uncited |
 | 5 | Cache | `max-age=1` real expiry: TTL eviction vs. lazy miss-on-read | cache.rs honors s-maxage/max-age but a wall-clock expiry assertion would be timing-flaky |
 | 6 | Cron | `event.retry`/`noRetry` on scheduled() controller | not surfaced by the standalone CronRunner path yet |
-| 7 | DO | `storage.sql` KV↔SQL visibility interplay and alarm persistence across a process restart | restart persistence is proven manually; an automated restart step is not wired into the runner yet |
+| 7 | DO | `storage.sql` KV↔SQL visibility interplay (whether a KV write and a SQL row are visible across the two surfaces of the same object) | `do-storage` exercises `sql.exec` and KV separately; no CF doc fixes cross-surface visibility |
 | 8 | DO | `blockConcurrencyWhile` reject → surface to waiting fetch (error propagation shape) | needs a failing init fixture; added when a workerd-side citation is found |
 | 9 | R2 | Whether `R2MultipartUpload.complete()` resolves with `httpMetadata`/`customMetadata` populated (the native adapter strips them; `r2-multipart` reads metadata back via `get()` instead) | no CF doc fixes the complete() result fields |
 | 10 | Cron | `ScheduledEvent.type` (`"scheduled"`) on the service-worker syntax; the module `ScheduledController` has no `type` field, so `cron-basic` does not assert it | module syntax only in this suite |
