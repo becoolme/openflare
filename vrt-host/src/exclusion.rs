@@ -242,6 +242,7 @@ mod tests {
             routes: Vec::new(),
             crons: Vec::new(),
             queue_consumers: Vec::new(),
+            tail_consumers: Vec::new(),
             durable_object_classes: Vec::new(),
             workflows: Vec::new(),
             quotas: WorkerQuotas {
