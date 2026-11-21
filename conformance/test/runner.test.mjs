@@ -185,8 +185,7 @@ test("stageCaseDir copies asset subdirectories and drops case metadata", () => {
   assert.equal(fs.readFileSync(path.join(staged, "public", "notes.md"), "utf8"), "# asset");
 });
 
-test("conformanceExitCode: skips are fatal only under fail-on-skip", () => {
-  assert.equal(conformanceExitCode({ passed: 11, failed: 0, skipped: 0 }), 0);
+test("conformanceExitCode: skips are fatal only under fail-on-skip", () => {  assert.equal(conformanceExitCode({ passed: 11, failed: 0, skipped: 0 }), 0);
   assert.equal(conformanceExitCode({ passed: 10, failed: 0, skipped: 1 }), 0);
   assert.equal(
     conformanceExitCode({ passed: 10, failed: 0, skipped: 1 }, { failOnSkip: true }),
@@ -197,4 +196,152 @@ test("conformanceExitCode: skips are fatal only under fail-on-skip", () => {
     1,
   );
   assert.equal(conformanceExitCode({ passed: 0, failed: 1, skipped: 2 }), 1);
+});
+
+// ── restart steps ───────────────────────────────────────────────────
+
+function restartCase(extra = {}) {
+  const c = baseCase({
+    steps: [
+      { name: "ping", request: { path: "/ping" }, expect: { status: 200, json: { ok: true } } },
+      {
+        name: "restart runtime",
+        restart: {
+          services: ["vrt-host", "vrt"],
+          waitReady: {
+            request: { path: "/state" },
+            expect: { status: 200, json: { ready: true } },
+            timeoutMs: 5000,
+            intervalMs: 25,
+          },
+        },
+      },
+      { name: "after", request: { path: "/after" }, expect: { status: 200, json: { ok: true } } },
+    ],
+    ...extra,
+  });
+  return c;
+}
+
+const caseOpts = (url, overrides = {}) => ({
+  url,
+  noDeploy: true,
+  restartCmd: "true",
+  restartTimeoutMs: 5000,
+  readyTimeoutMs: 2000,
+  timeoutMs: 2000,
+  keepGoing: true,
+  log: () => {},
+  ...overrides,
+});
+
+test("restart step runs the hook, then gates on the readiness probe", async () => {
+  const logPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "conf-restart-")), "ran");
+  const old = process.env.CONF_RESTART_LOG;
+  process.env.CONF_RESTART_LOG = logPath;
+  const seen = [];
+  let stateHits = 0;
+  const { srv, url } = await fakeStack((req, res) => {
+    seen.push(req.url);
+    if (req.url === "/state") {
+      // The runtime needs a moment to come back after the hook returns:
+      // the probe must poll, not assume readiness.
+      if (++stateHits < 3) {
+        res.statusCode = 503;
+        return res.end("not ready");
+      }
+    }
+    res.setHeader("content-type", "application/json");
+    res.end(req.url === "/state" ? '{"ready":true}' : '{"ok":true}');
+  });
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-test-"));
+    const e = entry(path.join(tmp, "t-case"), "t-case", restartCase());
+    const r = await runCase(
+      e,
+      caseOpts(url, { restartCmd: 'printf "%s" "$RESTART_SERVICES" > "$CONF_RESTART_LOG"' }),
+    );
+    assert.equal(r.status, "passed", JSON.stringify(r));
+    // The hook saw the ordered service list from case.json.
+    assert.equal(fs.readFileSync(logPath, "utf8"), "vrt-host vrt");
+    assert.deepEqual(r.steps[1].restart, ["vrt-host", "vrt"]);
+    // Readiness retried while the fake stack reported 503, and the
+    // post-restart step only ran afterwards.
+    assert.ok(seen.filter((p) => p === "/state").length >= 2, seen.join(","));
+    assert.ok(seen.indexOf("/ping") < seen.indexOf("/state"));
+    assert.ok(seen.lastIndexOf("/state") < seen.indexOf("/after"));
+  } finally {
+    process.env.CONF_RESTART_LOG = old;
+    srv.close();
+  }
+});
+
+test("restart hook failure fails the case (fail closed)", async () => {
+  const { srv, url } = await fakeStack((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end('{"ok":true,"ready":true}');
+  });
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-test-"));
+    const e = entry(path.join(tmp, "t-case"), "t-case", restartCase());
+    const r = await runCase(
+      e,
+      caseOpts(url, { restartCmd: 'echo "compose exploded" >&2; exit 3', keepGoing: false }),
+    );
+    assert.equal(r.status, "failed");
+    assert.equal(r.steps[1].status, "failed");
+    assert.match(r.steps[1].failures.join("\n"), /restart-cmd failed/);
+    assert.match(r.steps[1].failures.join("\n"), /compose exploded/);
+    // --fail-fast: the post-restart step must not run after the failure.
+    assert.equal(r.steps.length, 2);
+  } finally {
+    srv.close();
+  }
+});
+
+test("restart readiness timeout fails the case (fail closed)", async () => {
+  const { srv, url } = await fakeStack((req, res) => {
+    if (req.url === "/state") {
+      res.statusCode = 503;
+      return res.end("still booting");
+    }
+    res.setHeader("content-type", "application/json");
+    res.end('{"ok":true}');
+  });
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-test-"));
+    const c = restartCase();
+    c.steps[1].restart.waitReady.timeoutMs = 150;
+    const e = entry(path.join(tmp, "t-case"), "t-case", c);
+    const r = await runCase(e, caseOpts(url, { keepGoing: false }));
+    assert.equal(r.status, "failed");
+    assert.match(r.steps[1].failures.join("\n"), /restart readiness/);
+    assert.match(r.steps[1].failures.join("\n"), /status: expected 200, got 503/);
+  } finally {
+    srv.close();
+  }
+});
+
+test("a restart case without a restart hook is skipped before deploying", async () => {
+  const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "conf-restart-")), "deployed");
+  const old = process.env.CONF_DEPLOY_MARK;
+  process.env.CONF_DEPLOY_MARK = marker;
+  const { srv, url } = await fakeStack((_req, res) => res.end('{"ok":true}'));
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-test-"));
+    const e = entry(path.join(tmp, "t-case"), "t-case", restartCase());
+    const r = await runCase(
+      e,
+      caseOpts(url, {
+        restartCmd: undefined,
+        deployCmd: 'touch "$CONF_DEPLOY_MARK"',
+      }),
+    );
+    assert.equal(r.status, "skipped");
+    assert.match(r.reason, /restart-cmd/);
+    assert.equal(fs.existsSync(marker), false, "skipped case must not deploy");
+  } finally {
+    process.env.CONF_DEPLOY_MARK = old;
+    srv.close();
+  }
 });

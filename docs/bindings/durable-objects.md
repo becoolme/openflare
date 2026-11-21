@@ -37,6 +37,13 @@ resolved to a worker id at pack time, fail closed on a miss).
   `vrt do-migrate`.
 - Storage state is external to the bundle: a worker can be restarted,
   rescheduled or redeployed without losing object data.
+- Alarms are durable object metadata, not process state:
+  `storage.setAlarm()` persists the armed time, so an alarm armed before
+  a runtime restart is still delivered by the new process and
+  `getAlarm()` keeps reporting it. Restarting `vrt-host` (which
+  supervises workerd) in place does not drop a pending alarm;
+  `conformance/cases/durable-objects/do-alarm-restart` proves this
+  end-to-end.
 
 ## Backends
 
@@ -88,6 +95,10 @@ exposed; `new_sqlite_classes` sets `enableSql = true`.
 
 - `examples/standalone-do` — `durable_objects.bindings` + a SQLite
   `[[migrations]]` entry, storage + alarm over `localDisk`.
+- `conformance/cases/durable-objects/do-alarm-restart` — arms a
+  self re-arming alarm, restarts `vrt-host` in place through the
+  conformance runner's `restart` step, and asserts that the next alarm
+  fires in the new process while pre-restart storage is intact.
 - `vrt-host/tests/do_wal.rs`, `vrt-host/tests/do_transfer.rs` — WAL and
   transfer-path tests.
 - `vrt-host/tests/do_w1r4_workerd.rs` — real-workerd DO tests (skip
@@ -96,3 +107,10 @@ exposed; `new_sqlite_classes` sets `enableSql = true`.
   tests (skip without a binary).
 - `shared/vrt-project-config-vectors.json` — golden vectors covering
   `durable_objects` and `migrations` normalization.
+
+## Changelog
+
+- 2026-11-20: Alarm persistence across a runtime process restart is now
+  covered by the conformance suite (`do-alarm-restart`): a pending alarm
+  is delivered by the new `vrt-host`/workerd process and pre-restart
+  object storage is still present. No behavior change.
