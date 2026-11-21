@@ -17,7 +17,9 @@
 //! support them either), more than one splat, and setting headers on
 //! Worker-generated responses (only asset responses, like Cloudflare).
 //!
-//! Limits: 100 rules, 2,000 characters per line.
+//! Limits: 100 rules, 2,000 characters per line. Overlong lines are
+//! ignored without opening or closing a block, exactly like Cloudflare's
+//! `parseHeaders`.
 
 pub const MAX_RULES: usize = 100;
 pub const MAX_LINE_BYTES: usize = 2_000;
@@ -83,24 +85,22 @@ pub fn parse_headers(text: &str) -> Vec<HeaderRule> {
     let mut rules: Vec<HeaderRule> = Vec::new();
     let mut current: Option<HeaderRule> = None;
     for line in text.lines() {
-        let indented = line.starts_with(' ') || line.starts_with('\t');
-        if line.len() > MAX_LINE_BYTES {
-            // An overlong *block opener* is an invalid source: close the
-            // preceding block so its header ops cannot attach to it.
-            // (Overlong indented lines are simply not an op.)
-            if !indented {
-                if let Some(rule) = current.take() {
-                    if !rule.ops.is_empty() && rules.len() < MAX_RULES {
-                        rules.push(rule);
-                    }
-                }
-            }
-            continue;
-        }
         let trimmed = line.trim();
+        // Blank lines and comments never affect the active block.
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
+        if trimmed.len() > MAX_LINE_BYTES {
+            // Cloudflare `parseHeaders` (`workers-shared/utils/configuration/
+            // parseHeaders.ts`) trims the line, skips blank/comment lines and
+            // then rejects an overlong line with a plain `continue`: the line
+            // is ignored and the active block stays open, so a following
+            // header line still belongs to the preceding path. This is not a
+            // block boundary: closing the block here would drop headers that
+            // Cloudflare applies.
+            continue;
+        }
+        let indented = line.starts_with(' ') || line.starts_with('\t');
         if !indented {
             if let Some(rule) = current.take() {
                 if !rule.ops.is_empty() && rules.len() < MAX_RULES {
@@ -438,17 +438,35 @@ mod tests {
     }
 
     #[test]
-    fn overlong_block_opener_closes_the_previous_block() {
-        // A path longer than a `_headers` line must not let its header
-        // ops attach to the preceding rule.
+    fn overlong_lines_are_ignored_and_keep_the_active_block() {
+        // Cloudflare `parseHeaders` rejects an overlong line with a plain
+        // `continue`: it is neither a block opener nor a block boundary, so
+        // the following header line still belongs to the preceding path.
         let long = format!("/{}", "a".repeat(MAX_LINE_BYTES + 10));
         let text = format!("/public/*\n  X-Frame-Options: DENY\n{long}\n  Access-Control-Allow-Origin: *\n");
         let rules = parse_headers(&text);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].source, "/public/*");
-        assert_eq!(rules[0].ops.len(), 1);
+        assert_eq!(rules[0].ops.len(), 2);
+    }
+
+    #[test]
+    fn overlong_comments_do_not_close_the_block() {
+        // Comments are skipped before the length cap (Cloudflare order), so
+        // an overlong comment can never split a block either.
+        let long = format!("#{}", "c".repeat(MAX_LINE_BYTES + 10));
+        let text = format!(
+            "/public/*\n  X-Frame-Options: DENY\n{long}\n  Content-Security-Policy: default-src 'self'\n"
+        );
+        let rules = parse_headers(&text);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].ops.len(), 2);
         let h = headers(&text, "/public/x");
-        assert!(h.get("access-control-allow-origin").is_none());
+        assert_eq!(h.get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(
+            h.get("content-security-policy").unwrap(),
+            "default-src 'self'"
+        );
     }
 
     #[test]
