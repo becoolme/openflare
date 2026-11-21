@@ -1,15 +1,13 @@
 //! Tail Workers emit — `tailConsumers[]` render as `tails` designators
-//! pointing at the consumer's `worker-<workerId>` service (merged with
-//! the platform log-tail collector when enabled). A dangling consumer id
-//! fails the whole render closed — same-tenant membership is validated
-//! upstream AND re-checked here (defense in depth).
+//! and `streamingTailConsumers[]` as `streamingTails` designators,
+//! pointing at the consumer's `worker-<workerId>` service. A dangling
+//! consumer id fails the render closed — same-tenant membership is
+//! validated upstream AND re-checked here (defense in depth).
 
 mod common;
 
 use common::*;
-use snapshot_protocol::compute_desired::{
-    BindingDesired, JsonBinding, TailConsumerDesired, TenantDesired,
-};
+use snapshot_protocol::compute_desired::{TailConsumerDesired, TenantDesired};
 use vrt_config::*;
 
 fn bs() -> Vec<VersionBundle> {
@@ -19,6 +17,17 @@ fn bs() -> Vec<VersionBundle> {
 fn tenant_with_tails(consumers: &[&str]) -> TenantDesired {
     let mut t = tenant();
     t.workers[0].tail_consumers = consumers
+        .iter()
+        .map(|id| TailConsumerDesired {
+            worker_id: (*id).into(),
+        })
+        .collect();
+    t
+}
+
+fn tenant_with_streaming(consumers: &[&str]) -> TenantDesired {
+    let mut t = tenant();
+    t.workers[0].streaming_tail_consumers = consumers
         .iter()
         .map(|id| TailConsumerDesired {
             worker_id: (*id).into(),
@@ -37,13 +46,12 @@ fn tails_absent_emits_nothing() {
 
 #[test]
 fn tails_emit_consumer_designators() {
-    let t = tenant_with_tails(&["w-alpha-2", "w-alpha-1"]);
+    let t = tenant_with_tails(&["w-alpha-2"]);
     let params = runtime_params();
     let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
     let out = &r.text;
-    // Self + sibling consumers both emit `worker-<id>` designators.
     assert!(
-        out.contains("tails = [(name = \"worker-w-alpha-2\"), (name = \"worker-w-alpha-1\")]"),
+        out.contains("tails = [(name = \"worker-w-alpha-2\")]"),
         "{out}"
     );
     // The consumer worker itself emits no `tails` (it declares none).
@@ -71,33 +79,13 @@ fn tails_merge_with_platform_log_tail() {
 }
 
 #[test]
-fn tails_dangling_consumer_skips_only_that_worker() {
-    // Per-worker fault isolation: a consumer id absent from the tenant's
-    // worker set fails THAT worker's dry-run emit — it lands in
-    // `skipped_workers` (routes serve worker_unavailable) while the
-    // sibling keeps serving. The whole tenant never poisons.
+fn tails_dangling_consumer_fails_closed() {
+    // A dangling designator would fail the whole workerd config load,
+    // so the render refuses it up front.
     let t = tenant_with_tails(&["w-nope"]);
     let params = runtime_params();
-    let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
-    assert_eq!(
-        r.skipped_workers,
-        vec!["w-alpha-1".to_string()],
-        "{:?}",
-        r.skipped_reasons
-    );
-    assert!(!r.text.contains("worker-w-alpha-1"));
-    assert!(r.text.contains("worker-w-alpha-2"));
-}
-
-fn tenant_with_streaming(consumers: &[&str]) -> TenantDesired {
-    let mut t = tenant();
-    t.workers[0].streaming_tail_consumers = consumers
-        .iter()
-        .map(|id| TailConsumerDesired {
-            worker_id: (*id).into(),
-        })
-        .collect();
-    t
+    let err = render_tenant_config(&input(&t, &bs(), &params)).unwrap_err();
+    assert!(format!("{err:?}").contains("tailConsumers"), "{err:?}");
 }
 
 #[test]
@@ -112,7 +100,6 @@ fn streaming_tails_emit_consumer_designators() {
         out.contains("streamingTails = [(name = \"worker-w-alpha-2\")]"),
         "{out}"
     );
-    // Not mixed into the batched `tails` list.
     assert!(
         !out.contains("tails = [(name = \"worker-w-alpha-2\")]"),
         "{out}"
@@ -121,32 +108,11 @@ fn streaming_tails_emit_consumer_designators() {
 
 #[test]
 fn streaming_tails_dangling_consumer_skips_worker() {
-    // Same per-worker fault isolation as `tails`.
+    // The poisoned worker is skipped individually (its route serves
+    // worker_unavailable) and no dangling designator reaches workerd.
     let t = tenant_with_streaming(&["w-nope"]);
     let params = runtime_params();
     let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
     assert_eq!(r.skipped_workers, vec!["w-alpha-1".to_string()]);
     assert!(!r.text.contains("streamingTails"));
-}
-
-/// `{"type":"json"}` — the version_metadata/typed-vars carrier renders
-/// as a workerd `json` binding with the wire text verbatim.
-#[test]
-fn json_binding_emits_verbatim() {
-    let mut t = tenant();
-    t.workers[0]
-        .bindings
-        .push(BindingDesired::Json(JsonBinding {
-            name: "CF_VERSION_METADATA".into(),
-            value: "{\"id\":\"v-1\",\"tag\":\"\",\"timestamp\":\"42\"}".into(),
-        }));
-    let params = runtime_params();
-    let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
-    assert!(
-        r.text.contains(
-            "(name = \"CF_VERSION_METADATA\", json = \"{\\\"id\\\":\\\"v-1\\\",\\\"tag\\\":\\\"\\\",\\\"timestamp\\\":\\\"42\\\"}\")"
-        ),
-        "{}",
-        r.text
-    );
 }

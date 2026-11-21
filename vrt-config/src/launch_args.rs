@@ -134,6 +134,7 @@ mod tests {
             durable_object_classes: Vec::new(),
             workflows: Vec::new(),
             tail_consumers: Vec::new(),
+            streaming_tail_consumers: Vec::new(),
             quotas: WorkerQuotas::platform_default(),
         }
     }
