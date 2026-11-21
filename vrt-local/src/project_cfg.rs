@@ -2536,6 +2536,8 @@ mod tests {
         // `unsafe.bindings` not an array of tables.
         let dir = wrangler_loader_body("[unsafe]\nbindings=\"x\"\n");
         assert!(load_worker_meta(dir.path()).is_err());
+    }
+
     #[test]
     fn streaming_tail_consumers_into_pack_shape() {
         // CF `streaming_tail_consumers = [{service}]` — same shape as
