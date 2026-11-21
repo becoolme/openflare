@@ -323,6 +323,7 @@ pub fn render(
         wfop_pepper: "g1-gate-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),

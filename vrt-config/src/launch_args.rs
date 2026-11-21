@@ -35,6 +35,9 @@ pub struct ExperimentalNeeds {
     /// Any worker binds a `workerLoader` — the binding is
     /// `$experimental`-gated upstream.
     pub worker_loaders: bool,
+    /// Any worker binds an `analyticsEngine` — `experimental_feature(
+    /// "AnalyticsEngine")` in workerd's bindings.
+    pub analytics_engine: bool,
 }
 
 impl ExperimentalNeeds {
@@ -55,6 +58,11 @@ impl ExperimentalNeeds {
                     .iter()
                     .any(|b| matches!(b, BindingDesired::WorkerLoader(_)))
             }),
+            analytics_engine: tenant.workers.iter().any(|w| {
+                w.bindings
+                    .iter()
+                    .any(|b| matches!(b, BindingDesired::AnalyticsEngine(_)))
+            }),
         }
     }
 }
@@ -73,6 +81,7 @@ pub fn experimental_extra_args(
         || needs.durable_objects_or_workflows
         || needs.crons
         || needs.worker_loaders
+        || needs.analytics_engine
         || system_compat_flags
             .iter()
             .any(|f| f != "experimental" && crate::is_experimental_compat_flag(f));
@@ -155,6 +164,23 @@ mod tests {
         w.bindings = vec![BindingDesired::WorkerLoader(WorkerLoaderBinding {
             name: "LOADER".into(),
         })];
+        let args = tenant_experimental_extra_args(&[], &tenant(vec![w]));
+        assert_eq!(args, vec!["--experimental".to_string()]);
+    }
+
+    #[test]
+    fn analytics_engine_tenant_derives_experimental_arg() {
+        // `analyticsEngine` is `$experimental`-gated upstream too
+        // (`experimental_feature("AnalyticsEngine")` in bindings) — a
+        // tenant declaring `[[analytics_engine_datasets]]` must get
+        // `--experimental` in argv or workerd refuses the config.
+        let mut w = worker();
+        w.bindings = vec![BindingDesired::AnalyticsEngine(
+            snapshot_protocol::compute_desired::AnalyticsEngineBinding {
+                name: "AE".into(),
+                dataset: "weather".into(),
+            },
+        )];
         let args = tenant_experimental_extra_args(&[], &tenant(vec![w]));
         assert_eq!(args, vec!["--experimental".to_string()]);
     }

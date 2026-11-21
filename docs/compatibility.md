@@ -112,6 +112,11 @@ These are not tied to one binding.
   (`streamingTails`) are not supported. `TailItem.scriptName` is null
   in standalone workerd (there is no per-script name). See
   [`docs/bindings/tail-workers.md`](bindings/tail-workers.md).
+- **Analytics Engine** (`[[analytics_engine_datasets]]`): native
+  `writeDataPoint()` ingests into a per-tenant spool that flushes to
+  canonical Parquet under `<work>/ae/out/`. Full-fidelity storage (no
+  sampling/`_sample_interval`); query via DuckDB or ClickHouse
+  `s3(...,'Parquet')` — see [Analytics Engine](bindings/analytics-engine.md).
 - **No D1 migrations runner** — `migrations_dir` is an unsupported key.
 - **Routes**: only plain hostnames and `<fqdn>/*` patterns; no zone
   management, no `custom_domain`.
@@ -123,8 +128,8 @@ Any unrecognized wrangler key fails the deploy with
 [`docs/wrangler-config.md`](wrangler-config.md) for the full table.
 Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 (`ai`), Vectorize (`vectorize`), AI Search (`ai_search`,
-`ai_search_namespaces`), Analytics Engine (`analytics_engine_datasets`),
-Secrets Store (`secrets_store_secrets`), Pipelines, dispatch namespaces
+`ai_search_namespaces`), Secrets Store
+(`secrets_store_secrets`), Pipelines, dispatch namespaces
 (`dispatch_namespaces`), `send_email`, `mtls_certificates`, `browser`,
 `containers`, `unsafe`, raw
 `wasm_modules`/`text_blobs`/`data_blobs`/`version_metadata` upload keys.
@@ -147,6 +152,11 @@ Runtime failures visible at ingress carry platform codes documented in
   workerd `tails` designators; user consumers coexist with the platform
   log collector. Delivery is best effort, consumers must be different
   same-tenant deployed Workers, and streaming tails remain unsupported.
+- 2026-11-20: Analytics Engine (`[[analytics_engine_datasets]]` → native
+  `analyticsEngine` bindings) ingests `writeDataPoint()` events to a
+  per-tenant socket, spools JSONL, and flushes to canonical Parquet
+  (`ae/out/<seg>/<dataset>/dt=<date>/part-*.parquet`). Query via
+  DuckDB/ClickHouse; no sampling or hosted SQL API yet.
 
 - 2026-11-20: Worker loaders (`[[worker_loaders]]` → native `WorkerLoader`
   bindings, `get`/`load`, named cache, dynamic entrypoints and DO facets)

@@ -66,6 +66,7 @@ environment blocks.
 | `r2_buckets` | supported — see [R2](bindings/r2.md); per-entry keys `binding`, `bucket_name` | `project_cfg.rs:761` |
 | `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint, validated at pack) | `project_cfg.rs:788` |
 | `worker_loaders` | supported — see [Worker loaders](bindings/worker-loaders.md); per-entry key `binding` only | `project_cfg.rs:820` |
+| `analytics_engine_datasets` | supported — see [Analytics Engine](bindings/analytics-engine.md); per-entry keys `binding`, `dataset`, `remote` | `project_cfg.rs:821` |
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:846` |
 | `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
@@ -98,6 +99,8 @@ Also type-checked then dropped inside supported blocks:
 - `kv_namespaces[].id`, `.preview_id`, `.remote` — `id` becomes the
   local namespace identifier; `preview_id`/`remote` are dropped.
 - `d1_databases[].preview_database_id`, `.remote` — dropped.
+- `analytics_engine_datasets[].remote` — accepted metadata; remote
+  semantics unimplemented, dropped.
 - `services[].entrypoint` — becomes the `{ service, entrypoint }` table
   form of `[bindings.service]`; the name is validated at pack
   (`worker_pkg.rs`; see [Service bindings](bindings/service-bindings.md)).
@@ -112,7 +115,7 @@ Any other top-level key → `VRT_CONFIG_UNSUPPORTED_FIELD`
 ```
 
 That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
-`ai_search_namespaces`, `analytics_engine_datasets`, `send_email`,
+`ai_search_namespaces`, `send_email`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
 `version_metadata`, `secrets_store_secrets`,

@@ -338,6 +338,7 @@ fn smoke_params(echo_host: &str, echo_port: u16) -> RuntimeParams {
         wfop_pepper: "m14-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),

@@ -227,6 +227,7 @@ fn render_do(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf) {
         wfop_pepper: "poc-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
