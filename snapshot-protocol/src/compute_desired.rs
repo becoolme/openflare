@@ -2682,4 +2682,47 @@ mod tests {
         let many: Vec<String> = (0..101).map(|i| format!("/{i}")).collect();
         assert!(!valid_run_worker_first_rules(&many));
     }
+
+    #[test]
+    fn worker_loader_wire_shape_and_validation() {
+        // `{"type":"workerLoader","name":...}` is the signed desired
+        // snapshot shape emitted by the control plane.
+        let doc = serde_json::json!({"type": "workerLoader", "name": "LOADER"});
+        let b: BindingDesired = serde_json::from_value(doc.clone()).unwrap();
+        let BindingDesired::WorkerLoader(l) = &b else {
+            panic!()
+        };
+        assert_eq!(l.name, "LOADER");
+        assert_eq!(serde_json::to_value(&b).unwrap(), doc);
+
+        // deny_unknown_fields: a resource ref is not part of the
+        // contract and must not be silently accepted.
+        let with_id = serde_json::json!({"type": "workerLoader", "name": "L", "id": "x"});
+        assert!(serde_json::from_value::<BindingDesired>(with_id).is_err());
+
+        // The loader name flows through the shared binding-name
+        // checks: JS identifier required, duplicates rejected.
+        for (name, err) in [
+            ("1bad", DesiredError::BindingName),
+            ("has-dash", DesiredError::BindingName),
+        ] {
+            let p = payload_with_binding(serde_json::json!({"type": "workerLoader", "name": name}));
+            assert_eq!(desired(&p).unwrap().validate(), Err(err));
+        }
+        let dup = {
+            let mut p = valid_payload();
+            let workers = p["tenants"][0]["workers"].as_array_mut().unwrap();
+            workers[0]["bindings"] = serde_json::json!([
+                {"type": "workerLoader", "name": "L"},
+                {"type": "workerLoader", "name": "L"},
+            ]);
+            p
+        };
+        assert_eq!(
+            desired(&dup).unwrap().validate(),
+            Err(DesiredError::Duplicate("bindingName"))
+        );
+        let ok = payload_with_binding(serde_json::json!({"type": "workerLoader", "name": "LOADER"}));
+        assert!(desired(&ok).unwrap().validate().is_ok());
+    }
 }

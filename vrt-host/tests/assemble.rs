@@ -1065,3 +1065,16 @@ fn binding_backend_dir_rekeys_fingerprint() {
     assert_ne!(none, a);
     assert_ne!(a, b, "binding-backend dir must rekey the fingerprint");
 }
+
+/// A tenant declaring `[[worker_loaders]]` renders capnp `workerLoader`
+/// bindings, which are `$experimental`-gated upstream: workerd refuses
+/// to parse the config without `--experimental` in argv. The derive
+/// must flip the flag for loader tenants — and only when needed.
+#[test]
+fn worker_loaders_enable_experimental_extra_arg() {
+    let args = |loaders: bool| {
+        vrt_host::assemble::experimental_extra_args(&[], false, false, false, loaders)
+    };
+    assert!(args(true).iter().any(|a| a == "--experimental"));
+    assert!(args(false).is_empty());
+}
