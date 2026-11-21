@@ -21,6 +21,8 @@ pub enum ResourceKind {
     D1,
     /// Message queue via vrt-sql QueueBackend (T37).
     Queue,
+    /// K2 durable event-log stream via vrt-sql K2Backend.
+    K2,
 }
 
 /// Typed binding resource resolved from the authorized desired state.
@@ -62,6 +64,11 @@ pub enum BindingResource {
         /// Platform queue id (26 lowercase alnum).
         id: String,
     },
+    /// `{"type":"k2"}` — server-assigned K2 stream id.
+    K2Stream {
+        /// Platform stream id (32 lowercase hex).
+        id: String,
+    },
 }
 
 impl BindingResource {
@@ -74,6 +81,7 @@ impl BindingResource {
             Self::AssetsManifest { .. } => ResourceKind::Assets,
             Self::D1Database { .. } => ResourceKind::D1,
             Self::Queue { .. } => ResourceKind::Queue,
+            Self::K2Stream { .. } => ResourceKind::K2,
         }
     }
 
@@ -86,6 +94,7 @@ impl BindingResource {
             Self::AssetsManifest { digest } => digest,
             Self::D1Database { id, .. } => id,
             Self::Queue { id } => id,
+            Self::K2Stream { id } => id,
         }
     }
 }

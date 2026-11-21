@@ -60,6 +60,9 @@ const WORKERS = [
   { serviceName: "facade-pg", entrypoint: "PgTransport", entry: "facade-pg.ts", needsBindingBackend: true },
   { serviceName: "facade-d1", entrypoint: "D1Facade", entry: "facade-d1.ts", needsBindingBackend: true },
   { serviceName: "facade-queue", entrypoint: "QueueFacade", entry: "facade-queue.ts", needsBindingBackend: true },
+  // K2 durable event log — inner `fetcher` of the k2 wrapped binding
+  // (produce-only: POST /send → provider → vrt-sql K2Backend).
+  { serviceName: "facade-k2", entrypoint: "K2Facade", entry: "facade-k2.ts", needsBindingBackend: true },
   // MIG-16: in-process Rate Limiting binding — pure RPC entrypoint, no
   // binding-backend (state is local to the workerd process).
   { serviceName: "facade-ratelimit", entrypoint: "RateLimiter", entry: "facade-ratelimit.ts", needsBindingBackend: false },

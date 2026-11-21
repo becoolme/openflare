@@ -61,6 +61,8 @@ pub struct TenantService {
     pub d1: Option<Arc<crate::d1::D1Client>>,
     /// T37: queue downstream (the same vrt-sql as d1; absent -> queue 503).
     pub queue: Option<Arc<crate::queue::QueueClient>>,
+    /// K2 downstream (the same vrt-sql; absent -> k2 produce 503).
+    pub k2: Option<Arc<crate::k2::K2Client>>,
     /// P1: PG HTTP data plane (absent → PG ops fail closed
     /// `PG_CREDENTIAL_UNAVAILABLE` — authorized but undeliverable).
     pub pg: Option<Arc<crate::pg::PgBackend>>,
@@ -166,6 +168,8 @@ async fn dispatch(State(svc): State<Arc<TenantService>>, request: Request) -> Re
         ("d1", d1_dispatch(svc, request).await)
     } else if path.starts_with("/internal/bindings/v1/queue/") {
         ("queue", queue_dispatch(svc, request).await)
+    } else if path.starts_with("/internal/bindings/v1/k2/") {
+        ("k2", k2_dispatch(svc, request).await)
     } else if path == "/internal/assets/v1/fetch" {
         ("assets", assets_dispatch(svc, request).await)
     } else if path == "/internal/assets/v1/route-index" || path == "/internal/assets/v1/can-fetch" {
@@ -272,6 +276,13 @@ fn permit_denied_response(path: &str) -> Response<Body> {
         }
     } else if path.starts_with("/internal/bindings/v1/queue/") {
         queue_wire_error(StatusCode::TOO_MANY_REQUESTS, "provider busy; retry")
+    } else if path.starts_with("/internal/bindings/v1/k2/") {
+        k2_wire_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "OVERLOADED",
+            "provider busy; retry",
+            true,
+        )
     } else if path.starts_with("/internal/bindings/v1/pg/") {
         error_response(
             "PG_RATE_LIMITED",
@@ -2175,6 +2186,155 @@ async fn queue_dispatch(svc: Arc<TenantService>, request: Request) -> Response<B
                 }
             }
         }
+    }
+}
+
+/// ---------- K2 producer (CF K2 `send()` wire -> vrt-sql) ----------
+///
+/// `/internal/bindings/v1/k2/{bindingId}/send` — POST only. The
+/// response surface is CF K2's non-throwing `{success:true}` /
+/// `{error:{code,message,retryable}}` envelope; backend envelopes are
+/// relayed verbatim so the shim sees one uniform contract.
+fn parse_k2_path(path: &str) -> Option<(String, &'static str)> {
+    let rest = path.strip_prefix("/internal/bindings/v1/k2/")?;
+    let (id, op) = rest.rsplit_once('/')?;
+    if id.is_empty() {
+        return None;
+    }
+    let op = match op {
+        "send" => "send",
+        _ => return None,
+    };
+    Some((id.to_string(), op))
+}
+
+/// K2 error surface: the CF `{success:false,error:{code,message,
+/// retryable}}` envelope the shim returns from `send()` — never a
+/// thrown exception on expected failure paths.
+fn k2_wire_error(status: StatusCode, code: &str, msg: &str, retryable: bool) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            crate::k2::error_json(code, msg, retryable).to_string(),
+        ))
+        .unwrap()
+}
+
+async fn k2_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body> {
+    let Some((binding_id, _op)) = parse_k2_path(request.uri().path()) else {
+        return k2_wire_error(
+            StatusCode::BAD_REQUEST,
+            "BAD_ROUTE",
+            "bad k2 route",
+            false,
+        );
+    };
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > crate::k2::K2_MAX_BODY_BYTES)
+    {
+        return k2_wire_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "BATCH_TOO_LARGE",
+            "request too large",
+            false,
+        );
+    }
+    let identity = match parse_request_identity(&binding_id, request.headers()) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return k2_wire_error(
+                err.status(),
+                err.code(),
+                "identity rejected",
+                err.retryable_in(ResourceKind::K2),
+            );
+        }
+    };
+    let ctx = match svc
+        .authorizer
+        .authorize(&svc.tenant_id, &identity, &binding_id, ResourceKind::K2)
+    {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            return k2_wire_error(
+                err.status(),
+                err.code(),
+                "authorization denied",
+                err.retryable_in(ResourceKind::K2),
+            );
+        }
+    };
+    let permissions = ctx.permissions();
+    // `send` is produce → requires the signed `write` grant.
+    if !permissions.write {
+        return k2_wire_error(
+            StatusCode::FORBIDDEN,
+            "BINDING_PERMISSION_DENIED",
+            "binding lacks write permission",
+            false,
+        );
+    }
+    let Some(client) = svc.k2.clone() else {
+        return k2_wire_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BACKEND_UNAVAILABLE",
+            "k2 backend unavailable",
+            true,
+        );
+    };
+    let body = match tokio::time::timeout(
+        svc.body_read_timeout,
+        to_bytes(request.into_body(), crate::k2::K2_MAX_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        _ => {
+            return k2_wire_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BATCH_TOO_LARGE",
+                "failed to read request body",
+                false,
+            );
+        }
+    };
+    // CF K2 `send()` contract → vrt-sql produce request (record <=1MB,
+    // batch <=5MB, headers shape — 4xx/413 rejections already carry the
+    // typed envelope).
+    let send_body = match crate::k2::validate_send_body(&body) {
+        Ok(v) => v,
+        Err((status, err)) => {
+            return Response::builder()
+                .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(err.to_string()))
+                .unwrap();
+        }
+    };
+    match client
+        .forward(&ctx, "produce", axum::body::Bytes::from(send_body.to_string()))
+        .await
+    {
+        Ok((_status, bytes)) => Response::builder()
+            // The typed envelope carries the outcome; a single 200
+            // surface keeps the shim contract uniform (backend
+            // `success:false` envelopes arrive on non-200 upstream
+            // statuses too).
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(bytes))
+            .unwrap(),
+        Err(_) => k2_wire_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "BACKEND_UNAVAILABLE",
+            "k2 backend unavailable",
+            true,
+        ),
     }
 }
 

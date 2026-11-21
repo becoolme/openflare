@@ -37,6 +37,7 @@ pub mod pg;
 pub mod pgproxy;
 pub mod purge;
 pub mod queue;
+pub mod k2;
 pub mod quota;
 pub mod r2;
 pub mod server;

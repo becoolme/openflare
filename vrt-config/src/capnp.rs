@@ -150,6 +150,9 @@ pub struct FacadeRefs {
     /// `queue` bindings → native workerd `queue` binding whose inner
     /// `service` is this facade (T37 broker wire: /message /batch /metrics).
     pub queue: ServiceEndpoint,
+    /// `k2` bindings → wrapped `cloudflare-internal:k2` whose inner
+    /// `fetcher` service is this facade (K2 produce wire: POST /send).
+    pub k2: ServiceEndpoint,
     /// `ratelimit` bindings -> plain service binding to this facade's
     /// `RateLimiter` entrypoint (MIG-16; no binding-backend).
     pub ratelimit: ServiceEndpoint,
@@ -1617,6 +1620,9 @@ fn emit_binding(
         BindingDesired::Queue(q) => {
             emit_queue_binding(out, q, worker, input)?;
         }
+        BindingDesired::K2(k) => {
+            emit_k2_binding(out, k, worker, input)?;
+        }
         BindingDesired::Ratelimit(r) => {
             emit_ratelimit_binding(out, r, worker, input)?;
         }
@@ -1985,6 +1991,44 @@ fn emit_queue_binding(
         "        (name = {}, queue = (name = {}, entrypoint = {}, props = (json = {}))),
 ",
         capnp_text(&q.name),
+        capnp_text(&facade.service),
+        capnp_text(&facade.entrypoint),
+        capnp_text(&props),
+    ));
+    Ok(())
+}
+
+/// Emit a `k2` binding (K2 durable event log): `env.<name>` is a
+/// `wrapped` binding over the `cloudflare-internal:k2` internal module;
+/// the inner `fetcher` points at the facade-k2 system worker, which
+/// signs the request and forwards it to the provider's k2 route.
+/// Routing uses `namespaceResourceId` = streamId in props — a
+/// client-supplied stream id never reaches routing (T37 precedent).
+fn emit_k2_binding(
+    out: &mut String,
+    k: &snapshot_protocol::compute_desired::K2Binding,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+) -> Result<(), ConfigError> {
+    let props = String::from_utf8(canonical_bytes(&json!({
+        "bindingId": format!("{}~{}", worker.worker_id, k.name),
+        "descriptorSha256": worker.active_version.artifact_digest,
+        "instanceId": input.tenant.tenant_id,
+        "namespaceResourceId": k.stream_id,
+        "permissions": {"read": k.permissions.read, "write": k.permissions.write},
+        "resourceSpecGeneration": input.revision,
+        "versionId": worker.active_version.version_id,
+        "workerId": worker.worker_id,
+    })))
+    .expect("canonical props are utf8");
+    let facade = &input.params.facades.k2;
+    out.push_str(&format!(
+        "        (name = {}, wrapped = (moduleName = {}, innerBindings = [
+            (name = \"fetcher\", service = (name = {}, entrypoint = {}, props = (json = {})))
+        ])),
+",
+        capnp_text(&k.name),
+        capnp_text("cloudflare-internal:k2"),
         capnp_text(&facade.service),
         capnp_text(&facade.entrypoint),
         capnp_text(&props),

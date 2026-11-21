@@ -304,6 +304,7 @@ fn spawn_provider(
         body_read_timeout: std::time::Duration::from_secs(30),
         d1: None,
         queue: None,
+        k2: None,
         pg: None,
     });
     std::thread::spawn(move || {

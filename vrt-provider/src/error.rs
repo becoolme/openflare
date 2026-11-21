@@ -303,7 +303,7 @@ impl ProviderError {
                     | Self::R2ProviderUnavailable
                     | Self::R2ResultUnknown
             ),
-            ResourceKind::Assets | ResourceKind::D1 | ResourceKind::Queue => {
+            ResourceKind::Assets | ResourceKind::D1 | ResourceKind::Queue | ResourceKind::K2 => {
                 matches!(self, Self::ResourceUnavailable)
             }
             ResourceKind::Pg => matches!(
