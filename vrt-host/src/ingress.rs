@@ -370,6 +370,34 @@ struct CfMetadata {
     timezone: Option<String>,
     latitude: Option<String>,
     longitude: Option<String>,
+    // Local-MMDB-only fields (upstream `cf-*` headers never carry
+    // them; Cloudflare derives them edge-side). `asn` is a JSON
+    // NUMBER in `request.cf`, not a string.
+    asn: Option<u32>,
+    as_org: Option<String>,
+}
+
+impl CfMetadata {
+    /// Fill fields a verified upstream chain did NOT provide from a
+    /// local [`crate::geoip::GeoRecord`]. Verified upstream values
+    /// always win — the MMDB only covers what the edge in front of
+    /// us did not describe (direct ingress, non-CF proxy, mirror
+    /// deployments), which is exactly what `request.cf` on
+    /// Cloudflare itself reports for the connecting client.
+    fn merge_geo(&mut self, r: &crate::geoip::GeoRecord) {
+        self.country = self.country.take().or_else(|| r.country.clone());
+        self.continent = self.continent.take().or_else(|| r.continent.clone());
+        self.city = self.city.take().or_else(|| r.city.clone());
+        self.region = self.region.take().or_else(|| r.region.clone());
+        self.region_code = self.region_code.take().or_else(|| r.region_code.clone());
+        self.metro_code = self.metro_code.take().or_else(|| r.metro_code.clone());
+        self.postal_code = self.postal_code.take().or_else(|| r.postal_code.clone());
+        self.timezone = self.timezone.take().or_else(|| r.timezone.clone());
+        self.latitude = self.latitude.take().or_else(|| r.latitude.clone());
+        self.longitude = self.longitude.take().or_else(|| r.longitude.clone());
+        self.asn = self.asn.or(r.asn);
+        self.as_org = self.as_org.take().or_else(|| r.as_org.clone());
+    }
 }
 
 /// MIG-31: bounded, control-free UTF-8 header value (Cloudflare encodes
@@ -489,6 +517,17 @@ fn cf_blob_json(meta: &CfMetadata, http_protocol: &str) -> String {
     if let Some(c) = &meta.colo {
         map.insert("colo".to_string(), serde_json::Value::String(c.clone()));
     }
+    // Local-MMDB fields — `asn` is a NUMBER in `request.cf` (CF
+    // emits `395747`, not `"395747"`).
+    if let Some(a) = meta.asn {
+        map.insert("asn".to_string(), serde_json::Value::Number(a.into()));
+    }
+    if let Some(o) = &meta.as_org {
+        map.insert(
+            "asOrganization".to_string(),
+            serde_json::Value::String(o.clone()),
+        );
+    }
     // MIG-31: visitor location fields are strings in `request.cf`.
     for (key, value) in [
         ("city", &meta.city),
@@ -544,6 +583,11 @@ pub struct IngressState {
     forwarded_proto: ForwardedProto,
     /// MIG-9: typed upstream client-IP trust (`cf-connecting-ip`).
     client_ip: ClientIpPolicy,
+    /// Local GeoIP database for `request.cf` geo/ASN fields —
+    /// `None` disables lookups (config `geoip.enabled = false`).
+    /// The handle itself hot-reloads; the Option is fixed at
+    /// startup like every other policy field.
+    geoip: Option<Arc<crate::geoip::GeoIp>>,
     /// WebSocket tunnel: close after this long with no bytes in either
     /// direction.
     ws_idle_timeout: Duration,
@@ -594,6 +638,7 @@ impl IngressState {
             // MIG-9 fail closed: `none` until config proves a trusted
             // source — `cf-connecting-ip` is never forged for clients.
             client_ip: ClientIpPolicy::None,
+            geoip: None,
             ws_idle_timeout: WS_DEFAULT_IDLE_TIMEOUT,
             ws_max_duration: WS_DEFAULT_MAX_DURATION,
             ws_max_sessions: WS_DEFAULT_MAX_SESSIONS,
@@ -647,6 +692,7 @@ impl IngressState {
             switch_hold_max_bytes: max_bytes,
             forwarded_proto: self.forwarded_proto.clone(),
             client_ip: self.client_ip.clone(),
+            geoip: self.geoip.clone(),
             ws_idle_timeout: self.ws_idle_timeout,
             ws_max_duration: self.ws_max_duration,
             ws_max_sessions: self.ws_max_sessions,
@@ -681,6 +727,7 @@ impl IngressState {
             switch_hold_max_bytes: self.switch_hold_max_bytes,
             forwarded_proto: policy,
             client_ip: self.client_ip.clone(),
+            geoip: self.geoip.clone(),
             ws_idle_timeout: self.ws_idle_timeout,
             ws_max_duration: self.ws_max_duration,
             ws_max_sessions: self.ws_max_sessions,
@@ -715,6 +762,43 @@ impl IngressState {
             switch_hold_max_bytes: self.switch_hold_max_bytes,
             forwarded_proto: self.forwarded_proto.clone(),
             client_ip: policy,
+            geoip: self.geoip.clone(),
+            ws_idle_timeout: self.ws_idle_timeout,
+            ws_max_duration: self.ws_max_duration,
+            ws_max_sessions: self.ws_max_sessions,
+            ws_active: self.ws_active.clone(),
+            ws_tenant_active: self.ws_tenant_active.clone(),
+            ws_max_per_tenant: self.ws_max_per_tenant,
+            panic_once: std::sync::atomic::AtomicBool::new(false),
+            logs: match self.logs.get() {
+                Some(h) => {
+                    let c = std::sync::OnceLock::new();
+                    let _ = c.set(h.clone());
+                    c
+                }
+                None => std::sync::OnceLock::new(),
+            },
+            dev_catch_all: self.dev_catch_all.clone(),
+        })
+    }
+
+    /// Install the local GeoIP handle resolved from `[geoip]` config
+    /// (rebuild pattern, same as [`Self::with_client_ip`]). `None`
+    /// disables lookups entirely — `request.cf` then carries only the
+    /// upstream-verified fields, exactly as before.
+    pub fn with_geoip(self: &Arc<Self>, geo: Option<Arc<crate::geoip::GeoIp>>) -> Arc<Self> {
+        Arc::new(IngressState {
+            routes: ArcSwap::new(self.routes.load_full()),
+            registry: self.registry.clone(),
+            request_timeout: self.request_timeout,
+            connect_timeout: self.connect_timeout,
+            max_body_bytes: self.max_body_bytes,
+            switch_hold_budget: self.switch_hold_budget,
+            switch_hold_max_reqs: self.switch_hold_max_reqs,
+            switch_hold_max_bytes: self.switch_hold_max_bytes,
+            forwarded_proto: self.forwarded_proto.clone(),
+            client_ip: self.client_ip.clone(),
+            geoip: geo,
             ws_idle_timeout: self.ws_idle_timeout,
             ws_max_duration: self.ws_max_duration,
             ws_max_sessions: self.ws_max_sessions,
@@ -756,6 +840,7 @@ impl IngressState {
             switch_hold_max_bytes: self.switch_hold_max_bytes,
             forwarded_proto: self.forwarded_proto.clone(),
             client_ip: self.client_ip.clone(),
+            geoip: self.geoip.clone(),
             ws_idle_timeout: at_least(idle_timeout),
             ws_max_duration: at_least(max_duration),
             ws_max_sessions: max_sessions.max(1),
@@ -1252,6 +1337,7 @@ async fn handle_routed(
         peer,
         &state.forwarded_proto,
         &state.client_ip,
+        state.geoip.as_deref(),
         parts.version,
         is_ws,
     );
@@ -1748,6 +1834,7 @@ fn scrubbed_headers(
     peer: SocketAddr,
     proto_policy: &ForwardedProto,
     client_ip_policy: &ClientIpPolicy,
+    geoip: Option<&crate::geoip::GeoIp>,
     version: axum::http::Version,
     ws_upgrade: bool,
 ) -> HeaderMap {
@@ -1834,7 +1921,20 @@ fn scrubbed_headers(
     // worker. `cf-visitor` is synthesized from our own scheme verdict
     // (the inbound JSON is never echoed — its shape varies by CF
     // product and carries fields we do not model).
-    let cf = cf_metadata(client_ip_policy, &peer.ip(), inbound);
+    let mut cf = cf_metadata(client_ip_policy, &peer.ip(), inbound);
+    // Local GeoIP: fill the fields a verified upstream chain did not
+    // provide. The lookup IP is the client identity the typed policy
+    // derived — falling back to the TCP peer, which in `none` mode
+    // (no trusted proxy) IS the client as far as this edge can
+    // verify. A database record can never override verified upstream
+    // data and never supplies `cf-connecting-ip`/`colo`/`ray`.
+    if let Some(geo) = geoip {
+        let lookup_ip = resolve_client_ip(client_ip_policy, &peer.ip(), inbound)
+            .unwrap_or_else(|| canon_ip(peer.ip()));
+        if let Some(rec) = geo.lookup(lookup_ip) {
+            cf.merge_geo(&rec);
+        }
+    }
     if let Some(ray) = &cf.ray {
         if let Ok(v) = HeaderValue::from_str(ray) {
             out.insert("cf-ray", v);
@@ -2176,6 +2276,8 @@ mod cf_blob_tests {
             timezone: Some("Asia/Tokyo".into()),
             latitude: Some("35.6895".into()),
             longitude: Some("139.6917".into()),
+            asn: Some(2516),
+            as_org: Some("KDDI CORPORATION".into()),
         };
         let blob = cf_blob_json(&m, "HTTP/1.1");
         assert!(!blob.contains("Pid") && !blob.contains("Uid"));
@@ -2193,6 +2295,10 @@ mod cf_blob_tests {
         // Strings, not numbers — CF's request.cf types.
         assert_eq!(v["latitude"], "35.6895");
         assert_eq!(v["longitude"], "139.6917");
+        // asn is the exception: a JSON number, matching CF.
+        assert_eq!(v["asn"], 2516);
+        assert!(v["asn"].is_u64());
+        assert_eq!(v["asOrganization"], "KDDI CORPORATION");
         // Japan is not an EU member.
         assert!(v["isEUCountry"].is_null());
         // EU member state → "1".
@@ -2208,6 +2314,39 @@ mod cf_blob_tests {
         let v: serde_json::Value = serde_json::from_str(&empty).unwrap();
         assert!(v["country"].is_null() && v["colo"].is_null());
         assert_eq!(v["httpProtocol"], "HTTP/1.1");
+    }
+
+    /// Local GeoIP fills only the fields a verified upstream chain
+    /// did not provide — upstream values always win, and the
+    /// MMDB-only fields (asn/asOrganization) appear alongside them.
+    #[test]
+    fn merge_geo_fills_gaps_never_overrides() {
+        let geo = crate::geoip::GeoRecord {
+            country: Some("US".into()),
+            city: Some("Omaha".into()),
+            region_code: Some("NE".into()),
+            asn: Some(15169),
+            as_org: Some("Google LLC".into()),
+            ..Default::default()
+        };
+        // Upstream already described country+city; MMDB disagrees.
+        let mut m = CfMetadata {
+            country: Some("JP".into()),
+            city: Some("Tokyo".into()),
+            ..Default::default()
+        };
+        m.merge_geo(&geo);
+        assert_eq!(m.country.as_deref(), Some("JP")); // upstream wins
+        assert_eq!(m.city.as_deref(), Some("Tokyo")); // upstream wins
+        assert_eq!(m.region_code.as_deref(), Some("NE")); // gap filled
+        assert_eq!(m.asn, Some(15169)); // MMDB-only field
+        assert_eq!(m.as_org.as_deref(), Some("Google LLC"));
+        // And the same record fills everything on an empty metadata
+        // (the no-upstream direct-ingress path).
+        let mut bare = CfMetadata::default();
+        bare.merge_geo(&geo);
+        assert_eq!(bare.country.as_deref(), Some("US"));
+        assert_eq!(bare.asn, Some(15169));
     }
 
     #[test]
@@ -2253,6 +2392,7 @@ mod cf_blob_tests {
             "10.42.0.1:4000".parse().unwrap(),
             &ForwardedProto::FixedHttp,
             &cf_policy(),
+            None,
             axum::http::Version::HTTP_11,
             false,
         );
@@ -2272,6 +2412,7 @@ mod cf_blob_tests {
             "192.0.2.55:4000".parse().unwrap(),
             &ForwardedProto::FixedHttp,
             &cf_policy(),
+            None,
             axum::http::Version::HTTP_11,
             false,
         );
@@ -2448,6 +2589,7 @@ mod ws_tests {
             "203.0.113.9:4000".parse().unwrap(),
             &ForwardedProto::FixedHttp,
             &ClientIpPolicy::None,
+            None,
             Version::HTTP_11,
             ws,
         )
