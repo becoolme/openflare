@@ -110,8 +110,8 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-images.js", esModule = embed "sys/10f73e528233bdc5fd00ebf0b492863ba4f2cac996d1b31f135e8eea36db1721"),
-        (name = "facade/images-wire.js", esModule = embed "sys/4ac999c835e8b443c0fa4ab7cb624d6cfc1f27f31624fa3efe910bc07648847d"),
+        (name = "facade/facade-images.js", esModule = embed "sys/04d86dbc98a8d78341aa8bc1af6618e22f798ef74bbf3d18acc5322bf683aa6c"),
+        (name = "facade/images-wire.js", esModule = embed "sys/bbfe04472fdd639ff6d35a66b72bffad845d976298e8dfa6b2bd9c0e26e40b8e"),
       ],
       globalOutbound = (name = "vrt-no-network", entrypoint = "DenyAll"),
     )),
