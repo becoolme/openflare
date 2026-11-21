@@ -1349,6 +1349,61 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     out.insert("workflows".into(), Value::Array(out_arr));
                 }
             }
+            "tail_consumers" => {
+                // CF semantics: a list of Tail Workers receiving this
+                // worker's invocation events. Both the documented
+                // `[{ service = "name" }]` form and the legacy string
+                // array are accepted; only `service` is meaningful in
+                // wrangler (no environment/namespace support here).
+                // Duplicates collapse to the first occurrence so the
+                // rendered `tails` list is stable, and an empty list is
+                // valid CF config meaning "no consumers" (no wire key).
+                let arr = value
+                    .as_array()
+                    .ok_or_else(|| invalid("tail_consumers", "must be an array"))?;
+                let mut out_arr: Vec<Value> = Vec::new();
+                let mut seen = std::collections::BTreeSet::new();
+                for (i, entry) in arr.iter().enumerate() {
+                    let field = format!("tail_consumers[{i}]");
+                    let service = match entry {
+                        Value::String(_) => req_str(entry, &field)?,
+                        Value::Object(obj) => {
+                            for k in obj.keys() {
+                                if k != "service" {
+                                    return Err(unsupported(&format!("{field}.{k}"), None));
+                                }
+                            }
+                            req_str(
+                                obj.get("service").unwrap_or(&Value::Null),
+                                &format!("{field}.service"),
+                            )?
+                        }
+                        _ => {
+                            return Err(invalid(
+                                &field,
+                                "must be a service name or { service }",
+                            ))
+                        }
+                    };
+                    if seen.insert(service.to_string()) {
+                        out_arr.push(serde_json::json!({ "service": service }));
+                    }
+                }
+                if out_arr.len()
+                    > snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER
+                {
+                    return Err(invalid(
+                        "tail_consumers",
+                        &format!(
+                            "at most {} consumers per worker",
+                            snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER
+                        ),
+                    ));
+                }
+                if !out_arr.is_empty() {
+                    out.insert("tailConsumers".into(), Value::Array(out_arr));
+                }
+            }
             "env" => {
                 return Err(invalid(
                     "env",
@@ -1643,6 +1698,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("workflows") {
         wire.insert("workflows".into(), v.clone());
     }
+    if let Some(v) = obj.get("tailConsumers") {
+        wire.insert("tailConsumers".into(), v.clone());
+    }
 
     // W1-r1: STRUCTURAL anti-drop — every normalized top-level key
     // must reach the wire (or be an explicitly documented
@@ -1663,6 +1721,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "durableObjectBindings",
         "durableObjectMigrations",
         "workflows",
+        "tailConsumers",
         "quotas",
         "bindings",
     ];
@@ -1919,6 +1978,59 @@ mod tests {
         let j = jsonc_to_json("{ // hi\n \"a\": 1, /* x */ \"b\": [1,2,], }").unwrap();
         let v: Value = serde_json::from_str(&j).unwrap();
         assert_eq!(v["b"][1], Value::from(2));
+    }
+
+    #[test]
+    fn tail_consumers_normalize_and_fail_closed() {
+        let normalized = |extra: Value| {
+            let mut cfg = serde_json::json!({
+                "name": "w",
+                "main": "m.js",
+                "compatibility_date": "2025-01-01"
+            });
+            cfg.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            normalize_wrangler_config(&cfg, "wrangler.json")
+        };
+
+        // Object and legacy string forms, first occurrence wins.
+        let out = normalized(serde_json::json!({
+            "tail_consumers": [
+                {"service": "tail-a"},
+                "tail-b",
+                {"service": "tail-a"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            out["tailConsumers"],
+            serde_json::json!([{"service": "tail-a"}, {"service": "tail-b"}])
+        );
+
+        // An empty list is valid CF config and leaves no wire key.
+        let out = normalized(serde_json::json!({"tail_consumers": []})).unwrap();
+        assert!(out.get("tailConsumers").is_none());
+
+        // Unknown entry keys name the exact path.
+        let err = normalized(serde_json::json!({
+            "tail_consumers": [{"service": "tail-a", "environment": "staging"}]
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, "VRT_CONFIG_UNSUPPORTED_FIELD");
+        assert_eq!(err.field.as_deref(), Some("tail_consumers[0].environment"));
+
+        // Wrong shape / empty service are typed invalid-input errors.
+        for entry in [serde_json::json!("tail-a"), serde_json::json!([42])] {
+            let err = normalized(serde_json::json!({"tail_consumers": entry})).unwrap_err();
+            assert_eq!(err.code, "VRT_CONFIG_INVALID");
+        }
+        let err = normalized(serde_json::json!({
+            "tail_consumers": [{"service": "  "}]
+        }))
+        .unwrap_err();
+        assert_eq!(err.code, "VRT_CONFIG_INVALID");
+        assert_eq!(err.field.as_deref(), Some("tail_consumers[0].service"));
     }
 
     #[test]

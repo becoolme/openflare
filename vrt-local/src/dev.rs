@@ -430,6 +430,9 @@ fn binding_table(meta: &crate::WorkerToml) -> Vec<String> {
     for c in &meta.queue_consumers {
         out.push(format!("queueConsumer -> {}", c.queue));
     }
+    for t in &meta.tail_consumers {
+        out.push(format!("tailConsumer -> {}", t.service));
+    }
     for c in &meta.crons {
         out.push(format!("cron     {}", c.expression));
     }

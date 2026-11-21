@@ -12370,6 +12370,7 @@ sleep 10
                 vec![]
             },
             workflows: vec![],
+            tail_consumers: vec![],
             quotas: WorkerQuotas {
                 cpu_ms: 50,
                 memory_mb: 128,

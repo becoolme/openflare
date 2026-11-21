@@ -45,6 +45,10 @@ const MAX_QUEUE_CONSUMERS_PER_WORKER: usize = 100;
 /// CF has no explicit limit, a conservative cap is chosen to prevent snapshot bloat).
 const MAX_DO_CLASSES_PER_WORKER: usize = 64;
 const MAX_WORKFLOWS_PER_WORKER: usize = 32;
+/// Maximum Tail Workers a producer may declare. Cloudflare's documented
+/// config has no explicit cap; this bounds the signed document and the
+/// rendered `tails` list without approaching workerd's service limits.
+pub const MAX_TAIL_CONSUMERS_PER_WORKER: usize = 16;
 /// CF `limits.steps` bound — wrangler accepts positive ints; we cap
 /// conservatively (engine default is effectively unbounded).
 const MAX_WORKFLOW_STEPS: u32 = 100_000;
@@ -229,6 +233,16 @@ pub struct WorkerDesired {
     /// snapshot that carries it (fail closed, never silently drop).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<WorkflowDesired>,
+
+    /// Tail Workers this worker forwards invocation events to (wrangler
+    /// `tail_consumers`). Each entry names a DIFFERENT worker of the same
+    /// tenant, resolved from its deployment name at pack time. Skipped
+    /// when empty so snapshots without tail consumers stay
+    /// byte-identical; old cells reject a snapshot that carries the
+    /// field via `deny_unknown_fields` (fail closed, never silently drop
+    /// a declared consumer).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail_consumers: Vec<TailConsumerDesired>,
 
     /// Per-isolate/per-request resource limits enforced by the runtime.
     pub quotas: WorkerQuotas,
@@ -589,6 +603,20 @@ pub struct WorkflowDesired {
     pub limits_steps: Option<u32>,
 }
 
+/// One wrangler `tail_consumers[]` entry, resolved to the consumer's
+/// stable worker id at pack time. Cloudflare names the consumer by
+/// script name; OpenFlare resolves that name inside the deploying
+/// tenant and stores the identity so a later rename or a cross-tenant
+/// reference can never re-point the designator. The tail handler is
+/// best-effort (workerd drops events when the consumer is unavailable)
+/// and MUST NOT be used for billing or audit.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TailConsumerDesired {
+    /// Consumer worker id in the SAME tenant (never the producer itself).
+    pub worker_id: String,
+}
+
 /// T37b `queueConsumers[]`: a worker's consumption relationship to a queue (not a binding --
 /// it does not appear in `env.*` and only drives the dispatcher to deliver messages to the worker's
 /// `queue(batch, env, ctx)` handler). Numeric bounds were checked against miniflare
@@ -876,6 +904,13 @@ pub enum DesiredError {
     #[error("workflow script_name target is not in the same tenant")]
     WorkflowTarget,
 
+    /// A tail consumer names a worker outside this tenant, does not
+    /// exist in the spec, or is the producer itself — workerd refuses
+    /// a dangling `tails` designator and a self-tail has no documented
+    /// CF semantics, so the snapshot never ships either.
+    #[error("tail consumer target is invalid")]
+    TailConsumer,
+
     /// A cron expression is not a valid 5-field schedule.
     #[error("invalid cron expression")]
     CronExpression,
@@ -920,6 +955,7 @@ impl DesiredError {
             Self::ServiceCycle => "DESIRED_SERVICE_CYCLE",
             Self::DoClass => "DESIRED_DO_CLASS_UNDECLARED",
             Self::WorkflowTarget => "DESIRED_WORKFLOW_TARGET_SCOPE",
+            Self::TailConsumer => "DESIRED_TAIL_CONSUMER_SCOPE",
         }
     }
 }
@@ -1055,6 +1091,26 @@ impl ComputeDesired {
 
             // Service bindings may only target workers of the same tenant.
             for worker in &tenant.workers {
+                // Tail consumers: a same-tenant, DIFFERENT worker; unique
+                // per producer. Workerd refuses a `tails` designator with
+                // no service, so a dangling declaration must never ship.
+                if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+                    return Err(DesiredError::Capacity("tailConsumers"));
+                }
+                let mut tail_targets = HashSet::new();
+                for tail in &worker.tail_consumers {
+                    if !valid_identifier(&tail.worker_id, MAX_IDENTIFIER_LEN) {
+                        return Err(DesiredError::Identifier("tailConsumers.workerId"));
+                    }
+                    if tail.worker_id == worker.worker_id
+                        || !tenant_worker_ids.contains(&tail.worker_id)
+                    {
+                        return Err(DesiredError::TailConsumer);
+                    }
+                    if !tail_targets.insert(&tail.worker_id) {
+                        return Err(DesiredError::Duplicate("tailConsumers.workerId"));
+                    }
+                }
                 for binding in &worker.bindings {
                     if let BindingDesired::Service(service) = binding {
                         if !valid_identifier(&service.worker_id, MAX_IDENTIFIER_LEN)
@@ -2093,6 +2149,67 @@ mod tests {
                 "",
             ),
             ("service-ok-same-tenant", Box::new(|_| {}), ""),
+            (
+                "tail-consumer-ok-same-tenant",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}])
+                }),
+                "",
+            ),
+            (
+                "tail-consumer-self",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-1"}])
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "tail-consumer-missing",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] = json!([{"workerId": "w-nope"}])
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "tail-consumer-cross-tenant",
+                Box::new(|v| {
+                    let av = v["tenants"][0]["workers"][0]["activeVersion"].clone();
+                    let q = v["tenants"][0]["workers"][0]["quotas"].clone();
+                    v["tenants"].as_array_mut().unwrap().push(json!({
+                        "tenantId": "team-beta",
+                        "workers": [{
+                            "workerId": "w-beta-9",
+                            "name": "beta-nine",
+                            "activeVersion": av,
+                            "bindings": [],
+                            "routes": [],
+                            "crons": [],
+                            "quotas": q
+                        }]
+                    }));
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-beta-9"}]);
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "tail-consumer-duplicate",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}, {"workerId": "w-alpha-2"}]);
+                }),
+                "DESIRED_DUPLICATE",
+            ),
+            (
+                "tail-consumer-bad-id",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "bad id"}]);
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
             (
                 "service-named-entrypoint-ok",
                 Box::new(|v| {

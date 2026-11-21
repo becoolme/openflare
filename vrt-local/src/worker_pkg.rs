@@ -98,6 +98,10 @@ pub struct WorkerToml {
     /// W1: `[[workflows]]` -- same shape after normalization.
     #[serde(default)]
     pub(crate) workflows: Vec<WorkflowToml>,
+    /// `[[tailConsumers]]` -- Tail Workers (same-tenant worker names)
+    /// that receive this worker's invocation events.
+    #[serde(default)]
+    pub(crate) tail_consumers: Vec<TailConsumerToml>,
     #[serde(default)]
     pub(crate) quotas: Option<QuotasToml>,
     /// T21: `[assets]` directory declaration.
@@ -270,6 +274,15 @@ pub(crate) struct WorkflowToml {
     pub(crate) limits_steps: Option<u32>,
 }
 
+/// One `[[tailConsumers]]` entry (wrangler `tail_consumers`). The
+/// `service` is a worker NAME in the same tenant; pack resolves it to
+/// the stable worker id (fail closed when it does not exist).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TailConsumerToml {
+    pub(crate) service: String,
+}
+
 /// T21: `[assets]` — static-assets directory packed at deploy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -403,6 +416,10 @@ pub struct PackedWorker {
     /// W1: workflow declarations -- `uniqueKey` already derived by HMAC with the deploy key
     /// (`vrt-wf:` domain), the same-worker restriction and name/binding validation have passed.
     pub workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired>,
+    /// Tail Workers this version forwards invocation events to. The
+    /// declared service name is resolved to a same-tenant worker id at
+    /// pack time; a miss fails closed.
+    pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// Declared hostnames (replaces state list when non-empty).
     pub hostnames: Vec<String>,
     /// Quotas.
@@ -1183,6 +1200,39 @@ pub fn assemble(
         }
     }
 
+    // Tail Workers (`tail_consumers`): resolve each service name inside
+    // this tenant. A miss (never deployed / typo) fails the deploy now —
+    // a dangling workerd `tails` designator would fail the whole config
+    // load at generation start, and a silently dropped consumer would
+    // lose events. Self-reference is rejected: CF documents tail
+    // consumers as watching OTHER Workers, and a self-tail has no
+    // documented recursion bound. Duplicates collapse to the first
+    // occurrence (order is preserved for deterministic rendering).
+    let mut tail_consumers = Vec::new();
+    {
+        use snapshot_protocol::compute_desired::{
+            TailConsumerDesired, MAX_TAIL_CONSUMERS_PER_WORKER,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for consumer in &meta.tail_consumers {
+            if consumer.service == name {
+                return Err(LocalError::Worker(
+                    "tail_consumers service must be another worker",
+                ));
+            }
+            let target = resolve_worker(&consumer.service)
+                .ok_or(LocalError::Worker("tail_consumers service target"))?;
+            if seen.insert(target.clone()) {
+                tail_consumers.push(TailConsumerDesired { worker_id: target });
+            }
+        }
+        if tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+            return Err(LocalError::Worker(
+                "tail_consumers at most 16 consumers per worker",
+            ));
+        }
+    }
+
     // T21: `[assets] dir` — pack the directory into the local
     // content-addressed store (materialized by `Local::deploy`; the
     // binding references the manifest digest it produced).
@@ -1225,6 +1275,7 @@ pub fn assemble(
         queue_consumers,
         durable_object_classes,
         workflows,
+        tail_consumers,
         hostnames,
         quotas: normalize_quotas(meta.quotas)?,
         first_deploy_id: id_material[..16].to_string(),

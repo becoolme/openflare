@@ -109,6 +109,7 @@ pub fn worker(
         queue_consumers: vec![],
         durable_object_classes: vec![],
         workflows: vec![],
+        tail_consumers: vec![],
         quotas: quotas(),
     }
 }

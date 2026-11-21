@@ -74,6 +74,7 @@ environment blocks.
 | `route` / `routes` | supported — pattern strings or `{ pattern }`; only plain hostnames or `<fqdn>/*`; `route` and `routes` are mutually exclusive (`VRT_CONFIG_INVALID`) | `project_cfg.rs:1202`, `route_to_hostname` `:510` |
 | `assets` | supported — see [Static assets](bindings/static-assets.md); `directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first` | `project_cfg.rs:1235` |
 | `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1269` |
+| `tail_consumers` | supported — see [Tail Workers](bindings/tail-workers.md); `service` table or legacy string entries; distinct same-tenant already-deployed consumers, deduped, max 16; empty list valid | `project_cfg.rs:1352` |
 | `limits` | supported — see [Per-worker quotas](quotas.md); `cpu_ms` (1..300000) and `subrequests` (0..10000); other keys rejected | `project_cfg.rs:1393` |
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
 
@@ -114,7 +115,7 @@ That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
 `ai_search_namespaces`, `analytics_engine_datasets`, `send_email`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
-`version_metadata`, `tail_consumers`, `secrets_store_secrets`,
+`version_metadata`, `secrets_store_secrets`,
 `unsafe`, `migrations_dir`, `observability`,
 `logpush`, `site`, `preview_id` (top level),
 `node_compat`, `route`-shaped `custom_domain` fields inside routes
@@ -132,5 +133,9 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 "update wrangler_config_to_worker_toml" error shape.
 
 ## Changelog
+
+- 2026-11-21: `tail_consumers` is accepted (table or legacy string
+  entries, deduped, max 16) and carried to the signed snapshot as
+  resolved same-tenant worker ids; empty lists are ignored.
 
 - 2026-11-20: `vrt deploy`, `vrt dev`, and `vrt doctor` accept `--env` to select Wrangler named environments.
