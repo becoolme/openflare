@@ -15,11 +15,22 @@ export const MAX_INDEX_BYTES = 4 * 1024 * 1024;
 // multi-MB path list, and this side treats any index exceeding the
 // bound the same way (degrade to `canFetchAsset`, never 503).
 export const MAX_INDEX_PATHS = 4096;
+/// `_redirects` cap (2,000 static + 100 dynamic).
+export const MAX_REDIRECTS = 2100;
+
+export interface RedirectRuleWire {
+  source: string;
+  status: number;
+}
 
 export interface RouteIndex {
   htmlHandling: string;
   notFoundHandling: string;
   paths: Set<string>;
+  /// `_redirects` sources (bounded by the provider). A match is always
+  /// fetchable: 3xx returns the redirect, 200 proxies a same-manifest
+  /// path.
+  redirects: RedirectRuleWire[];
   approxBytes: number;
   digest: string;
   /// E3: manifest digest the provider asserts this index describes —
@@ -463,14 +474,53 @@ function htmlDrop(has: Has, path: string, skip: boolean): HtmlIntent {
   return index === null ? null : { asset: index };
 }
 
+/// Mirror of the provider's `_redirects` matcher (existence only).
+/// Static sources are exact; dynamic ones have one trailing `*` or
+/// `:name` segments (validation happens provider-side).
+function redirectMatches(rules: readonly RedirectRuleWire[], path: string): boolean {
+  for (const rule of rules) {
+    if (rule.source === path) return true;
+    if (!rule.source.includes("*") && !rule.source.includes(":")) continue;
+    const src = rule.source.split("/");
+    const req = path.split("/");
+    let matched = true;
+    for (let i = 0; i < src.length; i++) {
+      if (src[i] === "*") return true;
+      if (req[i] === undefined) {
+        matched = false;
+        break;
+      }
+      if (src[i].startsWith(":")) {
+        if (req[i] === "") {
+          matched = false;
+          break;
+        }
+        continue;
+      }
+      if (src[i] !== req[i]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched && req.length === src.length) return true;
+  }
+  return false;
+}
+
 export function intentFetchable(
   index: RouteIndex,
   path: string,
   navigate: boolean,
   hasStaticRouting: boolean,
+  rawPath: string = path,
 ): boolean {
   const has = (p: string) => index.paths.has(p);
   if (has(path)) return true;
+  // `_redirects` runs before asset lookup, so a redirect-only path is
+  // still handled by the assets service. It matches the RAW request
+  // path (provider parity), while everything below uses the decoded,
+  // normalized path.
+  if (redirectMatches(index.redirects, rawPath)) return true;
   const nfh =
     hasStaticRouting || navigate ? index.notFoundHandling : "none";
   // Existence exactly as the provider resolves it: a request the
@@ -591,6 +641,7 @@ export function parseIndex(raw: unknown): IndexParse {
     htmlHandling?: unknown;
     notFoundHandling?: unknown;
     paths?: unknown;
+    redirects?: unknown;
     tooLarge?: unknown;
     manifestDigest?: unknown;
   };
@@ -620,6 +671,31 @@ export function parseIndex(raw: unknown): IndexParse {
     paths.add(p);
     approxBytes += p.length + 8;
   }
+  const redirects: RedirectRuleWire[] = [];
+  if (doc.redirects !== undefined) {
+    if (!Array.isArray(doc.redirects) || doc.redirects.length > MAX_REDIRECTS) {
+      return { kind: "invalid" };
+    }
+    for (const r of doc.redirects) {
+      if (typeof r !== "object" || r === null) return { kind: "invalid" };
+      const { source, status } = r as { source?: unknown; status?: unknown };
+      if (
+        typeof source !== "string" ||
+        !source.startsWith("/") ||
+        source.length > 1024 ||
+        (status !== 200 &&
+          status !== 301 &&
+          status !== 302 &&
+          status !== 303 &&
+          status !== 307 &&
+          status !== 308)
+      ) {
+        return { kind: "invalid" };
+      }
+      redirects.push({ source, status });
+      approxBytes += source.length + 16;
+    }
+  }
   if (approxBytes > MAX_INDEX_BYTES) return { kind: "tooLarge" };
   return {
     kind: "index",
@@ -627,6 +703,7 @@ export function parseIndex(raw: unknown): IndexParse {
       htmlHandling: doc.htmlHandling,
       notFoundHandling: doc.notFoundHandling,
       paths,
+      redirects,
       approxBytes,
       digest: "", // set by the caller (cfg.manifestDigest)
       manifestDigest: md,

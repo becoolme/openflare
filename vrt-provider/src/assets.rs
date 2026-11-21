@@ -28,6 +28,7 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
+use crate::assets_redirects::{self, RedirectAction, RedirectRule};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -183,6 +184,11 @@ fn encode_segment(seg: &str) -> String {
         }
     }
     out
+}
+
+/// `_headers` / `_redirects` are configuration, never served.
+fn is_config_path(path: &str) -> bool {
+    path == "/_headers" || path == "/_redirects"
 }
 
 /// Encode a decoded path segment by segment (Cloudflare `encodePath`).
@@ -600,6 +606,12 @@ fn drop_trailing_slash(
 #[derive(Debug, Clone)]
 pub struct AssetStore {
     root: PathBuf,
+    /// Parsed `_redirects` per (tenant, file digest) — a manifest's rules
+    /// are immutable, so the cache is keyed by content hash. Bounded by a
+    /// clear-on-overflow policy (manifests churn slowly).
+    redirect_cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<RedirectRule>>>>,
+    >,
 }
 
 fn is_lower_hex(value: &str, bytes: usize) -> bool {
@@ -620,6 +632,9 @@ impl AssetStore {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            redirect_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -705,6 +720,51 @@ impl AssetStore {
             return Err("object digest mismatch (poisoned store)".into());
         }
         Ok(Some(bytes))
+    }
+
+    /// Load + parse the manifest's `/_redirects` file. `None` when the
+    /// manifest has no such file. The parsed rules are immutable for a
+    /// content digest and cached; an unreadable/oversized file is an
+    /// error (fail closed — routing must not silently ignore redirects).
+    pub fn redirect_rules(
+        &self,
+        tenant: &str,
+        manifest: &AssetManifest,
+    ) -> Result<Option<std::sync::Arc<Vec<RedirectRule>>>, String> {
+        let Some(file) = manifest.files.iter().find(|f| f.path == "/_redirects") else {
+            return Ok(None);
+        };
+        if file.size as usize > assets_redirects::MAX_FILE_BYTES {
+            return Err("_redirects exceeds the parse cap".into());
+        }
+        let key = format!("{tenant}:{}", file.sha256);
+        {
+            let cache = self
+                .redirect_cache
+                .lock()
+                .map_err(|_| "redirect cache poisoned".to_string())?;
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Some(hit.clone()));
+            }
+        }
+        let Some(bytes) = self.object(tenant, file)? else {
+            return Err("_redirects object missing from the store".into());
+        };
+        if bytes.len() > assets_redirects::MAX_FILE_BYTES {
+            return Err("_redirects exceeds the parse cap".into());
+        }
+        let text =
+            String::from_utf8(bytes).map_err(|_| "_redirects is not valid UTF-8".to_string())?;
+        let rules = std::sync::Arc::new(assets_redirects::parse_redirects(&text));
+        let mut cache = self
+            .redirect_cache
+            .lock()
+            .map_err(|_| "redirect cache poisoned".to_string())?;
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, rules.clone());
+        Ok(Some(rules))
     }
 
     /// Write object bytes after verifying `sha256(bytes) == digest`;
@@ -916,14 +976,17 @@ pub fn fetch(
         );
     }
     let url = header_str("x-open-compute-asset-url").unwrap_or_default();
-    // `search` is carried through html-handling redirects verbatim —
-    // Cloudflare appends the original `url.search` to its encoded
-    // destination. A fragment never reaches the origin.
+    // `search` (with `?`) is carried through html-handling redirects
+    // verbatim — Cloudflare appends the original `url.search` to its
+    // encoded destination — and `_redirects` forwards `query` when the
+    // destination does not carry its own. A fragment never reaches the
+    // origin.
     let url = url.split('#').next().unwrap_or_default();
     let (raw_path, search) = match url.find('?') {
         Some(i) => (&url[..i], &url[i..]),
         None => (url, ""),
     };
+    let query = search.strip_prefix('?').filter(|q| !q.is_empty());
     let raw_path = raw_path
         .find("://")
         .map(|i| {
@@ -954,12 +1017,76 @@ pub fn fetch(
     };
     // B12: outcome label decided by the resolution + served status.
     let worker_id = crate::metrics::worker_label(request);
-    let resolved = resolve(&manifest, &path);
+    // `_headers` / `_redirects` are configuration files: Cloudflare
+    // never serves them.
+    if is_config_path(&path) {
+        crate::metrics::assets_outcome(&worker_id, "not_found");
+        return typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND);
+    }
+    let redirect_rules = match store.redirect_rules(tenant, &manifest) {
+        Ok(rules) => rules,
+        Err(e) => {
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "assets fetch: _redirects unreadable"
+            );
+            crate::metrics::assets_outcome(&worker_id, "error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    // `_redirects` matches the RAW (still percent-encoded) request path:
+    // captures are inserted into `Location` verbatim, so an encoded `/`
+    // (`%2F`), `?` (`%3F`) or `#` (`%23`) keeps its filename meaning
+    // instead of turning into a separator, query or fragment.
+    let mut proxied = false;
+    let resolved = match redirect_rules
+        .as_deref()
+        .and_then(|rules| assets_redirects::match_redirect(rules, raw_path, query))
+    {
+        Some(RedirectAction::Redirect { status, location }) => {
+            let Ok(code) = StatusCode::from_u16(status) else {
+                crate::metrics::assets_outcome(&worker_id, "error");
+                return typed("ASSET_INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            let Ok(location) = HeaderValue::from_str(&location) else {
+                crate::metrics::assets_outcome(&worker_id, "error");
+                return typed("ASSET_INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            let mut r = Response::new(Body::empty());
+            *r.status_mut() = code;
+            r.headers_mut().insert(header::LOCATION, location);
+            crate::metrics::assets_outcome(&worker_id, "redirect");
+            return r;
+        }
+        // `200` proxying: serve a same-manifest path, never recursing
+        // through the redirect table again. A missing target is a 404,
+        // not the manifest's not-found fallback.
+        Some(RedirectAction::Proxy(target)) => {
+            proxied = true;
+            // The destination is an internal path, not a client request:
+            // decode it (manifest paths are decoded), apply the same
+            // configuration-file exclusion as for the request path, and
+            // serve an exact file as-is (no `.html` canonical redirect).
+            match normalize_asset_path(&target) {
+                Ok(target) if !is_config_path(&target) => {
+                    match manifest.files.iter().find(|f| f.path == target) {
+                        Some(file) => Resolved::Serve(file.clone()),
+                        None => resolve_with_nfh(&manifest, &target, NotFoundHandling::None),
+                    }
+                }
+                _ => Resolved::NotFound,
+            }
+        }
+        None => resolve(&manifest, &path),
+    };
     // Cloudflare re-encodes the canonical path and redirects when it
     // differs from the request pathname (`/a b.txt` → `/a%20b.txt`),
-    // combined with html-handling so a request only redirects once.
+    // combined with html-handling so a request only redirects once. A
+    // `200` rewrite keeps the client URL untouched.
     let canonical_path = encode_path(&path);
-    let needs_encode_redirect = !raw_path.is_empty()
+    let needs_encode_redirect = !proxied
+        && !raw_path.is_empty()
         && canonical_path != raw_path
         && !matches!(resolved, Resolved::NotFound | Resolved::Redirect(_));
     let redirect_location = |target: &str| {
@@ -1144,6 +1271,27 @@ pub fn route_index(
             .iter()
             .map(|f| f.path.len() + 8)
             .sum::<usize>();
+    let redirects = match store.redirect_rules(tenant, &manifest) {
+        Ok(rules) => rules,
+        Err(_) => {
+            crate::metrics::assets_outcome(&worker_id, "route_error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let redirect_entries: Vec<serde_json::Value> = redirects
+        .as_deref()
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|r| serde_json::json!({"source": r.source, "status": r.status}))
+                .collect()
+        })
+        .unwrap_or_default();
+    let approx_bytes = approx_bytes
+        + redirect_entries
+            .iter()
+            .map(|v| v.to_string().len())
+            .sum::<usize>();
     let too_large =
         manifest.files.len() > MAX_ROUTE_INDEX_PATHS || approx_bytes > MAX_ROUTE_INDEX_BYTES;
     // E3: every response names the manifest it describes — the router
@@ -1162,6 +1310,7 @@ pub fn route_index(
             "notFoundHandling": nfh_wire(manifest.not_found_handling),
             "manifestDigest": manifest_digest,
             "paths": paths,
+            "redirects": redirect_entries,
         })
     };
     let body = match serde_json::to_vec(&body_doc) {
@@ -1229,8 +1378,30 @@ pub fn can_fetch(
             Err(()) => false,
             Ok(path) => match store.manifest(tenant, manifest_digest) {
                 Ok(Some(manifest)) => {
-                    let nfh = probe_nfh(&manifest, has_static_routing, navigate);
-                    !matches!(resolve_with_nfh(&manifest, &path, nfh), Resolved::NotFound)
+                    if is_config_path(&path) {
+                        false
+                    } else {
+                        // Redirect rules match the raw request path, the
+                        // same input `fetch` gives them.
+                        let redirect_hit = match store.redirect_rules(tenant, &manifest) {
+                            Ok(rules) => rules.as_deref().is_some_and(|rules| {
+                                assets_redirects::match_redirect(rules, raw_path, None).is_some()
+                            }),
+                            Err(_) => {
+                                crate::metrics::assets_outcome(&worker_id, "route_error");
+                                return typed(
+                                    "ASSET_STORAGE_UNAVAILABLE",
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                );
+                            }
+                        };
+                        if redirect_hit {
+                            true
+                        } else {
+                            let nfh = probe_nfh(&manifest, has_static_routing, navigate);
+                            !matches!(resolve_with_nfh(&manifest, &path, nfh), Resolved::NotFound)
+                        }
+                    }
                 }
                 Ok(None) => {
                     crate::metrics::assets_outcome(&worker_id, "route_error");

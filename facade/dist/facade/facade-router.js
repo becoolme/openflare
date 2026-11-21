@@ -67,14 +67,15 @@ export class AssetsRouter extends WorkerEntrypoint {
         if (cfg.invokeAhead) return toUserWorker();
         const method = request.method.toUpperCase();
         if (method !== "GET" && method !== "HEAD") return toUserWorker();
-        const pathname = normalizePath(new URL(request.url).pathname);
+        const rawPath = new URL(request.url).pathname;
+        const pathname = normalizePath(rawPath);
         if (pathname === null) return toUserWorker();
         const navigate = request.headers.get("sec-fetch-mode") === "navigate";
-        const fetchable = await this.#fetchable(request, pathname, navigate, hasStaticRouting, cfg.manifestDigest);
+        const fetchable = await this.#fetchable(request, pathname, rawPath, navigate, hasStaticRouting, cfg.manifestDigest);
         if (fetchable.error) return ROUTE_UNREACHABLE(fetchable.error);
         return fetchable.value ? toAssets() : toUserWorker();
     }
-    async #fetchable(request, pathname, navigate, hasStaticRouting, digest) {
+    async #fetchable(request, pathname, rawPath, navigate, hasStaticRouting, digest) {
         const env = this.env;
         let slot = cacheGet(digest);
         if (slot === undefined) {
@@ -130,7 +131,7 @@ export class AssetsRouter extends WorkerEntrypoint {
             };
         }
         return {
-            value: intentFetchable(slot.index, pathname, navigate, hasStaticRouting)
+            value: intentFetchable(slot.index, pathname, navigate, hasStaticRouting, rawPath)
         };
     }
     async #probe(request, hasStaticRouting, digest) {

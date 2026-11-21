@@ -85,6 +85,25 @@ that does not match the bytes is never committed.
   protocol-relative `//evil.com`.
 - `not_found_handling` accepts `none`, `404-page`,
   `single-page-application`.
+- `_redirects` is parsed and applied before asset lookup (Cloudflare
+  order): static rules first, then dynamic ones; 301/302/303/307/308,
+  one trailing `*` (`:splat`), segment placeholders (`:name`), and
+  `200` proxying to a relative path. Query-parameter/country/cookie
+  conditions, domain-level rules and rewrites other than 200 are not
+  supported. `_headers` is **not** implemented yet. Both files are
+  configuration and are never served as assets — neither directly nor
+  through a `200` rewrite destination.
+- `_redirects` matching runs on the raw (still percent-encoded) request
+  path, like Cloudflare: capture values are substituted into `Location`
+  verbatim, so `/en/%2Fevil.com` rewrites to `/%2Fevil.com` instead of a
+  protocol-relative `//evil.com`, and `%3F`/`%23` inside a filename keep
+  their meaning. A capture that starts a new segment is never allowed to
+  turn a relative destination into a protocol-relative URL
+  (`/en//evil.com` + `/:splat` → `/evil.com`); an explicitly authored
+  `//host/...` destination is preserved. Placeholders are
+  substituted in one pass (longest-match, inserted values never
+  rescanned). `facade-router` matches the same raw pathname so routing
+  and serving agree.
 - `run_worker_first`: `true`/`false` or a list of `/`-prefixed globs
   with `!` asset-first exclusions — at most 100 rules × 100 bytes, no
   duplicates, at least one non-`!` rule (validated identically in the

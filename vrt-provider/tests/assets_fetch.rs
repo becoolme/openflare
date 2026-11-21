@@ -508,6 +508,43 @@ async fn route_index_lists_paths_and_modes() {
 }
 
 #[tokio::test]
+async fn route_index_carries_redirect_sources() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/_redirects", b"/old /new 301\n/blog/* /posts/:splat 302\n"),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = probe(&e.app, "route-index", &e.digest, &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let redirects = v["redirects"].as_array().unwrap();
+    assert_eq!(redirects[0]["source"], "/old");
+    assert_eq!(redirects[0]["status"], 301);
+    assert_eq!(redirects[1]["source"], "/blog/*");
+    // A redirect-only path is fetchable through the probe as well.
+    let hit = probe(
+        &e.app,
+        "can-fetch",
+        &e.digest,
+        &[
+            ("x-open-compute-asset-url", "https://w.test/old"),
+            ("x-open-compute-asset-method", "GET"),
+        ],
+    )
+    .await;
+    let body = axum::body::to_bytes(hit.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"true");
+}
+
+#[tokio::test]
 async fn route_index_unknown_manifest_is_typed_404() {
     let e = env(&[("/index.html", b"i")], "none", TENANT);
     let res = probe(&e.app, "route-index", &"9".repeat(64), &[]).await;
@@ -748,4 +785,81 @@ async fn percent_encoded_paths_decode_before_match() {
         .await
         .unwrap();
     assert_eq!(&body[..], b"true");
+}
+
+/// `_redirects` (Cloudflare static-assets): rules apply before asset
+/// resolution, preserve the incoming query, support splats and `200`
+/// proxying, and the file itself is never served.
+#[tokio::test]
+async fn redirects_apply_before_assets_and_are_never_served() {
+    let e = env(
+        &[
+            ("/index.html", b"<h1>hi</h1>"),
+            ("/old", b"asset"),
+            (
+                "/_redirects",
+                b"/old /new 301\n/blog/* https://blog.example.com/:splat\n/proxy /index.html 200\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    // 301 wins over the existing `/old` asset and keeps the query.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/old?q=1", &[]).await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers().get("location").unwrap(), "/new?q=1");
+    // Splat + external destination.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/a/b", &[]).await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(
+        res.headers().get("location").unwrap(),
+        "https://blog.example.com/a/b"
+    );
+    // 200 proxying serves the destination asset.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/proxy", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"<h1>hi</h1>");
+    // Configuration files are not assets.
+    for path in ["/_redirects", "/_headers"] {
+        let res = fetch(&e.app, &e.digest, "GET", &format!("https://x{path}"), &[]).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(code_of(&res), "ASSET_NOT_FOUND", "{path}");
+    }
+    // Non-matching paths still resolve normally.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/index.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+}
+
+/// `_redirects` capture substitution must not let the request rewrite a
+/// local rule into a cross-origin or configuration-file target.
+#[tokio::test]
+async fn redirects_encode_captures_and_never_proxy_configuration() {
+    let e = env(
+        &[
+            ("/index.html", b"<h1>hi</h1>"),
+            ("/posts/a.html", b"post"),
+            (
+                "/_redirects",
+                b"/en/* /:splat 301\n/blog/* /posts/:splat 302\n/raw/* /:splat 200\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    // `%2F` stays an encoded filename character, not a `//host` prefix.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/en/%2Fevil.com", &[]).await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers().get("location").unwrap(), "/%2Fevil.com");
+
+    // `%3F` stays part of the filename and the query survives.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/a%3Fb?q=1", &[]).await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.headers().get("location").unwrap(), "/posts/a%3Fb?q=1");
+
+    // A `200` rewrite into `/_redirects` must not serve configuration.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/raw/_redirects", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(code_of(&res), "ASSET_NOT_FOUND");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/raw/_headers", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }

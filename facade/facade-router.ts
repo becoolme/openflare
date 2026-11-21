@@ -143,13 +143,15 @@ export class AssetsRouter extends WorkerEntrypoint<RouterEnv> {
 
     const method = request.method.toUpperCase();
     if (method !== "GET" && method !== "HEAD") return toUserWorker();
-    const pathname = normalizePath(new URL(request.url).pathname);
+    const rawPath = new URL(request.url).pathname;
+    const pathname = normalizePath(rawPath);
     if (pathname === null) return toUserWorker();
     const navigate = request.headers.get("sec-fetch-mode") === "navigate";
 
     const fetchable = await this.#fetchable(
       request,
       pathname,
+      rawPath,
       navigate,
       hasStaticRouting,
       cfg.manifestDigest,
@@ -163,6 +165,7 @@ export class AssetsRouter extends WorkerEntrypoint<RouterEnv> {
   async #fetchable(
     request: Request,
     pathname: string,
+    rawPath: string,
     navigate: boolean,
     hasStaticRouting: boolean,
     digest: string,
@@ -236,7 +239,15 @@ export class AssetsRouter extends WorkerEntrypoint<RouterEnv> {
       );
       return { value: false, error: "route_index_invalid" };
     }
-    return { value: intentFetchable(slot.index, pathname, navigate, hasStaticRouting) };
+    return {
+      value: intentFetchable(
+        slot.index,
+        pathname,
+        navigate,
+        hasStaticRouting,
+        rawPath,
+      ),
+    };
   }
 
   async #probe(

@@ -14,6 +14,7 @@
 //! - [`config`]: typed provider configuration for the binary.
 
 pub mod assets;
+pub mod assets_redirects;
 pub mod authorize;
 pub mod cli;
 pub mod config;

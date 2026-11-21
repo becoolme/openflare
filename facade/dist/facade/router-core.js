@@ -1,6 +1,7 @@
 export const MAX_INDEX_ENTRIES = 8;
 export const MAX_INDEX_BYTES = 4 * 1024 * 1024;
 export const MAX_INDEX_PATHS = 4096;
+export const MAX_REDIRECTS = 2100;
 const indexCache = new Map();
 let indexCacheBytes = 0;
 let clock = 0;
@@ -374,9 +375,39 @@ function htmlDrop(has, path, skip) {
         asset: index
     };
 }
-export function intentFetchable(index, path, navigate, hasStaticRouting) {
+function redirectMatches(rules, path) {
+    for (const rule of rules){
+        if (rule.source === path) return true;
+        if (!rule.source.includes("*") && !rule.source.includes(":")) continue;
+        const src = rule.source.split("/");
+        const req = path.split("/");
+        let matched = true;
+        for(let i = 0; i < src.length; i++){
+            if (src[i] === "*") return true;
+            if (req[i] === undefined) {
+                matched = false;
+                break;
+            }
+            if (src[i].startsWith(":")) {
+                if (req[i] === "") {
+                    matched = false;
+                    break;
+                }
+                continue;
+            }
+            if (src[i] !== req[i]) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched && req.length === src.length) return true;
+    }
+    return false;
+}
+export function intentFetchable(index, path, navigate, hasStaticRouting, rawPath = path) {
     const has = (p)=>index.paths.has(p);
     if (has(path)) return true;
+    if (redirectMatches(index.redirects, rawPath)) return true;
     const nfh = hasStaticRouting || navigate ? index.notFoundHandling : "none";
     if (htmlIntent(has, index.htmlHandling, path, false) !== null) return true;
     if (nfh === "single-page-application") return has("/index.html");
@@ -482,6 +513,30 @@ export function parseIndex(raw) {
         paths.add(p);
         approxBytes += p.length + 8;
     }
+    const redirects = [];
+    if (doc.redirects !== undefined) {
+        if (!Array.isArray(doc.redirects) || doc.redirects.length > MAX_REDIRECTS) {
+            return {
+                kind: "invalid"
+            };
+        }
+        for (const r of doc.redirects){
+            if (typeof r !== "object" || r === null) return {
+                kind: "invalid"
+            };
+            const { source, status } = r;
+            if (typeof source !== "string" || !source.startsWith("/") || source.length > 1024 || status !== 200 && status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) {
+                return {
+                    kind: "invalid"
+                };
+            }
+            redirects.push({
+                source,
+                status
+            });
+            approxBytes += source.length + 16;
+        }
+    }
     if (approxBytes > MAX_INDEX_BYTES) return {
         kind: "tooLarge"
     };
@@ -491,6 +546,7 @@ export function parseIndex(raw) {
             htmlHandling: doc.htmlHandling,
             notFoundHandling: doc.notFoundHandling,
             paths,
+            redirects,
             approxBytes,
             digest: "",
             manifestDigest: md
