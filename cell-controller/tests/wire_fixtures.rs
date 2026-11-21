@@ -183,6 +183,7 @@ fn desired_ack_fixture() {
             quotas: true,
             analytics_engine: true,
             unsafe_eval: true,
+            observability: true,
         }),
     };
     check(

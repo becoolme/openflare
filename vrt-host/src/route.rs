@@ -209,6 +209,7 @@ mod tests {
                     }],
                     crons: vec![],
                     queue_consumers: vec![],
+                                        observability: None,
                     durable_object_classes: vec![],
                     workflows: vec![],
                     tail_consumers: vec![],
