@@ -532,6 +532,12 @@ fn real_workerd_r2_multipart_end_to_end() {
         v["etag"].as_str().unwrap_or("").ends_with("-3"),
         "composite etag: {v}"
     );
+    // complete() is a full R2Object — create-time metadata is on it.
+    assert_eq!(v["completeCustomMetadata"], "e2e", "{v}");
+    assert_eq!(
+        v["completeContentType"], "application/octet-stream",
+        "{v}"
+    );
 
     // abort → complete must be rejected (terminal upload state).
     let (st, body) = http(port, "POST", "/abort?key=w5-ab", b"");

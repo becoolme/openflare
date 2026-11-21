@@ -87,6 +87,13 @@ fn part(n: i32, etag: &str) -> R2UploadedPart {
     }
 }
 
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 /// The full shared contract — identical on every backend.
 async fn conformance(p: &dyn R2Provider) {
     let c = ctx_for(TENANT, BUCKET);
@@ -94,6 +101,9 @@ async fn conformance(p: &dyn R2Provider) {
     let small = b"tail".to_vec();
 
     // -- happy path: create → 3 parts → complete → object --
+    // Window covers create→complete: S3 records `uploaded` at create
+    // time while the local backends stamp it at commit; both are inside.
+    let started_ms = unix_ms();
     let up = p
         .create_multipart(&c, "mp/obj", &create_opts())
         .await
@@ -109,8 +119,15 @@ async fn conformance(p: &dyn R2Provider) {
         .await
         .unwrap()
         .expect("complete returns metadata");
+    let finished_ms = unix_ms();
     assert_eq!(meta.size, (2 * PART + small.len()) as u64, "object size");
     assert!(meta.etag.ends_with("-3"), "composite etag: {}", meta.etag);
+    assert_eq!(meta.http_etag, format!("\"{}\"", meta.etag));
+    assert!(
+        (started_ms..=finished_ms).contains(&meta.uploaded),
+        "uploaded {} outside [{started_ms}, {finished_ms}]",
+        meta.uploaded
+    );
     assert_eq!(
         meta.custom_metadata
             .as_ref()
@@ -128,10 +145,12 @@ async fn conformance(p: &dyn R2Provider) {
         "http metadata preserved"
     );
     match p.get(&c, "mp/obj", None, None).await.unwrap() {
-        R2GetResult::Body(_, body) => {
+        R2GetResult::Body(stored, body) => {
             assert_eq!(body.len(), 2 * PART + small.len());
             assert_eq!(&body[..4], &[0xAB; 4]);
             assert_eq!(&body[2 * PART..], small.as_slice());
+            // `complete()` is the authority: later reads must agree.
+            assert_eq!(stored, meta, "complete() metadata matches later get()");
         }
         _ => panic!("completed object must be readable"),
     }
@@ -151,7 +170,10 @@ async fn conformance(p: &dyn R2Provider) {
         .await
         .unwrap()
         .expect("idempotent complete retry returns metadata");
-    assert_eq!(retried.etag, meta.etag, "idempotent retry same etag");
+    assert_eq!(
+        retried, meta,
+        "idempotent retry returns the same object metadata, metadata included"
+    );
 
     // -- terminal state: complete consumed the upload --
     assert!(
@@ -176,6 +198,40 @@ async fn conformance(p: &dyn R2Provider) {
         ),
         "abort after complete"
     );
+
+    // -- complete() result contract, no metadata supplied --
+    // Cloudflare documents `complete()` as `Promise<R2Object>` and both
+    // metadata fields are non-optional on `R2Object`; workerd's non-list
+    // parser materializes them as `{}` when the object has none. Every
+    // backend must return them present, so a caller never re-reads.
+    let up_empty = p
+        .create_multipart(&c, "mp/empty-meta", &Default::default())
+        .await
+        .unwrap()
+        .upload_id;
+    let empty_part = p
+        .upload_part(&c, "mp/empty-meta", &up_empty, 1, &big)
+        .await
+        .unwrap();
+    let empty = p
+        .complete_multipart(&c, "mp/empty-meta", &up_empty, &[empty_part])
+        .await
+        .unwrap()
+        .expect("complete returns metadata");
+    assert_eq!(
+        empty.http_metadata,
+        Some(R2HttpMetadata::default()),
+        "httpMetadata present (empty) when the upload supplied none"
+    );
+    assert_eq!(
+        empty.custom_metadata,
+        Some(BTreeMap::new()),
+        "customMetadata present (empty) when the upload supplied none"
+    );
+    assert_eq!(empty.range, None);
+    assert_eq!(empty.size, PART as u64);
+    assert!(!empty.etag.is_empty());
+    assert!(empty.uploaded > 0);
 
     // -- abort flow + post-abort ops --
     let up2 = p

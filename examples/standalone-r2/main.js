@@ -37,6 +37,7 @@ export default {
         new TextEncoder().encode("-tail"),
       ];
       const upload = await env.BUCKET.createMultipartUpload(key, {
+        httpMetadata: { contentType: "application/octet-stream" },
         customMetadata: { origin: "e2e" },
       });
       const uploaded = [];
@@ -56,6 +57,10 @@ export default {
         sha256: await sha256hex(body),
         expectedSize: expected.byteLength,
         expectedSha256: await sha256hex(expected),
+        // complete() is a full R2Object: create-time metadata comes back
+        // on the result itself, not only from a later get().
+        completeCustomMetadata: meta.customMetadata?.origin ?? null,
+        completeContentType: meta.httpMetadata?.contentType ?? null,
       });
     }
     if (url.pathname === "/abort") {

@@ -128,8 +128,8 @@
           "name": "third_party/open-compute/facade/r2/native-adapter.js",
           "dist": "facade/dist/third_party/open-compute/facade/r2/native-adapter.js",
           "source": "third_party/open-compute/facade/r2/native-adapter.ts",
-          "sourceSha256": "c76662432f27af9df7b333e8399737590485a547828eec3469759043b6103eae",
-          "sha256": "a12e3177a99a23d0ca6d1fb4c7114dc9ceaf6403cddf02e18a6f227a4985a502"
+          "sourceSha256": "f7798bc303b0cfe2076115064d9a53ff4139f5d0fb5b8de214a20a7aa058ceb0",
+          "sha256": "0c2186678c5893c56a127a6154e7c0728bc68e4f436c6cb8a8e6a721607e827b"
         },
         {
           "name": "third_party/open-compute/facade/r2/transport.js",

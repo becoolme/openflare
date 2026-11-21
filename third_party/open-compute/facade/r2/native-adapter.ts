@@ -482,20 +482,21 @@ export async function nativeR2Fetch(
           const part = record(item);
           return { partNumber: integer(part.part), etag: text(part.etag) };
         });
-        // Cloudflare's complete() result omits HTTP and custom metadata;
-        // later reads return the stored values.
-        const {
-          httpFields: _http,
-          customFields: _custom,
-          ...completed
-        } = metadata(
-          await bucket.completeMultipartUpload(
-            key,
-            text(input.uploadId),
-            parts,
+        // `complete()` resolves to a full R2Object: Cloudflare documents
+        // Promise<R2Object> with non-optional httpMetadata/customMetadata,
+        // and workerd parses the result through the same non-list metadata
+        // path as head/put (r2-multipart.c++, r2-bucket.c++). Pass the
+        // stored values through so callers need not re-read the object.
+        return reply(
+          metadata(
+            await bucket.completeMultipartUpload(
+              key,
+              text(input.uploadId),
+              parts,
+            ),
           ),
+          false,
         );
-        return reply(completed, false);
       }
       case "abortMultipartUpload":
         await bucket.abortMultipartUpload(key, text(input.uploadId));

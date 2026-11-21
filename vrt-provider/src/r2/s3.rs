@@ -468,7 +468,9 @@ impl S3R2Provider {
                     .map(|v| v.trim_matches('"').to_string())
                     .unwrap_or_default();
                 if etag_matches(&head_etag, expected_etag) {
-                    Ok(Some(self.decode_head(key, &headers, None)?))
+                    Ok(Some(
+                        self.decode_head(key, &headers, None)?.completed_multipart(),
+                    ))
                 } else {
                     // Object exists but under a different etag — the
                     // state is real but not ours to explain.
@@ -507,7 +509,9 @@ impl S3R2Provider {
                     .map(|v| v.trim_matches('"').to_string())
                     .unwrap_or_default();
                 if etag_matches(&head_etag, expected_etag) {
-                    Ok(Some(self.decode_head(key, &headers, None)?))
+                    Ok(Some(
+                        self.decode_head(key, &headers, None)?.completed_multipart(),
+                    ))
                 } else {
                     Err(ProviderError::R2MultipartInvalid)
                 }
@@ -1311,7 +1315,9 @@ impl R2Provider for S3R2Provider {
                 if !etag_matches(&head_etag, &result_etag) {
                     return Err(ProviderError::R2ResultUnknown);
                 }
-                Ok(Some(self.decode_head(key, &headers, None)?))
+                Ok(Some(
+                    self.decode_head(key, &headers, None)?.completed_multipart(),
+                ))
             }
             None => Err(ProviderError::R2ResultUnknown),
         }

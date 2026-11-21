@@ -1057,7 +1057,9 @@ impl FsR2Inner {
             let committed = read_object(&object_path(bdir, key), false)
                 .map_err(|_| ProviderError::R2ProviderUnavailable)?;
             return match committed {
-                Some((m, _)) if etag_matches(&m.etag, &expected) => Ok(Some(m)),
+                Some((m, _)) if etag_matches(&m.etag, &expected) => {
+                    Ok(Some(m.completed_multipart()))
+                }
                 _ => Err(ProviderError::R2MultipartInvalid),
             };
         };
@@ -1097,7 +1099,7 @@ impl FsR2Inner {
         let _ = std::fs::remove_file(&tmp_body);
         let _ = std::fs::remove_dir_all(&dir);
         self.drop_upload_lock(bdir, upload_id);
-        Ok(Some(metadata))
+        Ok(Some(metadata.completed_multipart()))
     }
 
     fn abort_multipart_block(

@@ -6,8 +6,12 @@
   "requiresWorkerd": true,
   "evidence": [
     "https://developers.cloudflare.com/r2/api/workers/workers-multipart-usage/ (createMultipartUpload -> R2MultipartUpload.uploadPart/complete/abort, resumeMultipartUpload; non-final parts >=5MiB)",
+    "https://developers.cloudflare.com/r2/api/workers/workers-api-reference/ (complete(): Promise<R2Object>; R2Object.httpMetadata and customMetadata are non-optional and come from R2MultipartOptions)",
+    "https://github.com/cloudflare/workerd/blob/main/src/workerd/api/r2-api.capnp (R2CompleteMultipartUploadResponse = R2PutResponse = R2HeadResponse, so the payload carries httpFields/customFields)",
+    "https://github.com/cloudflare/workerd/blob/main/src/workerd/api/r2-multipart.c++ (complete() parses through parseHeadResultWrapper)",
+    "https://github.com/cloudflare/workerd/blob/main/src/workerd/api/r2-bucket.c++ (parseObjectMetadata expects HTTP + custom metadata for non-list operations and materializes {} when absent)",
     "examples/standalone-r2/main.js (the same chain proven on the standalone stack e2e)",
-    "vrt-provider/tests/r2_multipart.rs (part-order, min-size and signed-uploadId rules)"
+    "vrt-provider/tests/r2_multipart.rs (part-order, min-size, signed-uploadId rules, and complete() metadata on all three backends)"
   ],
   "steps": [
     {
@@ -28,6 +32,10 @@
           "size": 10485763,
           "bytes": 10485763,
           "head": true,
+          "completeCustomMetadata": {
+            "origin": "conformance"
+          },
+          "completeContentType": "application/octet-stream",
           "customMetadata": {
             "origin": "conformance"
           }

@@ -445,7 +445,7 @@ impl R2Provider for MemoryR2Provider {
             let objects = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
             return match objects.get(&bucket_key(ctx)).and_then(|m| m.get(key)) {
                 Some(o) if etag_matches(&o.metadata.etag, &expected) => {
-                    Ok(Some(o.metadata.clone()))
+                    Ok(Some(o.metadata.clone().completed_multipart()))
                 }
                 _ => Err(ProviderError::R2MultipartInvalid),
             };
@@ -502,7 +502,7 @@ impl R2Provider for MemoryR2Provider {
                 metadata: metadata.clone(),
             },
         );
-        Ok(Some(metadata))
+        Ok(Some(metadata.completed_multipart()))
     }
 
     async fn abort_multipart(

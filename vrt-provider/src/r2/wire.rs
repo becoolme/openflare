@@ -379,6 +379,35 @@ pub struct R2ObjectMetadata {
     pub ssec_key_md5: Option<String>,
 }
 
+impl R2ObjectMetadata {
+    /// Apply the shared `R2MultipartUpload.complete()` result contract.
+    ///
+    /// Cloudflare documents `complete()` as `Promise<R2Object>`, and
+    /// `R2Object.httpMetadata` / `R2Object.customMetadata` are
+    /// non-optional (Workers API reference). workerd backs that up:
+    /// `R2MultipartUpload::complete()` parses through the same
+    /// `parseObjectMetadata` path as `head`/`put` with HTTP + custom
+    /// metadata in the expected set (`r2-multipart.c++`,
+    /// `r2-bucket.c++`), and the wire shape is aliased
+    /// `R2CompleteMultipartUploadResponse = R2PutResponse =
+    /// R2HeadResponse` (`r2-api.capnp`). R2 therefore materializes both
+    /// as objects — `{}` when the object has none — never as absent.
+    ///
+    /// Every backend funnels its complete result through this so a
+    /// caller never has to `get()` the object back to learn the metadata
+    /// it supplied at create time. `uploaded` stays the timestamp at
+    /// which that backend recorded the object's creation (the S3
+    /// backend persists it on `CreateMultipartUpload`); the helper only
+    /// normalizes presence/shape, never invents values.
+    #[must_use]
+    pub fn completed_multipart(mut self) -> Self {
+        self.http_metadata = Some(self.http_metadata.unwrap_or_default());
+        self.custom_metadata = Some(self.custom_metadata.unwrap_or_default());
+        self.range = None;
+        self
+    }
+}
+
 /// Provider list result — objects carry full metadata (include mask is
 /// applied at the response layer); `next_after` is the opaque resume key.
 #[derive(Clone, Debug)]

@@ -151,7 +151,7 @@ const config :Workerd.Config = (
         (name = "third_party/open-compute/facade/loader/python-snapshot.js", esModule = embed "sys/97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"),
         (name = "third_party/open-compute/facade/loader/shared.js", esModule = embed "sys/ad6ec6871acd01776f6fe414510e0126266f15f95480ce1172c3fa34babfef6e"),
         (name = "third_party/open-compute/facade/loader/snapshot.js", esModule = embed "sys/197e8b61660cae5b8829f707ea091adbc206f9ceec3a2bdb105ecbd65cde0a58"),
-        (name = "third_party/open-compute/facade/r2/native-adapter.js", esModule = embed "sys/a12e3177a99a23d0ca6d1fb4c7114dc9ceaf6403cddf02e18a6f227a4985a502"),
+        (name = "third_party/open-compute/facade/r2/native-adapter.js", esModule = embed "sys/0c2186678c5893c56a127a6154e7c0728bc68e4f436c6cb8a8e6a721607e827b"),
         (name = "third_party/open-compute/facade/r2/transport.js", esModule = embed "sys/c1299e7a51c29c821481b89bcc336eec9c1c78b42cd0ebeef974a3df31502c5d"),
         (name = "third_party/open-compute/facade/r2/validation.js", esModule = embed "sys/ca8ee1404354248a5ccb82c988508ae57ce8c00f2ece1822dc0302edc31fb546"),
       ],
