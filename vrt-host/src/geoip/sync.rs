@@ -44,6 +44,33 @@ const FAILURE_RETRY_SECS: u64 = 1800;
 /// Bound a single download — the file is ~100 MB over a CDN link.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+/// The release JSON is a few KiB — bound it before serde so a hostile
+/// or broken API response cannot spike RSS.
+const MAX_METADATA_BYTES: usize = 512 * 1024;
+/// Merged-IP MMDBs run ~100 MB; bound the streamed body so a hostile
+/// endpoint cannot fill the disk (the timeout alone does not cap
+/// bytes on a fast link).
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// An API-supplied `browser_download_url` is untrusted input: require
+/// https plus a GitHub release host so a compromised release/mirror
+/// cannot point the cell at `http://169.254.169.254/` or an internal
+/// https service (SSRF from inside the cluster). Operator-configured
+/// `downloadUrl` is exempt — its own https check lives in config.rs.
+fn validate_asset_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("asset url parse: {e}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!("asset url scheme must be https: {url}"));
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if !(host == "github.com"
+        || host.ends_with(".github.com")
+        || host.ends_with(".githubusercontent.com"))
+    {
+        return Err(format!("asset url host not allowed: {url}"));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug)]
 pub struct GeoIpSyncConfig {
@@ -151,25 +178,50 @@ async fn sync_once(
         if let Some(t) = token {
             req = req.bearer_auth(t);
         }
-        let body = req
+        let mut resp = req
             .send()
             .await
             .map_err(|e| format!("releases api: {e}"))?
             .error_for_status()
-            .map_err(|e| format!("releases api status: {e}"))?
-            .bytes()
+            .map_err(|e| format!("releases api status: {e}"))?;
+        // Bound the metadata body before serde — a hostile/broken API
+        // response must not spike RSS. A release JSON is a few KiB.
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| format!("releases api body: {e}"))?;
+            .map_err(|e| format!("releases api body: {e}"))?
+        {
+            body.extend_from_slice(&chunk);
+            if body.len() > MAX_METADATA_BYTES {
+                return Err("releases api body exceeds cap".to_string());
+            }
+        }
         let rel: Release =
             serde_json::from_slice(&body).map_err(|e| format!("releases api json: {e}"))?;
         let state = read_state(&cfg.mmdb_path).await;
-        if state.tag == rel.tag_name && cfg.mmdb_path.is_file() {
+        // Tag match alone is insufficient: a truncated/corrupt live
+        // database with an intact state.json must re-download.
+        let on_disk_ok = cfg
+            .mmdb_path
+            .metadata()
+            .ok()
+            .is_some_and(|m| m.is_file() && m.len() == state.bytes && state.bytes > 0);
+        if state.tag == rel.tag_name && on_disk_ok {
             return Ok("unchanged");
         }
         if let Some(asset) = rel.assets.iter().find(|a| a.name.ends_with(".mmdb")) {
+            // The asset URL is API-controlled — validate it like
+            // untrusted input (the configured downloadUrl got its
+            // https check in config.rs; this one did not).
+            validate_asset_url(&asset.browser_download_url)?;
             download_url = asset.browser_download_url.clone();
+            // Only stamp the upstream tag when it names the artifact
+            // actually installed — a fallback download must not be
+            // recorded as `rel.tag_name` (it would freeze updates and
+            // mislabel provenance).
+            new_tag = Some(rel.tag_name);
         }
-        new_tag = Some(rel.tag_name);
     } else {
         // Mirror mode: refresh only when the file is older than the
         // interval (or absent).
@@ -219,6 +271,11 @@ async fn fetch_and_install(
         {
             hasher.update(&chunk);
             bytes += chunk.len() as u64;
+            if bytes > MAX_DOWNLOAD_BYTES {
+                return Err(format!(
+                    "download exceeds {MAX_DOWNLOAD_BYTES} byte cap"
+                ));
+            }
             file.write_all(&chunk)
                 .await
                 .map_err(|e| format!("write: {e}"))?;

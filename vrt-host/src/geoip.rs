@@ -16,7 +16,9 @@
 //!
 //! Database: a single merged MMDB (`GeoLite2-City` schema plus `asn`
 //! and `proxy` subtrees — the NetworkCats/Merged-IP-Data layout). The
-//! reader is memory-mapped and swaps on mtime change; [`sync`]
+//! reader is heap-backed (`Vec<u8>`, deliberately NOT mmap — an
+//! in-place truncate of a mapped file is UB) and swaps on mtime
+//! change; [`sync`]
 //! refreshes the file in the background. Every failure mode degrades
 //! to "no geo data" — a missing/corrupt/stale database never blocks
 //! or poisons a request, matching the trust-store precedent.

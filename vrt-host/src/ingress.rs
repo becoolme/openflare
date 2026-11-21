@@ -1826,6 +1826,26 @@ fn path_and_query(uri: &axum::http::Uri) -> String {
         .to_string()
 }
 
+/// Which IP the local GeoIP lookup is allowed to describe. The TCP
+/// peer is only a valid lookup subject when it IS the client: policy
+/// `none`, or a peer outside the trusted CIDR set (its XFF is
+/// ignored — it's just another client). A TRUSTED proxy whose XFF
+/// resolves to nothing must not have its own datacenter IP looked
+/// up: that would re-inject the proxy's geo as edge-verified
+/// `cf-ipcountry`/`request.cf` — confidently wrong. No client
+/// identity ⇒ `None` ⇒ no local geo.
+fn geoip_lookup_ip(
+    client_ip_policy: &ClientIpPolicy,
+    peer: &std::net::IpAddr,
+    inbound: &HeaderMap,
+) -> Option<std::net::IpAddr> {
+    let peer_is_untrusted_client = client_ip_policy
+        .trusted_cidrs()
+        .is_none_or(|cidrs| !cidrs.iter().any(|c| c.contains(peer)));
+    resolve_client_ip(client_ip_policy, peer, inbound)
+        .or_else(|| peer_is_untrusted_client.then(|| canon_ip(*peer)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scrubbed_headers(
     inbound: &HeaderMap,
@@ -1929,9 +1949,16 @@ fn scrubbed_headers(
     // verify. A database record can never override verified upstream
     // data and never supplies `cf-connecting-ip`/`colo`/`ray`.
     if let Some(geo) = geoip {
-        let lookup_ip = resolve_client_ip(client_ip_policy, &peer.ip(), inbound)
-            .unwrap_or_else(|| canon_ip(peer.ip()));
-        if let Some(rec) = geo.lookup(lookup_ip) {
+        // The TCP peer is only a valid lookup subject when it IS the
+        // client: policy `none`, or a peer outside the trusted CIDR
+        // set (its XFF is ignored — it's just another client). A
+        // TRUSTED proxy whose XFF resolves to nothing must not have
+        // its own datacenter IP looked up: that would re-inject the
+        // proxy's geo as edge-verified `cf-ipcountry`/`request.cf` —
+        // confidently wrong. No client identity ⇒ no local geo.
+        if let Some(rec) = geoip_lookup_ip(client_ip_policy, &peer.ip(), inbound)
+            .and_then(|ip| geo.lookup(ip))
+        {
             cf.merge_geo(&rec);
         }
     }
@@ -2112,8 +2139,8 @@ mod cf_blob_tests {
     }
     fn cf_policy() -> ClientIpPolicy {
         ClientIpPolicy::Cloudflare {
-            trusted: vec![cidr("10.42.0.0/16")],
-            cloudflare: vec![cidr("104.16.0.0/13")],
+            trusted: vec![vrt_config::Cidr::parse("10.42.0.0/16").unwrap()],
+            cloudflare: vec![vrt_config::Cidr::parse("104.16.0.0/13").unwrap()],
         }
     }
     fn peer() -> std::net::IpAddr {
@@ -2150,7 +2177,7 @@ mod cf_blob_tests {
         ));
         assert!(!upstream_is_cloudflare(
             &ClientIpPolicy::TrustedXff {
-                trusted: vec![cidr("10.42.0.0/16")]
+                trusted: vec![vrt_config::Cidr::parse("10.42.0.0/16").unwrap()]
             },
             &peer(),
             &inbound
@@ -2747,5 +2774,45 @@ mod ws_tests {
         let s = st(1, 1);
         std::mem::forget(WsPermit::try_acquire(&s, "other", "w").unwrap());
         s
+    }
+
+    #[test]
+    fn geoip_lookup_ip_never_resolves_a_trusted_proxy() {
+        use std::str::FromStr;
+        let policy = ClientIpPolicy::Cloudflare {
+            trusted: vec![vrt_config::Cidr::parse("10.42.0.0/16").unwrap()],
+            cloudflare: vec![vrt_config::Cidr::parse("104.16.0.0/13").unwrap()],
+        };
+        let peer_ip = std::net::IpAddr::from_str("10.42.0.1").unwrap();
+        let headers = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::HeaderName::from_str("x-forwarded-for").unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+            h
+        };
+        let inbound = HeaderMap::new();
+        // Trusted CF-fronting peer + empty XFF chain ⇒ resolve_client_ip
+        // finds no client identity. The proxy's own datacenter IP must
+        // NOT be looked up (its geo would be re-injected as
+        // edge-verified cf-ipcountry/request.cf).
+        assert!(geoip_lookup_ip(&policy, &peer_ip, &inbound).is_none());
+        // Unparseable XFF: same result.
+        assert!(geoip_lookup_ip(&policy, &peer_ip, &headers("unknown,junk")).is_none());
+        // Trusted peer + real client in XFF ⇒ the client, not the peer.
+        assert_eq!(
+            geoip_lookup_ip(&policy, &peer_ip, &headers("203.0.113.9")),
+            Some(std::net::IpAddr::from_str("203.0.113.9").unwrap())
+        );
+        // Peer OUTSIDE the trusted set: its XFF is ignored, so the peer
+        // itself is the client as far as this edge can verify.
+        let outside = std::net::IpAddr::from_str("192.0.2.55").unwrap();
+        assert_eq!(geoip_lookup_ip(&policy, &outside, &inbound), Some(outside));
+        // No trusted-proxy policy at all ⇒ the peer is the client.
+        assert_eq!(
+            geoip_lookup_ip(&ClientIpPolicy::None, &peer_ip, &inbound),
+            Some(peer_ip)
+        );
     }
 }
