@@ -13,7 +13,8 @@
     "workerLoader": true,
     "workflows": true,
     "workflowsCrossWorker": true,
-    "workflowsOps": true
+    "workflowsOps": true,
+    "unsafeEval": true
   },
   "envelopeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "fenceRevision": 5,

@@ -1606,6 +1606,16 @@ fn emit_binding(
                 WORKER_LOADER_MAX_WORKERS,
             ));
         }
+        BindingDesired::UnsafeEval(u) => {
+            // CF `unsafe.bindings[type="unsafe_eval"]` — workerd's
+            // native `unsafeEval` (@23 :Void): `env.<name>` is the
+            // `UnsafeEval` object (`.eval`/`.newFunction`/
+            // `.newWasmModule`); global eval stays blocked in handlers.
+            out.push_str(&format!(
+                "        (name = {}, unsafeEval = void),\n",
+                capnp_text(&u.name),
+            ));
+        }
     }
     Ok(())
 }

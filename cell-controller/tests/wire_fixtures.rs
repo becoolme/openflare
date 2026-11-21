@@ -182,6 +182,7 @@ fn desired_ack_fixture() {
             worker_loader: true,
             quotas: true,
             analytics_engine: true,
+            unsafe_eval: true,
         }),
     };
     check(
