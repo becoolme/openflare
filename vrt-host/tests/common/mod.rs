@@ -413,6 +413,7 @@ pub fn worker(worker_id: &str, hostname: &str, digest: &str) -> WorkerDesired {
         }],
         crons: vec![],
         queue_consumers: vec![],
+        streaming_tail_consumers: vec![],
         durable_object_classes: vec![],
         workflows: vec![],
         tail_consumers: vec![],

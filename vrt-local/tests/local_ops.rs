@@ -1141,3 +1141,94 @@ fn status_reports_quotas_and_enforcement() {
         true
     );
 }
+
+/// `streamingTailConsumers` pack invariants — shared resolver with
+/// `tailConsumers` so self-target/dedupe/cap cannot drift: a
+/// self-designator would amplify each invocation into another
+/// unboundedly; duplicates collapse on the declared name; the resolved
+/// list stays within MAX_TAIL_CONSUMERS_PER_WORKER.
+#[test]
+fn streaming_tail_consumers_self_dedupe_cap() {
+    let root = root();
+    let _local = init(&root);
+    let resolve = |n: &str| Some(format!("w_{n}"));
+
+    // Self-target is refused before resolution even runs (the resolver
+    // above would resolve "svc" too — the name check must come first).
+    let dir = worker_dir(&root, "svc");
+    std::fs::write(
+        dir.join("vrt.toml"),
+        "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+         streamingTailConsumers = [{service = \"svc\"}]\n",
+    )
+    .unwrap();
+    assert!(vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &resolve)
+        .is_err());
+
+    // Duplicate declarations collapse to one designator.
+    std::fs::write(
+        dir.join("vrt.toml"),
+        "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+         streamingTailConsumers = [{service = \"a\"}, {service = \"a\"}]\n",
+    )
+    .unwrap();
+    let pkg =
+        vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &resolve).unwrap();
+    assert_eq!(pkg.streaming_tail_consumers.len(), 1);
+
+    // One entry past the cap fails closed.
+    let entries: String = (0..=snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER)
+        .map(|i| format!("{{service = \"c{i}\"}}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.join("vrt.toml"),
+        format!(
+            "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+             streamingTailConsumers = [{entries}]\n"
+        ),
+    )
+    .unwrap();
+    assert!(vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &resolve)
+        .is_err());
+}
+
+/// `streamingTailConsumers` is per-version state — a deploy that only
+/// changes the consumer list must mint a new version (same class the
+/// `queueConsumers` identity fix covered).
+#[test]
+fn streaming_tail_consumers_change_mints_new_version() {
+    let root = root();
+    let local = init(&root);
+    let consumer = worker_dir(&root, "consumer");
+    local.deploy(&consumer, &DeployOverrides::default()).unwrap();
+
+    let dir = worker_dir(&root, "svc");
+    let r1 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    std::fs::write(
+        dir.join("vrt.toml"),
+        "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+         streamingTailConsumers = [{service = \"consumer\"}]\n",
+    )
+    .unwrap();
+    let r2 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    assert_ne!(
+        r1.version_id, r2.version_id,
+        "a consumer-only change must mint a new version"
+    );
+    // And the new version's desired carries the designator.
+    let envelope = std::fs::read_to_string(root.join("desired").join("envelope.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+    let workers = &v["payload"]["tenants"][0]["workers"];
+    let svc = workers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "svc")
+        .unwrap();
+    assert_eq!(
+        svc["streamingTailConsumers"].as_array().map(|a| a.len()),
+        Some(1),
+        "{v}"
+    );
+}

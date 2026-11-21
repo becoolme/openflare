@@ -109,6 +109,12 @@ pub const DEFAULT_SUBREQUESTS: u32 = 50;
 /// Platform default simultaneous outbound connections.
 pub const DEFAULT_OUTBOUND_CONNECTIONS: u32 = 16;
 
+/// Per-worker bound on one tail-consumer list (`tail_consumers` and
+/// `streaming_tail_consumers` each) — keeps a declared fan-out from
+/// inflating both the signed desired document and the rendered
+/// workerd config.
+pub const MAX_TAIL_CONSUMERS_PER_WORKER: usize = 16;
+
 /// The `compute.desired` payload: complete desired state for one cell.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -244,7 +250,7 @@ pub struct WorkerDesired {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail_consumers: Vec<TailConsumerDesired>,
 
-    /// Streaming Tail Workers (`streaming_tail_consumers`) — same
+    /// Streaming Tail Workers (`streaming_tail_consumers`) — the same
     /// same-tenant resolution rule as `tail_consumers` but rendered to
     /// workerd `streamingTails` designators: the consumer receives
     /// TailStream events via `tailStream()` rather than batched
@@ -1144,6 +1150,8 @@ impl ComputeDesired {
                 // Tail consumers: a same-tenant, DIFFERENT worker; unique
                 // per producer. Workerd refuses a `tails` designator with
                 // no service, so a dangling declaration must never ship.
+                // Both lists share one target set, so the same worker
+                // cannot be delivered on two channels either.
                 if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
                     || worker.streaming_tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
                 {

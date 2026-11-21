@@ -185,6 +185,21 @@ impl LocalState {
             c["tailConsumers"] = serde_json::json!(pkg.tail_consumers);
             c
         };
+        // `streamingTailConsumers` is per-version state (VersionRecord
+        // replays it into desired; rollback restores it), so a deploy
+        // that only adds or removes a consumer must mint a new version
+        // — same fail-silent class `queueConsumers` guards above.
+        // Conditional like `workflows`: workers that never declared
+        // the key keep their pre-streaming-tails version ids.
+        let canonical = if pkg.streaming_tail_consumers.is_empty() {
+            canonical
+        } else {
+            let mut c = canonical;
+            c["streamingTailConsumers"] = serde_json::json!(pkg.streaming_tail_consumers);
+            c
+        };
+            c
+        };
         let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         format!("vrt_{}", &digest[..28])
