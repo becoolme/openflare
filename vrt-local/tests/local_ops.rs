@@ -226,6 +226,8 @@ fn status_pretty_output_worker_id_lookup_is_order_independent() {
             "activeVersionId",
             "hostnames",
             "name",
+            "quotas",
+            "quotasEnforced",
             "versions",
             "workerId"
         ]
@@ -1089,4 +1091,53 @@ fn do_script_name_resolves_same_tenant_only() {
         Some(&ctx),
     );
     assert!(missing.is_err());
+}
+
+/// Per-worker quotas diagnostics: `vrt status` reports the declared
+/// quotas AND whether this root's host actually renders them
+/// (`render.quotas`). A declared limit with no known host capability
+/// reads `quotasEnforced: false` — never a silent "looks enforced".
+#[test]
+fn status_reports_quotas_and_enforcement() {
+    let root = root();
+    let local = init(&root);
+    let dir = worker_dir(&root, "quota-demo");
+    std::fs::write(
+        dir.join("vrt.toml"),
+        "name = \"quota-demo\"\nmainModule = \"main.js\"\n\
+         compatibilityDate = \"2024-09-25\"\n\n[quotas]\ncpuMs = 200\nsubrequests = 120\n",
+    )
+    .unwrap();
+    local.deploy(&dir, &DeployOverrides::default()).unwrap();
+
+    let st = local.status().unwrap();
+    let w = &st.workers[0];
+    assert_eq!(w.quotas.cpu_ms, 200);
+    assert_eq!(w.quotas.subrequests, 120);
+    // Partial `[quotas]` fills the remaining dimensions with the
+    // platform default (one shared source of truth).
+    assert_eq!(
+        w.quotas.memory_mb,
+        snapshot_protocol::compute_desired::DEFAULT_MEMORY_MB
+    );
+    // A bare init root has no host config → no render capability proven.
+    assert!(!w.quotas_enforced);
+    let v = serde_json::to_value(&st).unwrap();
+    assert_eq!(v["workers"][0]["quotas"]["cpuMs"], 200);
+    assert_eq!(v["workers"][0]["quotasEnforced"], false);
+
+    // A host config with `render.quotas = true` (the pinned fork) flips
+    // the diagnostic to enforced.
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::write(
+        root.join("config").join("vrt-host.toml"),
+        "[render]\nmode = \"capnp\"\nquotas = true\n",
+    )
+    .unwrap();
+    let st = local.status().unwrap();
+    assert!(st.workers[0].quotas_enforced);
+    assert_eq!(
+        serde_json::to_value(&st).unwrap()["workers"][0]["quotasEnforced"],
+        true
+    );
 }

@@ -101,6 +101,12 @@ pub struct VersionRecord {
     /// byte compatible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired>,
+    /// Tail Workers this version forwards invocation events to. Resolved
+    /// to same-tenant worker ids at pack time; rollback restores the
+    /// version's consumer set. skip-if-empty keeps old records
+    /// byte-compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     pub quotas: WorkerQuotas,
 }
 
@@ -163,6 +169,17 @@ impl LocalState {
             c["workflows"] = serde_json::json!(pkg.workflows);
             c
         };
+        // Tail consumers are per-version behavior too: a deploy that only
+        // changes `tail_consumers` must mint a new version (rollback then
+        // restores the previous consumer set). Only added when declared so
+        // workers without tails keep their pre-existing version ids.
+        let canonical = if pkg.tail_consumers.is_empty() {
+            canonical
+        } else {
+            let mut c = canonical;
+            c["tailConsumers"] = serde_json::json!(pkg.tail_consumers);
+            c
+        };
         let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         format!("vrt_{}", &digest[..28])
@@ -212,6 +229,7 @@ impl LocalState {
                 queue_consumers: pkg.queue_consumers.clone(),
                 durable_object_classes: pkg.durable_object_classes.clone(),
                 workflows: pkg.workflows.clone(),
+                tail_consumers: pkg.tail_consumers.clone(),
                 quotas: pkg.quotas.clone(),
             });
         }
@@ -322,6 +340,7 @@ impl LocalState {
                 queue_consumers: active.queue_consumers.clone(),
                 durable_object_classes: active.durable_object_classes.clone(),
                 workflows: active.workflows.clone(),
+                tail_consumers: active.tail_consumers.clone(),
                 quotas: active.quotas.clone(),
             });
         }
@@ -337,15 +356,27 @@ impl LocalState {
 })
     }
 
-    pub fn worker_status(&self) -> Vec<WorkerStatus> {
+    pub fn worker_status(&self, quotas_enforced: bool) -> Vec<WorkerStatus> {
         self.workers
             .iter()
-            .map(|(name, w)| WorkerStatus {
-                name: name.clone(),
-                worker_id: w.worker_id.clone(),
-                active_version_id: w.active_version_id.clone(),
-                versions: w.versions.iter().map(|v| v.version_id.clone()).collect(),
-                hostnames: w.hostnames.clone(),
+            .map(|(name, w)| {
+                let quotas = w
+                    .active_version_id
+                    .as_ref()
+                    .and_then(|id| w.versions.iter().find(|v| &v.version_id == id))
+                    .map(|v| v.quotas.clone())
+                    .unwrap_or_else(WorkerQuotas::platform_default);
+                WorkerStatus {
+                    name: name.clone(),
+                    worker_id: w.worker_id.clone(),
+                    active_version_id: w.active_version_id.clone(),
+                    versions: w.versions.iter().map(|v| v.version_id.clone()).collect(),
+                    hostnames: w.hostnames.clone(),
+                    // Enforced only when the cell can render limits AND
+                    // this worker actually declared an enforceable one.
+                    quotas_enforced: quotas_enforced && quotas.declares_enforceable_limit(),
+                    quotas,
+                }
             })
             .collect()
     }

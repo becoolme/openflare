@@ -14,6 +14,32 @@ The standalone mode runs the whole stack with one `docker compose up`.
 
 > Status: early, actively developed. The wire formats and CLI may still change.
 
+## Deployment modes
+
+| | Standalone | Kubernetes + control plane |
+| --- | --- | --- |
+| Good for | local development, CI, a single owner on one machine | multi-cell, production deployments |
+| Control plane | `vrt-local` in this repo (`vrt` CLI, `docker compose`) | [`openflare-control`](https://github.com/becoolme/openflare-control): signed desired snapshots, Postgres store, cell API |
+| State | a local directory or S3 | Postgres plus S3/filesystem |
+| Deploy | `docker compose up` or `vrt dev` | kustomize manifests from the control repository |
+| Trust | one trusted owner | one owner per control plane; cells verify Ed25519-signed snapshots |
+
+Both modes run the same `vrt-host`, `vrt-provider`, `vrt-sql` and
+`cell-controller` components and the same signed-snapshot wire format.
+
+- **Standalone** — the fastest way to try the runtime: `docker compose -f
+  deploy/standalone/docker-compose.yml up --build --wait` (see
+  [Quick start](#quick-start-docker-standalone)), or `vrt dev` for a
+  no-container loop.
+- **Kubernetes** — a Postgres-backed control plane publishes signed
+  `compute.desired` documents to one or more cells. Manifests, the reference
+  plane and the cell API live in
+  [`openflare-control`](https://github.com/becoolme/openflare-control).
+
+The Kubernetes manifests are intentionally not part of this repository: the
+runtime stays a standalone-clean checkout, and the control plane releases on
+its own cadence.
+
 ## Why
 
 - **Real workerd, not an emulator.** Workers run on the same runtime
@@ -29,6 +55,43 @@ The standalone mode runs the whole stack with one `docker compose up`.
 - **State lives outside the worker process.** KV, R2, D1 and Durable Object
   storage go through a binding provider. A worker process can be restarted,
   rescheduled or scaled to zero without losing data.
+
+## Cloudflare compatibility
+
+OpenFlare runs the real `workerd`, so the JavaScript runtime APIs behave as on
+Cloudflare. The platform-level bindings differ where noted; the authoritative,
+per-binding detail (wrangler config, backends, every known difference) lives in
+[`docs/bindings/README.md`](docs/bindings/README.md), and platform-wide
+differences in [`docs/compatibility.md`](docs/compatibility.md).
+
+Legend: **Drop-in** — same API and configuration, differences limited to where
+the data lives. **Partial** — runs with the differences listed below.
+Anything not listed here is rejected at deploy with
+`VRT_CONFIG_UNSUPPORTED_FIELD`; the complete matrix (including unsupported
+bindings) is in [`docs/bindings/README.md`](docs/bindings/README.md).
+
+| Service / binding | Status | Notes |
+| --- | --- | --- |
+| [KV](docs/bindings/kv.md) | ✅ Drop-in | Full `KVNamespace` on filesystem or Kvrocks; `cacheTtl` is validated but there is no edge-cache tier. |
+| [R2](docs/bindings/r2.md) | 🟡 Partial | Objects, ranges, multipart, checksums; conditional writes depend on the S3 backend. `jurisdiction`/`storage_class` rejected; no SSE-C. |
+| [D1](docs/bindings/d1.md) | 🟡 Partial | workerd's `d1-api` on `vrt-sql` (single-writer SQLite, fs/S3 persistence); no Time Travel. |
+| [Durable Objects](docs/bindings/durable-objects.md) | 🟡 Partial | SQLite + KV storage, alarms, RPC, WebSockets, same-tenant `script_name`; no hibernation, `transferred_classes` rejected. |
+| [Queues](docs/bindings/queues.md) | 🟡 Partial | Producers/consumers, retries, delay, concurrency, DLQ; no pull consumer, no queue-level default delay. |
+| [Cron Triggers](docs/bindings/cron-triggers.md) | ✅ Drop-in | 5-field `triggers.crons` → `scheduled()`, at-most-once per `(worker, version, scheduledTime)`; wakes hibernated tenants. |
+| [Workflows](docs/bindings/workflows.md) | 🟡 Partial | Cloudflare engine (miniflare lineage) as a DO; `limits.steps` capped at 100,000. |
+| [Cache API](docs/bindings/cache-api.md) | 🟡 Partial | Per-tenant in-memory `caches.default`/`caches.open`; not persistent, requires `[cache]` in host config. |
+| [Service bindings](docs/bindings/service-bindings.md) | 🟡 Partial | Worker-to-worker fetch/RPC plus named `WorkerEntrypoint` (`services[].entrypoint`), same tenant. |
+| [Hyperdrive](docs/bindings/hyperdrive.md) | 🟡 Partial | Postgres wire protocol through the egress layer; credentials never enter the isolate. PostgreSQL only. |
+| [Rate limiting](docs/bindings/rate-limiting.md) | 🟡 Partial | `[[ratelimits]]` fixed-window counter in the per-tenant process; approximate, not shared across hosts. |
+| [Static assets](docs/bindings/static-assets.md) | 🟡 Partial | All four `html_handling` modes, `not_found_handling`, `run_worker_first`; content-addressed store, 512 files / 1 MiB each / 8 MiB per deploy. |
+| [WebSockets](docs/bindings/websockets.md) | 🟡 Partial | HTTP/1.1 upgrades to workers and DOs; 300 s idle, 4 h max, 4096 per ingress, 256 per tenant. |
+| [Vars and secrets](docs/bindings/vars-and-secrets.md) | 🟡 Partial | Vars are `text` bindings (non-strings arrive JSON-encoded); secrets are `vrt secret put` name→ref maps. |
+| [Tail Workers](docs/bindings/tail-workers.md) | 🟡 Partial | `tail_consumers` render as native workerd `tails`; same-tenant, best effort, no streaming tails. |
+| [Worker loaders](docs/bindings/worker-loaders.md) | 🟡 Partial | Native `WorkerLoader` (`get`/`load`, named caches, dynamic entrypoints, DO facets); quota-bounded per loader. |
+
+Platform-wide differences (no edge network, server-minted resource ids,
+structural scale-to-zero, a whitelisted `request.cf`, WebSocket session
+limits) are documented in [`docs/compatibility.md`](docs/compatibility.md).
 
 ## Components
 
@@ -46,7 +109,7 @@ The standalone mode runs the whole stack with one `docker compose up`.
 | `facade/` | TypeScript system workers that expose bindings to user code inside workerd |
 | `contract/` | cross-language contract fixtures (TS ⇄ Rust) and drift checks |
 | `third_party/open-compute` | vendored upstream code (Apache-2.0, see its `LICENSE` and `UPSTREAM.md`) |
-| `deploy/` | Dockerfiles and the standalone Docker Compose stack |
+| `deploy/` | Dockerfiles and the standalone Docker Compose stack (Kubernetes manifests live in `openflare-control`) |
 | `examples/` | example workers: hello, KV + assets, D1, R2, queues, cron, Durable Objects, workflows, wrangler projects |
 
 ## Quick start (Docker, standalone)
@@ -71,6 +134,13 @@ WORKERD_SHA256=$(node -p "JSON.parse(require('fs').readFileSync('deploy/docker/w
 WORKERD_SOURCE=file WORKERD_SHA256=$WORKERD_SHA256 \
   docker compose -f deploy/standalone/docker-compose.yml up --build --wait
 ```
+
+The compose stack is a single-machine quick start (dev/CI), not the
+production topology. Because Docker named volumes share one device, it
+passes the dev-only `vrt init --dev-allow-same-device-durability`
+exemption; production must keep the D1 object store on a separate device
+or use the s3 backend. Use `deploy/standalone/up.sh` in place of the bare
+compose command to get per-service logs when the stack fails to boot.
 
 Deploy the hello example. The management API reads a path local to the
 server, so copy the project into the container first (or deploy from the
@@ -219,6 +289,8 @@ summary in [`docs/compatibility.md`](docs/compatibility.md). Platform error
 codes returned by the ingress are listed in
 [`docs/log-codes.md`](docs/log-codes.md). WebSocket upgrade passthrough is
 described in [`docs/ingress-websocket.md`](docs/ingress-websocket.md).
+Per-worker CPU/memory/subrequest quotas (`limits`) and their cell capability
+bit are described in [`docs/quotas.md`](docs/quotas.md).
 
 ## License
 

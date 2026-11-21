@@ -176,14 +176,8 @@ async fn fetch(
 #[tokio::test]
 async fn get_serves_bytes_with_etag_and_mime() {
     let e = env(&[("/index.html", b"<h1>hi</h1>")], "none", TENANT);
-    let res = fetch(
-        &e.app,
-        &e.digest,
-        "GET",
-        "https://site.example/index.html",
-        &[],
-    )
-    .await;
+    // `/` is the canonical form of `/index.html` under html handling.
+    let res = fetch(&e.app, &e.digest, "GET", "https://site.example/", &[]).await;
     assert_eq!(res.status(), StatusCode::OK);
     let etag = res
         .headers()
@@ -226,13 +220,105 @@ async fn if_none_match_returns_304() {
 }
 
 #[tokio::test]
-async fn directory_without_slash_redirects_308() {
+async fn directory_without_slash_redirects_307() {
     let e = env(&[("/docs/index.html", b"d")], "none", TENANT);
     let res = fetch(&e.app, &e.digest, "GET", "https://x/docs", &[]).await;
-    assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(res.headers().get("location").unwrap(), "/docs/");
     let res = fetch(&e.app, &e.digest, "GET", "https://x/docs/", &[]).await;
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn canonical_redirects_preserve_query_and_encode_reserved_chars() {
+    // `.html` canonicalization keeps the query string (Cloudflare
+    // appends `url.search`) and percent-encodes the destination so a
+    // reserved filename character never turns into a query/fragment.
+    let e = env(
+        &[("/page.html", b"p"), ("/a?b.html", b"q"), ("/a#b.html", b"h")],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/page.html?id=5", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/page?id=5");
+
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%3Fb.html?q=1", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/a%3Fb?q=1");
+    // Following the redirect lands on the same asset.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%3Fb", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"q");
+
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%23b.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/a%23b");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/a%23b", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"h");
+}
+
+/// A decoded `%2F` must never produce a protocol-relative `Location` —
+/// the encoding redirect stays on the application origin, including for
+/// SPA/404 fallback responses.
+#[tokio::test]
+async fn encoded_slashes_never_produce_protocol_relative_redirects() {
+    for nfh in ["single-page-application", "404-page"] {
+        let files: &[(&str, &[u8])] = match nfh {
+            "404-page" => &[("/404.html", b"<h1>nope</h1>")],
+            _ => &[("/index.html", b"spa")],
+        };
+        let e = env(files, nfh, TENANT);
+        let res = fetch(&e.app, &e.digest, "GET", "https://x/%2Fevil.com", &[]).await;
+        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT, "{nfh}");
+        assert_eq!(res.headers().get("location").unwrap(), "/evil.com", "{nfh}");
+        let res = fetch(&e.app, &e.digest, "GET", "https://x//evil.com", &[]).await;
+        assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT, "{nfh}");
+        assert_eq!(res.headers().get("location").unwrap(), "/evil.com", "{nfh}");
+    }
+}
+
+#[tokio::test]
+async fn dotted_html_stems_stay_reachable() {
+    // `/release-1.2.html` canonicalizes to `/release-1.2`, which must
+    // resolve back to the same file (Cloudflare's `safeRedirect`).
+    let e = env(&[("/release-1.2.html", b"r")], "none", TENANT);
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/release-1.2.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/release-1.2");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/release-1.2", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"r");
+}
+
+#[tokio::test]
+async fn overlapping_page_and_directory_routes_keep_both_reachable() {
+    // `/foo.html` and `/foo/index.html` are different pages: each URL
+    // form must keep serving its own content instead of collapsing
+    // onto the `.html` sibling.
+    let e = env(
+        &[("/foo.html", b"page"), ("/foo/index.html", b"index")],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"page");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo/", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"index");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo/index.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/foo/");
+}
+
+#[tokio::test]
+async fn exact_extensionless_index_file_is_served() {
+    let e = env(&[("/api/index", b"bin")], "none", TENANT);
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/api/index", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"bin");
 }
 
 #[tokio::test]
@@ -331,7 +417,9 @@ async fn missing_manifest_is_storage_unavailable() {
 async fn listed_object_missing_is_storage_unavailable() {
     let e = env(&[("/index.html", b"i")], "none", TENANT);
     remove_stored(&e.root, &hex64(b"i"));
-    let res = fetch(&e.app, &e.digest, "GET", "https://x/index.html", &[]).await;
+    // Canonical `/` maps to `/index.html`; the manifest-listed object
+    // is the thing that was removed.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/", &[]).await;
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(code_of(&res), "ASSET_STORAGE_UNAVAILABLE");
 }
@@ -417,6 +505,189 @@ async fn route_index_lists_paths_and_modes() {
         .map(|p| p.as_str().unwrap())
         .collect();
     assert_eq!(paths, vec!["/index.html", "/app.js", "/about.html"]);
+}
+
+#[tokio::test]
+async fn route_index_carries_redirect_sources() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/_redirects", b"/old /new 301\n/blog/* /posts/:splat 302\n"),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = probe(&e.app, "route-index", &e.digest, &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let redirects = v["redirects"].as_array().unwrap();
+    assert_eq!(redirects[0]["source"], "/old");
+    assert_eq!(redirects[0]["status"], 301);
+    assert_eq!(redirects[1]["source"], "/blog/*");
+    // A redirect-only path is fetchable through the probe as well.
+    let hit = probe(
+        &e.app,
+        "can-fetch",
+        &e.digest,
+        &[
+            ("x-open-compute-asset-url", "https://w.test/old"),
+            ("x-open-compute-asset-method", "GET"),
+        ],
+    )
+    .await;
+    let body = axum::body::to_bytes(hit.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"true");
+}
+
+#[tokio::test]
+async fn route_index_carries_routes_json() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            (
+                "/_routes.json",
+                br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = probe(&e.app, "route-index", &e.digest, &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["routes"]["include"][0], "/api/*");
+    assert_eq!(v["routes"]["exclude"][0], "/api/public/*");
+}
+
+async fn can_fetch_body(
+    app: &axum::Router,
+    digest: &str,
+    url: &str,
+    static_routing: bool,
+) -> bool {
+    let mut extra = vec![
+        ("x-open-compute-asset-method", "GET"),
+        ("x-open-compute-asset-url", url),
+    ];
+    if static_routing {
+        extra.push(("x-open-compute-asset-has-static-routing", "true"));
+    }
+    let res = probe(app, "can-fetch", digest, &extra).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    &body[..] == b"true"
+}
+
+/// `_routes.json` (Cloudflare Pages): include invokes the Worker,
+/// exclude wins and serves assets, and a path matching neither list is
+/// served by assets. An explicit `run_worker_first` policy
+/// (`has_static_routing`) takes precedence and the file is ignored.
+#[tokio::test]
+async fn can_fetch_respects_routes_policy() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            (
+                "/_routes.json",
+                br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    // include -> Worker
+    assert!(!can_fetch_body(&e.app, &e.digest, "https://w.test/api/users", false).await);
+    // exclude wins over include -> assets (even when no asset exists)
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/api/public/x", false).await);
+    // unmatched -> assets (Pages default)
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/nope", false).await);
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/index.html", false).await);
+    // explicit routing policy ignores `_routes.json`
+    assert!(!can_fetch_body(&e.app, &e.digest, "https://w.test/api/public/x", true).await);
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/index.html", true).await);
+}
+
+/// `_routes.json` only decides which side answers a path; the asset side
+/// still applies `html_handling`. `/` and `/index.html` both match
+/// neither list, so both are served by assets — but only `/` is the
+/// canonical URL, and `/index.html` gets the 307 that Cloudflare
+/// documents for `auto-trailing-slash`.
+#[tokio::test]
+async fn routes_policy_keeps_html_handling_on_the_asset_side() {
+    let e = env(
+        &[
+            ("/index.html", b"index-body"),
+            (
+                "/_routes.json",
+                br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://w.test/", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"index-body");
+    let res = fetch(&e.app, &e.digest, "GET", "https://w.test/index.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/");
+}
+
+#[tokio::test]
+async fn invalid_routes_json_fails_closed() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/_routes.json", br#"{"version":1,"include":[]}"#),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = probe(&e.app, "route-index", &e.digest, &[]).await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"], "ASSET_STORAGE_UNAVAILABLE");
+    let res = probe(
+        &e.app,
+        "can-fetch",
+        &e.digest,
+        &[
+            ("x-open-compute-asset-method", "GET"),
+            ("x-open-compute-asset-url", "https://w.test/api/users"),
+        ],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn routes_json_is_never_served() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/_routes.json", br#"{"version":1,"include":["/*"]}"#),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/_routes.json", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -639,7 +910,8 @@ async fn percent_encoded_paths_decode_before_match() {
     );
     for url in [
         "http://w.test/my%20file.txt",
-        "http://w.test/%E4%B8%AD%E6%96%87%20page.html",
+        // Canonical stem of `/... page.html` under html handling.
+        "http://w.test/%E4%B8%AD%E6%96%87%20page",
     ] {
         let res = fetch(&e.app, &e.digest, "GET", url, &[]).await;
         assert_eq!(res.status(), StatusCode::OK, "{url}");
@@ -659,4 +931,229 @@ async fn percent_encoded_paths_decode_before_match() {
         .await
         .unwrap();
     assert_eq!(&body[..], b"true");
+}
+
+/// `_redirects` (Cloudflare static-assets): rules apply before asset
+/// resolution, preserve the incoming query, support splats and `200`
+/// proxying, and the file itself is never served.
+#[tokio::test]
+async fn redirects_apply_before_assets_and_are_never_served() {
+    let e = env(
+        &[
+            ("/index.html", b"<h1>hi</h1>"),
+            ("/old", b"asset"),
+            (
+                "/_redirects",
+                b"/old /new 301\n/blog/* https://blog.example.com/:splat\n/proxy /index.html 200\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    // 301 wins over the existing `/old` asset and keeps the query.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/old?q=1", &[]).await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers().get("location").unwrap(), "/new?q=1");
+    // Splat + external destination.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/a/b", &[]).await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(
+        res.headers().get("location").unwrap(),
+        "https://blog.example.com/a/b"
+    );
+    // 200 proxying serves the destination asset.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/proxy", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(body_of(res).await, b"<h1>hi</h1>");
+    // Configuration files are not assets.
+    for path in ["/_redirects", "/_headers"] {
+        let res = fetch(&e.app, &e.digest, "GET", &format!("https://x{path}"), &[]).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(code_of(&res), "ASSET_NOT_FOUND", "{path}");
+    }
+    // Non-matching paths still resolve normally.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/index.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+}
+
+/// `_redirects` capture substitution must not let the request rewrite a
+/// local rule into a cross-origin or configuration-file target.
+#[tokio::test]
+async fn redirects_encode_captures_and_never_proxy_configuration() {
+    let e = env(
+        &[
+            ("/index.html", b"<h1>hi</h1>"),
+            ("/posts/a.html", b"post"),
+            (
+                "/_redirects",
+                b"/en/* /:splat 301\n/blog/* /posts/:splat 302\n/raw/* /:splat 200\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    // `%2F` stays an encoded filename character, not a `//host` prefix.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/en/%2Fevil.com", &[]).await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers().get("location").unwrap(), "/%2Fevil.com");
+
+    // `%3F` stays part of the filename and the query survives.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/a%3Fb?q=1", &[]).await;
+    assert_eq!(res.status(), StatusCode::FOUND);
+    assert_eq!(res.headers().get("location").unwrap(), "/posts/a%3Fb?q=1");
+
+    // A `200` rewrite into `/_redirects` must not serve configuration.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/raw/_redirects", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(code_of(&res), "ASSET_NOT_FOUND");
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/raw/_headers", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+/// `_headers` rules apply to asset responses in file order, including
+/// detach/replace, and the provider enumerates the touched names for the
+/// facade (the facade forwards only those).
+#[tokio::test]
+async fn headers_apply_to_assets_and_detach_replace() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/assets/a.js", b"a"),
+            (
+                "/_headers",
+                b"/*\n  X-Frame-Options: DENY\n  Content-Security-Policy: default-src 'self'\n\n/assets/*\n  ! Content-Security-Policy\n  Cache-Control: public, max-age=60\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/assets/a.js", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("x-frame-options").unwrap(), "DENY");
+    assert!(res.headers().get("content-security-policy").is_none());
+    assert_eq!(
+        res.headers().get("cache-control").unwrap(),
+        "public, max-age=60"
+    );
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-frame-options"), "{names}");
+    assert!(names.contains("content-security-policy"), "{names}");
+    assert!(names.contains("cache-control"), "{names}");
+}
+
+/// Cloudflare `asset-worker/tests/handler.test.ts` — "Custom headers are
+/// applied even to redirect responses": the html-handling 307 carries the
+/// `Location` and the matching `_headers` value together.
+#[tokio::test]
+async fn headers_apply_to_html_handling_redirects() {
+    let e = env(
+        &[
+            ("/foo.html", b"foo"),
+            (
+                "/_headers",
+                b"/*\n  X-Custom-Foo-HTML-Header: Custom-Foo-HTML-Value\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/foo");
+    assert_eq!(
+        res.headers().get("x-custom-foo-html-header").unwrap(),
+        "Custom-Foo-HTML-Value"
+    );
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-custom-foo-html-header"), "{names}");
+}
+
+/// Cloudflare `asset-worker/tests/handler.test.ts` — "Custom headers are
+/// applied even to custom redirect responses": an authored `_redirects`
+/// 301 keeps its `Location` and still gets the `_headers` set/detach
+/// pass. The forbidden-name allowlist keeps applying.
+#[tokio::test]
+async fn headers_apply_to_custom_redirects() {
+    let e = env(
+        &[
+            (
+                "/_headers",
+                b"/*\n  X-Custom-Foo-Header: Custom-Foo-Value\n  X-Stale: set\n  X-Open-Compute-Worker-Id: forged\n/foo\n  ! X-Stale\n",
+            ),
+            ("/_redirects", b"/foo /bar 301\n"),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo", &[]).await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers().get("location").unwrap(), "/bar");
+    assert_eq!(
+        res.headers().get("x-custom-foo-header").unwrap(),
+        "Custom-Foo-Value"
+    );
+    // The later rule detaches the value the first rule set.
+    assert!(res.headers().get("x-stale").is_none());
+    // The forbidden `x-open-compute-*` surface is still unreachable.
+    assert!(res.headers().get("x-open-compute-worker-id").is_none());
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-custom-foo-header"), "{names}");
+    // Detached names are advertised too, so the facade drops the value it
+    // would otherwise have copied from the representation whitelist.
+    assert!(names.contains("x-stale"), "{names}");
+}
+
+/// Cloudflare `asset-worker/tests/handler.test.ts` — "Custom headers are
+/// applied even to not modified responses": a 304 keeps the `ETag` and
+/// the matching `_headers` value.
+#[tokio::test]
+async fn headers_apply_to_not_modified() {
+    let e = env(
+        &[
+            ("/a.txt", b"abc"),
+            (
+                "/_headers",
+                b"/*\n  X-Custom-Foo-Header: Custom-Foo-Value\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let etag = format!("\"{}\"", hex64(b"abc"));
+    let res = fetch(
+        &e.app,
+        &e.digest,
+        "GET",
+        "https://x/a.txt",
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(res.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        res.headers().get("x-custom-foo-header").unwrap(),
+        "Custom-Foo-Value"
+    );
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-custom-foo-header"), "{names}");
 }

@@ -323,6 +323,7 @@ pub fn render(
         wfop_pepper: "g1-gate-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -388,10 +389,10 @@ pub fn render(
     std::fs::write(&cfg, &text).unwrap();
     let args = vrt_host::assemble::experimental_extra_args(
         &params.system_compat_flags,
-        false,
-        has_do,
-        false,
-        false,
+        vrt_host::assemble::ExperimentalNeeds {
+            durable_objects_or_workflows: has_do,
+            ..Default::default()
+        },
     );
     (cfg, ingress_ports, args, text)
 }

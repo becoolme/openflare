@@ -115,6 +115,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // workerd pin carries the fork's `maxWorkers` field) --
         // unconditionally on.
         worker_loader: true,
+        // Per-worker quotas: the workerd pin carries the fork's `limits`
+        // (cpuMs/memoryMb/subRequests) and this vrt-host generation
+        // renders it. Opt-in (`quotas = true` in the controller config)
+        // so the ACK key is off the wire until the control plane's
+        // strict schema knows it; until then declared quota overrides
+        // are refused by the control plane (409, fail closed).
+        quotas: config.quotas,
+        // `analyticsEngine` bindings render AND vrt-host's AeService
+        // ships in this release -- unconditionally on (same reasoning
+        // as `worker_loader`).
+        analytics_engine: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

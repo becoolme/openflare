@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "id": "queues-batch",
+  "binding": "queues",
+  "title": "sendBatch is all-or-nothing and consumer max_concurrency caps concurrent invocations",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/queues/configuration/javascript-apis/ (sendBatch returns one promise for the whole batch; \"When the promise resolves, the messages are confirmed to be written to disk\" -- there is no per-item result, so a rejected call writes nothing)",
+    "https://developers.cloudflare.com/queues/platform/limits/ (message size 128 KB; maximum messages per sendBatch call 100 or 256KB in total)",
+    "https://developers.cloudflare.com/queues/configuration/configure-queues/#consumer-worker-configuration (max_concurrency: \"The maximum number of concurrent consumers allowed to run at once.\")",
+    "vrt-provider/src/queue.rs (producer_batch validates count, per-message size, total size, content type, delay, id and timestamp of every item before rendering the single vrt-sql send request)",
+    "vrt-sql/src/queue.rs (validate_msgs runs over the whole batch before the one transaction; a rejected batch inserts nothing)",
+    "cell-controller/src/queue_dispatch.rs (the per-queue lane claims and dispatches a batch only while inflight < max_concurrency)"
+  ],
+  "steps": [
+    {
+      "name": "reset invocation log",
+      "request": {
+        "method": "POST",
+        "path": "/reset"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "sendBatch with one oversize item is rejected and writes nothing",
+      "request": {
+        "method": "POST",
+        "path": "/batch-partial"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true,
+          "unchanged": true
+        }
+      },
+      "retry": {
+        "timeoutMs": 30000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "a legal batch does persist, so the sink itself is proven",
+      "request": {
+        "method": "POST",
+        "path": "/batch-valid"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "delta": 2
+        }
+      }
+    },
+    {
+      "name": "enqueue three messages for the max_concurrency=1 consumer",
+      "request": {
+        "method": "POST",
+        "path": "/send-conc"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "all three deliver without two invocations overlapping",
+      "request": {
+        "path": "/stats"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "deliveries": 3,
+          "maxOverlap": 1,
+          "bodies": ["c0", "c1", "c2"]
+        }
+      },
+      "retry": {
+        "timeoutMs": 90000,
+        "intervalMs": 2000
+      }
+    }
+  ]
+}

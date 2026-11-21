@@ -69,12 +69,32 @@ standalone `vrt serve` loop (1 s cadence).
 - Wire/message bounds mirror the miniflare broker: ≤ 128,000 B per
   message, ≤ 100 messages and ≤ 288,000 B per batch, delay 0–86,400 s,
   content types `text | json | bytes | v8` (`vrt-sql/src/queue.rs`).
+  `delaySeconds` (and the `X-Msg-Delay-Secs` / per-item `delaySecs`
+  wire field) follows the documented range: a negative or >86,400 value
+  fails the send with a queue error, `0` is the floor and means "no
+  delay", and a delayed message's `Message.timestamp` stays the send
+  time, so the delivery lag is the applied delay
+  (`conformance/cases/queues/queues-basic`).
+- `sendBatch` is all-or-nothing. The provider validates every item
+  (message count, per-message and batch bytes, content type, delay,
+  client-supplied id/timestamp) before it renders the single vrt-sql
+  send request, and `vrt-sql` validates the whole batch before opening
+  the transaction. One invalid item rejects the call and enqueues
+  nothing, matching the single `sendBatch` promise (a resolved call has
+  written the whole batch). See `conformance/cases/queues/queues-batch`.
+- `queues.consumers[].max_concurrency` caps in-flight consumer batches
+  per queue lane: the dispatcher stops claiming and dispatching while
+  `inflight` equals the configured value, so `max_concurrency: 1`
+  serializes handler invocations (`cell-controller/src/queue_dispatch.rs`,
+  `conformance/cases/queues/queues-batch`).
 - Consumer field bounds (validated both at normalize and in the signed
   snapshot): `max_batch_size` 1–100, `max_batch_timeout` 0–60 s,
   `max_retries` 0–100, `retry_delay` 0–86,400 s, `max_concurrency`
   1–1000. `dead_letter_queue` must differ from `queue`.
-- `queues.consumers[].max_concurrency` is honored by the dispatcher; the
-  standalone dispatcher runs on a fixed 1 s tick inside `vrt serve`.
+- An unset `max_concurrency` defaults to 10 in-flight batches on this
+  platform (Cloudflare documents "scale to the currently supported
+  maximum" instead); the standalone dispatcher runs on a fixed 1 s tick
+  inside `vrt serve`.
 
 ## Unsupported keys and error shape
 
@@ -91,6 +111,9 @@ standalone `vrt serve` loop (1 s cadence).
 
 - `examples/standalone-queue` — producer + consumer in one worker with
   `max_batch_size` / `max_batch_timeout`.
+- `conformance/cases/queues/queues-basic` — send/sendBatch, delay bounds.
+- `conformance/cases/queues/queues-batch` — sendBatch atomicity and
+  `max_concurrency` serialization.
 - `facade/test/queue.test.mjs` — facade queue contract tests.
 - `vrt-provider/tests/queue_wire.rs`, `vrt-provider/tests/queue_e2e.rs`
   — provider wire and end-to-end tests.

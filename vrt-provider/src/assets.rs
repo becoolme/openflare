@@ -28,6 +28,9 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
+use crate::assets_headers::{self, HeaderRule};
+use crate::assets_redirects::{self, RedirectAction, RedirectRule};
+use crate::assets_routes::{self, RoutesConfig};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -67,12 +70,18 @@ pub struct AssetFile {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 pub enum HtmlHandling {
-    /// `/foo` → exact → `/foo.html` → `/foo/index.html` (308 to
-    /// `/foo/`); `/foo/` → `/foo/index.html`. Cloudflare-compatible
-    /// subset.
+    /// Individual files are served without a trailing slash, folder
+    /// index files with one; every other form redirects to its
+    /// canonical URL (Cloudflare's `auto-trailing-slash`).
     #[default]
     #[serde(rename = "auto-trailing-slash")]
     AutoTrailingSlash,
+    /// Every HTML route is canonical with a trailing slash.
+    #[serde(rename = "force-trailing-slash")]
+    ForceTrailingSlash,
+    /// Every HTML route is canonical without a trailing slash.
+    #[serde(rename = "drop-trailing-slash")]
+    DropTrailingSlash,
     /// Exact path only.
     #[serde(rename = "none")]
     None,
@@ -97,7 +106,7 @@ pub enum NotFoundHandling {
 pub enum Resolved {
     /// Serve this manifest file entry.
     Serve(AssetFile),
-    /// 308 redirect to this path (directory index without trailing
+    /// 307 redirect to this path (non-canonical HTML route)
     /// slash under `auto-trailing-slash`).
     Redirect(String),
     /// SPA fallback hit — serves `/index.html` under
@@ -151,6 +160,83 @@ fn decode_segment(seg: &str) -> String {
     }
 }
 
+/// Percent-encode one path segment — mirror of Cloudflare's
+/// `encodePath`/`encodeURIComponent` (handler.ts): unreserved ASCII
+/// (`A-Za-z0-9-_.!~*'()`) stays literal, every other byte is
+/// `%XX` (uppercase). Redirect `Location`s are built from decoded
+/// paths, so this is what keeps reserved filename characters
+/// (`?`, `#`, `%`, `/`) meaning "part of the filename".
+fn encode_segment(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for b in seg.bytes() {
+        match b {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'!'
+            | b'~'
+            | b'*'
+            | b'\''
+            | b'('
+            | b')' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Substitute `:name` / `:splat` placeholders in one pass.
+///
+/// Shared by `_redirects` destinations and `_headers` values. Only
+/// complete, longest-match tokens are recognized, and inserted capture
+/// values are never rescanned — so `:id` cannot eat the prefix of
+/// `:id2`, and a captured literal `:other` stays literal.
+pub(crate) fn substitute_placeholders(template: &str, captures: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(idx) = rest.find(':') {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 1..];
+        let name_len = after
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if name_len == 0 {
+            out.push(':');
+            rest = after;
+            continue;
+        }
+        let name = &after[..name_len];
+        match captures.iter().find(|(n, _)| n == name) {
+            Some((_, value)) => out.push_str(value),
+            None => {
+                out.push(':');
+                out.push_str(name);
+            }
+        }
+        rest = &after[name_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `_headers` / `_redirects` / `_routes.json` are configuration, never
+/// served as static assets.
+fn is_config_path(path: &str) -> bool {
+    path == "/_headers" || path == "/_redirects" || path == "/_routes.json"
+}
+
+/// Encode a decoded path segment by segment (Cloudflare `encodePath`).
+pub fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_segment)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Normalize a request path to manifest form: percent-DECODE per
 /// segment first (manifest stores decoded file paths — Miniflare
 /// `decodePath` does the same before lookup), then require leading
@@ -182,6 +268,13 @@ pub fn normalize_asset_path(raw: &str) -> Result<String, ()> {
     if out.is_empty() {
         out.push('/');
     }
+    // Cloudflare `decodePath` collapses repeated slashes after decoding
+    // (`.replace(/\/+/g, "/")`). A decoded `%2F` must not add a second
+    // structural slash: `/%2Fevil.com` is `/evil.com`, never a
+    // protocol-relative `//evil.com` redirect target.
+    while out.contains("//") {
+        out = out.replace("//", "/");
+    }
     Ok(out)
 }
 
@@ -195,41 +288,354 @@ pub fn resolve(manifest: &AssetManifest, path: &str) -> Resolved {
 /// router's canFetch probe forces `none` for non-navigation requests
 /// (Miniflare assets.worker.js canFetch semantics, T31c).
 pub fn resolve_with_nfh(manifest: &AssetManifest, path: &str, nfh: NotFoundHandling) -> Resolved {
-    let find = |p: &str| manifest.files.iter().find(|f| f.path == p).cloned();
-    if let Some(f) = find(path) {
-        return Resolved::Serve(f);
+    match html_intent(manifest, path, nfh, false) {
+        Intent::Serve(asset) => Resolved::Serve(asset),
+        Intent::NotFoundPage(asset) => Resolved::NotFoundPage(asset),
+        Intent::SpaFallback(asset) => Resolved::SpaFallback(asset),
+        Intent::Redirect(target) => Resolved::Redirect(target),
+        Intent::None => Resolved::NotFound,
     }
-    let not_found = |_manifest: &AssetManifest| -> Resolved {
-        match nfh {
-            NotFoundHandling::None => Resolved::NotFound,
-            NotFoundHandling::Page404 => {
-                find("/404.html").map_or(Resolved::NotFound, Resolved::NotFoundPage)
-            }
-            NotFoundHandling::SinglePageApplication => {
-                find("/index.html").map_or(Resolved::NotFound, Resolved::SpaFallback)
-            }
+}
+
+/// One html-handling resolution outcome — a port of
+/// `Intent` in `workers-shared/asset-worker/src/handler.ts`:
+/// either an asset to serve at the requested URL, or the canonical
+/// URL to redirect to.
+enum Intent {
+    None,
+    Serve(AssetFile),
+    NotFoundPage(AssetFile),
+    SpaFallback(AssetFile),
+    Redirect(String),
+}
+
+impl Intent {
+    /// The asset this intent would serve, if any (the redirect
+    /// validator compares assets by content).
+    fn asset(&self) -> Option<&AssetFile> {
+        match self {
+            Intent::Serve(a) | Intent::NotFoundPage(a) | Intent::SpaFallback(a) => Some(a),
+            _ => None,
         }
-    };
+    }
+}
+
+fn find_asset(manifest: &AssetManifest, path: &str) -> Option<AssetFile> {
+    manifest.files.iter().find(|f| f.path == path).cloned()
+}
+
+fn not_found_intent(manifest: &AssetManifest, nfh: NotFoundHandling) -> Intent {
+    match nfh {
+        NotFoundHandling::None => Intent::None,
+        NotFoundHandling::Page404 => {
+            find_asset(manifest, "/404.html").map_or(Intent::None, Intent::NotFoundPage)
+        }
+        NotFoundHandling::SinglePageApplication => {
+            find_asset(manifest, "/index.html").map_or(Intent::None, Intent::SpaFallback)
+        }
+    }
+}
+
+/// Cloudflare `safeRedirect`: only follow a canonical rewrite when the
+/// destination is a free URL AND resolves (without further redirects)
+/// to the very same asset. This keeps `/foo.html` reachable when
+/// `/foo` is a different file, and refuses redirects whose target a
+/// different asset shadows.
+fn safe_redirect(
+    manifest: &AssetManifest,
+    file: &str,
+    dest: &str,
+    nfh: NotFoundHandling,
+    skip: bool,
+) -> Option<String> {
+    if skip || dest.is_empty() || find_asset(manifest, dest).is_some() {
+        return None;
+    }
+    let target = find_asset(manifest, file)?;
+    let intent = html_intent(manifest, dest, nfh, true);
+    let asset = intent.asset()?;
+    (asset.sha256 == target.sha256).then(|| dest.to_string())
+}
+
+/// Mode-dispatching resolution, mirroring Cloudflare's `getIntent`.
+fn html_intent(
+    manifest: &AssetManifest,
+    path: &str,
+    nfh: NotFoundHandling,
+    skip: bool,
+) -> Intent {
     match manifest.html_handling {
-        HtmlHandling::None => not_found(manifest),
-        HtmlHandling::AutoTrailingSlash => {
-            if path.ends_with('/') {
-                // `/foo/` → `/foo/index.html`
-                let index = format!("{path}index.html");
-                return find(&index).map_or_else(|| not_found(manifest), Resolved::Serve);
-            }
-            // `/foo` → `/foo.html` → `/foo/index.html` (redirect)
-            let html = format!("{path}.html");
-            if let Some(f) = find(&html) {
-                return Resolved::Serve(f);
-            }
-            let index = format!("{path}/index.html");
-            if find(&index).is_some() {
-                return Resolved::Redirect(format!("{path}/"));
-            }
-            not_found(manifest)
+        HtmlHandling::None => find_asset(manifest, path)
+            .map_or_else(|| not_found_intent(manifest, nfh), Intent::Serve),
+        HtmlHandling::AutoTrailingSlash => auto_trailing_slash(manifest, path, nfh, skip),
+        HtmlHandling::ForceTrailingSlash => force_trailing_slash(manifest, path, nfh, skip),
+        HtmlHandling::DropTrailingSlash => drop_trailing_slash(manifest, path, nfh, skip),
+    }
+}
+
+/// Strip the literal `suffix` off `path`, keeping whatever precedes it
+/// (`/foo/index` − `index` → `/foo/`, `/index` − `index` → `/`).
+fn strip_keep_prefix<'a>(path: &'a str, suffix: &str) -> &'a str {
+    &path[..path.len() - suffix.len()]
+}
+
+/// `auto-trailing-slash` — row for row from Cloudflare's
+/// `htmlHandlingAutoTrailingSlash`.
+fn auto_trailing_slash(
+    manifest: &AssetManifest,
+    path: &str,
+    nfh: NotFoundHandling,
+    skip: bool,
+) -> Intent {
+    let exact = find_asset(manifest, path);
+    if path.ends_with("/index") {
+        // A binary file literally named `/index` wins; only then are
+        // the `.html` aliases considered.
+        if let Some(f) = exact.clone() {
+            return Intent::Serve(f);
+        }
+        let dir = strip_keep_prefix(path, "index"); // `/foo/` or `/`
+        if let Some(dest) = safe_redirect(manifest, &format!("{path}.html"), dir, nfh, skip) {
+            return Intent::Redirect(dest); // /foo/index.html → /foo/
+        }
+        let stem = dir.trim_end_matches('/');
+        if let Some(dest) =
+            safe_redirect(manifest, &format!("{stem}.html"), stem, nfh, skip)
+        {
+            return Intent::Redirect(dest); // /foo.html → /foo
+        }
+    } else if path.ends_with("/index.html") {
+        let dir = strip_keep_prefix(path, "index.html"); // `/foo/` or `/`
+        if let Some(dest) = safe_redirect(manifest, path, dir, nfh, skip) {
+            return Intent::Redirect(dest); // /foo/index.html → /foo/
+        }
+        let stem = dir.trim_end_matches('/');
+        if let Some(dest) =
+            safe_redirect(manifest, &format!("{stem}.html"), stem, nfh, skip)
+        {
+            return Intent::Redirect(dest); // /foo.html → /foo
+        }
+    } else if path.ends_with('/') {
+        if let Some(f) = find_asset(manifest, &format!("{path}index.html")) {
+            return Intent::Serve(f);
+        }
+        let stem = path.trim_end_matches('/');
+        if let Some(dest) =
+            safe_redirect(manifest, &format!("{stem}.html"), stem, nfh, skip)
+        {
+            return Intent::Redirect(dest); // /foo/ → /foo
+        }
+    } else if let Some(stem) = path.strip_suffix(".html") {
+        if let Some(dest) = safe_redirect(manifest, path, stem, nfh, skip) {
+            return Intent::Redirect(dest); // /foo.html → /foo
+        }
+        if let Some(dest) = safe_redirect(
+            manifest,
+            &format!("{stem}/index.html"),
+            &format!("{stem}/"),
+            nfh,
+            skip,
+        ) {
+            return Intent::Redirect(dest); // /foo.html → /foo/
         }
     }
+    // Any path also resolves through its own `.html` / `/index.html`
+    // aliases — this is what makes dotted stems (`/release-1.2` →
+    // `/release-1.2.html`) and exact extensionless files reachable.
+    if let Some(f) = exact {
+        return Intent::Serve(f);
+    }
+    if let Some(f) = find_asset(manifest, &format!("{path}.html")) {
+        return Intent::Serve(f);
+    }
+    if let Some(dest) = safe_redirect(
+        manifest,
+        &format!("{path}/index.html"),
+        &format!("{path}/"),
+        nfh,
+        skip,
+    ) {
+        return Intent::Redirect(dest);
+    }
+    not_found_intent(manifest, nfh)
+}
+
+/// `force-trailing-slash` — Cloudflare's
+/// `htmlHandlingForceTrailingSlash`.
+fn force_trailing_slash(
+    manifest: &AssetManifest,
+    path: &str,
+    nfh: NotFoundHandling,
+    skip: bool,
+) -> Intent {
+    let exact = find_asset(manifest, path);
+    if path.ends_with("/index") {
+        if let Some(f) = exact.clone() {
+            return Intent::Serve(f);
+        }
+        let dir = strip_keep_prefix(path, "index"); // `/foo/` or `/`
+        if let Some(dest) = safe_redirect(manifest, &format!("{path}.html"), dir, nfh, skip) {
+            return Intent::Redirect(dest);
+        }
+        let stem = dir.trim_end_matches('/');
+        if let Some(dest) =
+            safe_redirect(manifest, &format!("{stem}.html"), dir, nfh, skip)
+        {
+            return Intent::Redirect(dest);
+        }
+    } else if path.ends_with("/index.html") {
+        let dir = strip_keep_prefix(path, "index.html"); // `/foo/` or `/`
+        if let Some(dest) = safe_redirect(manifest, path, dir, nfh, skip) {
+            return Intent::Redirect(dest);
+        }
+        let stem = dir.trim_end_matches('/');
+        if let Some(dest) =
+            safe_redirect(manifest, &format!("{stem}.html"), dir, nfh, skip)
+        {
+            return Intent::Redirect(dest);
+        }
+    } else if path.ends_with('/') {
+        if let Some(f) = find_asset(manifest, &format!("{path}index.html")) {
+            return Intent::Serve(f);
+        }
+        let stem = path.trim_end_matches('/');
+        if let Some(f) = find_asset(manifest, &format!("{stem}.html")) {
+            return Intent::Serve(f);
+        }
+    } else if let Some(stem) = path.strip_suffix(".html") {
+        let slashed = format!("{stem}/");
+        if let Some(dest) = safe_redirect(manifest, path, &slashed, nfh, skip) {
+            return Intent::Redirect(dest);
+        }
+        // Both `/foo.html` and `/foo/index.html` exist: the rewrite
+        // would land on the index, so serve the exact file here only.
+        if let Some(f) = exact.clone() {
+            return Intent::Serve(f);
+        }
+        if let Some(dest) = safe_redirect(
+            manifest,
+            &format!("{stem}/index.html"),
+            &slashed,
+            nfh,
+            skip,
+        ) {
+            return Intent::Redirect(dest);
+        }
+    }
+    if let Some(f) = exact {
+        return Intent::Serve(f);
+    }
+    let slashed = format!("{path}/");
+    if let Some(dest) = safe_redirect(manifest, &format!("{path}.html"), &slashed, nfh, skip) {
+        return Intent::Redirect(dest);
+    }
+    if let Some(dest) = safe_redirect(
+        manifest,
+        &format!("{path}/index.html"),
+        &slashed,
+        nfh,
+        skip,
+    ) {
+        return Intent::Redirect(dest);
+    }
+    not_found_intent(manifest, nfh)
+}
+
+/// `drop-trailing-slash` — Cloudflare's
+/// `htmlHandlingDropTrailingSlash`.
+fn drop_trailing_slash(
+    manifest: &AssetManifest,
+    path: &str,
+    nfh: NotFoundHandling,
+    skip: bool,
+) -> Intent {
+    let exact = find_asset(manifest, path);
+    if path.ends_with("/index") {
+        if let Some(f) = exact.clone() {
+            return Intent::Serve(f);
+        }
+        let stem = strip_keep_prefix(path, "/index"); // `/foo` or ``
+        if stem.is_empty() {
+            // `/index` → `/`
+            if let Some(dest) = safe_redirect(manifest, "/index.html", "/", nfh, skip) {
+                return Intent::Redirect(dest);
+            }
+        } else {
+            if let Some(dest) =
+                safe_redirect(manifest, &format!("{stem}.html"), stem, nfh, skip)
+            {
+                return Intent::Redirect(dest);
+            }
+            if let Some(dest) =
+                safe_redirect(manifest, &format!("{path}.html"), stem, nfh, skip)
+            {
+                return Intent::Redirect(dest);
+            }
+        }
+    } else if path.ends_with("/index.html") {
+        if path == "/index.html" {
+            // Never drop the root slash.
+            if let Some(dest) = safe_redirect(manifest, "/index.html", "/", nfh, skip) {
+                return Intent::Redirect(dest);
+            }
+        } else {
+            let stem = strip_keep_prefix(path, "/index.html");
+            if let Some(dest) = safe_redirect(manifest, path, stem, nfh, skip) {
+                return Intent::Redirect(dest);
+            }
+            // Both files exist: the rewrite would serve `/foo.html`, so
+            // `/foo/index.html` stays reachable at its exact URL.
+            if let Some(f) = exact.clone() {
+                return Intent::Serve(f);
+            }
+            if let Some(dest) =
+                safe_redirect(manifest, &format!("{stem}.html"), stem, nfh, skip)
+            {
+                return Intent::Redirect(dest);
+            }
+        }
+    } else if path.ends_with('/') {
+        if path == "/" {
+            if let Some(f) = find_asset(manifest, "/index.html") {
+                return Intent::Serve(f);
+            }
+        } else {
+            let stem = path.trim_end_matches('/');
+            if let Some(dest) =
+                safe_redirect(manifest, &format!("{stem}.html"), stem, nfh, skip)
+            {
+                return Intent::Redirect(dest);
+            }
+            if let Some(dest) =
+                safe_redirect(manifest, &format!("{stem}/index.html"), stem, nfh, skip)
+            {
+                return Intent::Redirect(dest);
+            }
+        }
+    } else if let Some(stem) = path.strip_suffix(".html") {
+        if let Some(dest) = safe_redirect(manifest, path, stem, nfh, skip) {
+            return Intent::Redirect(dest);
+        }
+        if let Some(dest) = safe_redirect(
+            manifest,
+            &format!("{stem}/index.html"),
+            stem,
+            nfh,
+            skip,
+        ) {
+            return Intent::Redirect(dest);
+        }
+    }
+    if let Some(f) = exact {
+        return Intent::Serve(f);
+    }
+    if let Some(f) = find_asset(manifest, &format!("{path}.html")) {
+        return Intent::Serve(f);
+    }
+    if let Some(f) = find_asset(manifest, &format!("{path}/index.html")) {
+        return Intent::Serve(f);
+    }
+    not_found_intent(manifest, nfh)
 }
 
 /// Content-addressed asset store rooted at `dir` (provider-shared with
@@ -238,6 +644,20 @@ pub fn resolve_with_nfh(manifest: &AssetManifest, path: &str, nfh: NotFoundHandl
 #[derive(Debug, Clone)]
 pub struct AssetStore {
     root: PathBuf,
+    /// Parsed `_redirects` per (tenant, file digest) — a manifest's rules
+    /// are immutable, so the cache is keyed by content hash. Bounded by a
+    /// clear-on-overflow policy (manifests churn slowly).
+    redirect_cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<RedirectRule>>>>,
+    >,
+    /// Parsed `_headers` per (tenant, file digest), same policy.
+    header_cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<HeaderRule>>>>,
+    >,
+    /// Parsed `_routes.json` per (tenant, file digest), same policy.
+    route_cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<RoutesConfig>>>,
+    >,
 }
 
 fn is_lower_hex(value: &str, bytes: usize) -> bool {
@@ -258,6 +678,15 @@ impl AssetStore {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            redirect_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            header_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            route_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         })
     }
 
@@ -343,6 +772,139 @@ impl AssetStore {
             return Err("object digest mismatch (poisoned store)".into());
         }
         Ok(Some(bytes))
+    }
+
+    /// Load + parse the manifest's `/_redirects` file. `None` when the
+    /// manifest has no such file. The parsed rules are immutable for a
+    /// content digest and cached; an unreadable/oversized file is an
+    /// error (fail closed — routing must not silently ignore redirects).
+    pub fn redirect_rules(
+        &self,
+        tenant: &str,
+        manifest: &AssetManifest,
+    ) -> Result<Option<std::sync::Arc<Vec<RedirectRule>>>, String> {
+        let Some(file) = manifest.files.iter().find(|f| f.path == "/_redirects") else {
+            return Ok(None);
+        };
+        if file.size as usize > assets_redirects::MAX_FILE_BYTES {
+            return Err("_redirects exceeds the parse cap".into());
+        }
+        let key = format!("{tenant}:{}", file.sha256);
+        {
+            let cache = self
+                .redirect_cache
+                .lock()
+                .map_err(|_| "redirect cache poisoned".to_string())?;
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Some(hit.clone()));
+            }
+        }
+        let Some(bytes) = self.object(tenant, file)? else {
+            return Err("_redirects object missing from the store".into());
+        };
+        if bytes.len() > assets_redirects::MAX_FILE_BYTES {
+            return Err("_redirects exceeds the parse cap".into());
+        }
+        let text =
+            String::from_utf8(bytes).map_err(|_| "_redirects is not valid UTF-8".to_string())?;
+        let rules = std::sync::Arc::new(assets_redirects::parse_redirects(&text));
+        let mut cache = self
+            .redirect_cache
+            .lock()
+            .map_err(|_| "redirect cache poisoned".to_string())?;
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, rules.clone());
+        Ok(Some(rules))
+    }
+
+    /// Load + parse the manifest's `/_headers` file. `None` when absent;
+    /// unreadable/oversized is an error (fail closed).
+    pub fn header_rules(
+        &self,
+        tenant: &str,
+        manifest: &AssetManifest,
+    ) -> Result<Option<std::sync::Arc<Vec<HeaderRule>>>, String> {
+        let Some(file) = manifest.files.iter().find(|f| f.path == "/_headers") else {
+            return Ok(None);
+        };
+        if file.size as usize > assets_headers::MAX_FILE_BYTES {
+            return Err("_headers exceeds the parse cap".into());
+        }
+        let key = format!("{tenant}:{}", file.sha256);
+        {
+            let cache = self
+                .header_cache
+                .lock()
+                .map_err(|_| "header cache poisoned".to_string())?;
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Some(hit.clone()));
+            }
+        }
+        let Some(bytes) = self.object(tenant, file)? else {
+            return Err("_headers object missing from the store".into());
+        };
+        if bytes.len() > assets_headers::MAX_FILE_BYTES {
+            return Err("_headers exceeds the parse cap".into());
+        }
+        let text =
+            String::from_utf8(bytes).map_err(|_| "_headers is not valid UTF-8".to_string())?;
+        let rules = std::sync::Arc::new(assets_headers::parse_headers(&text));
+        let mut cache = self
+            .header_cache
+            .lock()
+            .map_err(|_| "header cache poisoned".to_string())?;
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, rules.clone());
+        Ok(Some(rules))
+    }
+
+    /// Load + parse the manifest's `/_routes.json` invocation policy.
+    /// `None` when absent; unreadable/oversized/invalid is an error —
+    /// routing must never silently ignore a policy that decides whether
+    /// the user Worker runs (fail closed).
+    pub fn route_rules(
+        &self,
+        tenant: &str,
+        manifest: &AssetManifest,
+    ) -> Result<Option<std::sync::Arc<RoutesConfig>>, String> {
+        let Some(file) = manifest.files.iter().find(|f| f.path == "/_routes.json") else {
+            return Ok(None);
+        };
+        if file.size as usize > assets_routes::MAX_FILE_BYTES {
+            return Err("_routes.json exceeds the parse cap".into());
+        }
+        let key = format!("{tenant}:{}", file.sha256);
+        {
+            let cache = self
+                .route_cache
+                .lock()
+                .map_err(|_| "route cache poisoned".to_string())?;
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Some(hit.clone()));
+            }
+        }
+        let Some(bytes) = self.object(tenant, file)? else {
+            return Err("_routes.json object missing from the store".into());
+        };
+        if bytes.len() > assets_routes::MAX_FILE_BYTES {
+            return Err("_routes.json exceeds the parse cap".into());
+        }
+        let routes = std::sync::Arc::new(
+            assets_routes::parse_routes(&bytes).map_err(|e| format!("_routes.json: {e}"))?,
+        );
+        let mut cache = self
+            .route_cache
+            .lock()
+            .map_err(|_| "route cache poisoned".to_string())?;
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, routes.clone());
+        Ok(Some(routes))
     }
 
     /// Write object bytes after verifying `sha256(bytes) == digest`;
@@ -529,6 +1091,51 @@ fn typed(code: &'static str, status: StatusCode) -> Response<Body> {
     crate::error::error_response(code, status, true, false)
 }
 
+/// Internal response header that lists the header names `_headers`
+/// touched (set or detached). The assets facade forwards exactly these
+/// names — never arbitrary backend headers — after stripping the
+/// internal prefix. Bounded to keep the value small.
+pub const CUSTOM_HEADER_NAMES: &str = "x-open-compute-asset-header-names";
+/// Same bounds the deployment validator enforces
+/// (`assets_headers::validate_file`), so an accepted `_headers` can
+/// never make the forwarding list overflow here.
+const MAX_CUSTOM_HEADER_NAMES: usize = assets_headers::MAX_FORWARDED_NAMES;
+const MAX_CUSTOM_HEADER_NAME_BYTES: usize = assets_headers::MAX_FORWARDED_NAME_BYTES;
+
+/// Apply the manifest's `_headers` to one response, then advertise the
+/// touched names for the facade.
+///
+/// Cloudflare applies `_headers` to *every* response its asset handler
+/// produces — `attachCustomHeaders` is the single return of
+/// `handleRequest` (`asset-worker/src/handler.ts:324-364`), so served
+/// assets, 304s, html-handling 307s and authored `_redirects` 3xx are
+/// all covered. "Redirects are applied before headers" describes the
+/// routing order, not the set of responses the header rules reach.
+fn apply_header_rules(response: &mut Response<Body>, rules: &[HeaderRule], path: &str) {
+    let names = assets_headers::apply_headers(rules, path, response.headers_mut());
+    attach_custom_header_names(response, names);
+}
+
+fn attach_custom_header_names(response: &mut Response<Body>, names: Vec<String>) {
+    if names.is_empty() {
+        return;
+    }
+    let joined = names.join(",");
+    if names.len() > MAX_CUSTOM_HEADER_NAMES || joined.len() > MAX_CUSTOM_HEADER_NAME_BYTES {
+        // Deployment validation rejects such a file, so this only fires
+        // for a manifest published before validation existed.
+        tracing::warn!(
+            names = names.len(),
+            bytes = joined.len(),
+            "assets: _headers names list over the forwarding bound; dropping it"
+        );
+        return;
+    }
+    if let Ok(value) = HeaderValue::from_str(&joined) {
+        response.headers_mut().insert(CUSTOM_HEADER_NAMES, value);
+    }
+}
+
 /// `POST /internal/assets/v1/fetch` — identity is already authorized
 /// by the caller (`BindingContext`); this resolves + serves the bytes.
 pub fn fetch(
@@ -554,7 +1161,17 @@ pub fn fetch(
         );
     }
     let url = header_str("x-open-compute-asset-url").unwrap_or_default();
-    let raw_path = url.split(['?', '#']).next().unwrap_or_default();
+    // `search` (with `?`) is carried through html-handling redirects
+    // verbatim — Cloudflare appends the original `url.search` to its
+    // encoded destination — and `_redirects` forwards `query` when the
+    // destination does not carry its own. A fragment never reaches the
+    // origin.
+    let url = url.split('#').next().unwrap_or_default();
+    let (raw_path, search) = match url.find('?') {
+        Some(i) => (&url[..i], &url[i..]),
+        None => (url, ""),
+    };
+    let query = search.strip_prefix('?').filter(|q| !q.is_empty());
     let raw_path = raw_path
         .find("://")
         .map(|i| {
@@ -585,25 +1202,139 @@ pub fn fetch(
     };
     // B12: outcome label decided by the resolution + served status.
     let worker_id = crate::metrics::worker_label(request);
-    let resolved = resolve(&manifest, &path);
-    let outcome = match &resolved {
-        Resolved::SpaFallback(_) => "spa_fallback",
-        Resolved::Redirect(_) => "redirect",
-        Resolved::NotFound => "not_found",
-        Resolved::Serve(_) => "hit",
-        Resolved::NotFoundPage(_) => "not_found",
+    // `_headers` / `_redirects` are configuration files: Cloudflare
+    // never serves them.
+    if is_config_path(&path) {
+        crate::metrics::assets_outcome(&worker_id, "not_found");
+        return typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND);
+    }
+    let redirect_rules = match store.redirect_rules(tenant, &manifest) {
+        Ok(rules) => rules,
+        Err(e) => {
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "assets fetch: _redirects unreadable"
+            );
+            crate::metrics::assets_outcome(&worker_id, "error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let header_rules = match store.header_rules(tenant, &manifest) {
+        Ok(rules) => rules,
+        Err(e) => {
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "assets fetch: _headers unreadable"
+            );
+            crate::metrics::assets_outcome(&worker_id, "error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    // `_redirects` matches the RAW (still percent-encoded) request path:
+    // captures are inserted into `Location` verbatim, so an encoded `/`
+    // (`%2F`), `?` (`%3F`) or `#` (`%23`) keeps its filename meaning
+    // instead of turning into a separator, query or fragment.
+    let mut proxied = false;
+    let resolved = match redirect_rules
+        .as_deref()
+        .and_then(|rules| assets_redirects::match_redirect(rules, raw_path, query))
+    {
+        Some(RedirectAction::Redirect { status, location }) => {
+            let Ok(code) = StatusCode::from_u16(status) else {
+                crate::metrics::assets_outcome(&worker_id, "error");
+                return typed("ASSET_INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            let Ok(location) = HeaderValue::from_str(&location) else {
+                crate::metrics::assets_outcome(&worker_id, "error");
+                return typed("ASSET_INTERNAL_ERROR", StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            let mut r = Response::new(Body::empty());
+            *r.status_mut() = code;
+            r.headers_mut().insert(header::LOCATION, location);
+            // Cloudflare routes the authored redirect through the same
+            // `attachCustomHeaders` tail, so `_headers` applies here too.
+            if let Some(rules) = header_rules.as_deref() {
+                apply_header_rules(&mut r, rules, &path);
+            }
+            crate::metrics::assets_outcome(&worker_id, "redirect");
+            return r;
+        }
+        // `200` proxying: serve a same-manifest path, never recursing
+        // through the redirect table again. A missing target is a 404,
+        // not the manifest's not-found fallback.
+        Some(RedirectAction::Proxy(target)) => {
+            proxied = true;
+            // The destination is an internal path, not a client request:
+            // decode it (manifest paths are decoded), apply the same
+            // configuration-file exclusion as for the request path, and
+            // serve an exact file as-is (no `.html` canonical redirect).
+            match normalize_asset_path(&target) {
+                Ok(target) if !is_config_path(&target) => {
+                    match manifest.files.iter().find(|f| f.path == target) {
+                        Some(file) => Resolved::Serve(file.clone()),
+                        None => resolve_with_nfh(&manifest, &target, NotFoundHandling::None),
+                    }
+                }
+                _ => Resolved::NotFound,
+            }
+        }
+        None => resolve(&manifest, &path),
+    };
+    // Cloudflare re-encodes the canonical path and redirects when it
+    // differs from the request pathname (`/a b.txt` → `/a%20b.txt`),
+    // combined with html-handling so a request only redirects once. A
+    // `200` rewrite keeps the client URL untouched.
+    let canonical_path = encode_path(&path);
+    let needs_encode_redirect = !proxied
+        && !raw_path.is_empty()
+        && canonical_path != raw_path
+        && !matches!(resolved, Resolved::NotFound | Resolved::Redirect(_));
+    let redirect_location = |target: &str| {
+        let mut r = Response::new(Body::empty());
+        // Cloudflare's html-handling redirects are 307 (method and
+        // body preserved), not 308.
+        *r.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+        // Every html-handling target is origin-relative; never emit a
+        // protocol-relative (`//host`) Location, which a browser would
+        // resolve against the network path.
+        let target = if target.starts_with("//") {
+            format!("/{}", target.trim_start_matches('/'))
+        } else {
+            target.to_string()
+        };
+        let location = format!("{target}{search}");
+        if let Ok(v) = HeaderValue::from_str(&location) {
+            r.headers_mut().insert(header::LOCATION, v);
+        }
+        r
+    };
+    let outcome = if needs_encode_redirect {
+        "redirect"
+    } else {
+        match &resolved {
+            Resolved::SpaFallback(_) => "spa_fallback",
+            Resolved::Redirect(_) => "redirect",
+            Resolved::NotFound => "not_found",
+            Resolved::Serve(_) => "hit",
+            Resolved::NotFoundPage(_) => "not_found",
+        }
     };
     let is_404_page = matches!(resolved, Resolved::NotFoundPage(_));
-    let response = match resolved {
-        Resolved::Redirect(to) => {
-            let mut r = Response::new(Body::empty());
-            *r.status_mut() = StatusCode::PERMANENT_REDIRECT;
-            if let Ok(v) = HeaderValue::from_str(&to) {
-                r.headers_mut().insert(header::LOCATION, v);
-            }
-            r
-        }
+    // Cloudflare's `attachCustomHeaders` tail covers every asset response,
+    // including html-handling 307s (`handler.test.ts` "Custom headers are
+    // applied even to redirect responses"). Only the typed protocol 404 —
+    // an internal error surface, not an asset response — bypasses it.
+    let header_applicable = !matches!(resolved, Resolved::NotFound);
+    let mut response = match resolved {
+        Resolved::Redirect(to) => redirect_location(&encode_path(&to)),
         Resolved::NotFound => typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND),
+        Resolved::Serve(_) | Resolved::SpaFallback(_) | Resolved::NotFoundPage(_)
+            if needs_encode_redirect =>
+        {
+            redirect_location(&canonical_path)
+        }
         Resolved::Serve(file) | Resolved::SpaFallback(file) | Resolved::NotFoundPage(file) => {
             let bytes = match store.object(tenant, &file) {
                 Ok(Some(b)) => b,
@@ -638,6 +1369,9 @@ pub fn fetch(
                 if let Ok(v) = HeaderValue::from_str(&etag) {
                     r.headers_mut().insert(header::ETAG, v);
                 }
+                if let Some(rules) = header_rules.as_deref() {
+                    apply_header_rules(&mut r, rules, &path);
+                }
                 crate::metrics::assets_outcome(&worker_id, "not_modified");
                 return r;
             }
@@ -659,6 +1393,11 @@ pub fn fetch(
             r
         }
     };
+    if header_applicable {
+        if let Some(rules) = header_rules.as_deref() {
+            apply_header_rules(&mut response, rules, &path);
+        }
+    }
     if matches!(response.status(), StatusCode::NOT_FOUND) && outcome == "not_found" {
         crate::metrics::assets_outcome(&worker_id, "not_found");
     } else if !response.status().is_success() && !response.status().is_redirection() {
@@ -690,6 +1429,8 @@ fn nfh_wire(nfh: NotFoundHandling) -> &'static str {
 fn html_wire(html: HtmlHandling) -> &'static str {
     match html {
         HtmlHandling::AutoTrailingSlash => "auto-trailing-slash",
+        HtmlHandling::ForceTrailingSlash => "force-trailing-slash",
+        HtmlHandling::DropTrailingSlash => "drop-trailing-slash",
         HtmlHandling::None => "none",
     }
 }
@@ -745,11 +1486,65 @@ pub fn route_index(
             .iter()
             .map(|f| f.path.len() + 8)
             .sum::<usize>();
+    // `_routes.json` decides whether the router invokes the user Worker
+    // at all. An unreadable/invalid policy fails closed: the router must
+    // never guess a side for the request.
+    let routes = match store.route_rules(tenant, &manifest) {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "assets route-index: _routes.json unreadable"
+            );
+            crate::metrics::assets_outcome(&worker_id, "route_error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let redirects = match store.redirect_rules(tenant, &manifest) {
+        Ok(rules) => rules,
+        Err(_) => {
+            crate::metrics::assets_outcome(&worker_id, "route_error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let redirect_entries: Vec<serde_json::Value> = redirects
+        .as_deref()
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|r| serde_json::json!({"source": r.source, "status": r.status}))
+                .collect()
+        })
+        .unwrap_or_default();
+    let approx_bytes = approx_bytes
+        + redirect_entries
+            .iter()
+            .map(|v| v.to_string().len())
+            .sum::<usize>()
+        + routes
+            .as_deref()
+            .map(|r| {
+                r.include
+                    .iter()
+                    .chain(r.exclude.iter())
+                    .map(|s| s.len() + 4)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
     let too_large =
         manifest.files.len() > MAX_ROUTE_INDEX_PATHS || approx_bytes > MAX_ROUTE_INDEX_BYTES;
+    // Rules are tiny compared to the path list, so they ride along even
+    // when the paths degrade to `tooLarge`: routing still needs them.
+    let routes_doc = routes.as_deref().map(|r| {
+        serde_json::json!({
+            "include": r.include,
+            "exclude": r.exclude,
+        })
+    });
     // E3: every response names the manifest it describes — the router
     // refuses an index whose digest does not match its cfg binding.
-    let body_doc = if too_large {
+    let mut body_doc = if too_large {
         serde_json::json!({
             "htmlHandling": html_wire(manifest.html_handling),
             "notFoundHandling": nfh_wire(manifest.not_found_handling),
@@ -763,8 +1558,12 @@ pub fn route_index(
             "notFoundHandling": nfh_wire(manifest.not_found_handling),
             "manifestDigest": manifest_digest,
             "paths": paths,
+            "redirects": redirect_entries,
         })
     };
+    if let (Some(doc), Some(routes)) = (body_doc.as_object_mut(), routes_doc) {
+        doc.insert("routes".into(), routes);
+    }
     let body = match serde_json::to_vec(&body_doc) {
         Ok(b) => b,
         Err(_) => {
@@ -830,8 +1629,59 @@ pub fn can_fetch(
             Err(()) => false,
             Ok(path) => match store.manifest(tenant, manifest_digest) {
                 Ok(Some(manifest)) => {
-                    let nfh = probe_nfh(&manifest, has_static_routing, navigate);
-                    !matches!(resolve_with_nfh(&manifest, &path, nfh), Resolved::NotFound)
+                    if is_config_path(&path) {
+                        false
+                    } else {
+                        // `_routes.json` decides invocation directly when
+                        // no explicit `run_worker_first` policy is active
+                        // (has_static_routing). It matches the raw path, the
+                        // same input the router matches; an invalid policy
+                        // fails closed instead of guessing a side.
+                        let routes = match store.route_rules(tenant, &manifest) {
+                            Ok(routes) => routes,
+                            Err(_) => {
+                                crate::metrics::assets_outcome(&worker_id, "route_error");
+                                return typed(
+                                    "ASSET_STORAGE_UNAVAILABLE",
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                );
+                            }
+                        };
+                        let routed = if has_static_routing {
+                            None
+                        } else {
+                            routes
+                                .as_deref()
+                                .map(|routes| !routes.worker_first(raw_path))
+                        };
+                        if let Some(assets) = routed {
+                            assets
+                        } else {
+                            // Redirect rules match the raw request path, the
+                            // same input `fetch` gives them.
+                            let redirect_hit = match store.redirect_rules(tenant, &manifest) {
+                                Ok(rules) => rules.as_deref().is_some_and(|rules| {
+                                    assets_redirects::match_redirect(rules, raw_path, None).is_some()
+                                }),
+                                Err(_) => {
+                                    crate::metrics::assets_outcome(&worker_id, "route_error");
+                                    return typed(
+                                        "ASSET_STORAGE_UNAVAILABLE",
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                    );
+                                }
+                            };
+                            if redirect_hit {
+                                true
+                            } else {
+                                let nfh = probe_nfh(&manifest, has_static_routing, navigate);
+                                !matches!(
+                                    resolve_with_nfh(&manifest, &path, nfh),
+                                    Resolved::NotFound
+                                )
+                            }
+                        }
+                    }
                 }
                 Ok(None) => {
                     crate::metrics::assets_outcome(&worker_id, "route_error");
@@ -893,6 +1743,10 @@ mod normalize_tests {
         assert_eq!(normalize_asset_path("/x%").unwrap(), "/x%");
         // Decoded '/' becomes a real separator (collapse semantics).
         assert_eq!(normalize_asset_path("/a%2Fb.txt").unwrap(), "/a/b.txt");
+        // ...including at the start: a decoded `%2F` never yields a
+        // second structural slash (`//host` = protocol-relative URL).
+        assert_eq!(normalize_asset_path("/%2Fevil.com").unwrap(), "/evil.com");
+        assert_eq!(normalize_asset_path("//evil.com").unwrap(), "/evil.com");
         // Decoded traversal / NUL / backslash still fail closed.
         assert!(normalize_asset_path("/%2e%2e/etc").is_err());
         assert!(normalize_asset_path("/%00").is_err());
@@ -1053,5 +1907,255 @@ mod gc_sweep_tests {
             "objects kept — poisoned kept manifest fails closed"
         );
         assert_eq!(rep.objects_deleted, 0);
+    }
+}
+
+#[cfg(test)]
+mod html_handling_tests {
+    //! Cloudflare's four `html_handling` modes, row for row from the
+    //! `workers-shared-asset-config` fixture
+    //! (`test-cases/html-handling-test-cases.ts`) and
+    //! `asset-worker/src/handler.ts`.
+    use super::*;
+
+    fn f(path: &str) -> AssetFile {
+        AssetFile {
+            path: path.to_string(),
+            // Distinct content per path — `safe_redirect` compares
+            // assets by digest, exactly like Cloudflare's eTag check.
+            sha256: sha256_hex(path.as_bytes()),
+            size: 1,
+            mime: "text/html".to_string(),
+        }
+    }
+
+    fn manifest(html: HtmlHandling, files: &[&str]) -> AssetManifest {
+        AssetManifest {
+            files: files.iter().map(|p| f(p)).collect(),
+            html_handling: html,
+            not_found_handling: NotFoundHandling::None,
+        }
+    }
+
+    fn serve(path: &str) -> Resolved {
+        Resolved::Serve(f(path))
+    }
+
+    fn redirect(path: &str) -> Resolved {
+        Resolved::Redirect(path.to_string())
+    }
+
+    fn check(mode: HtmlHandling, files: &[&str], cases: &[(&str, Resolved)]) {
+        for (req, want) in cases {
+            assert_eq!(
+                resolve_with_nfh(&manifest(mode, files), req, NotFoundHandling::None),
+                *want,
+                "{mode:?} {files:?} {req}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_trailing_slash_matches_cloudflare() {
+        use HtmlHandling::AutoTrailingSlash as M;
+        check(M, &["/index.html"], &[
+            ("/index.html", redirect("/")),
+            ("/index", redirect("/")),
+            ("/", serve("/index.html")),
+        ]);
+        // `/both.html` and `/both/index.html` both exist: each request
+        // form serves its own file, and only canonicalizes when the
+        // destination resolves to that same file.
+        let both = ["/both.html", "/both/index.html"];
+        check(M, &both, &[
+            ("/both", serve("/both.html")),
+            ("/both.html", redirect("/both")),
+            ("/both/", serve("/both/index.html")),
+            ("/both/index.html", redirect("/both/")),
+            ("/both/index", redirect("/both/")),
+        ]);
+        let file = ["/file.html"];
+        check(M, &file, &[
+            ("/file", serve("/file.html")),
+            ("/file.html", redirect("/file")),
+            ("/file/", redirect("/file")),
+            ("/file/index", redirect("/file")),
+            ("/file/index.html", redirect("/file")),
+        ]);
+        let folder = ["/folder/index.html"];
+        check(M, &folder, &[
+            ("/folder", redirect("/folder/")),
+            ("/folder.html", redirect("/folder/")),
+            ("/folder/", serve("/folder/index.html")),
+            ("/folder/index", redirect("/folder/")),
+            ("/folder/index.html", redirect("/folder/")),
+        ]);
+        // An exact non-HTML file shadows the `.html` rewrite: `/file-bin`
+        // exists, so `/file-bin.html` keeps its own URL and `/file-bin/`
+        // has no canonical form.
+        let bin = ["/file-bin", "/file-bin.html"];
+        check(M, &bin, &[
+            ("/file-bin", serve("/file-bin")),
+            ("/file-bin.html", serve("/file-bin.html")),
+            ("/file-bin/", Resolved::NotFound),
+            ("/file-bin/index", Resolved::NotFound),
+            ("/file-bin/index.html", Resolved::NotFound),
+        ]);
+        // Dotted stems stay reachable through their `.html` alias.
+        check(M, &["/release-1.2.html"], &[
+            ("/release-1.2", serve("/release-1.2.html")),
+            ("/release-1.2.html", redirect("/release-1.2")),
+        ]);
+        // Dotted directory names under drop/auto forms.
+        check(M, &["/v1.0/index.html"], &[
+            ("/v1.0", redirect("/v1.0/")),
+            ("/v1.0/", serve("/v1.0/index.html")),
+        ]);
+        // Exact extensionless `/index` files are served, not aliased.
+        check(M, &["/api/index"], &[
+            ("/api/index", serve("/api/index")),
+        ]);
+        // Non-HTML assets are never rewritten.
+        check(M, &["/app.js"], &[("/app.js", serve("/app.js"))]);
+    }
+
+    #[test]
+    fn force_trailing_slash_matches_cloudflare() {
+        use HtmlHandling::ForceTrailingSlash as M;
+        check(M, &["/index.html"], &[
+            ("/index.html", redirect("/")),
+            ("/index", redirect("/")),
+            ("/", serve("/index.html")),
+        ]);
+        let both = ["/both.html", "/both/index.html"];
+        check(M, &both, &[
+            ("/both", redirect("/both/")),
+            ("/both.html", serve("/both.html")),
+            ("/both/", serve("/both/index.html")),
+            ("/both/index", redirect("/both/")),
+            ("/both/index.html", redirect("/both/")),
+        ]);
+        let file = ["/file.html"];
+        check(M, &file, &[
+            ("/file", redirect("/file/")),
+            ("/file.html", redirect("/file/")),
+            ("/file/", serve("/file.html")),
+            ("/file/index", redirect("/file/")),
+            ("/file/index.html", redirect("/file/")),
+        ]);
+        let folder = ["/folder/index.html"];
+        check(M, &folder, &[
+            ("/folder", redirect("/folder/")),
+            ("/folder.html", redirect("/folder/")),
+            ("/folder/", serve("/folder/index.html")),
+            ("/folder/index", redirect("/folder/")),
+            ("/folder/index.html", redirect("/folder/")),
+        ]);
+        let bin = ["/file-bin", "/file-bin.html"];
+        check(M, &bin, &[
+            ("/file-bin", serve("/file-bin")),
+            ("/file-bin.html", redirect("/file-bin/")),
+            ("/file-bin/", serve("/file-bin.html")),
+            ("/file-bin/index", redirect("/file-bin/")),
+            ("/file-bin/index.html", redirect("/file-bin/")),
+        ]);
+        check(M, &["/release-1.2.html"], &[
+            ("/release-1.2", redirect("/release-1.2/")),
+            ("/release-1.2/", serve("/release-1.2.html")),
+        ]);
+        check(M, &["/app.js"], &[("/app.js", serve("/app.js"))]);
+    }
+
+    #[test]
+    fn drop_trailing_slash_matches_cloudflare() {
+        use HtmlHandling::DropTrailingSlash as M;
+        check(M, &["/index.html"], &[
+            ("/index.html", redirect("/")),
+            ("/index", redirect("/")),
+            ("/", serve("/index.html")),
+        ]);
+        let both = ["/both.html", "/both/index.html"];
+        check(M, &both, &[
+            ("/both", serve("/both.html")),
+            ("/both.html", redirect("/both")),
+            ("/both/", redirect("/both")),
+            ("/both/index", redirect("/both")),
+            // `/both` already serves `/both.html`, so the index keeps
+            // its exact URL instead of redirecting into the other page.
+            ("/both/index.html", serve("/both/index.html")),
+        ]);
+        let file = ["/file.html"];
+        check(M, &file, &[
+            ("/file", serve("/file.html")),
+            ("/file.html", redirect("/file")),
+            ("/file/", redirect("/file")),
+            ("/file/index", redirect("/file")),
+            ("/file/index.html", redirect("/file")),
+        ]);
+        let folder = ["/folder/index.html"];
+        check(M, &folder, &[
+            ("/folder", serve("/folder/index.html")),
+            ("/folder.html", redirect("/folder")),
+            ("/folder/", redirect("/folder")),
+            ("/folder/index", redirect("/folder")),
+            ("/folder/index.html", redirect("/folder")),
+        ]);
+        let bin = ["/file-bin", "/file-bin.html"];
+        check(M, &bin, &[
+            ("/file-bin", serve("/file-bin")),
+            ("/file-bin.html", serve("/file-bin.html")),
+            ("/file-bin/", Resolved::NotFound),
+            ("/file-bin/index", Resolved::NotFound),
+            ("/file-bin/index.html", Resolved::NotFound),
+        ]);
+        check(M, &["/release-1.2.html"], &[
+            ("/release-1.2", serve("/release-1.2.html")),
+            ("/release-1.2.html", redirect("/release-1.2")),
+        ]);
+        check(M, &["/v1.0/index.html"], &[
+            ("/v1.0", serve("/v1.0/index.html")),
+            ("/v1.0/", redirect("/v1.0")),
+        ]);
+        check(M, &["/app.js"], &[("/app.js", serve("/app.js"))]);
+    }
+
+    #[test]
+    fn none_serves_exact_paths_only() {
+        use HtmlHandling::None as M;
+        let files = ["/index.html", "/file.html", "/folder/index.html", "/app.js"];
+        check(M, &files, &[
+            ("/file", Resolved::NotFound),
+            ("/file.html", serve("/file.html")),
+            ("/folder", Resolved::NotFound),
+            ("/folder/", Resolved::NotFound),
+            ("/", Resolved::NotFound),
+            ("/app.js", serve("/app.js")),
+        ]);
+    }
+
+    #[test]
+    fn misses_are_not_found() {
+        use HtmlHandling::*;
+        check(AutoTrailingSlash, &["/file.html"], &[("/nope", Resolved::NotFound)]);
+        check(ForceTrailingSlash, &["/file.html"], &[("/nope.html", Resolved::NotFound)]);
+        check(DropTrailingSlash, &["/file.html"], &[("/nope/", Resolved::NotFound)]);
+    }
+
+    #[test]
+    fn encode_path_matches_encode_uri_component() {
+        // Unreserved keep, reserved/non-ASCII percent-encode per segment.
+        assert_eq!(encode_path("/a b/c.txt"), "/a%20b/c.txt");
+        assert_eq!(encode_path("/a?b#c%d"), "/a%3Fb%23c%25d");
+        assert_eq!(encode_path("/\u{4e2d}\u{6587} page"), "/%E4%B8%AD%E6%96%87%20page");
+        assert_eq!(encode_path("/[boop]"), "/%5Bboop%5D");
+        assert_eq!(encode_path("/a-b_c.d!e~f*g'h(i)"), "/a-b_c.d!e~f*g'h(i)");
+    }
+
+    #[test]
+    fn wire_names_match_cloudflare() {
+        assert_eq!(html_wire(HtmlHandling::AutoTrailingSlash), "auto-trailing-slash");
+        assert_eq!(html_wire(HtmlHandling::ForceTrailingSlash), "force-trailing-slash");
+        assert_eq!(html_wire(HtmlHandling::DropTrailingSlash), "drop-trailing-slash");
+        assert_eq!(html_wire(HtmlHandling::None), "none");
     }
 }

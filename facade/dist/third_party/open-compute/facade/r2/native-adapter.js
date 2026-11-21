@@ -429,8 +429,7 @@ export async function nativeR2Fetch(request, bucket) {
                             etag: text(part.etag)
                         };
                     });
-                    const { httpFields: _http, customFields: _custom, ...completed } = metadata(await bucket.completeMultipartUpload(key, text(input.uploadId), parts));
-                    return reply(completed, false);
+                    return reply(metadata(await bucket.completeMultipartUpload(key, text(input.uploadId), parts)), false);
                 }
             case "abortMultipartUpload":
                 await bucket.abortMultipartUpload(key, text(input.uploadId));

@@ -53,7 +53,25 @@ tenant worker -- r2Bucket binding --> facade-r2 (R2Transport.fetch) --> native a
 workerd; every call still carries `(key, uploadId)` to the provider, so the
 HMAC scope check keeps rejecting an uploadId used on a different key.
 
+`complete()` resolves to a full `R2Object`. Cloudflare documents the
+return type as `Promise<R2Object>` with non-optional `httpMetadata` /
+`customMetadata`, and workerd parses the completion payload through the
+same non-list metadata path as `head`/`put` (`R2CompleteMultipartUploadResponse`
+is aliased to `R2PutResponse` in `r2-api.capnp`). The native adapter
+therefore passes the stored fields through instead of stripping them, and
+every backend (fs, memory, S3) returns both as objects — `{}` when the
+upload supplied none. A caller never has to `get()` the object to learn
+the metadata it set at create time.
+
 ## Changelog
+
+- 2026-11-20: `R2MultipartUpload.complete()` now returns the stored
+  `httpMetadata` / `customMetadata` on the `R2Object` itself. Dropped the
+  native adapter's stripping step, normalized fs/memory/S3 to always
+  materialize both (empty objects when unset), and promoted the
+  conformance expectation from `UNVERIFIED.md` using the Workers API
+  reference plus workerd's `r2-api.capnp` / `r2-multipart.c++` /
+  `r2-bucket.c++`.
 
 - 2026-11-19: Ported `examples/standalone-r2/main.js` to the R2Bucket API
   (R2ObjectBody, R2MultipartUpload, resumeMultipartUpload) with the same

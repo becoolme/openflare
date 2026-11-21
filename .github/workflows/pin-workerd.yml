@@ -1,0 +1,293 @@
+name: Pin workerd
+
+# Keeps `deploy/docker/workerd.lock` on the newest `becoolme/workerd` VRT release.
+#
+# The lock is the pin of record: `scripts/fetch-workerd.sh` turns it into the
+# binary CI and local runs verify, and the `real-workerd` job re-downloads the
+# release assets and re-checks every digest. A bump is mechanical, so this
+# workflow proposes it as a PR instead of pushing to main: the PR runs the
+# normal CI (against the new binary) and a person merges it.
+#
+# "Newer" is not a version range. A VRT release is immutable and its tag
+# carries the sync date and the upstream commit, so the newest published
+# `vrt-*` release whose tag differs from the lock's `version` *is* the bump.
+# No such release means nothing happened and the run exits quietly. A
+# deliberate downgrade (the lock pinned to an older release) would be
+# re-proposed; closing the PR for that tag records the decision, because an
+# existing or closed PR is never reopened here.
+#
+# Failure behavior: anything that could produce an unverified pin fails before
+# a branch is pushed -- a manifest that names a different tag, an upstream
+# version that cannot be named, a lock that does not round-trip through
+# `--check`, or a working tree change outside the lock. Re-running is safe and
+# idempotent: the commit is derived from the release (fixed author/committer
+# dates), and an existing branch or PR for the same tag is left alone.
+
+on:
+  schedule:
+    # Daily. The audit is cheap; a PR only appears when a release was cut.
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two runs pushing the same branch is a conflict, never a fix.
+concurrency:
+  group: pin-workerd
+  cancel-in-progress: false
+
+jobs:
+  pin:
+    name: Open pin-bump PR
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write # push chore/pin-workerd-<tag>
+      pull-requests: write # open/comment on the PR with GITHUB_TOKEN
+      checks: read # wait for the PR's checks before falling back to a dispatch
+      actions: write # dispatch ci.yml on the branch when the PR gets no checks
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FORK_REPO: becoolme/workerd
+      UPSTREAM_REPO: cloudflare/workerd
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.22.1"
+
+      # A lock that is not a fork release pin (e.g. a deliberate npm pin) is not
+      # this workflow's to change: report and stop instead of silently
+      # switching the pin source.
+      - name: Check the pin source
+        id: source
+        run: |
+          set -euo pipefail
+          source="$(node -p 'JSON.parse(require("fs").readFileSync("deploy/docker/workerd.lock", "utf8")).source ?? "npm"')"
+          echo "name=$source" >> "$GITHUB_OUTPUT"
+          if [ "$source" != "github-release" ]; then
+            echo "::notice::workerd.lock is pinned from '$source'; this workflow only manages fork releases"
+          fi
+
+      - name: Find the newest VRT release
+        id: release
+        if: steps.source.outputs.name == 'github-release'
+        run: |
+          set -euo pipefail
+          pinned="$(node -p 'JSON.parse(require("fs").readFileSync("deploy/docker/workerd.lock", "utf8")).version')"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+
+          # Sort here instead of trusting the API's order: `created_at` and
+          # `published_at` differ for releases published later than cut.
+          gh api "repos/$FORK_REPO/releases?per_page=50" > "$RUNNER_TEMP/releases.json"
+          latest="$(jq -r '
+            [.[]
+              | select(.draft == false and .prerelease == false)
+              | select(.tag_name | startswith("vrt-"))]
+            | sort_by(.published_at)
+            | reverse
+            | .[0]
+            | if . == null then "" else "\(.tag_name) \(.published_at)" end
+          ' "$RUNNER_TEMP/releases.json")"
+
+          if [ -z "$latest" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no published vrt-* release in $FORK_REPO yet; nothing to pin"
+            exit 0
+          fi
+          tag="${latest%% *}"
+          published="${latest#* }"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+
+          if [ "$tag" = "$pinned" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::deploy/docker/workerd.lock already pins $tag; nothing to do"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "new release on the fork: $pinned -> $tag (published $published)"
+
+      - name: Download the release manifest
+        if: steps.release.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pin"
+          gh release download "${{ steps.release.outputs.tag }}" \
+            --repo "$FORK_REPO" \
+            --pattern manifest.json \
+            --dir "$RUNNER_TEMP/pin" \
+            --clobber
+          # The manifest is the input to every digest below, so it has to be
+          # the manifest of the release we are about to pin.
+          got="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).tag)' "$RUNNER_TEMP/pin/manifest.json")"
+          if [ "$got" != "${{ steps.release.outputs.tag }}" ]; then
+            echo "::error::manifest.json names $got, expected ${{ steps.release.outputs.tag }}"
+            exit 1
+          fi
+
+      # The manifest's `upstream.tag` is empty when the fork synced a commit
+      # that cloudflare/workerd has not tagged yet. The lock still has to name
+      # a workerd release, so resolve the nearest ancestor tag; an unnameable
+      # pin fails here instead of being guessed.
+      - name: Name the upstream workerd release
+        id: upstream
+        if: steps.release.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          version="$(node scripts/resolve-workerd-upstream-version.mjs \
+            --manifest "$RUNNER_TEMP/pin/manifest.json" \
+            --repo "$UPSTREAM_REPO")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "upstream workerd release: $version"
+
+      - name: Write the lock from the manifest
+        if: steps.release.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          node scripts/update-workerd-lock.mjs \
+            --manifest "$RUNNER_TEMP/pin/manifest.json" \
+            --upstream-version "${{ steps.upstream.outputs.version }}"
+          # Round-trip: the committed lock must be exactly what --check accepts.
+          node scripts/update-workerd-lock.mjs \
+            --manifest "$RUNNER_TEMP/pin/manifest.json" \
+            --upstream-version "${{ steps.upstream.outputs.version }}" \
+            --check
+          # A pin bump touches the lock and nothing else.
+          changed="$(git status --porcelain)"
+          if [ "$changed" != " M deploy/docker/workerd.lock" ]; then
+            echo "::error::unexpected working tree changes:"
+            printf '%s\n' "$changed"
+            exit 1
+          fi
+
+      - name: Render the pull request body
+        if: steps.release.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          PINNED: ${{ steps.release.outputs.pinned }}
+        run: |
+          set -euo pipefail
+          node scripts/render-workerd-pin-pr-body.mjs \
+            --lock deploy/docker/workerd.lock \
+            --tag "$TAG" \
+            --previous "$PINNED" \
+            --upstream-version "${{ steps.upstream.outputs.version }}" \
+            > "$RUNNER_TEMP/pin/pr-body.md"
+
+      - name: Create the pin branch and pull request
+        id: pr
+        if: steps.release.outputs.changed == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          PUBLISHED: ${{ steps.release.outputs.published }}
+        run: |
+          set -euo pipefail
+          branch="chore/pin-workerd-$TAG"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+          # Idempotent: a branch or PR for this tag is an earlier run, or a
+          # person's. Never rewrite or re-open one. `--state all` matters: a
+          # closed PR is a decision to stay on the older pin.
+          existing="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" \
+            --state all --limit 1 --json number,state,url \
+            --jq '.[0] | select(. != null) | "\(.number) \(.state) \(.url)"')"
+          if [ -n "$existing" ]; then
+            url="${existing##* }"
+            echo "::notice::$branch already has a PR ($existing); leaving it alone"
+            echo "pr=$url" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add deploy/docker/workerd.lock
+          # Timestamps come from the release, not the clock: a re-run of the
+          # same tag produces the same commit, so a retry is a no-op push
+          # rather than a force-push over an unmerged branch.
+          GIT_AUTHOR_DATE="$PUBLISHED" GIT_COMMITTER_DATE="$PUBLISHED" \
+            git commit -m "chore(pin): pin workerd to VRT $TAG"
+          if ! git push origin "$branch" 2> "$RUNNER_TEMP/pin/push-err"; then
+            # The same tag always produces the same commit, so a rejected push
+            # means main moved under an unmerged branch or a person pushed to
+            # it. Fail loudly instead of rewriting someone else's branch.
+            cat "$RUNNER_TEMP/pin/push-err" >&2
+            echo "::error::$branch exists with different commits; delete it to let this workflow retry"
+            exit 1
+          fi
+
+          if ! gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "chore(pin): pin workerd to VRT $TAG" \
+            --body-file "$RUNNER_TEMP/pin/pr-body.md" > "$RUNNER_TEMP/pin/pr-url" 2> "$RUNNER_TEMP/pin/pr-err"; then
+            # Lost a race with another run that created the same PR: accept it.
+            cat "$RUNNER_TEMP/pin/pr-err" >&2
+            url="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open \
+              --json url --jq '.[0].url')"
+            if [ -z "$url" ]; then
+              echo "::error::could not open a pull request for $branch"
+              exit 1
+            fi
+          else
+            url="$(cat "$RUNNER_TEMP/pin/pr-url")"
+          fi
+          echo "pr=$url" >> "$GITHUB_OUTPUT"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "opened $url"
+
+      # PRs opened with GITHUB_TOKEN do not reliably start `pull_request`
+      # workflows, and the point of this PR is the `real-workerd` job that
+      # downloads the new assets and runs the suite. Wait for checks to appear;
+      # if none do, dispatch the same workflow on the branch and say so on the
+      # PR. Either way the verification happens, never silently skipped.
+      - name: Make sure the pin is verified
+        if: steps.pr.outputs.created == 'true'
+        env:
+          BRANCH: ${{ steps.pr.outputs.branch }}
+          PR: ${{ steps.pr.outputs.pr }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          count=0
+          for _ in 1 2 3 4 5 6 7 8; do
+            count="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs?per_page=1" \
+              --jq '.total_count' 2>/dev/null || echo 0)"
+            if [ "${count:-0}" -gt 0 ]; then break; fi
+            sleep 15
+          done
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "PR checks are already running on $sha"
+            exit 0
+          fi
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
+          # A comment is convenience; failing to post it must not hide the fact
+          # that the verification run was dispatched.
+          gh pr comment "$PR" --body "No \`pull_request\` checks appeared on this branch (PRs opened with \`GITHUB_TOKEN\` do not always trigger them), so the pin workflow dispatched \`ci.yml\` on \`$BRANCH\`. Merge after that run is green." \
+            || echo "::warning::could not comment on $PR; the dispatched ci.yml run on $BRANCH is the verification"
+          echo "::warning::no PR checks on $sha; dispatched ci.yml on $BRANCH"
+
+      - name: Summary
+        if: always() && steps.source.outputs.name == 'github-release'
+        run: |
+          set -uo pipefail
+          {
+            echo "### Pin workerd"
+            echo
+            echo "- pinned: \`${{ steps.release.outputs.pinned }}\`"
+            echo "- release: \`${{ steps.release.outputs.tag }}\`"
+            echo "- changed: \`${{ steps.release.outputs.changed }}\`"
+            if [ -n "${{ steps.pr.outputs.pr }}" ]; then
+              echo "- pull request: ${{ steps.pr.outputs.pr }}"
+            fi
+            if [ -n "${{ steps.upstream.outputs.version }}" ]; then
+              echo "- upstream workerd: \`${{ steps.upstream.outputs.version }}\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

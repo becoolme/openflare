@@ -4,6 +4,8 @@
 
 Executable cases cover KV, R2, D1, Queues, Cache, Cron, Durable Objects,
 static Assets, plain Vars, and the basic Rate Limiting binding result.
+D1 coverage includes prepared-statement calls, Sessions, `dump()`,
+`raw({columnNames})`, and the documented 50 MB query-result limit.
 The areas that need infrastructure or protocols the runner cannot yet
 exercise are listed in [`UNVERIFIED.md`](UNVERIFIED.md), including service
 bindings, Hyperdrive, Secrets, WebSockets, and Workflows. A listed case
@@ -26,6 +28,7 @@ file) in the case's `evidence` list. Behavior with no citation goes in
 conformance/
   run.mjs                 the runner (pure Node, importable lib + CLI)
   deploy-standalone.sh    deploy hook for the docker compose stack
+  restart-standalone.sh   restart hook for the docker compose stack
   cases/<binding>/<id>/   one deployable worker project per case
     case.json             declarative steps + expected responses + evidence
     worker.js             the probe worker
@@ -45,7 +48,7 @@ Against the standalone compose stack (real workerd):
 ```sh
 cp /path/to/workerd deploy/standalone/workerd   # pinned, digest-checked
 WORKERD_SOURCE=file WORKERD_SHA256=<from deploy/docker/workerd.lock> \
-  docker compose -f deploy/standalone/docker-compose.yml up --build --wait
+  deploy/standalone/up.sh
 
 node conformance/run.mjs \
   --url http://127.0.0.1:8080 \
@@ -65,6 +68,9 @@ Options (`node conformance/run.mjs --help`):
 | `--url <base>` | ingress base URL (required) |
 | `--deploy-cmd <shell>` | deploy hook; `$CASE_DIR` is the staged dir |
 | `--no-deploy` | skip deploys; cases assumed already live |
+| `--restart-cmd <shell>` | restart hook; `$RESTART_SERVICES` is the ordered service list (default `conformance/restart-standalone.sh`) |
+| `--no-restart` | never restart; cases with a restart step report `skipped` (fatal under `--fail-on-skip`) |
+| `--restart-timeout <ms>` | restart hook budget (default 120 s) |
 | `--host <name>` | override the Host header for every request |
 | `--stub` | the stack runs the stub runtime; `requiresWorkerd` cases report `skipped` (validates the runner itself without workerd) |
 | `--only <regex>` | run a subset of case ids |
@@ -87,6 +93,25 @@ workerd binary pinned in `deploy/docker/workerd.lock`, deploys every
 case, and runs with `--fail-on-skip`. A release must cite a green run of
 that workflow (attach the `conformance-report` artifact); the per-PR
 `ci` job only runs the runner's unit tests, which never touch a stack.
+
+### When the stack will not come up
+
+`docker compose up --wait` reports only `container … is unhealthy`; it
+does not say why. Two layers now surface the cause:
+
+- `deploy/standalone/up.sh` wraps the bring-up and dumps
+  `docker compose ps -a` plus each unhealthy/non-zero service's last
+  200 log lines (use it in place of the bare compose command).
+- `conformance/deploy-standalone.sh` runs the same check before every
+  case deploy, so a stack that degraded mid-run fails with logs instead
+  of a readiness timeout.
+
+The weekly workflow file is maintained separately; switching its
+bring-up step to `deploy/standalone/up.sh` gives the job log the same
+diagnostics. `vrt-sql` exiting with `VRT_SQL_DURABILITY_SAME_DEVICE`
+means the dev-only exemption documented in
+[`deploy/standalone/README.md`](../deploy/standalone/README.md#durability-in-this-stack-devci-only)
+is missing from the generated `vrt-sql.toml`.
 
 ## Adding a case
 
@@ -113,11 +138,57 @@ that workflow (attach the `conformance-report` artifact); the per-PR
      expect passes — use it for eventually-consistent effects (queue
      delivery, cron ticks, alarms). Step 0 always retries up to the
      case's readiness budget after a deploy.
+   - A step may instead be a restart action — see
+     [Restart steps](#restart-steps).
 4. Prefer **normalized responses**: the worker maps volatile values
    (etags, epochs, durations) onto stable booleans/shapes so the JSON
    expectation stays deterministic.
 5. `node conformance/run.mjs --validate` must pass; `npm test` checks
    every manifest.
+
+## Restart steps
+
+A step is either an HTTP assertion (`request` + `expect`) or a restart
+action. A restart step restarts the runtime processes that host workerd
+**in place** — the compose hook uses `docker compose restart`, so no
+volume is recreated and nothing is redeployed — and then polls a
+readiness probe until it matches:
+
+```json
+{
+  "name": "restart the runtime process",
+  "restart": {
+    "services": ["vrt-host", "vrt"],
+    "waitReady": {
+      "request": { "path": "/state" },
+      "expect": { "status": 200 },
+      "timeoutMs": 90000,
+      "intervalMs": 500
+    }
+  }
+}
+```
+
+- `services` is an ordered list handed to the hook verbatim. On the
+  standalone stack the order matters: `vrt-host` supervises workerd and
+  `vrt` joins its network namespace, so `vrt` is restarted after
+  `vrt-host`.
+- `waitReady` is **required**. The runner probes it after the hook
+  returns, with no fixed sleeps; a probe that never matches within
+  `timeoutMs` fails the step.
+- The hook (`--restart-cmd`) receives `RESTART_SERVICES` and `CASE_ID`
+  and must exit non-zero when the restart did not happen. Any hook
+  failure fails the case: a restart case can never pass without the
+  restart.
+- With `--no-restart` (or no hook at all) a case that declares a restart
+  step is reported `skipped`; `--fail-on-skip` makes that fatal for a
+  release gate.
+- The default hook is `conformance/restart-standalone.sh` (logged at
+  start-up); stacks without that compose topology pass their own
+  `--restart-cmd` or `--no-restart`.
+
+`do-alarm-restart` uses this to prove that an armed DO alarm fires in
+the new process and that pre-restart storage is still present.
 
 ## Reading the report
 
@@ -129,6 +200,22 @@ stack), not that it passed.
 
 ## Changelog
 
+- 2026-11-21: Standalone bring-up now opts into the dev-only
+  `allowSameDeviceDurability` exemption (Docker named volumes share one
+  device), so the weekly gate can actually boot `vrt-sql`; added
+  `deploy/standalone/up.sh` and a health preflight in
+  `deploy-standalone.sh` that dump the failing service's logs instead of
+  only `container … is unhealthy`.
+- 2026-11-20: Added restart steps (`restart: {services, waitReady}`)
+  and the `restart-standalone.sh` hook, so a case can restart the runtime
+  in place and gate the next step on a readiness probe. `do-alarm-restart`
+  proves DO alarm persistence across a process restart; the alarm-restart
+  clause is gone from `UNVERIFIED.md`.
+- 2026-11-20: Added the `d1-dump-raw` fixture: `dump()` SQL export
+  (empty database, exact quoting/escaping, restore round-trip),
+  `raw({columnNames:true|false})`, duplicate/empty result shapes, and the
+  documented 50 MB query-result error. Removed the D1 `dump()` entry from
+  `UNVERIFIED.md`.
 - 2026-11-20: Added basic Assets, Vars, and Rate Limiting fixtures; listed
   unsupported multi-worker, database, secret, WebSocket, workflow, and
   advanced asset behaviors as unverified.

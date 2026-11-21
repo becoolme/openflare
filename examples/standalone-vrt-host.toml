@@ -37,6 +37,13 @@ facadeManifest = "__VRT_ROOT__/facade/manifest.json"
 bindingBackendSocket = "__VRT_BACKEND_SOCK__"
 systemCompatDate = "2024-09-25"
 systemCompatFlags = []
+# Per-worker quotas: render the workerd `limits` block (cpuMs /
+# memoryMb / subRequests) for quotas a worker declares. The image's
+# workerd comes from `deploy/docker/workerd.lock` (the VRT fork), which
+# carries the limits patch. A STOCK workerd must set this to false (and
+# then a tenant declaring a limit fails closed instead of running
+# unlimited). 0 / platform-default dimensions are never rendered.
+quotas = true
 secretsFile = "__VRT_ROOT__/secrets/secrets.json"         # maintained by vrt-local secret put (0600)
 varsFile = "__VRT_ROOT__/vars/vars.json"                  # maintained by vrt-local deploy (0600)
 # T17/F1: both files are re-read + permission-checked on every converge -- secret/var changes
@@ -109,6 +116,18 @@ failWindowMs = 90000
 # before a "same tag" restart trusts it.
 # Optional env: VRT_GEOIP_GITHUB_TOKEN raises the GitHub API rate
 # limit for cells behind a shared NAT (never written to config/logs).
+
+# Analytics Engine: per-tenant ingest sockets at
+# `<workDir>/ae/sock/<seg(tenant)>.sock` for `analyticsEngine`
+# bindings (`env.<binding>.writeDataPoint()`); JSONL spool +
+# canonical Parquet parts under `<workDir>/ae/`. Always on when the
+# service builds — the cell advertises the capability unconditionally,
+# so the only degrade path is a startup build failure (observable via
+# `vrt_host_ae_degraded`; AE renders then refuse, fail closed).
+[analyticsEngine]
+# maxBodyBytes = 262144                              # POST cap per event
+# maxSpoolBytes = 268435456                          # per-tenant spool cap (503 backpressure over it)
+# flushIntervalSecs = 60                             # spool→Parquet cadence, clamped 10..3600
 
 [ingress]
 requestTimeoutMs = 30000

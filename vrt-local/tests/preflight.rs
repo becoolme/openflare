@@ -231,3 +231,43 @@ fn check_never_runs_test_handler_and_never_touches_live_storage() {
         "preflight scratch leaked: {leftover:?}"
     );
 }
+
+/// CR1 regression: a cron-carrying worker renders `facade-cron-<id>`
+/// with the `$experimental` `service_binding_extra_handlers` flag, so
+/// workerd only loads the config with `--experimental` on argv. The
+/// deploy preflight used to derive that argv locally and forgot crons,
+/// which made every standalone cron deploy fail with
+/// `The compatibility flag service_binding_extra_handlers is
+/// experimental ... you must pass --experimental` (conformance
+/// `cron-basic`). The derivation is now shared with assemble
+/// (`vrt_config::launch_args`); this test pins the preflight half.
+#[test]
+fn check_derives_experimental_arg_for_cron_workers() {
+    let Some(workerd) = std::env::var_os("VRT_WORKERD_BIN").map(PathBuf::from) else {
+        eprintln!("VRT_WORKERD_BIN unset — real-workerd deploy check skipped");
+        return;
+    };
+    let root = root();
+    let local = init(&root, true);
+    write_host_toml(&root, "capnp", &workerd);
+
+    let dir = root.join("w-cron");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"cron1\"\nmain = \"main.js\"\ncompatibility_date = \"2024-09-25\"\n\
+         [triggers]\ncrons = [\"* * * * *\"]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("main.js"),
+        "export default {\n\
+         \x20 async fetch() { return new Response(\"ok\"); },\n\
+         \x20 async scheduled() {},\n\
+         };\n",
+    )
+    .unwrap();
+    local
+        .deploy(&dir, &DeployOverrides::default())
+        .expect("cron deploy must pass the check — facade-cron needs --experimental argv");
+}

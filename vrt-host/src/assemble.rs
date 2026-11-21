@@ -132,6 +132,12 @@ pub struct Assembler {
     /// derivation). `None` ⇒ no `cacheApiOutbound` → `caches.*`
     /// throws `No Cache was configured` (explicit, fail closed).
     cache_root: Option<PathBuf>,
+    /// AE: unix-socket root for per-tenant Analytics Engine ingest —
+    /// `<root>/<seg(tenant)>.sock` drives `params.ae_addr` and the
+    /// supervisor's listener bind (`ae::tenant_socket_path`, single
+    /// derivation). `None` ⇒ `analyticsEngine` bindings fail the
+    /// render closed (`aeAddr`).
+    ae_root: Option<PathBuf>,
     /// H5-r1: provider listener directory — the binding-backend
     /// `--external-addr` is derived PER TENANT as
     /// `vrt_securefs::socket_path(dir, tenant)` (byte-identical to the
@@ -141,6 +147,12 @@ pub struct Assembler {
     /// the verbatim `params.binding_backend_socket` (standalone
     /// single-tenant contract only).
     binding_backend_dir: Option<PathBuf>,
+    /// Per-worker quotas capability (`render.quotas`): when false, a
+    /// worker declaring an enforceable limit fails the assemble
+    /// (`CONFIG_QUOTA_UNSUPPORTED`) — the old generation keeps serving,
+    /// never a silently unlimited new one. Defaults ON (the pinned
+    /// workerd carries the limits patch); see [`Self::with_quotas`].
+    quotas: bool,
 }
 
 /// T13/M2: deterministic per-tenant uid/gid assignment from a
@@ -230,7 +242,9 @@ impl Assembler {
             wf_delete_addr: None,
             log_hub: None,
             cache_root: None,
+            ae_root: None,
             binding_backend_dir: None,
+            quotas: true,
         }
     }
 
@@ -254,6 +268,16 @@ impl Assembler {
         self
     }
 
+    /// AE: enable Analytics Engine ingest — tenants declaring
+    /// `analyticsEngine` bindings get per-dataset `external` services
+    /// resolving to `<root>/<seg(tenant)>.sock` (the supervisor binds
+    /// the same path via `ae::tenant_socket_path`). Unset ⇒ the
+    /// render fails closed (`aeAddr`) for AE-carrying tenants.
+    pub fn with_ae_root(mut self, root: PathBuf) -> Self {
+        self.ae_root = Some(root);
+        self
+    }
+
     /// H5-r1: provider listener directory — per-tenant
     /// `binding-backend` derivation (`vrt_securefs::socket_path`,
     /// the same helper the provider binds with). See the field doc.
@@ -271,6 +295,14 @@ impl Assembler {
 
     pub fn with_wf_delete_addr(mut self, addr: impl Into<String>) -> Self {
         self.wf_delete_addr = Some(addr.into());
+        self
+    }
+
+    /// Per-worker quotas capability (`render.quotas`): only a host whose
+    /// `workerdBinary` carries the VRT limits patch may keep it on
+    /// (default). See the field doc.
+    pub fn with_quotas(mut self, enabled: bool) -> Self {
+        self.quotas = enabled;
         self
     }
 
@@ -408,6 +440,10 @@ impl Assembler {
                     // fingerprint or a toggled config would reuse a
                     // stale generation digest.
                     &self.cache_root,
+                    // AE: the AE socket root rewrites every
+                    // AE-carrying tenant's `ae_addr` — same rekey
+                    // rule as cache_root.
+                    &self.ae_root,
                     // H5-r1: the binding-backend dir rewrites every
                     // tenant's `binding_backend_socket` — same rekey
                     // rule as cache_root.
@@ -483,6 +519,11 @@ impl Assembler {
         generation: u64,
         gen_dir: &std::path::Path,
     ) -> Result<TenantLaunchSpec, AssembleError> {
+        // Per-worker quotas: a cell whose workerd has no `limits`
+        // enforcement must never host a tenant that declared one. The
+        // check runs before any generation bytes are written, so the
+        // previous generation keeps serving (fail closed).
+        vrt_config::ensure_quotas_enforceable(tenant, self.quotas)?;
         // T21: ASSETS bindings must be materialized BEFORE launch —
         // manifest + every object verified into the provider-shared
         // store. Any gap (missing bytes, digest mismatch, poisoned
@@ -723,23 +764,7 @@ impl Assembler {
         // generations need `--experimental` for the emitted qconsumer
         // flag (the stub launcher has no system_compat_flags channel).
         let mut extra_args = self.extra_args.clone();
-        for a in experimental_extra_args(
-            &[],
-            tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-            tenant
-                .workers
-                .iter()
-                .any(|w| !w.durable_object_classes.is_empty() || !w.workflows.is_empty()),
-            tenant.workers.iter().any(|w| !w.crons.is_empty()),
-            tenant.workers.iter().any(|w| {
-                w.bindings.iter().any(|b| {
-                    matches!(
-                        b,
-                        snapshot_protocol::compute_desired::BindingDesired::WorkerLoader(_)
-                    )
-                })
-            }),
-        ) {
+        for a in vrt_config::tenant_experimental_extra_args(&[], tenant) {
             if !extra_args.iter().any(|e| e == &a) {
                 extra_args.push(a);
             }
@@ -854,6 +879,16 @@ impl Assembler {
             .transpose()
             .map_err(AssembleError::Io)?
             .unwrap_or_default();
+        // AE: per-tenant ingest socket — the SAME path the actor
+        // binds via `deps.ae` (`ae::tenant_socket_addr`). Empty ⇒
+        // `analyticsEngine` bindings fail the render closed.
+        params.ae_addr = self
+            .ae_root
+            .as_ref()
+            .map(|root| crate::ae::tenant_socket_addr(root, &tenant.tenant_id))
+            .transpose()
+            .map_err(AssembleError::Io)?
+            .unwrap_or_default();
         // H5-r1: per-tenant `binding-backend` external-addr. The
         // provider binds `<dir>/<seg(tenant)>.sock` and treats the
         // socket NAME as the tenant authority (listener-bound
@@ -949,25 +984,11 @@ impl Assembler {
         // emitted qconsumer worker (compat-date.capnp:296 `$experimental`)
         // and workerd refuses to start without `--experimental` on argv.
         // The literal `experimental` catch-all is NOT derived (the T31g
-        // gate above keeps it a deliberate opt-in).
+        // gate above keeps it a deliberate opt-in). The predicate is
+        // shared with vrt-local's deploy preflight
+        // (`vrt_config::launch_args`) so both paths agree.
         let mut extra_args = self.extra_args.clone();
-        for a in experimental_extra_args(
-            &params.system_compat_flags,
-            tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-            tenant
-                .workers
-                .iter()
-                .any(|w| !w.durable_object_classes.is_empty() || !w.workflows.is_empty()),
-            tenant.workers.iter().any(|w| !w.crons.is_empty()),
-            tenant.workers.iter().any(|w| {
-                w.bindings.iter().any(|b| {
-                    matches!(
-                        b,
-                        snapshot_protocol::compute_desired::BindingDesired::WorkerLoader(_)
-                    )
-                })
-            }),
-        ) {
+        for a in vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, tenant) {
             if !extra_args.iter().any(|e| e == &a) {
                 extra_args.push(a);
             }
@@ -1262,23 +1283,13 @@ fn stub_do_storage(tenant: &TenantDesired) -> Option<crate::spec::DoStorageSpec>
 /// CR1: cron-carrying workers derive `--experimental` the same way —
 /// their `facade-cron-<id>` service emits the `$experimental`
 /// `service_binding_extra_handlers` flag (Fetcher.scheduled()).
-pub fn experimental_extra_args(
-    system_compat_flags: &[String],
-    tenant_has_queue_consumers: bool,
-    tenant_has_durable_objects: bool,
-    tenant_has_crons: bool,
-    tenant_has_worker_loaders: bool,
-) -> Vec<String> {
-    let needs = tenant_has_queue_consumers
-        || tenant_has_durable_objects
-        || tenant_has_crons
-        || tenant_has_worker_loaders
-        || system_compat_flags
-            .iter()
-            .any(|f| f != "experimental" && vrt_config::is_experimental_compat_flag(f));
-    if needs {
-        vec!["--experimental".to_string()]
-    } else {
-        Vec::new()
-    }
-}
+/// AE: `analyticsEngine` bindings derive it too — workerd's
+/// `experimental_feature("AnalyticsEngine")` check refuses the
+/// binding without the argv flag.
+///
+/// The predicate itself lives in `vrt_config::launch_args` — one
+/// implementation shared with `vrt-local`'s deploy preflight; launch
+/// paths call [`vrt_config::tenant_experimental_extra_args`], which
+/// derives the needs from the tenant so no caller can drift.
+pub use vrt_config::{experimental_extra_args, ExperimentalNeeds};
+

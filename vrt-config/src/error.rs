@@ -124,6 +124,13 @@ pub enum ConfigError {
     #[error("compat flag not allowed for tenants: {0}")]
     CompatFlag(&'static str),
 
+    /// A declared per-worker quota cannot be enforced by this runtime
+    /// generation (the cell does not render `limits`, or the dimension
+    /// has no workerd enforcement hook yet). Payload names the field.
+    /// Fail closed: a declared limit must never be silently ignored.
+    #[error("per-worker quota cannot be enforced: {0}")]
+    Quotas(&'static str),
+
     /// Every worker in the tenant failed its per-worker emit dry-run —
     /// nothing servable would remain, so failing the whole render and
     /// keeping the previous generation is strictly safer than an empty
@@ -152,6 +159,7 @@ impl ConfigError {
             Self::Digest(_) => "CONFIG_INVALID_DIGEST",
             Self::Capacity(_) => "CONFIG_CAPACITY_EXCEEDED",
             Self::CompatFlag(_) => "CONFIG_COMPAT_FLAG",
+            Self::Quotas(_) => "CONFIG_QUOTA_UNSUPPORTED",
             Self::AllWorkersExcluded => "CONFIG_ALL_WORKERS_EXCLUDED",
             Self::Ipv4MappedExcept { .. } => "CONFIG_NETPOL_IPV4_MAPPED_EXCEPT",
         }

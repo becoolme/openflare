@@ -565,6 +565,8 @@ step "assert R2 multipart chain"
 mp="$(curl -sS --max-time 30 -X POST -H "Host: r2-demo.vrt.local" "$BASE_URL/multipart?key=w5-mp")"
 echo "$mp" | grep -q '"expectedSize":10485765'   || { echo "multipart size mismatch: $mp" >&2; FAILED=1; exit 1; }
 echo "$mp" | grep -q '"etag":"[0-9a-f]*-3"'   || { echo "multipart composite etag missing: $mp" >&2; FAILED=1; exit 1; }
+echo "$mp" | grep -q '"completeCustomMetadata":"e2e"' || { echo "complete() lost customMetadata: $mp" >&2; FAILED=1; exit 1; }
+echo "$mp" | grep -q '"completeContentType":"application/octet-stream"' || { echo "complete() lost httpMetadata: $mp" >&2; FAILED=1; exit 1; }
 sha="$(echo "$mp" | sed -n 's/.*"sha256":"\([0-9a-f]*\)".*/\1/p')"
 exp="$(echo "$mp" | sed -n 's/.*"expectedSha256":"\([0-9a-f]*\)".*/\1/p')"
 [ -n "$sha" ] && [ "$sha" = "$exp" ]   || { echo "multipart content hash mismatch: $mp" >&2; FAILED=1; exit 1; }

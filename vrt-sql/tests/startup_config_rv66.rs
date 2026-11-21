@@ -54,8 +54,11 @@ fs = { root = "/tmp/p" }
 }
 
 /// The same-device exemption is dev-only: no shipped deployment config
-/// or example template may carry it (`vrt dev` injects it into the
-/// config it generates; nothing else does, and no env var enables it).
+/// or example template may enable it (`vrt dev` and the standalone
+/// compose quick start inject it into the configs they generate;
+/// nothing else does, and no env var enables it). Markdown docs are
+/// excluded on purpose — operator-facing READMEs must be able to name
+/// the key to say "production never sets this".
 #[test]
 fn shipped_configs_never_enable_same_device_durability() {
     fn walk(dir: &std::path::Path, hits: &mut Vec<String>) {
@@ -64,6 +67,8 @@ fn shipped_configs_never_enable_same_device_durability() {
             let p = e.path();
             if p.is_dir() {
                 walk(&p, hits);
+            } else if p.extension().and_then(|x| x.to_str()) == Some("md") {
+                continue;
             } else if let Ok(text) = std::fs::read_to_string(&p) {
                 if text.contains("allowSameDeviceDurability") || text.contains("allow_same_device_durability") {
                     hits.push(p.display().to_string());

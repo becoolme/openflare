@@ -128,8 +128,8 @@
           "name": "third_party/open-compute/facade/r2/native-adapter.js",
           "dist": "facade/dist/third_party/open-compute/facade/r2/native-adapter.js",
           "source": "third_party/open-compute/facade/r2/native-adapter.ts",
-          "sourceSha256": "c76662432f27af9df7b333e8399737590485a547828eec3469759043b6103eae",
-          "sha256": "a12e3177a99a23d0ca6d1fb4c7114dc9ceaf6403cddf02e18a6f227a4985a502"
+          "sourceSha256": "f7798bc303b0cfe2076115064d9a53ff4139f5d0fb5b8de214a20a7aa058ceb0",
+          "sha256": "0c2186678c5893c56a127a6154e7c0728bc68e4f436c6cb8a8e6a721607e827b"
         },
         {
           "name": "third_party/open-compute/facade/r2/transport.js",
@@ -156,8 +156,8 @@
           "name": "facade/facade-assets.js",
           "dist": "facade/dist/facade/facade-assets.js",
           "source": "facade/facade-assets.ts",
-          "sourceSha256": "d97cf1937ee4ed7c5f4fa47d24e6096b9408c371bcd00cccda47ce79eebc221d",
-          "sha256": "fdec0a4690220c46620fa5aebc6a1f819a169fd2b30eac34334d7c746b9db1c4"
+          "sourceSha256": "4aeeca80822b2c25f23032ac3f611567002aee1ed0a97f3a390674768179d42d",
+          "sha256": "022859b9f78333db380453fa953d92d9293f2524c2b5c8da8679ae5d21fb8f08"
         },
         {
           "name": "facade/props.js",
@@ -268,8 +268,8 @@
           "name": "facade/d1-wire.js",
           "dist": "facade/dist/facade/d1-wire.js",
           "source": "facade/d1-wire.ts",
-          "sourceSha256": "d7e3c394dbc4eb448deb1075e855463556f45f1d197f32a186e9073aa465feba",
-          "sha256": "c18db39b11ac63c64b562ad72d2516d5e668bda0a339f77aa83b7801593de637"
+          "sourceSha256": "5127b07d50475674b4528dbbe53676174c5c4cb25f64695cf1030de79a46cb4b",
+          "sha256": "6c946b92333e55e1acc70e860de50191471cf62e5cc926e6ba6ba45127164320"
         },
         {
           "name": "facade/deadline.js",
@@ -282,8 +282,8 @@
           "name": "facade/facade-d1.js",
           "dist": "facade/dist/facade/facade-d1.js",
           "source": "facade/facade-d1.ts",
-          "sourceSha256": "c9e44bba353429b291a138bdc19d774b01fe2e6025ff78b9e7fdce1f3be86243",
-          "sha256": "da831d5a768a562aaf89cb6addb4357cd2f041e2b6f01ea97a4b15aa552e68d7"
+          "sourceSha256": "eb79f216b33f4d9105f670fee8d8cd4858d5caf805e9d9e0676c706efd8d903b",
+          "sha256": "28bd5fe09b3ee764bd52342aa8d5ac6c16f616b88d63de113b66e01a32a37866"
         },
         {
           "name": "facade/props.js",
@@ -471,15 +471,15 @@
           "name": "facade/facade-router.js",
           "dist": "facade/dist/facade/facade-router.js",
           "source": "facade/facade-router.ts",
-          "sourceSha256": "a46bd6ab31b31bd11e101460a9b22ce3c07c4af5bf2489c53d1c36e32efc9404",
-          "sha256": "4feafc409935e22130890b0ac33ab82ed6c4d5abebe36b4364e59691709ab865"
+          "sourceSha256": "6feccc573a81d8bf37253d7fc5ab4f2de28f5a9bc4bb06e036f52678ac039be5",
+          "sha256": "6789c180addd1949fe06dcf46b210a24713e125019a5f96752d10d1e3e757d1d"
         },
         {
           "name": "facade/router-core.js",
           "dist": "facade/dist/facade/router-core.js",
           "source": "facade/router-core.ts",
-          "sourceSha256": "1a152fa125db84fbe9aaf82803cd2b533d7839700765f26c88bb0f5127082753",
-          "sha256": "20e280327e49e4df5bda1309e773cdbf6a632f8941494c7f7abccdf7b1f1bf98"
+          "sourceSha256": "0e9bd1f60fc4301e4116f76027aeb086ec1fe5ea2f71ee08f9ce63b256063573",
+          "sha256": "09b4bb3a701c9a8d25bde3782b123291409c18dda395a17d33f232501dc144c8"
         },
         {
           "name": "facade/router-wire.js",

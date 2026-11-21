@@ -1,6 +1,9 @@
 export const MAX_INDEX_ENTRIES = 8;
 export const MAX_INDEX_BYTES = 4 * 1024 * 1024;
 export const MAX_INDEX_PATHS = 4096;
+export const MAX_REDIRECTS = 2100;
+export const MAX_ROUTES_RULES = 100;
+export const MAX_ROUTE_RULE_CHARS = 100;
 const indexCache = new Map();
 let indexCacheBytes = 0;
 let clock = 0;
@@ -143,20 +146,289 @@ export function normalizePath(raw) {
         out += part;
     }
     if (trailing && !out.endsWith("/")) out += "/";
-    return out === "" ? "/" : out;
+    if (out === "") out = "/";
+    while(out.includes("//"))out = out.replaceAll("//", "/");
+    return out;
 }
-export function intentFetchable(index, path, navigate, hasStaticRouting) {
-    const has = (p)=>index.paths.has(p);
-    if (has(path)) return true;
-    const nfh = hasStaticRouting || navigate ? index.notFoundHandling : "none";
-    if (index.htmlHandling === "auto-trailing-slash") {
-        if (path.endsWith("/")) {
-            if (has(`${path}index.html`)) return true;
+function findAsset(has, path) {
+    return has(path) ? path : null;
+}
+function safeRedirect(has, mode, file, dest, skip) {
+    if (skip || dest === "" || has(dest)) return null;
+    const target = findAsset(has, file);
+    if (target === null) return null;
+    const intent = htmlIntent(has, mode, dest, true);
+    return intent !== null && "asset" in intent && intent.asset === target ? dest : null;
+}
+function htmlIntent(has, mode, path, skip) {
+    if (mode === "none") {
+        const asset = findAsset(has, path);
+        return asset === null ? null : {
+            asset
+        };
+    }
+    if (mode === "force-trailing-slash") return htmlForce(has, path, skip);
+    if (mode === "drop-trailing-slash") return htmlDrop(has, path, skip);
+    return htmlAuto(has, path, skip);
+}
+function htmlAuto(has, path, skip) {
+    const exact = findAsset(has, path);
+    if (path.endsWith("/index")) {
+        if (exact !== null) return {
+            asset: exact
+        };
+        const dir = path.slice(0, -"index".length);
+        const first = safeRedirect(has, "auto-trailing-slash", `${path}.html`, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/index.html")) {
+        const dir = path.slice(0, -"index.html".length);
+        const first = safeRedirect(has, "auto-trailing-slash", path, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/")) {
+        const index = findAsset(has, `${path}index.html`);
+        if (index !== null) return {
+            asset: index
+        };
+        const stem = path.replace(/\/+$/, "");
+        const target = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+        if (target !== null) return {
+            redirect: target
+        };
+    } else if (path.endsWith(".html")) {
+        const stem = path.slice(0, -".html".length);
+        const first = safeRedirect(has, "auto-trailing-slash", path, stem, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const second = safeRedirect(has, "auto-trailing-slash", `${stem}/index.html`, `${stem}/`, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    }
+    if (exact !== null) return {
+        asset: exact
+    };
+    const html = findAsset(has, `${path}.html`);
+    if (html !== null) return {
+        asset: html
+    };
+    const tail = safeRedirect(has, "auto-trailing-slash", `${path}/index.html`, `${path}/`, skip);
+    return tail === null ? null : {
+        redirect: tail
+    };
+}
+function htmlForce(has, path, skip) {
+    const exact = findAsset(has, path);
+    if (path.endsWith("/index")) {
+        if (exact !== null) return {
+            asset: exact
+        };
+        const dir = path.slice(0, -"index".length);
+        const first = safeRedirect(has, "force-trailing-slash", `${path}.html`, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "force-trailing-slash", `${stem}.html`, dir, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/index.html")) {
+        const dir = path.slice(0, -"index.html".length);
+        const first = safeRedirect(has, "force-trailing-slash", path, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "force-trailing-slash", `${stem}.html`, dir, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/")) {
+        const index = findAsset(has, `${path}index.html`);
+        if (index !== null) return {
+            asset: index
+        };
+        const stem = path.replace(/\/+$/, "");
+        const html = findAsset(has, `${stem}.html`);
+        if (html !== null) return {
+            asset: html
+        };
+    } else if (path.endsWith(".html")) {
+        const slashed = `${path.slice(0, -".html".length)}/`;
+        const first = safeRedirect(has, "force-trailing-slash", path, slashed, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        if (exact !== null) return {
+            asset: exact
+        };
+        const second = safeRedirect(has, "force-trailing-slash", `${slashed}index.html`, slashed, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    }
+    if (exact !== null) return {
+        asset: exact
+    };
+    const slashed = `${path}/`;
+    const first = safeRedirect(has, "force-trailing-slash", `${path}.html`, slashed, skip);
+    if (first !== null) return {
+        redirect: first
+    };
+    const second = safeRedirect(has, "force-trailing-slash", `${path}/index.html`, slashed, skip);
+    return second === null ? null : {
+        redirect: second
+    };
+}
+function htmlDrop(has, path, skip) {
+    const exact = findAsset(has, path);
+    if (path.endsWith("/index")) {
+        if (exact !== null) return {
+            asset: exact
+        };
+        const stem = path.slice(0, -"/index".length);
+        if (stem === "") {
+            const root = safeRedirect(has, "drop-trailing-slash", "/index.html", "/", skip);
+            if (root !== null) return {
+                redirect: root
+            };
         } else {
-            if (has(`${path}.html`)) return true;
-            if (has(`${path}/index.html`)) return true;
+            const first = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+            if (first !== null) return {
+                redirect: first
+            };
+            const second = safeRedirect(has, "drop-trailing-slash", `${path}.html`, stem, skip);
+            if (second !== null) return {
+                redirect: second
+            };
+        }
+    } else if (path.endsWith("/index.html")) {
+        if (path === "/index.html") {
+            const root = safeRedirect(has, "drop-trailing-slash", "/index.html", "/", skip);
+            if (root !== null) return {
+                redirect: root
+            };
+        } else {
+            const stem = path.slice(0, -"/index.html".length);
+            const first = safeRedirect(has, "drop-trailing-slash", path, stem, skip);
+            if (first !== null) return {
+                redirect: first
+            };
+            if (exact !== null) return {
+                asset: exact
+            };
+            const second = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+            if (second !== null) return {
+                redirect: second
+            };
+        }
+    } else if (path.endsWith("/")) {
+        if (path === "/") {
+            const index = findAsset(has, "/index.html");
+            if (index !== null) return {
+                asset: index
+            };
+        } else {
+            const stem = path.replace(/\/+$/, "");
+            const first = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+            if (first !== null) return {
+                redirect: first
+            };
+            const second = safeRedirect(has, "drop-trailing-slash", `${stem}/index.html`, stem, skip);
+            if (second !== null) return {
+                redirect: second
+            };
+        }
+    } else if (path.endsWith(".html")) {
+        const stem = path.slice(0, -".html".length);
+        const first = safeRedirect(has, "drop-trailing-slash", path, stem, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const second = safeRedirect(has, "drop-trailing-slash", `${stem}/index.html`, stem, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    }
+    if (exact !== null) return {
+        asset: exact
+    };
+    const html = findAsset(has, `${path}.html`);
+    if (html !== null) return {
+        asset: html
+    };
+    const index = findAsset(has, `${path}/index.html`);
+    return index === null ? null : {
+        asset: index
+    };
+}
+function redirectMatches(rules, path) {
+    for (const rule of rules){
+        if (rule.source === path) return true;
+        if (!rule.source.includes("*") && !rule.source.includes(":")) continue;
+        const src = rule.source.split("/");
+        const req = path.split("/");
+        let matched = true;
+        for(let i = 0; i < src.length; i++){
+            if (src[i] === "*") return true;
+            if (req[i] === undefined) {
+                matched = false;
+                break;
+            }
+            if (src[i].startsWith(":")) {
+                if (req[i] === "") {
+                    matched = false;
+                    break;
+                }
+                continue;
+            }
+            if (src[i] !== req[i]) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched && req.length === src.length) return true;
+    }
+    return false;
+}
+function routeMatches(rules, path) {
+    for (const rule of rules){
+        if (rule.endsWith("*")) {
+            if (path.startsWith(rule.slice(0, -1))) return true;
+        } else if (rule === path) {
+            return true;
         }
     }
+    return false;
+}
+export function routesWorkerFirst(routes, path) {
+    if (routeMatches(routes.exclude, path)) return false;
+    return routeMatches(routes.include, path);
+}
+export function intentFetchable(index, path, navigate, hasStaticRouting, rawPath = path) {
+    if (!hasStaticRouting && index.routes !== null) {
+        return !routesWorkerFirst(index.routes, rawPath);
+    }
+    const has = (p)=>index.paths.has(p);
+    if (has(path)) return true;
+    if (redirectMatches(index.redirects, rawPath)) return true;
+    const nfh = hasStaticRouting || navigate ? index.notFoundHandling : "none";
+    if (htmlIntent(has, index.htmlHandling, path, false) !== null) return true;
     if (nfh === "single-page-application") return has("/index.html");
     if (nfh === "404-page") {
         let dir = path;
@@ -216,6 +488,8 @@ export function compileCfg(raw) {
 }
 const HTML_HANDLINGS = new Set([
     "auto-trailing-slash",
+    "force-trailing-slash",
+    "drop-trailing-slash",
     "none"
 ]);
 const NOT_FOUND_HANDLINGS = new Set([
@@ -224,6 +498,30 @@ const NOT_FOUND_HANDLINGS = new Set([
     "single-page-application"
 ]);
 const DIGEST_HEX = /^[0-9a-f]{64}$/;
+function parseRoutesWire(value) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "object" || Array.isArray(value)) return undefined;
+    const { include, exclude } = value;
+    if (!Array.isArray(include) || include.length === 0) return undefined;
+    if (exclude !== undefined && !Array.isArray(exclude)) return undefined;
+    const inc = include;
+    const exc = exclude ?? [];
+    if (inc.length + exc.length > MAX_ROUTES_RULES) return undefined;
+    const valid = (rule)=>{
+        if (typeof rule !== "string" || rule.length === 0 || rule.length > MAX_ROUTE_RULE_CHARS) {
+            return false;
+        }
+        if (!rule.startsWith("/") || rule.includes("?") || rule.includes("#")) return false;
+        if (!/^[\x20-\x7e]+$/.test(rule)) return false;
+        const star = rule.indexOf("*");
+        return star === -1 || star === rule.length - 1;
+    };
+    if (!inc.every(valid) || !exc.every(valid)) return undefined;
+    return {
+        include: inc,
+        exclude: exc
+    };
+}
 export function parseIndex(raw) {
     if (typeof raw !== "object" || raw === null) return {
         kind: "invalid"
@@ -240,6 +538,10 @@ export function parseIndex(raw) {
         };
     }
     const md = doc.manifestDigest;
+    const routes = parseRoutesWire(doc.routes);
+    if (routes === undefined) return {
+        kind: "invalid"
+    };
     if (doc.tooLarge === true) return {
         kind: "tooLarge"
     };
@@ -258,6 +560,33 @@ export function parseIndex(raw) {
         paths.add(p);
         approxBytes += p.length + 8;
     }
+    const redirects = [];
+    if (doc.redirects !== undefined) {
+        if (!Array.isArray(doc.redirects) || doc.redirects.length > MAX_REDIRECTS) {
+            return {
+                kind: "invalid"
+            };
+        }
+        for (const r of doc.redirects){
+            if (typeof r !== "object" || r === null) return {
+                kind: "invalid"
+            };
+            const { source, status } = r;
+            if (typeof source !== "string" || !source.startsWith("/") || source.length > 1024 || status !== 200 && status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) {
+                return {
+                    kind: "invalid"
+                };
+            }
+            redirects.push({
+                source,
+                status
+            });
+            approxBytes += source.length + 16;
+        }
+    }
+    if (routes !== null) {
+        approxBytes += routes.include.reduce((n, r)=>n + r.length + 4, 8) + routes.exclude.reduce((n, r)=>n + r.length + 4, 0);
+    }
     if (approxBytes > MAX_INDEX_BYTES) return {
         kind: "tooLarge"
     };
@@ -267,6 +596,8 @@ export function parseIndex(raw) {
             htmlHandling: doc.htmlHandling,
             notFoundHandling: doc.notFoundHandling,
             paths,
+            redirects,
+            routes,
             approxBytes,
             digest: "",
             manifestDigest: md

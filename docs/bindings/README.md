@@ -32,14 +32,14 @@ host/provider configuration, not per-binding provider plug-ins.
 | [Service bindings](service-bindings.md) | Partial | Worker-to-worker bindings inside one tenant: default export or a named `WorkerEntrypoint` via `services[].entrypoint`. |
 | [Hyperdrive](hyperdrive.md) | Partial | Postgres wire protocol through the egress layer to `vrt-provider`'s loopback proxy; credentials never enter the isolate. Requires the `database_tenant` extension key; Postgres only, no MySQL. |
 | [Rate limiting](rate-limiting.md) | Partial | `[[ratelimits]]` with `namespace_id` + `simple.limit`/`period`. Fixed-window counter inside the per-tenant facade worker — approximate, per process, not shared across hosts. |
-| [Static assets](static-assets.md) | Partial | `assets.directory`/`binding`/`not_found_handling`/`run_worker_first`, content-addressed store. `html_handling` supports only `auto-trailing-slash` and `none`; per-deploy caps of 512 files / 1 MiB each / 8 MiB total. |
+| [Static assets](static-assets.md) | Partial | `assets.directory`/`binding`/`not_found_handling`/`run_worker_first`, content-addressed store; all four `html_handling` modes (Cloudflare resolver semantics); per-deploy caps of 512 files / 1 MiB each / 8 MiB total. |
 | [WebSockets](websockets.md) | Partial | HTTP/1.1 upgrade passthrough to workers and Durable Objects. 300 s idle / 4 h max session, 4096 sessions per ingress, 256 per tenant. |
 | [Vars and secrets](vars-and-secrets.md) | Partial | `vars` become `text` bindings, so non-string values arrive JSON-encoded as strings. Secrets are `vrt secret put` + `[secrets]` name→ref maps injected as process env vars; `secrets_store_secrets` is rejected. |
 | Workers AI (`ai`) | Unsupported | Any unrecognized top-level key fails the deploy with `VRT_CONFIG_UNSUPPORTED_FIELD`. |
 | Vectorize (`vectorize`) | Unsupported | Same typed deploy error. |
 | `ai_search` / `ai_search_namespaces` | Unsupported | Same typed deploy error. |
-| Tail Workers (`tail_consumers`) | Unsupported | Same typed deploy error. (OpenFlare uses an internal tail worker per tenant for logs; it is not user-configurable.) |
-| Analytics Engine (`analytics_engine_datasets`) | Unsupported | Same typed deploy error. |
+| [Tail Workers](tail-workers.md) | Partial | `tail_consumers` render as native workerd `tails` designators next to the platform log collector. Same-tenant, already-deployed consumers only; delivery is best effort and streaming tails are not supported. |
+| [Analytics Engine](analytics-engine.md) | Partial | `[[analytics_engine_datasets]]` → a native `analyticsEngine` binding (`writeDataPoint`). Events ingest to a per-tenant socket, spool as JSONL, and flush to canonical Parquet — full fidelity, no sampling; query via DuckDB/ClickHouse. |
 | [Worker loaders](worker-loaders.md) | Partial | `[[worker_loaders]]` → a native `WorkerLoader` binding (`get`/`load`, named cache, dynamic entrypoints and Durable Object facets, `WorkerCode.limits` honoured). The tenant supplies all code at runtime; a platform quota bounds live workers per loader. |
 | `send_email`, `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`, `containers`, `wasm_modules`, `text_blobs`, `data_blobs`, `version_metadata`, `unsafe`, `placement.mode`, `secrets_store_secrets` | Unsupported | Same typed deploy error — the key names the field, e.g. `[VRT_CONFIG_UNSUPPORTED_FIELD] ai is not supported by the VRT runtime`. |
 

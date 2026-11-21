@@ -12,12 +12,19 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use vrt_local::{InitParams, LocalError, VrtLocal};
 
+// Dev-only opt-out for the vrt-sql fs-persistence durability guard
+// (persistence.allowSameDeviceDurability). Passed by the
+// `deploy/standalone` dev/CI compose stack; a production deployment
+// must never pass it.
+const DEV_ALLOW_SAME_DEVICE_DURABILITY: &str = "--dev-allow-same-device-durability";
+
 const USAGE: &str = "\
 vrt — standalone Vibeploy Workers runtime control plane
 
 USAGE:
   vrt init --root <dir> --cell <id> --tenant <id> [--mode capnp|stub]
            [--facade-dist <dir>] [--workerd <path>] [--ingress-listen <addr>]
+           [--dev-allow-same-device-durability]
   vrt serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
            [--vrt-sql-bin <p>] [--mgmt-tcp-listen <addr> --mgmt-tcp-token-file <p>]
   vrt dev [<worker_dir>] [--env <name>] [--listen <addr>] [--no-watch] [--no-color] [--no-logs]
@@ -635,6 +642,12 @@ fn unix_http(
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
     let root = root_of(args)?;
+    if args.iter().any(|a| a == DEV_ALLOW_SAME_DEVICE_DURABILITY) {
+        eprintln!(
+            "WARNING: {DEV_ALLOW_SAME_DEVICE_DURABILITY}: vrt-sql will allow fs persistence on the \
+             same device as dbRoot — DEV/CI ONLY, durability is NOT guaranteed (no disaster recovery)"
+        );
+    }
     let reconfigure = args.iter().any(|a| a == "--reconfigure");
     let cell = arg(args, "--cell").unwrap_or("local");
     let tenant = arg(args, "--tenant").unwrap_or("local");
@@ -761,7 +774,7 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
         token_path.display()
     );
     println!(
-        "configs: {}/config/vrt-host.toml, vrt-provider.toml",
+        "configs: {}/config/vrt-host.toml, vrt-provider.toml, vrt-sql.toml",
         root.display()
     );
     Ok(())
@@ -811,7 +824,11 @@ fn config_diff(
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     write_configs(&tmp, root, key, mode, args)?;
     let mut changed = Vec::new();
-    for name in ["vrt-host.toml", "vrt-provider.toml"] {
+    // Include vrt-sql.toml: a dev-only exemption change
+    // (--dev-allow-same-device-durability) is a config change too, so
+    // an upgraded root gets a clear --reconfigure hint instead of a
+    // silent no-op that leaves vrt-sql refusing to boot.
+    for name in ["vrt-host.toml", "vrt-provider.toml", "vrt-sql.toml"] {
         let new = std::fs::read_to_string(tmp.join(name)).unwrap_or_default();
         let old = std::fs::read_to_string(vrt_local::layout::config_dir(root).join(name))
             .unwrap_or_default();
@@ -938,6 +955,14 @@ fn write_configs(
             "__VRT_SQL_METRICS__",
             arg(args, "--vrt-sql-metrics-listen").unwrap_or("127.0.0.1:9492"),
         );
+    // Dev-only: the standalone compose quick start (and CI) puts the
+    // object store next to the db on one device, which the fail-closed
+    // durability guard rejects. The exemption is opt-in per init.
+    let sql = if args.iter().any(|a| a == DEV_ALLOW_SAME_DEVICE_DURABILITY) {
+        vrt_local::templates::dev_allow_same_device_durability(&sql)
+    } else {
+        sql
+    };
     let cfg = out_dir;
     for (name, doc) in [
         ("vrt-host.toml", host),

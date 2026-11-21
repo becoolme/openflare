@@ -45,6 +45,10 @@ const MAX_QUEUE_CONSUMERS_PER_WORKER: usize = 100;
 /// CF has no explicit limit, a conservative cap is chosen to prevent snapshot bloat).
 const MAX_DO_CLASSES_PER_WORKER: usize = 64;
 const MAX_WORKFLOWS_PER_WORKER: usize = 32;
+/// Maximum Tail Workers a producer may declare. Cloudflare's documented
+/// config has no explicit cap; this bounds the signed document and the
+/// rendered `tails` list without approaching workerd's service limits.
+pub const MAX_TAIL_CONSUMERS_PER_WORKER: usize = 16;
 /// CF `limits.steps` bound — wrangler accepts positive ints; we cap
 /// conservatively (engine default is effectively unbounded).
 const MAX_WORKFLOW_STEPS: u32 = 100_000;
@@ -91,6 +95,19 @@ pub const MAX_MEMORY_MB: u32 = 4096;
 pub const MAX_SUBREQUESTS: u32 = 10_000;
 /// `quotas.outboundConnections` bounds (simultaneous outbound connections).
 pub const MAX_OUTBOUND_CONNECTIONS: u32 = 1024;
+
+/// Platform default CPU budget (ms) — the value a worker that never
+/// declared `limits` carries. One source of truth for the control
+/// plane, `vrt-local` and `vrt-config` (a default that disagreed
+/// between them would silently turn into an enforced limit).
+pub const DEFAULT_CPU_MS: u32 = 50;
+/// Platform default isolate memory (MiB); matches Cloudflare's 128 MB
+/// isolate.
+pub const DEFAULT_MEMORY_MB: u32 = 128;
+/// Platform default outbound subrequests per request.
+pub const DEFAULT_SUBREQUESTS: u32 = 50;
+/// Platform default simultaneous outbound connections.
+pub const DEFAULT_OUTBOUND_CONNECTIONS: u32 = 16;
 
 /// The `compute.desired` payload: complete desired state for one cell.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -217,6 +234,16 @@ pub struct WorkerDesired {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub workflows: Vec<WorkflowDesired>,
 
+    /// Tail Workers this worker forwards invocation events to (wrangler
+    /// `tail_consumers`). Each entry names a DIFFERENT worker of the same
+    /// tenant, resolved from its deployment name at pack time. Skipped
+    /// when empty so snapshots without tail consumers stay
+    /// byte-identical; old cells reject a snapshot that carries the
+    /// field via `deny_unknown_fields` (fail closed, never silently drop
+    /// a declared consumer).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail_consumers: Vec<TailConsumerDesired>,
+
     /// Per-isolate/per-request resource limits enforced by the runtime.
     pub quotas: WorkerQuotas,
 }
@@ -280,6 +307,13 @@ pub enum BindingDesired {
     /// Points at no provider resource; the tenant supplies code at
     /// runtime. Rendered as workerd `workerLoader` (experimental).
     WorkerLoader(WorkerLoaderBinding),
+    /// `{"type":"analyticsEngine"}` — Analytics Engine dataset
+    /// (`env.<name>` is a `AnalyticsEngineDataset` with
+    /// `writeDataPoint()`). Rendered as workerd `analyticsEngine`
+    /// (experimental) targeting the tenant's AE ingest socket; the
+    /// emitted service designator name IS the dataset name — workerd
+    /// derives the event's `dataset` field from it.
+    AnalyticsEngine(AnalyticsEngineBinding),
 }
 
 /// `{"type":"var"}` — see [`BindingDesired::Var`].
@@ -506,6 +540,22 @@ pub struct WorkerLoaderBinding {
     pub name: String,
 }
 
+/// `{"type":"analyticsEngine"}` — an Analytics Engine dataset binding.
+/// `dataset` becomes both the workerd service-designator name (the
+/// event's `dataset` field) and the per-tenant spool/parquet
+/// partition, so it is charset-bound at validation
+/// (`[A-Za-z0-9_]{1,256}`) — safe as a capnp service name, an
+/// `--external-addr` token, and a filesystem path segment.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnalyticsEngineBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// Dataset name — wrangler `dataset`, defaults to the binding name
+    /// at project-config parse (mirrors CF).
+    pub dataset: String,
+}
+
 /// P3c-1 `durableObjectClasses[]`: one DO class declared by this worker.
 /// Corresponds to wrangler `new_sqlite_classes` (`enableSql=true`) or
 /// `new_classes` (`enableSql=false` -- under localDisk both use the same sqlite
@@ -574,6 +624,20 @@ pub struct WorkflowDesired {
     /// json binding when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits_steps: Option<u32>,
+}
+
+/// One wrangler `tail_consumers[]` entry, resolved to the consumer's
+/// stable worker id at pack time. Cloudflare names the consumer by
+/// script name; OpenFlare resolves that name inside the deploying
+/// tenant and stores the identity so a later rename or a cross-tenant
+/// reference can never re-point the designator. The tail handler is
+/// best-effort (workerd drops events when the consumer is unavailable)
+/// and MUST NOT be used for billing or audit.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TailConsumerDesired {
+    /// Consumer worker id in the SAME tenant (never the producer itself).
+    pub worker_id: String,
 }
 
 /// T37b `queueConsumers[]`: a worker's consumption relationship to a queue (not a binding --
@@ -720,10 +784,75 @@ pub struct WorkerQuotas {
     pub cpu_ms: u32,
     /// Isolate memory in MiB.
     pub memory_mb: u32,
-    /// Outbound subrequests per request (0 = no subrequests).
+    /// Outbound subrequests per request.
     pub subrequests: u32,
-    /// Simultaneous outbound connections (0 = none).
+    /// Simultaneous outbound connections.
     pub outbound_connections: u32,
+}
+
+impl WorkerQuotas {
+    /// The platform default set — what a worker that never declared
+    /// `limits` carries. Rendering treats these values as "not
+    /// declared": no `limits` dimension is emitted for them, so an
+    /// undeclared worker keeps stock workerd behaviour.
+    pub const fn platform_default() -> Self {
+        Self {
+            cpu_ms: DEFAULT_CPU_MS,
+            memory_mb: DEFAULT_MEMORY_MB,
+            subrequests: DEFAULT_SUBREQUESTS,
+            outbound_connections: DEFAULT_OUTBOUND_CONNECTIONS,
+        }
+    }
+
+    /// True when every dimension equals [`Self::platform_default`].
+    pub fn is_platform_default(&self) -> bool {
+        self.cpu_ms == DEFAULT_CPU_MS
+            && self.memory_mb == DEFAULT_MEMORY_MB
+            && self.subrequests == DEFAULT_SUBREQUESTS
+            && self.outbound_connections == DEFAULT_OUTBOUND_CONNECTIONS
+    }
+
+    /// First dimension that differs from [`Self::platform_default`], in
+    /// render order. `None` = nothing was explicitly declared.
+    pub fn declared_deviation(&self) -> Option<&'static str> {
+        if self.cpu_ms != DEFAULT_CPU_MS {
+            return Some("cpuMs");
+        }
+        if self.memory_mb != DEFAULT_MEMORY_MB {
+            return Some("memoryMb");
+        }
+        if self.subrequests != DEFAULT_SUBREQUESTS {
+            return Some("subrequests");
+        }
+        if self.outbound_connections != DEFAULT_OUTBOUND_CONNECTIONS {
+            return Some("outboundConnections");
+        }
+        None
+    }
+
+    /// True when at least one dimension this runtime generation can
+    /// render (`cpuMs`, `memoryMb`, `subRequests`) was declared, i.e.
+    /// the cell must emit a `limits` block for this worker.
+    ///
+    /// `subrequests = 0` means "no subrequest budget" in the protocol
+    /// but "unlimited" on the workerd side; it therefore needs no
+    /// `limits` entry (omitted dimension = stock behaviour) and does not
+    /// count as rendered.
+    pub fn declares_enforceable_limit(&self) -> bool {
+        (self.cpu_ms != DEFAULT_CPU_MS && self.cpu_ms > 0)
+            || (self.memory_mb != DEFAULT_MEMORY_MB && self.memory_mb > 0)
+            || (self.subrequests != DEFAULT_SUBREQUESTS && self.subrequests > 0)
+    }
+
+    /// True when a positive `outboundConnections` budget was declared.
+    /// This dimension has no `limits` field in the pinned workerd fork
+    /// yet (the connection-counter patch is deferred), so it can never
+    /// be enforced — a declared value is refused instead of being
+    /// silently dropped. `0` means "no declared budget" (stock
+    /// behaviour) and is accepted.
+    pub fn declares_unenforceable_limit(&self) -> bool {
+        self.outbound_connections > 0 && self.outbound_connections != DEFAULT_OUTBOUND_CONNECTIONS
+    }
 }
 
 /// Typed `compute.desired` validation error with stable `DESIRED_*` codes.
@@ -798,6 +927,13 @@ pub enum DesiredError {
     #[error("workflow script_name target is not in the same tenant")]
     WorkflowTarget,
 
+    /// A tail consumer names a worker outside this tenant, does not
+    /// exist in the spec, or is the producer itself — workerd refuses
+    /// a dangling `tails` designator and a self-tail has no documented
+    /// CF semantics, so the snapshot never ships either.
+    #[error("tail consumer target is invalid")]
+    TailConsumer,
+
     /// A cron expression is not a valid 5-field schedule.
     #[error("invalid cron expression")]
     CronExpression,
@@ -842,6 +978,7 @@ impl DesiredError {
             Self::ServiceCycle => "DESIRED_SERVICE_CYCLE",
             Self::DoClass => "DESIRED_DO_CLASS_UNDECLARED",
             Self::WorkflowTarget => "DESIRED_WORKFLOW_TARGET_SCOPE",
+            Self::TailConsumer => "DESIRED_TAIL_CONSUMER_SCOPE",
         }
     }
 }
@@ -977,6 +1114,26 @@ impl ComputeDesired {
 
             // Service bindings may only target workers of the same tenant.
             for worker in &tenant.workers {
+                // Tail consumers: a same-tenant, DIFFERENT worker; unique
+                // per producer. Workerd refuses a `tails` designator with
+                // no service, so a dangling declaration must never ship.
+                if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+                    return Err(DesiredError::Capacity("tailConsumers"));
+                }
+                let mut tail_targets = HashSet::new();
+                for tail in &worker.tail_consumers {
+                    if !valid_identifier(&tail.worker_id, MAX_IDENTIFIER_LEN) {
+                        return Err(DesiredError::Identifier("tailConsumers.workerId"));
+                    }
+                    if tail.worker_id == worker.worker_id
+                        || !tenant_worker_ids.contains(&tail.worker_id)
+                    {
+                        return Err(DesiredError::TailConsumer);
+                    }
+                    if !tail_targets.insert(&tail.worker_id) {
+                        return Err(DesiredError::Duplicate("tailConsumers.workerId"));
+                    }
+                }
                 for binding in &worker.bindings {
                     if let BindingDesired::Service(service) = binding {
                         if !valid_identifier(&service.worker_id, MAX_IDENTIFIER_LEN)
@@ -1297,6 +1454,21 @@ impl WorkerDesired {
                 // (validated as a binding name at the match head) is
                 // the only field.
                 BindingDesired::WorkerLoader(_) => {}
+                BindingDesired::AnalyticsEngine(ae) => {
+                    // `dataset` is emitted as a workerd service name
+                    // AND used as a spool/parquet path segment —
+                    // `[A-Za-z0-9_]{1,256}` keeps both uses safe
+                    // (no `=` for --external-addr, no `/` for paths).
+                    if ae.dataset.is_empty()
+                        || ae.dataset.len() > 256
+                        || !ae
+                            .dataset
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return Err(DesiredError::Identifier("bindings.dataset"));
+                    }
+                }
             }
         }
         Ok(())
@@ -1467,6 +1639,7 @@ impl BindingDesired {
             Self::Queue(b) => &b.name,
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
+            Self::AnalyticsEngine(b) => &b.name,
         }
     }
 
@@ -1487,7 +1660,8 @@ impl BindingDesired {
             | Self::Service(_)
             | Self::DurableObject(_)
             | Self::Ratelimit(_)
-            | Self::WorkerLoader(_) => None,
+            | Self::WorkerLoader(_)
+            | Self::AnalyticsEngine(_) => None,
         }
     }
 }
@@ -2015,6 +2189,67 @@ mod tests {
                 "",
             ),
             ("service-ok-same-tenant", Box::new(|_| {}), ""),
+            (
+                "tail-consumer-ok-same-tenant",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}])
+                }),
+                "",
+            ),
+            (
+                "tail-consumer-self",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-1"}])
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "tail-consumer-missing",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] = json!([{"workerId": "w-nope"}])
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "tail-consumer-cross-tenant",
+                Box::new(|v| {
+                    let av = v["tenants"][0]["workers"][0]["activeVersion"].clone();
+                    let q = v["tenants"][0]["workers"][0]["quotas"].clone();
+                    v["tenants"].as_array_mut().unwrap().push(json!({
+                        "tenantId": "team-beta",
+                        "workers": [{
+                            "workerId": "w-beta-9",
+                            "name": "beta-nine",
+                            "activeVersion": av,
+                            "bindings": [],
+                            "routes": [],
+                            "crons": [],
+                            "quotas": q
+                        }]
+                    }));
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-beta-9"}]);
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "tail-consumer-duplicate",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}, {"workerId": "w-alpha-2"}]);
+                }),
+                "DESIRED_DUPLICATE",
+            ),
+            (
+                "tail-consumer-bad-id",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "bad id"}]);
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
             (
                 "service-named-entrypoint-ok",
                 Box::new(|v| {

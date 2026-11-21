@@ -30,6 +30,8 @@ struct HostCfg {
     binding_backend_socket: String,
     system_compat_date: String,
     system_compat_flags: Vec<String>,
+    /// `render.quotas` — the host's workerd enforces per-worker limits.
+    quotas: bool,
 }
 
 /// Run the deploy-time check against the post-deploy state (`st`
@@ -107,6 +109,9 @@ pub(crate) fn deploy_preflight(
         // degrades to an explicit 501 (fail closed).
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        // Standalone has no AE ingest service — `analyticsEngine`
+        // bindings fail the render closed (`aeAddr`).
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         // MIG-12: mirror the production probe-socket emit so the
         // workerd load check covers the wrapped-module surface.
@@ -130,6 +135,11 @@ pub(crate) fn deploy_preflight(
             })?,
         );
     }
+    // Per-worker quotas: the deploy must fail HERE when the host's
+    // workerd cannot enforce a declared limit — otherwise the published
+    // snapshot would render as a skipped worker (or run unlimited).
+    vrt_config::ensure_quotas_enforceable(tenant, cfg.quotas)
+        .map_err(|e| LocalError::Op("deploy check", format!("quotas: {e}")))?;
     let rendered = vrt_config::render_tenant_config(&vrt_config::TenantRenderInput {
         tenant,
         revision: st.revision,
@@ -269,21 +279,13 @@ fn materialize_and_check(
     )
     .map_err(LocalError::Io)?;
 
-    // `--experimental` argv parity with assemble's derivation: queue
-    // consumers, DO/workflow namespaces, or non-"experimental" system
-    // experimental flags all require it.
-    let needs_experimental = tenant.workers.iter().any(|w| {
-        !w.queue_consumers.is_empty()
-            || !w.durable_object_classes.is_empty()
-            || !w.workflows.is_empty()
-    }) || cfg
-        .system_compat_flags
-        .iter()
-        .any(|f| f != "experimental" && vrt_config::is_experimental_compat_flag(f));
-    let mut extra = Vec::new();
-    if needs_experimental {
-        extra.push("--experimental".to_string());
-    }
+    // `--experimental` argv parity with assemble's derivation: the
+    // predicate is shared (`vrt_config::launch_args`), so queue
+    // consumers, DO/workflow namespaces, cron facades, workerLoader
+    // bindings and non-"experimental" system experimental flags all
+    // force the arg here exactly as they do at serve time. Deriving it
+    // locally is how cron-basic deployments once failed the check.
+    let extra = vrt_config::tenant_experimental_extra_args(&cfg.system_compat_flags, tenant);
 
     // Needles: every env value the child would see — redacted out of
     // the failure tail just like the launch path.
@@ -306,6 +308,22 @@ fn seq() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// `render.quotas` — does this root's host enforce per-worker limits?
+/// Diagnostic only: an unreadable/malformed host config reads `false`
+/// (fail closed: never claim enforcement we cannot see). A valid
+/// `[render]` without the key reads `true` — that is the host's own
+/// default (the pinned workerd carries the limits patch).
+pub(crate) fn host_quotas_enforced(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("config/vrt-host.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Value>().ok())
+        .and_then(|doc| {
+            doc.get("render")
+                .map(|r| r.get("quotas").and_then(|v| v.as_bool()).unwrap_or(true))
+        })
+        .unwrap_or(false)
 }
 
 /// Read `config/vrt-host.toml`; `None` when absent or stub mode.
@@ -372,5 +390,9 @@ fn read_host_config(root: &Path) -> Result<Option<HostCfg>, LocalError> {
         binding_backend_socket: render_str("bindingBackendSocket")?,
         system_compat_date: render_str("systemCompatDate")?,
         system_compat_flags: flags,
+        quotas: render
+            .get("quotas")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     }))
 }

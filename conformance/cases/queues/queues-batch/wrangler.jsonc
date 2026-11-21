@@ -1,0 +1,28 @@
+// Conformance case: sendBatch atomicity + consumer max_concurrency.
+// SINK has no consumer so its backlog is a stable view of what a
+// producer call actually wrote. Q/conf-q-conc is consumed one message
+// per invocation with max_concurrency 1, so the handler can record
+// whether two invocations ever overlap.
+{
+  "name": "conf-queues-batch",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-queues-batch.vrt.local/*"],
+  "queues": {
+    "producers": [
+      { "binding": "Q", "queue": "conf-q-conc" },
+      { "binding": "SINK", "queue": "conf-q-sink" },
+    ],
+    "consumers": [
+      {
+        "queue": "conf-q-conc",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_concurrency": 1,
+      },
+    ],
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "conf-queues-batch-db", "database_id": "conf-queues-batch" },
+  ],
+}

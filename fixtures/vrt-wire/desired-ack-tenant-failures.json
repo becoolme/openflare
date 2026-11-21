@@ -1,11 +1,13 @@
 {
   "appliedAt": "2026-01-01T00:00:00Z",
   "capabilities": {
+    "analyticsEngine": true,
     "assets": true,
     "cron": true,
     "d1": true,
     "d1CellOps": true,
     "queue": true,
+    "quotas": true,
     "serviceEntrypoint": true,
     "storagePurge": true,
     "workerLoader": true,

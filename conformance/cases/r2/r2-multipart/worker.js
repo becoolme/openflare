@@ -44,8 +44,11 @@ export default {
           size: meta.size,
           bytes: body.byteLength,
           head: body[0] === 0x61 && body[PART] === 0x62 && body[body.byteLength - 1] === 0x63,
-          // Read back from the stored object: metadata set at create time
-          // applies to the completed object (complete() result shape is uncited).
+          // complete() is a full R2Object: metadata set at create time is
+          // on the result itself, not only on a later get().
+          completeCustomMetadata: meta.customMetadata ?? null,
+          completeContentType: meta.httpMetadata?.contentType ?? null,
+          // Cross-check that the stored object carries the same value.
           customMetadata: res.customMetadata ?? null,
         });
       }

@@ -110,11 +110,220 @@ test("html_handling: /about matches /about.html", async () => {
   assert.equal(res.headers.get(HDR), "assets");
 });
 
-test("html_handling: /dir matches /dir/index.html (308 fetchable)", async () => {
+test("html_handling: /dir matches /dir/index.html (307 fetchable)", async () => {
   const a = [];
   const r = new AssetsRouter();
   const res = await hit(env({}, userWorker([]), assetsWorker(a, INDEX)),req("/dir"));
   assert.equal(res.headers.get(HDR), "assets");
+});
+
+test("force-trailing-slash: every HTML form still routes to assets", async () => {
+  const idx = {
+    htmlHandling: "force-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/about.html", "/dir/index.html"],
+  };
+  for (const p of ["/about", "/about.html", "/about/", "/dir", "/dir/", "/dir/index", "/dir/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("drop-trailing-slash: every HTML form still routes to assets", async () => {
+  const idx = {
+    htmlHandling: "drop-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/about.html", "/dir/index.html"],
+  };
+  for (const p of ["/about", "/about.html", "/about/", "/dir", "/dir/", "/dir/index", "/dir/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("dotted HTML stems route to their .html alias", async () => {
+  // `/release-1.2` → `/release-1.2.html`: a dot does not make the
+  // path a concrete asset, and the redirect destination must stay
+  // fetchable (matches vrt-provider resolve()).
+  const idx = { ...INDEX, paths: ["/release-1.2.html", "/app.js"] };
+  for (const p of ["/release-1.2", "/release-1.2.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("overlapping page and directory routes both route to assets", async () => {
+  const idx = { ...INDEX, paths: ["/both.html", "/both/index.html"] };
+  for (const p of ["/both", "/both/", "/both.html", "/both/index", "/both/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("shadowed canonical forms fall through to the user worker", async () => {
+  // `/file-bin` exists, so the `/file-bin.html` rewrite has no free
+  // destination: the provider 404s `/file-bin/`, `/file-bin/index` and
+  // `/file-bin/index.html` in auto/drop mode. The router must not claim
+  // them for assets (worker fallback instead of a 404 from assets).
+  for (const htmlHandling of ["auto-trailing-slash", "drop-trailing-slash"]) {
+    const idx = { htmlHandling, notFoundHandling: "none", paths: ["/file-bin", "/file-bin.html"] };
+    for (const p of ["/file-bin", "/file-bin.html"]) {
+      const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+      assert.equal(res.headers.get(HDR), "assets", `${htmlHandling} ${p}`);
+    }
+    for (const p of ["/file-bin/", "/file-bin/index", "/file-bin/index.html"]) {
+      const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+      assert.equal(res.headers.get(HDR), null, `${htmlHandling} ${p}`);
+    }
+  }
+  // force mode serves/redirects `/file-bin.html` at `/file-bin/`, so all
+  // forms stay on the assets side.
+  const force = {
+    htmlHandling: "force-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/file-bin", "/file-bin.html"],
+  };
+  for (const p of ["/file-bin", "/file-bin.html", "/file-bin/", "/file-bin/index", "/file-bin/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], force)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("_redirects matching uses the raw request path", async () => {
+  // The provider matches `_redirects` against the un-decoded path, so the
+  // router must agree: an encoded path that only matches after decoding
+  // belongs to the worker, and an encoded segment that encodes a `/`
+  // still matches a `:name` rule.
+  const idx = {
+    ...INDEX,
+    paths: ["/app.js"],
+    redirects: [
+      { source: "/old", status: 302 },
+      { source: "/en/:slug", status: 302 },
+    ],
+  };
+  const encodedLiteral = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/%6Fld"));
+  assert.equal(encodedLiteral.headers.get(HDR), null);
+  const plain = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/old"));
+  assert.equal(plain.headers.get(HDR), "assets");
+  // `/en/a%2Fb` is one raw segment → matches `/en/:slug`.
+  const encodedSlash = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/en/a%2Fb"));
+  assert.equal(encodedSlash.headers.get(HDR), "assets");
+  // The decoded form has two segments and does not match.
+  const decodedSlash = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/en/a/b"));
+  assert.equal(decodedSlash.headers.get(HDR), null);
+});
+
+test("exact extensionless /index file routes to assets", async () => {
+  const idx = { ...INDEX, paths: ["/api/index"] };
+  const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/api/index"));
+  assert.equal(res.headers.get(HDR), "assets");
+});
+
+test("html_handling none: only exact asset paths route to assets", async () => {
+  const idx = {
+    htmlHandling: "none",
+    notFoundHandling: "none",
+    paths: ["/about.html", "/app.js"],
+  };
+  const miss = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/about"));
+  assert.equal(miss.headers.get(HDR), null);
+  const hitExact = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/about.html"));
+  assert.equal(hitExact.headers.get(HDR), "assets");
+});
+
+test("_redirects sources route to assets before the worker", async () => {
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/new.html"],
+    redirects: [
+      { source: "/old", status: 301 },
+      { source: "/blog/*", status: 302 },
+      { source: "/m/:id", status: 307 },
+    ],
+  };
+  for (const p of ["/old", "/blog/a/b", "/m/42"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+  // Non-matching paths still fall through.
+  const miss = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/nope"));
+  assert.equal(miss.headers.get(HDR), null);
+});
+
+test("_routes.json include runs the worker even when an asset exists", async () => {
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/index.html", "/api/users", "/api/public/data.txt"],
+    routes: { include: ["/api/*"], exclude: ["/api/public/*"] },
+  };
+  // include wins over asset existence.
+  const api = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/api/users"));
+  assert.equal(api.headers.get(HDR), null);
+  // exclude wins over include.
+  const excluded = await hit(
+    env({}, userWorker([]), assetsWorker([], idx)),
+    req("/api/public/data.txt"),
+  );
+  assert.equal(excluded.headers.get(HDR), "assets");
+  // Unmatched paths default to assets, with no existence probe. That
+  // includes the root index and its non-canonical `/index.html` form;
+  // the asset side applies html_handling and answers the 307.
+  for (const p of ["/", "/index.html", "/missing"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("_routes.json matches the raw request path", async () => {
+  const idx = {
+    htmlHandling: "none",
+    notFoundHandling: "none",
+    paths: [],
+    routes: { include: ["/api/*"], exclude: [] },
+  };
+  const encoded = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/%61pi/x"));
+  assert.equal(encoded.headers.get(HDR), "assets"); // no decode before match
+  const plain = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/api/x"));
+  assert.equal(plain.headers.get(HDR), null);
+});
+
+test("explicit run_worker_first rules take precedence over _routes.json", async () => {
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/index.html", "/api/public/data.txt"],
+    routes: { include: ["/api/*"], exclude: ["/api/public/*"] },
+  };
+  // The user-worker rule matches even though `_routes.json` excludes it.
+  const cfg = { userWorker: ["/api/*"] };
+  const excluded = await hit(
+    env(cfg, userWorker([]), assetsWorker([], idx)),
+    req("/api/public/data.txt"),
+  );
+  assert.equal(excluded.headers.get(HDR), null);
+  // Unmatched paths no longer use the `_routes.json` default: assets
+  // still wins on existence, and a miss falls through to the worker.
+  const asset = await hit(env(cfg, userWorker([]), assetsWorker([], idx)), req("/index.html"));
+  assert.equal(asset.headers.get(HDR), "assets");
+  const miss = await hit(env(cfg, userWorker([]), assetsWorker([], idx)), req("/missing"));
+  assert.equal(miss.headers.get(HDR), null);
+});
+
+test("malformed _routes.json fails closed", async () => {
+  for (const routes of [
+    { include: [] },
+    { include: ["/api/*/x"], exclude: [] },
+    { include: ["/api/*"], exclude: ["x"] },
+    { include: ["/" + "a".repeat(101)] },
+  ]) {
+    const idx = { ...INDEX, routes };
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/app.js"));
+    assert.equal(res.status, 503, JSON.stringify(routes));
+    assert.equal(JSON.parse(await res.text()).error.code, "ASSETS_ROUTE_UNAVAILABLE");
+  }
 });
 
 test("SPA fallback only applies to navigate requests", async () => {

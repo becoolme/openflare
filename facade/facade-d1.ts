@@ -1,7 +1,7 @@
 // facade-d1 system worker — inner `fetcher` of the wrapped binding
-// `cloudflare-internal:d1-api`. Receives `/query`/`/execute` POSTs
-// from the d1-api implementation, injects signed props identity, and
-// forwards to the provider's D1 route (facade-d1 → provider → vrt-sql).
+// `cloudflare-internal:d1-api`. Receives `/query`/`/execute`/`/dump`
+// POSTs from the d1-api implementation, injects signed props identity,
+// and forwards to the provider's D1 route (facade-d1 → provider → vrt-sql).
 //
 // Trust boundary (T34): the request originates INSIDE workerd's d1-api,
 // which relays the tenant Worker's call — so every inbound `x-vrt-*`
@@ -37,6 +37,19 @@ function d1Error(message: string, status = 200): Response {
   );
 }
 
+/** `dump()` failure: d1-api treats ANY 200 body as the dump itself, so
+ * every error path for `/dump` must carry a non-200 status. The body is
+ * only diagnostic; workerd surfaces "D1_DUMP_ERROR: Status + <status>". */
+function dumpError(status: number): Response {
+  return new Response(
+    JSON.stringify({ success: false, error: "D1_ERROR: dump failed" }),
+    {
+      status: status >= 400 ? status : 502,
+      headers: { "content-type": "application/json", "cache-control": "no-store" },
+    },
+  );
+}
+
 interface FetchLike {
   fetch(input: unknown, init?: { headers?: unknown; [key: string]: unknown }): unknown;
 }
@@ -49,6 +62,11 @@ export class D1Facade extends WorkerEntrypoint {
     // either way the operator sees "Internal Server Error" with no
     // cause. The structured detail lives in the provider's logs; the
     // tenant only gets a bounded reason string.
+    //
+    // `dump` is decided from the path before props parsing: its error
+    // surface must be non-200 (a 200 body would be returned as the dump).
+    const isDump =
+      new URL(request.url).pathname.split("/").filter(Boolean).pop() === "dump";
     try {
       // Props are validated once inside wrapBindingBackend; parse once
       // more for the bindingId that anchors the provider path.
@@ -101,23 +119,25 @@ export class D1Facade extends WorkerEntrypoint {
         D1_BACKEND_TIMEOUT_MS,
       );
       if (resp === BACKEND_TIMEOUT) {
-        return d1Error("backend timeout (504) - retryable");
+        return isDump ? dumpError(504) : d1Error("backend timeout (504) - retryable");
       }
       if (resp instanceof Error) {
-        return d1Error("backend error (502) - retryable");
+        return isDump ? dumpError(502) : d1Error("backend error (502) - retryable");
       }
       if (!(resp instanceof Response)) {
-        return d1Error("backend protocol error");
+        return isDump ? dumpError(502) : d1Error("backend protocol error");
       }
       if (!resp.ok) {
         // Provider denial/5xx: bounded surface only — the provider's
         // structured warn log carries the reason code; the tenant
         // learns nothing beyond "denied".
-        return d1Error(`backend denied request (${resp.status})`);
+        return isDump
+          ? dumpError(resp.status)
+          : d1Error(`backend denied request (${resp.status})`);
       }
       return resp;
     } catch {
-      return d1Error("facade error");
+      return isDump ? dumpError(500) : d1Error("facade error");
     }
   }
 }

@@ -6,6 +6,7 @@ const config :Workerd.Config = (
   services = [
     (name = "worker-w-alpha-1", worker = (
       compatibilityDate = "2026-11-01",
+      limits = (subRequests = 100),
       modules = [
         (name = "index.js", esModule = embed "bundles/daa8eaa80a45398cae9a6f07666c0bda8c4e2a8c4288e732e0a36e083aa9f6a4/index.js"),
         (name = "blob.bin", data = embed "bundles/daa8eaa80a45398cae9a6f07666c0bda8c4e2a8c4288e732e0a36e083aa9f6a4/blob.bin"),
@@ -32,6 +33,7 @@ const config :Workerd.Config = (
     )),
     (name = "worker-w-alpha-2", worker = (
       compatibilityDate = "2026-10-15",
+      limits = (cpuMs = 10, memoryMb = 64),
       modules = [
         (name = "auth.js", esModule = embed "bundles/a240937c4aee30091d616ab4d6ee9014417f8f9fc6a1d53c92926f3bfa02fe41/auth.js"),
       ],
@@ -54,7 +56,7 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-assets.js", esModule = embed "sys/fdec0a4690220c46620fa5aebc6a1f819a169fd2b30eac34334d7c746b9db1c4"),
+        (name = "facade/facade-assets.js", esModule = embed "sys/022859b9f78333db380453fa953d92d9293f2524c2b5c8da8679ae5d21fb8f08"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
         (name = "facade/router-wire.js", esModule = embed "sys/e6dda1dd32f372b5ef8d1d092691a7dc9b6fb60e30cd71a9ab713c979e957ee9"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
@@ -71,8 +73,8 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-d1.js", esModule = embed "sys/da831d5a768a562aaf89cb6addb4357cd2f041e2b6f01ea97a4b15aa552e68d7"),
-        (name = "facade/d1-wire.js", esModule = embed "sys/c18db39b11ac63c64b562ad72d2516d5e668bda0a339f77aa83b7801593de637"),
+        (name = "facade/facade-d1.js", esModule = embed "sys/28bd5fe09b3ee764bd52342aa8d5ac6c16f616b88d63de113b66e01a32a37866"),
+        (name = "facade/d1-wire.js", esModule = embed "sys/6c946b92333e55e1acc70e860de50191471cf62e5cc926e6ba6ba45127164320"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
@@ -149,7 +151,7 @@ const config :Workerd.Config = (
         (name = "third_party/open-compute/facade/loader/python-snapshot.js", esModule = embed "sys/97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"),
         (name = "third_party/open-compute/facade/loader/shared.js", esModule = embed "sys/ad6ec6871acd01776f6fe414510e0126266f15f95480ce1172c3fa34babfef6e"),
         (name = "third_party/open-compute/facade/loader/snapshot.js", esModule = embed "sys/197e8b61660cae5b8829f707ea091adbc206f9ceec3a2bdb105ecbd65cde0a58"),
-        (name = "third_party/open-compute/facade/r2/native-adapter.js", esModule = embed "sys/a12e3177a99a23d0ca6d1fb4c7114dc9ceaf6403cddf02e18a6f227a4985a502"),
+        (name = "third_party/open-compute/facade/r2/native-adapter.js", esModule = embed "sys/0c2186678c5893c56a127a6154e7c0728bc68e4f436c6cb8a8e6a721607e827b"),
         (name = "third_party/open-compute/facade/r2/transport.js", esModule = embed "sys/c1299e7a51c29c821481b89bcc336eec9c1c78b42cd0ebeef974a3df31502c5d"),
         (name = "third_party/open-compute/facade/r2/validation.js", esModule = embed "sys/ca8ee1404354248a5ccb82c988508ae57ce8c00f2ece1822dc0302edc31fb546"),
       ],

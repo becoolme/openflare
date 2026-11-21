@@ -1,0 +1,11 @@
+// Conformance case: D1 dump() (SQLite-compatible SQL export) and
+// raw({columnNames}) variants, plus the 50 MB query-result cap.
+{
+  "name": "conf-d1-dump-raw",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-d1-dump-raw.vrt.local/*"],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "conf-d1-dump-raw-db", "database_id": "conf-d1-dump-raw" },
+  ],
+}

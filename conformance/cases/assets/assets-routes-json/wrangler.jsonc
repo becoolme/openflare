@@ -1,0 +1,10 @@
+{
+  "name": "conf-assets-routes",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "routes": ["conf-assets-routes.vrt.local/*"],
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS"
+  }
+}

@@ -12,21 +12,15 @@ reference is found, promote it to a case.
 | 2 | KV | `cacheTtl` semantics — edge/disk caching hint <30 s rejected (`KV_INVALID_OPTIONS` is asserted; the actual caching effect is not) | No public doc fixes observable hit/miss timing |
 | 3 | R2 | `ssecKey` (SSE-C) end-to-end; the wire carries it but no CF Workers doc commits to behavior | vendor surface only |
 | 4 | R2 | `uploadedBefore`/`uploadedAfter`/`secondsGranularity`/`httpHeaders` condition branches | covered partially by `r2_s3_conditional.rs` for puts; `get` side uncited |
-| 5 | D1 | `withSession()`/bookmarks (`x-cf-d1-*` headers) round-trip semantics | forwarded verbatim (d1-wire.ts) but no doc pins the local-mode result |
-| 6 | D1 | `dump()` / `raw({columnNames:false})` variants and `D1_RESULT_TOO_LARGE` limits | workerd-d1 surface exists; limit values differ by deployment |
-| 7 | Queues | `sendBatch` partial failure (one oversized item) — whether the call rejects atomically | broker semantics in open-compute; not cited from CF docs |
-| 8 | Queues | Exact `delaySeconds` floor — consumer-side `delaySecs` is recorded but wall-clock delay is only asserted loosely | CI timing noise makes a tight bound flaky |
-| 9 | Queues | `max_concurrency` fan-out behavior | configured (`queues.consumers[].max_concurrency`) but its observable effect on delivery ordering is uncited |
-| 10 | Cache | `max-age=1` real expiry: TTL eviction vs. lazy miss-on-read | cache.rs honors s-maxage/max-age but a wall-clock expiry assertion would be timing-flaky |
-| 11 | Cron | `event.retry`/`noRetry` on scheduled() controller | not surfaced by the standalone CronRunner path yet |
-| 12 | DO | `storage.sql` KV↔SQL visibility interplay and alarm persistence across a process restart | restart persistence is proven manually; an automated restart step is not wired into the runner yet |
-| 13 | DO | `blockConcurrencyWhile` reject → surface to waiting fetch (error propagation shape) | needs a failing init fixture; added when a workerd-side citation is found |
-| 14 | R2 | Whether `R2MultipartUpload.complete()` resolves with `httpMetadata`/`customMetadata` populated (the native adapter strips them; `r2-multipart` reads metadata back via `get()` instead) | no CF doc fixes the complete() result fields |
-| 15 | Cron | `ScheduledEvent.type` (`"scheduled"`) on the service-worker syntax; the module `ScheduledController` has no `type` field, so `cron-basic` does not assert it | module syntax only in this suite |
-| 16 | Service bindings | Calling a second Worker through default and named service entrypoints, including cross-Worker failure behavior | the standalone harness deploys one project at a time and cannot provision a target Worker as a dependency |
-| 17 | Hyperdrive | PostgreSQL connection behavior, pooling, and credential rotation through a Hyperdrive binding | requires a reachable PostgreSQL service and rotation lifecycle that the conformance stack does not provision |
-| 18 | Rate limiting | Counter sharing across isolates/instances and the exact reset window under concurrent requests | `ratelimit-basic` covers only the documented `limit({key})` result shape; the local adapter is in-process and cannot establish Cloudflare's distributed consistency |
-| 19 | Secrets | Secret injection, rotation, and redaction from logs or errors | the harness has no isolated secret provisioning/rotation path; plain `vars` coverage does not establish secret handling |
-| 20 | WebSockets | Upgrade acceptance, bidirectional message lifecycle, close codes, and Durable Object hibernation | the HTTP-only runner cannot drive a WebSocket client or assert hibernation across process lifecycle |
-| 21 | Workflows | Run creation, durable step persistence, retry, and terminal state behavior | workflow orchestration is not connected to the standalone runner or a persistent workflow store |
-| 22 | Assets | `run_worker_first` fallthrough, exclusion patterns, and advanced routing behavior | `assets-basic` covers only a successful `env.ASSETS.fetch()` for one packaged file |
+| 5 | Cache | `max-age=1` real expiry: TTL eviction vs. lazy miss-on-read | cache.rs honors s-maxage/max-age but a wall-clock expiry assertion would be timing-flaky |
+| 6 | Cron | `event.retry`/`noRetry` on scheduled() controller | not surfaced by the standalone CronRunner path yet |
+| 7 | DO | `storage.sql` KV↔SQL visibility interplay (whether a KV write and a SQL row are visible across the two surfaces of the same object) | `do-storage` exercises `sql.exec` and KV separately; no CF doc fixes cross-surface visibility |
+| 8 | DO | `blockConcurrencyWhile` reject → surface to waiting fetch (error propagation shape) | needs a failing init fixture; added when a workerd-side citation is found |
+| 9 | Cron | `ScheduledEvent.type` (`"scheduled"`) on the service-worker syntax; the module `ScheduledController` has no `type` field, so `cron-basic` does not assert it | module syntax only in this suite |
+| 10 | Service bindings | Calling a second Worker through default and named service entrypoints, including cross-Worker failure behavior | the standalone harness deploys one project at a time and cannot provision a target Worker as a dependency |
+| 11 | Hyperdrive | PostgreSQL connection behavior, pooling, and credential rotation through a Hyperdrive binding | requires a reachable PostgreSQL service and rotation lifecycle that the conformance stack does not provision |
+| 12 | Rate limiting | Counter sharing across isolates/instances and the exact reset window under concurrent requests | `ratelimit-basic` covers only the documented `limit({key})` result shape; the local adapter is in-process and cannot establish Cloudflare's distributed consistency |
+| 13 | Secrets | Secret injection, rotation, and redaction from logs or errors | the harness has no isolated secret provisioning/rotation path; plain `vars` coverage does not establish secret handling |
+| 14 | WebSockets | Upgrade acceptance, bidirectional message lifecycle, close codes, and Durable Object hibernation | the HTTP-only runner cannot drive a WebSocket client or assert hibernation across process lifecycle |
+| 15 | Workflows | Run creation, durable step persistence, retry, and terminal state behavior | workflow orchestration is not connected to the standalone runner or a persistent workflow store |
+| 16 | Assets | `run_worker_first` fallthrough, exclusion patterns, and advanced routing behavior | `assets-basic` covers only a successful `env.ASSETS.fetch()` for one packaged file |

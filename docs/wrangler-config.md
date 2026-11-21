@@ -66,6 +66,7 @@ environment blocks.
 | `r2_buckets` | supported — see [R2](bindings/r2.md); per-entry keys `binding`, `bucket_name` | `project_cfg.rs:761` |
 | `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint, validated at pack) | `project_cfg.rs:788` |
 | `worker_loaders` | supported — see [Worker loaders](bindings/worker-loaders.md); per-entry key `binding` only | `project_cfg.rs:820` |
+| `analytics_engine_datasets` | supported — see [Analytics Engine](bindings/analytics-engine.md); per-entry keys `binding`, `dataset`, `remote` | `project_cfg.rs:821` |
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:846` |
 | `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
@@ -74,6 +75,8 @@ environment blocks.
 | `route` / `routes` | supported — pattern strings or `{ pattern }`; only plain hostnames or `<fqdn>/*`; `route` and `routes` are mutually exclusive (`VRT_CONFIG_INVALID`) | `project_cfg.rs:1202`, `route_to_hostname` `:510` |
 | `assets` | supported — see [Static assets](bindings/static-assets.md); `directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first` | `project_cfg.rs:1235` |
 | `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1269` |
+| `tail_consumers` | supported — see [Tail Workers](bindings/tail-workers.md); `service` table or legacy string entries; distinct same-tenant already-deployed consumers, deduped, max 16; empty list valid | `project_cfg.rs:1352` |
+| `limits` | supported — see [Per-worker quotas](quotas.md); `cpu_ms` (1..300000) and `subrequests` (0..10000); other keys rejected | `project_cfg.rs:1393` |
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
 
 ## Accepted and ignored
@@ -96,6 +99,8 @@ Also type-checked then dropped inside supported blocks:
 - `kv_namespaces[].id`, `.preview_id`, `.remote` — `id` becomes the
   local namespace identifier; `preview_id`/`remote` are dropped.
 - `d1_databases[].preview_database_id`, `.remote` — dropped.
+- `analytics_engine_datasets[].remote` — accepted metadata; remote
+  semantics unimplemented, dropped.
 - `services[].entrypoint` — becomes the `{ service, entrypoint }` table
   form of `[bindings.service]`; the name is validated at pack
   (`worker_pkg.rs`; see [Service bindings](bindings/service-bindings.md)).
@@ -110,12 +115,12 @@ Any other top-level key → `VRT_CONFIG_UNSUPPORTED_FIELD`
 ```
 
 That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
-`ai_search_namespaces`, `analytics_engine_datasets`, `send_email`,
+`ai_search_namespaces`, `send_email`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
-`version_metadata`, `tail_consumers`, `secrets_store_secrets`,
+`version_metadata`, `secrets_store_secrets`,
 `unsafe`, `migrations_dir`, `observability`,
-`limits` (top level), `logpush`, `site`, `preview_id` (top level),
+`logpush`, `site`, `preview_id` (top level),
 `node_compat`, `route`-shaped `custom_domain` fields inside routes
 objects (`zone_name`, `zone_id`, `custom_domain` on `routes[]` entries
 are not carried — only `pattern` is read).
@@ -131,5 +136,9 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 "update wrangler_config_to_worker_toml" error shape.
 
 ## Changelog
+
+- 2026-11-21: `tail_consumers` is accepted (table or legacy string
+  entries, deduped, max 16) and carried to the signed snapshot as
+  resolved same-tenant worker ids; empty lists are ignored.
 
 - 2026-11-20: `vrt deploy`, `vrt dev`, and `vrt doctor` accept `--env` to select Wrangler named environments.

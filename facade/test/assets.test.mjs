@@ -169,6 +169,61 @@ test("backend x-open-compute-* response headers are stripped", async () => {
   assert.equal(response.headers.get("x-internal-trace"), null);
 });
 
+test("_headers-touched response headers are forwarded, internal names are not", async () => {
+  const { transport } = assets(
+    () =>
+      new Response("ok", {
+        status: 200,
+        headers: {
+          "content-type": "text/plain",
+          "x-open-compute-asset-header-names":
+            "content-security-policy,x-frame-options,x-open-compute-foo,connection",
+          "content-security-policy": "default-src 'self'",
+          "x-frame-options": "DENY",
+          "x-open-compute-foo": "forged",
+          "connection": "close",
+        },
+      }),
+  );
+  const response = await transport.fetchAsset(wire());
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-security-policy"), "default-src 'self'");
+  assert.equal(response.headers.get("x-frame-options"), "DENY");
+  assert.equal(response.headers.get("x-open-compute-foo"), null);
+  assert.equal(response.headers.get("connection"), null);
+  for (const name of response.headers.keys()) {
+    assert.ok(!name.startsWith("x-open-compute-"), `leaked ${name}`);
+  }
+});
+
+test("_headers-touched names are forwarded on redirect and 304 responses", async () => {
+  // The provider applies `_headers` to html-handling / `_redirects` 3xx and
+  // 304s too (Cloudflare `attachCustomHeaders` runs for every response), so
+  // the facade must forward the touched names regardless of status.
+  for (const status of [301, 307, 304]) {
+    const headers = {
+      "x-open-compute-asset-header-names": "x-custom-foo-header",
+      "x-custom-foo-header": "Custom-Foo-Value",
+    };
+    if (status === 304) headers.etag = '"abc"';
+    else headers.location = "/bar";
+    const { transport } = assets(() => new Response(null, { status, headers }));
+    const response = await transport.fetchAsset(wire());
+    assert.equal(response.status, status);
+    assert.equal(
+      response.headers.get("x-custom-foo-header"),
+      "Custom-Foo-Value",
+      `status ${status}`,
+    );
+    if (status !== 304) {
+      assert.equal(response.headers.get("location"), "/bar", `status ${status}`);
+    }
+    for (const name of response.headers.keys()) {
+      assert.ok(!name.startsWith("x-open-compute-"), `leaked ${name}`);
+    }
+  }
+});
+
 test("unknown backend error codes collapse to a whitelist entry", async () => {
   const { transport } = assets(() => errorResponse("SECRET_INTERNAL_FUZZ", 500));
   await assertBindingError(transport.fetchAsset(wire()), "ASSET_STORAGE_UNAVAILABLE");

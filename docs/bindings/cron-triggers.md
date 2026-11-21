@@ -42,6 +42,15 @@ expression = "*/15 * * * *"
   double-fire.
 - A cron trigger wakes a hibernated tenant (`WakeSourceKind::Cron`).
 
+Runtime requirement: `facade-cron-<workerId>` carries the
+`$experimental` `service_binding_extra_handlers` flag (it enables
+`Fetcher.scheduled()`), so workerd only loads the rendered config with
+`--experimental` on argv. The derivation lives in
+`vrt_config::launch_args` and is shared by the serve path
+(`vrt-host::assemble`) and the deploy-time config check
+(`vrt-local` preflight) — a cron-only tenant must never need an
+operator-supplied flag.
+
 ## Backends
 
 None — no data plane. The claim log lives under the state root

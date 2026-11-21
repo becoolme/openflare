@@ -13,6 +13,44 @@ non-root uid — Docker seeds it from the image's `/data`, no manual
 chown). Only the ingress port is published — bound to `127.0.0.1`
 by default; the management socket never leaves the container.
 
+## Bring-up with diagnostics: `up.sh`
+
+`deploy/standalone/up.sh` runs the same bring-up as the conformance
+gate and makes a failed boot diagnosable:
+
+```sh
+WORKERD_SOURCE=file WORKERD_SHA256=$WORKERD_SHA256 deploy/standalone/up.sh
+```
+
+It calls `docker compose up --build --wait`; on failure it prints
+`docker compose ps -a` plus the last 200 log lines of every unhealthy
+or non-zero-exit service. Compose itself only reports
+`container ... is unhealthy` — the real error (for example a rejected
+`vrt-sql.toml`) is in that service's logs. Knobs: `COMPOSE_FILE`,
+`COMPOSE_PROJECT`, `COMPOSE_EXTRA` (overlays), `LOG_TAIL`.
+
+## Durability in this stack (dev/CI only)
+
+`vrt-sql` fails closed when the fs persistence root (`/data/objstore`)
+shares a device with `dbRoot` (`/data/sql/data`): one disk loss would
+destroy the db and its backup copy together. All Docker named volumes
+live on one device, so this quick-start stack passes
+`vrt init --dev-allow-same-device-durability`, which writes
+`persistence.allowSameDeviceDurability = true` into the generated
+`vrt-sql.toml`.
+
+- Both `vrt init` and `vrt-sql` print a warning (“durability is NOT
+  guaranteed”); the generated file carries a `DEV ONLY` comment.
+- **Production must not pass this flag.** Put the persistence root on a
+  genuinely separate device, or use `backend = "s3"`. Nothing else in
+  the repo injects the key (enforced by
+  `vrt-sql/tests/startup_config_rv66.rs`).
+- Upgrading a pre-existing volume: the old `vrt-sql.toml` has no
+  exemption, so `vrt init` now reports `config differs on: …` and
+  asks for `--reconfigure`. Add `--reconfigure` to the `vrt-init`
+  service `command:` once (or recreate the volume) — otherwise
+  `vrt-sql` exits with `VRT_SQL_DURABILITY_SAME_DEVICE`.
+
 ## Acceptance entry point: `e2e.sh`
 
 `deploy/standalone/e2e.sh` is the real-machine acceptance gate —

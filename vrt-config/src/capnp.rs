@@ -41,7 +41,7 @@ use crate::manifest::{valid_compat_date, valid_compat_flag, valid_module_name, M
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snapshot_protocol::compute_desired::{
-    BindingDesired, RunWorkerFirst, TenantDesired, WorkerDesired, MAX_IDENTIFIER_LEN,
+    BindingDesired, RunWorkerFirst, TenantDesired, WorkerDesired, WorkerQuotas, MAX_IDENTIFIER_LEN,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -279,6 +279,12 @@ pub struct RuntimeParams {
     /// emitted and `caches.*` throws `No Cache was configured`
     /// (explicit failure, never silent success).
     pub cache_addr: String,
+    /// AE: this tenant's Analytics Engine ingest socket
+    /// `--external-addr` target (`unix:<path>`). Empty ⇒ a tenant
+    /// declaring `analyticsEngine` bindings fails the whole render
+    /// closed — an unbound dataset external would resolve to nothing
+    /// and `writeDataPoint()` would fail silently inside workerd.
+    pub ae_addr: String,
     /// PT1: watchdog heartbeat unix socket path INSIDE `socket_dir`.
     /// Non-empty ⇒ emit the `vrt-heartbeat` service + its private
     /// socket; empty ⇒ byte-identical legacy render (no heartbeat).
@@ -496,6 +502,14 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         && input.params.do_storage_dir.is_empty()
     {
         return Err(ConfigError::Identifier("doStorageDir"));
+    }
+
+    // AE: `analyticsEngine` bindings need the tenant ingest socket —
+    // without it the dataset-named `external` service would have no
+    // `--external-addr` and workerd could not resolve the designator
+    // (fail closed at assemble depth, same as `doStorageDir`).
+    if !ae_datasets(input.tenant).is_empty() && input.params.ae_addr.is_empty() {
+        return Err(ConfigError::Identifier("aeAddr"));
     }
 
     // W3-r2 P0: per-worker fault isolation. Every worker in a tenant
@@ -777,6 +791,19 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
             capnp_text(CACHE_SERVICE)
         ));
     }
+    // AE: one `external` service per DISTINCT dataset name — workerd
+    // copies the designator's service name into the event's `dataset`
+    // field (server/bindings.rs `engine.set_dataset(name)`), so the
+    // service must be named verbatim after the dataset. All of them
+    // resolve to this tenant's single AE ingest socket. Dataset
+    // charset `[A-Za-z0-9_]` can never collide with platform service
+    // names, which are all hyphenated (`worker-*`, `vrt-*`, `facade-*`).
+    for ds in ae_datasets(input.tenant) {
+        out.push_str(&format!(
+            "    (name = {}, external = (http = ())),\n",
+            capnp_text(ds)
+        ));
+    }
     out.push_str(&format!(
         "    (name = {}, network = (\n      allow = [\"public\"],\n      deny = [\"private\", \"local\", \"unix\", \"unix-abstract\"],\n      tlsOptions = (trustBrowserCas = true),\n    )),\n    (name = {}, network = (\n      allow = [\"local\"],\n      deny = [\"unix\", \"unix-abstract\"],\n    )),\n",
         capnp_text(OUTBOUND_NETWORK_SERVICE),
@@ -914,6 +941,12 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
                     address: input.params.cache_addr.clone(),
                 });
             }
+            for ds in ae_datasets(input.tenant) {
+                v.push(ExternalAddr {
+                    service: ds.to_string(),
+                    address: input.params.ae_addr.clone(),
+                });
+            }
             v
         },
         env,
@@ -964,6 +997,64 @@ fn emit_worker_surface(
         emit_cron_facade(out, worker, input, embeds)?;
     }
     emit_worker_sockets(out, worker, input);
+    Ok(())
+}
+
+/// Emit the workerd `limits` group (`Worker.limits` — a VRT fork
+/// extension) for a worker's declared quotas.
+///
+/// Semantics (see `doc/platform/workers-runtime-quotas.md`):
+/// - Only dimensions this generation can enforce are emitted:
+///   `cpuMs`, `memoryMb`, `subRequests`.
+/// - A dimension equal to the platform default is "not declared" and is
+///   omitted, so a worker without explicit limits renders byte-for-byte
+///   like stock workerd (no behaviour change on upgrade).
+/// - `0` is never emitted (workerd reads an absent dimension as
+///   unlimited; `subrequests = 0` is the protocol's "no budget").
+/// - `outboundConnections` has no workerd hook yet and is rejected by
+///   [`validate_tenant`] instead of being silently dropped.
+fn emit_worker_limits(out: &mut String, quotas: &WorkerQuotas) {
+    let mut dims: Vec<String> = Vec::new();
+    if quotas.cpu_ms > 0 && quotas.cpu_ms != snapshot_protocol::compute_desired::DEFAULT_CPU_MS {
+        dims.push(format!("cpuMs = {}", quotas.cpu_ms));
+    }
+    if quotas.memory_mb > 0
+        && quotas.memory_mb != snapshot_protocol::compute_desired::DEFAULT_MEMORY_MB
+    {
+        dims.push(format!("memoryMb = {}", quotas.memory_mb));
+    }
+    if quotas.subrequests > 0
+        && quotas.subrequests != snapshot_protocol::compute_desired::DEFAULT_SUBREQUESTS
+    {
+        dims.push(format!("subRequests = {}", quotas.subrequests));
+    }
+    if !dims.is_empty() {
+        out.push_str(&format!("      limits = ({}),\n", dims.join(", ")));
+    }
+}
+
+/// Fail closed when the target cell cannot enforce per-worker quotas.
+///
+/// A worker that declares an enforceable limit (`cpuMs`/`memoryMb`/
+/// `subRequests` away from the platform default) on a cell whose
+/// `quotas` capability is absent must not be served: rendering would
+/// either omit the declared limit silently or hand workerd a config it
+/// rejects. Callers (vrt-host assemble, vrt-local preflight) pass the
+/// cell capability bit; `vrt-config` itself cannot know it.
+pub fn ensure_quotas_enforceable(
+    tenant: &TenantDesired,
+    enforced: bool,
+) -> Result<(), ConfigError> {
+    if enforced {
+        return Ok(());
+    }
+    for worker in &tenant.workers {
+        if worker.quotas.declares_enforceable_limit() {
+            return Err(ConfigError::Quotas(
+                worker.quotas.declared_deviation().unwrap_or("quotas"),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1100,6 +1191,7 @@ fn emit_tenant_worker(
                 .join(", ")
         ));
     }
+    emit_worker_limits(out, &worker.quotas);
     // Modules: main module first (workerd treats modules[0] as the entry),
     // the rest sorted by name for deterministic output.
     let mut modules: Vec<&crate::manifest::Module> = bundle.manifest().modules.iter().collect();
@@ -1234,11 +1326,45 @@ fn emit_tenant_worker(
             capnp_text(CACHE_SERVICE)
         ));
     }
+    // One `tails` list per worker: the platform log collector (when
+    // enabled) shares it with user-declared Tail Workers
+    // (`tail_consumers`). workerd accepts a list, so declaring a user
+    // consumer never replaces the internal collector. The internal one
+    // is always first; user entries keep declaration order (validated
+    // unique, resolved to same-tenant worker ids at pack time).
+    let mut tails: Vec<String> = Vec::new();
     if input.params.log_tail.enabled() {
-        out.push_str(&format!(
-            "      tails = [(name = {})],\n",
-            capnp_text(&crate::logs::tail_service_name(&worker.worker_id)),
-        ));
+        tails.push(crate::logs::tail_service_name(&worker.worker_id));
+    }
+    for tail in &worker.tail_consumers {
+        // Per-worker fault isolation (`skipped_workers`) can remove a
+        // worker AFTER `validate_tenant`; emitting a designator to it
+        // would fail the whole generation. Treat a dropped consumer as
+        // a render error so the fixpoint also drops its producers
+        // instead of handing workerd a dangling `tails` entry.
+        if !input
+            .tenant
+            .workers
+            .iter()
+            .any(|w| w.worker_id == tail.worker_id)
+        {
+            return Err(ConfigError::ServiceReference("tailConsumers"));
+        }
+        let name = worker_service_name(&tail.worker_id);
+        if !tails.contains(&name) {
+            tails.push(name);
+        }
+    }
+    if !tails.is_empty() {
+        out.push_str("      tails = [");
+        out.push_str(
+            &tails
+                .iter()
+                .map(|name| format!("(name = {})", capnp_text(name)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str("],\n");
     }
     out.push_str(&format!(
         "      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
@@ -1452,6 +1578,19 @@ fn emit_binding(
                 &pg.permissions,
                 &pg.name,
             )?;
+        }
+        BindingDesired::AnalyticsEngine(ae) => {
+            // `analyticsEngine` (@17 :ServiceDesignator) — the
+            // designator NAME becomes the event's `dataset` field
+            // (workerd `engine.set_dataset(designator.get_name())`),
+            // so the dataset-named `external` service emitted above is
+            // the verbatim target. `$experimental`-gated upstream —
+            // assemble derives `--experimental` from the binding.
+            out.push_str(&format!(
+                "        (name = {}, analyticsEngine = {}),\n",
+                capnp_text(&ae.name),
+                capnp_text(&ae.dataset),
+            ));
         }
         BindingDesired::WorkerLoader(loader) => {
             // workerLoader is `$experimental`-gated upstream — assemble
@@ -1821,6 +1960,23 @@ fn emit_system_worker(
 /// `worker-<workerId>` capnp service name.
 fn worker_service_name(worker_id: &str) -> String {
     format!("worker-{worker_id}")
+}
+
+/// Sorted unique dataset names across a tenant's `analyticsEngine`
+/// bindings — one `external` service + one `--external-addr` entry per
+/// distinct name (the designator name doubles as the event `dataset`).
+fn ae_datasets(tenant: &TenantDesired) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for worker in &tenant.workers {
+        for binding in &worker.bindings {
+            if let BindingDesired::AnalyticsEngine(ae) = binding {
+                out.push(ae.dataset.as_str());
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// P3c-1: `do-storage-<workerId>` capnp service name — the worker's
@@ -2462,10 +2618,53 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
         if !valid_identifier(&version.version_id, MAX_IDENTIFIER_LEN) {
             return Err(ConfigError::Identifier("versionId"));
         }
+        // Per-worker quotas: bounds are re-checked at emit depth
+        // (compute.desired validation is the first gate) and
+        // `outboundConnections` is refused outright — the pinned workerd
+        // fork has no connection-counter hook, so a declared value would
+        // be silently ignored (fail closed, never a fake limit).
+        let quotas = &worker.quotas;
+        if !(snapshot_protocol::compute_desired::MIN_CPU_MS
+            ..=snapshot_protocol::compute_desired::MAX_CPU_MS)
+            .contains(&quotas.cpu_ms)
+        {
+            return Err(ConfigError::Quotas("cpuMs"));
+        }
+        if !(snapshot_protocol::compute_desired::MIN_MEMORY_MB
+            ..=snapshot_protocol::compute_desired::MAX_MEMORY_MB)
+            .contains(&quotas.memory_mb)
+        {
+            return Err(ConfigError::Quotas("memoryMb"));
+        }
+        if quotas.subrequests > snapshot_protocol::compute_desired::MAX_SUBREQUESTS {
+            return Err(ConfigError::Quotas("subrequests"));
+        }
+        if quotas.outbound_connections > snapshot_protocol::compute_desired::MAX_OUTBOUND_CONNECTIONS
+        {
+            return Err(ConfigError::Quotas("outboundConnections"));
+        }
+        if quotas.declares_unenforceable_limit() {
+            return Err(ConfigError::Quotas("outboundConnections"));
+        }
         let mut names = HashSet::new();
         for binding in &worker.bindings {
             if !valid_binding_name(binding.name()) || !names.insert(binding.name()) {
                 return Err(ConfigError::Identifier("bindingName"));
+            }
+            // AE: `dataset` becomes an `--external-addr` service token
+            // AND a spool/parquet path segment — the `[A-Za-z0-9_]`
+            // bound must hold at emit depth too (defense-in-depth
+            // behind compute.desired validation).
+            if let BindingDesired::AnalyticsEngine(ae) = binding {
+                if ae.dataset.is_empty()
+                    || ae.dataset.len() > 256
+                    || !ae
+                        .dataset
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(ConfigError::Identifier("bindings.dataset"));
+                }
             }
         }
         // P3c-1: DO class declarations — format + uniqueness at emit
@@ -2513,6 +2712,30 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
                 if !declares {
                     return Err(ConfigError::ServiceReference("durableObject"));
                 }
+            }
+        }
+    }
+    // Tail consumers (`tail_consumers`): same-tenant, different worker,
+    // unique per producer. workerd rejects a `tails` designator that
+    // names no service, so any dangling/self entry fails the render
+    // before a config is written (the snapshot layer already rejects it;
+    // this is the last trusted boundary).
+    for worker in &tenant.workers {
+        if worker.tail_consumers.len()
+            > snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER
+        {
+            return Err(ConfigError::Capacity("tailConsumers"));
+        }
+        let mut targets = HashSet::new();
+        for tail in &worker.tail_consumers {
+            if !valid_identifier(&tail.worker_id, MAX_IDENTIFIER_LEN)
+                || tail.worker_id == worker.worker_id
+                || !worker_ids.contains(tail.worker_id.as_str())
+            {
+                return Err(ConfigError::ServiceReference("tailConsumers"));
+            }
+            if !targets.insert(tail.worker_id.as_str()) {
+                return Err(ConfigError::Identifier("tailConsumers"));
             }
         }
     }

@@ -20,6 +20,18 @@ From `examples/standalone-wrangler/wrangler.jsonc`:
 }
 ```
 
+Any of Cloudflare's four `html_handling` modes can be added to that
+block (the example keeps the default `auto-trailing-slash`):
+
+```jsonc
+{
+  "assets": {
+    "directory": "public",
+    "html_handling": "drop-trailing-slash" // auto-trailing-slash (default) | force-trailing-slash | drop-trailing-slash | none
+  }
+}
+```
+
 Native `vrt.toml` equivalent (`examples/standalone-kv-assets/vrt.toml`):
 
 ```toml
@@ -27,6 +39,7 @@ Native `vrt.toml` equivalent (`examples/standalone-kv-assets/vrt.toml`):
 dir = "public"
 binding = "ASSETS"                    # optional — defaults to ASSETS
 notFoundHandling = "single-page-application"
+htmlHandling = "auto-trailing-slash"  # optional — same four modes
 # assetsFirst = true                  # opt into Cloudflare assets-first routing
 ```
 
@@ -53,11 +66,86 @@ that does not match the bytes is never committed.
 
 ## Known differences from Cloudflare
 
-- `html_handling` accepts only `auto-trailing-slash` and `none`;
-  Cloudflare's `force-trailing-slash` / `drop-trailing-slash` are
-  rejected at pack (`vrt-local/src/worker_pkg.rs`).
+- `html_handling` accepts all four Cloudflare modes
+  (`auto-trailing-slash`, `force-trailing-slash`, `drop-trailing-slash`,
+  `none`) and follows Cloudflare's resolver
+  (`asset-worker/src/handler.ts`) row for row: the request *form*
+  (`.html`, `/index`, trailing slash, bare path) picks the candidate
+  order, overlapping `/foo.html` + `/foo/index.html` keep their own
+  URLs, and a canonical rewrite is only emitted when its destination
+  resolves back to the same asset (`safeRedirect`) — otherwise the
+  exact URL is served. Non-canonical forms return **307** with a
+  `Location` header built from the percent-encoded path plus the
+  original query string; dotted stems (`/release-1.2` →
+  `/release-1.2.html`) and exact extensionless files (`/api/index`) are
+  served normally. Non-HTML assets (`/app.js`) are served verbatim and
+  never rewritten. Redirect targets are always origin-relative:
+  repeated slashes are collapsed like Cloudflare's `decodePath`, so
+  `/%2Fevil.com` redirects to `/evil.com` and never to a
+  protocol-relative `//evil.com`.
 - `not_found_handling` accepts `none`, `404-page`,
   `single-page-application`.
+- `_redirects` is parsed and applied before asset lookup (Cloudflare
+  order): static rules first, then dynamic ones; 301/302/303/307/308,
+  one trailing `*` (`:splat`), segment placeholders (`:name`), and
+  `200` proxying to a relative path. Query-parameter/country/cookie
+  conditions, domain-level rules and rewrites other than 200 are not
+  supported. `_headers` is supported: rules apply in file order to
+  asset responses (not Worker responses) — including `304`
+  revalidations and html-handling / `_redirects` `3xx` redirects, which
+  keep their `Location` and still get the configured headers, matching
+  Cloudflare's `attachCustomHeaders` tail. Multiple matches accumulate,
+  `! Name` detaches earlier values, `:splat`/`:name` substitute in
+  values (in one pass, `:name` may be combined with a trailing `*`),
+  and duplicates are comma-joined. `_headers`/`_redirects` are
+  configuration and are never served as assets — neither directly nor
+  through a `200` rewrite destination. The assets facade only forwards
+  the names the provider marks as `_headers`-touched, so
+  backend-internal headers can never leak.
+- `_headers`/`_redirects` are validated at pack time
+  (`vrt-local/src/worker_pkg.rs`, both the directory scan and the
+  upload path): ≤ 512 KiB, valid UTF-8, and — for `_headers` — at most
+  256 distinct / 4 KiB of forwarded header names. The provider reads
+  these files with those smaller caps, so shipping an unusable one
+  would otherwise fail closed on every asset request (or silently drop
+  the whole forwarding list) after a successful deploy.
+- `_redirects` matching runs on the raw (still percent-encoded) request
+  path, like Cloudflare: capture values are substituted into `Location`
+  verbatim, so `/en/%2Fevil.com` rewrites to `/%2Fevil.com` instead of a
+  protocol-relative `//evil.com`, and `%3F`/`%23` inside a filename keep
+  their meaning. A capture that starts a new segment is never allowed to
+  turn a relative destination into a protocol-relative URL
+  (`/en//evil.com` + `/:splat` → `/evil.com`); an explicitly authored
+  `//host/...` destination is preserved. Placeholders are
+  substituted in one pass (longest-match, inserted values never
+  rescanned). `facade-router` matches the same raw pathname so routing
+  and serving agree.
+- `_routes.json` (Cloudflare Pages invocation routes) is honoured when
+  the deployment is routed through `facade-router`: `version` must be
+  `1`, `include` routes invoke the Worker and `exclude` routes are
+  served by assets, with `exclude` always winning. A path matching
+  neither list is served by assets (Pages default). `*` is a trailing
+  wildcard matching any number of segments (`/users/*`), everything
+  else is an exact path, and matching uses the raw request pathname.
+  Limits match Pages: at least one `include` rule, ≤ 100
+  `include`+`exclude` rules combined, ≤ 100 characters per rule,
+  `version` must be `1`, and unknown top-level fields are rejected. The
+  policy rides the `route-index` response (and `can-fetch` in the
+  `tooLarge` degradation path), so routing and serving agree. An invalid
+  or unreadable `_routes.json` fails closed
+  (`ASSET_STORAGE_UNAVAILABLE` / 503 from the router) instead of
+  guessing a side; the packer rejects it before publish.
+  `_routes.json` is configuration and is never served. It only picks the
+  side that answers a path; the asset side still applies `html_handling`,
+  so `/index.html` (matching neither list) is served by assets and
+  answers the documented `307 to /` instead of a 200. An explicit
+  `run_worker_first` policy (`true` or a rule list) takes precedence and
+  ignores the file, mirroring Workers config authority;
+  `run_worker_first: false`/absent leaves `_routes.json` in control.
+  Non-GET/HEAD requests keep the existing worker-first rule (assets only
+  serve GET/HEAD), so an excluded POST still reaches the Worker.
+  Native `vrt.toml` deployments that never opt into `assetsFirst` have
+  no router, so the file only applies to assets-first deployments.
 - `run_worker_first`: `true`/`false` or a list of `/`-prefixed globs
   with `!` asset-first exclusions — at most 100 rules × 100 bytes, no
   duplicates, at least one non-`!` rule (validated identically in the
@@ -71,6 +159,10 @@ that does not match the bytes is never committed.
   skipped.
 - MIME types come from a fixed extension table; unknown extensions map
   to `application/octet-stream`.
+- `_headers`/`_redirects`/`_routes.json` are validated at pack time
+  (`vrt-local/src/worker_pkg.rs`, both the directory scan and the
+  upload path) so an unusable configuration fails the deploy instead of
+  503ing every asset/routed request afterwards.
 
 ## Unsupported keys and error shape
 
@@ -89,4 +181,7 @@ that does not match the bytes is never committed.
 - `facade/test/assets.test.mjs`, `facade/test/router.test.mjs`,
   `facade/test/router-contract.test.mjs` — facade asset/router contract
   tests.
-- `vrt-provider/tests/assets_fetch.rs` — provider assets route tests.
+- `vrt-provider/tests/assets_fetch.rs` — provider assets route tests,
+  including `_routes.json` policies and fail-closed invalid config.
+- `conformance/cases/assets/assets-routes-json` — end-to-end
+  include/exclude routing on the standalone stack.

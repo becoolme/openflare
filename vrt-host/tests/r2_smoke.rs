@@ -365,6 +365,7 @@ fn render_cfg(dir: &Path, port: u16, bundle: &VersionBundle) -> (PathBuf, Vec<St
         wfop_pepper: "r2-smoke-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -434,10 +435,7 @@ fn render_cfg(dir: &Path, port: u16, bundle: &VersionBundle) -> (PathBuf, Vec<St
         cfg,
         vrt_host::assemble::experimental_extra_args(
             &params.system_compat_flags,
-            false,
-            false,
-            false,
-            false,
+            Default::default(),
         ),
     )
 }
@@ -531,6 +529,12 @@ fn real_workerd_r2_multipart_end_to_end() {
     assert!(
         v["etag"].as_str().unwrap_or("").ends_with("-3"),
         "composite etag: {v}"
+    );
+    // complete() is a full R2Object — create-time metadata is on it.
+    assert_eq!(v["completeCustomMetadata"], "e2e", "{v}");
+    assert_eq!(
+        v["completeContentType"], "application/octet-stream",
+        "{v}"
     );
 
     // abort → complete must be rejected (terminal upload state).

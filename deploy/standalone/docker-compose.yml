@@ -79,6 +79,14 @@ services:
       - 0.0.0.0:9493
       - --vrt-sql-metrics-listen
       - 0.0.0.0:9492
+      # DEV/CI ONLY: both named volumes (vrt-data + vrt-sql-objects)
+      # live on ONE Docker device, so vrt-sql's fail-closed durability
+      # guard ("persistence root must be on a different device from
+      # dbRoot") would reject the stack at boot. This flag opts into the
+      # dev exemption in the generated vrt-sql.toml. Production must NOT
+      # pass it: keep the object store on a separate device, or use the
+      # s3 persistence backend.
+      - --dev-allow-same-device-durability
 
   vrt:
     <<: [*vrt-common, *vrt-image]

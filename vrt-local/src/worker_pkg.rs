@@ -98,6 +98,10 @@ pub struct WorkerToml {
     /// W1: `[[workflows]]` -- same shape after normalization.
     #[serde(default)]
     pub(crate) workflows: Vec<WorkflowToml>,
+    /// `[[tailConsumers]]` -- Tail Workers (same-tenant worker names)
+    /// that receive this worker's invocation events.
+    #[serde(default)]
+    pub(crate) tail_consumers: Vec<TailConsumerToml>,
     #[serde(default)]
     pub(crate) quotas: Option<QuotasToml>,
     /// T21: `[assets]` directory declaration.
@@ -270,6 +274,15 @@ pub(crate) struct WorkflowToml {
     pub(crate) limits_steps: Option<u32>,
 }
 
+/// One `[[tailConsumers]]` entry (wrangler `tail_consumers`). The
+/// `service` is a worker NAME in the same tenant; pack resolves it to
+/// the stable worker id (fail closed when it does not exist).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TailConsumerToml {
+    pub(crate) service: String,
+}
+
 /// T21: `[assets]` — static-assets directory packed at deploy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -279,7 +292,8 @@ pub(crate) struct AssetsToml {
     /// Binding name (`env.<name>.fetch()`) — defaults to `ASSETS`.
     #[serde(default = "default_assets_binding")]
     pub(crate) binding: String,
-    /// Cloudflare-compatible subset: `auto-trailing-slash` | `none`.
+    /// Cloudflare's `html_handling`: `auto-trailing-slash` |
+    /// `force-trailing-slash` | `drop-trailing-slash` | `none`.
     #[serde(default)]
     pub(crate) html_handling: Option<String>,
     /// `none` | `404-page` | `single-page-application`.
@@ -312,13 +326,35 @@ fn default_assets_binding() -> String {
     "ASSETS".into()
 }
 
+/// `[quotas]` — per-worker resource limits. Every field is optional and
+/// defaults to the platform default, so a partial declaration is
+/// normalized instead of rejected; `WorkerQuotas::platform_default()` is the single
+/// source of truth shared with `vrt-config` (a default that disagreed
+/// would silently become an enforced limit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QuotasToml {
+    #[serde(default = "default_cpu_ms")]
     pub(crate) cpu_ms: u32,
+    #[serde(default = "default_memory_mb")]
     pub(crate) memory_mb: u32,
+    #[serde(default = "default_subrequests")]
     pub(crate) subrequests: u32,
+    #[serde(default = "default_outbound_connections")]
     pub(crate) outbound_connections: u32,
+}
+
+fn default_cpu_ms() -> u32 {
+    WorkerQuotas::platform_default().cpu_ms
+}
+fn default_memory_mb() -> u32 {
+    WorkerQuotas::platform_default().memory_mb
+}
+fn default_subrequests() -> u32 {
+    WorkerQuotas::platform_default().subrequests
+}
+fn default_outbound_connections() -> u32 {
+    WorkerQuotas::platform_default().outbound_connections
 }
 
 /// P3c-1: DO packing context -- the deploy key (uniqueKey HMAC derivation) and
@@ -380,6 +416,10 @@ pub struct PackedWorker {
     /// W1: workflow declarations -- `uniqueKey` already derived by HMAC with the deploy key
     /// (`vrt-wf:` domain), the same-worker restriction and name/binding validation have passed.
     pub workflows: Vec<snapshot_protocol::compute_desired::WorkflowDesired>,
+    /// Tail Workers this version forwards invocation events to. The
+    /// declared service name is resolved to a same-tenant worker id at
+    /// pack time; a miss fails closed.
+    pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// Declared hostnames (replaces state list when non-empty).
     pub hostnames: Vec<String>,
     /// Quotas.
@@ -465,7 +505,15 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
             Some(_) => Err(LocalError::Worker("assets handling")),
         }
     };
-    let html_handling = valid_handling(&assets.html_handling, &["auto-trailing-slash", "none"])?;
+    let html_handling = valid_handling(
+        &assets.html_handling,
+        &[
+            "auto-trailing-slash",
+            "force-trailing-slash",
+            "drop-trailing-slash",
+            "none",
+        ],
+    )?;
     let not_found = valid_handling(
         &assets.not_found_handling,
         &["none", "404-page", "single-page-application"],
@@ -501,10 +549,28 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
             let req_path = format!("/{rel_str}");
             let bytes =
                 std::fs::read(&entry_path).map_err(|_| LocalError::Worker("assets read"))?;
+            validate_config_asset(&req_path, &bytes)?;
             entries.push((req_path, bytes));
         }
     }
     assets_from_entries(entries, &html_handling, &not_found)
+}
+
+/// Validate an asset configuration file (`/_headers`, `/_redirects`,
+/// `/_routes.json`) before it is published. The provider reads these
+/// with a smaller cap than ordinary assets and fails closed at request
+/// time, and the facade forwards `_headers` names under a bounded list
+/// — so an accepted deployment must not ship a file that can 503 every
+/// asset request, silently drop configured headers, or leave routing
+/// unable to decide whether the Worker runs.
+fn validate_config_asset(path: &str, bytes: &[u8]) -> Result<(), LocalError> {
+    let result = match path {
+        "/_headers" => vrt_provider::assets_headers::validate_file(bytes),
+        "/_redirects" => vrt_provider::assets_redirects::validate_file(bytes),
+        "/_routes.json" => vrt_provider::assets_routes::validate_file(bytes),
+        _ => Ok(()),
+    };
+    result.map_err(|e| LocalError::WorkerOwned(format!("{path}: {e}")))
 }
 
 /// Build the canonical manifest + digest-keyed objects from
@@ -1134,6 +1200,39 @@ pub fn assemble(
         }
     }
 
+    // Tail Workers (`tail_consumers`): resolve each service name inside
+    // this tenant. A miss (never deployed / typo) fails the deploy now —
+    // a dangling workerd `tails` designator would fail the whole config
+    // load at generation start, and a silently dropped consumer would
+    // lose events. Self-reference is rejected: CF documents tail
+    // consumers as watching OTHER Workers, and a self-tail has no
+    // documented recursion bound. Duplicates collapse to the first
+    // occurrence (order is preserved for deterministic rendering).
+    let mut tail_consumers = Vec::new();
+    {
+        use snapshot_protocol::compute_desired::{
+            TailConsumerDesired, MAX_TAIL_CONSUMERS_PER_WORKER,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for consumer in &meta.tail_consumers {
+            if consumer.service == name {
+                return Err(LocalError::Worker(
+                    "tail_consumers service must be another worker",
+                ));
+            }
+            let target = resolve_worker(&consumer.service)
+                .ok_or(LocalError::Worker("tail_consumers service target"))?;
+            if seen.insert(target.clone()) {
+                tail_consumers.push(TailConsumerDesired { worker_id: target });
+            }
+        }
+        if tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+            return Err(LocalError::Worker(
+                "tail_consumers at most 16 consumers per worker",
+            ));
+        }
+    }
+
     // T21: `[assets] dir` — pack the directory into the local
     // content-addressed store (materialized by `Local::deploy`; the
     // binding references the manifest digest it produced).
@@ -1176,24 +1275,47 @@ pub fn assemble(
         queue_consumers,
         durable_object_classes,
         workflows,
+        tail_consumers,
         hostnames,
-        quotas: meta
-            .quotas
-            .map(|q| WorkerQuotas {
-                cpu_ms: q.cpu_ms,
-                memory_mb: q.memory_mb,
-                subrequests: q.subrequests,
-                outbound_connections: q.outbound_connections,
-            })
-            .unwrap_or(WorkerQuotas {
-                cpu_ms: 50,
-                memory_mb: 128,
-                subrequests: 50,
-                outbound_connections: 16,
-            }),
+        quotas: normalize_quotas(meta.quotas)?,
         first_deploy_id: id_material[..16].to_string(),
         pending_assets,
     })
+}
+
+/// Normalize `[quotas]`: absent → platform defaults (stock behaviour);
+/// present → every field is bounds-checked and the FIRST offender is
+/// named in a deploy-time error (`VRT_CONFIG_INVALID` on the wrangler
+/// path, `LocalError::Worker` here). `compute.desired::validate` runs the
+/// same bounds again before signing — defense in depth, but this layer
+/// owns the human-readable field name.
+fn normalize_quotas(quotas: Option<QuotasToml>) -> Result<WorkerQuotas, LocalError> {
+    use snapshot_protocol::compute_desired::{
+        MAX_CPU_MS, MAX_MEMORY_MB, MAX_OUTBOUND_CONNECTIONS, MAX_SUBREQUESTS, MIN_CPU_MS,
+        MIN_MEMORY_MB,
+    };
+    let Some(q) = quotas else {
+        return Ok(WorkerQuotas::platform_default());
+    };
+    let quotas = WorkerQuotas {
+        cpu_ms: q.cpu_ms,
+        memory_mb: q.memory_mb,
+        subrequests: q.subrequests,
+        outbound_connections: q.outbound_connections,
+    };
+    if !(MIN_CPU_MS..=MAX_CPU_MS).contains(&quotas.cpu_ms) {
+        return Err(LocalError::Worker("quotas.cpuMs"));
+    }
+    if !(MIN_MEMORY_MB..=MAX_MEMORY_MB).contains(&quotas.memory_mb) {
+        return Err(LocalError::Worker("quotas.memoryMb"));
+    }
+    if quotas.subrequests > MAX_SUBREQUESTS {
+        return Err(LocalError::Worker("quotas.subrequests"));
+    }
+    if quotas.outbound_connections > MAX_OUTBOUND_CONNECTIONS {
+        return Err(LocalError::Worker("quotas.outboundConnections"));
+    }
+    Ok(quotas)
 }
 
 fn type_for_extension(path: &Path) -> Option<&'static str> {
@@ -1682,6 +1804,7 @@ fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError>
         if total > MAX_ASSET_TOTAL_BYTES {
             return Err(LocalError::Worker("assets total too large"));
         }
+        validate_config_asset(path, &bytes)?;
         declared.insert(sha.to_string());
         objects.push((sha.to_string(), bytes));
     }
@@ -1696,4 +1819,195 @@ fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError>
         manifest_digest,
         objects,
     })
+}
+
+#[cfg(test)]
+mod assets_handling_tests {
+    use super::*;
+
+    fn assets(mode: Option<&str>) -> AssetsToml {
+        AssetsToml {
+            dir: "public".to_string(),
+            binding: "ASSETS".to_string(),
+            html_handling: mode.map(str::to_string),
+            not_found_handling: None,
+            assets_first: false,
+            run_worker_first: None,
+        }
+    }
+
+    #[test]
+    fn scan_accepts_every_cloudflare_html_handling_mode() {
+        let root = std::env::temp_dir().join(format!("vrt-assets-modes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("public");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"x").unwrap();
+        for mode in [
+            "auto-trailing-slash",
+            "force-trailing-slash",
+            "drop-trailing-slash",
+            "none",
+        ] {
+            let pending = scan_assets_dir(&root, &assets(Some(mode)))
+                .unwrap_or_else(|e| panic!("{mode}: {e:?}"));
+            let doc: serde_json::Value =
+                serde_json::from_slice(&pending.manifest_bytes).unwrap();
+            assert_eq!(doc["htmlHandling"], mode);
+        }
+        assert!(scan_assets_dir(&root, &assets(Some("force"))).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Deploy validation: a `_headers`/`_redirects` file the provider
+    /// would fail closed on (or could not forward whole) must be
+    /// rejected at pack time — for the directory scan and the upload
+    /// path alike.
+    #[test]
+    fn config_assets_are_validated_before_publish() {
+        let root = std::env::temp_dir().join(format!("vrt-assets-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("public");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"x").unwrap();
+
+        // Valid files deploy.
+        std::fs::write(dir.join("_headers"), b"/*\n  X-Frame-Options: DENY\n").unwrap();
+        std::fs::write(dir.join("_redirects"), b"/old /new 301\n").unwrap();
+        std::fs::write(
+            dir.join("_routes.json"),
+            br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+        )
+        .unwrap();
+        let pending = scan_assets_dir(&root, &assets(None)).expect("valid config assets");
+
+        // Non-UTF-8 `_headers` would 503 every asset request.
+        std::fs::write(dir.join("_headers"), b"/*\n  X-A: \xff\n").unwrap();
+        assert!(scan_assets_dir(&root, &assets(None)).is_err());
+        std::fs::write(dir.join("_headers"), b"/*\n  X-Ok: yes\n").unwrap();
+        // A `_routes.json` the provider would reject at routing time must
+        // not reach the store: no include rules, an unsupported version,
+        // and non-trailing wildcards all fail closed.
+        for bad in [
+            br#"{"version":1,"include":[]}"#.as_slice(),
+            br#"{"version":2,"include":["/*"]}"#.as_slice(),
+            br#"{"version":1,"include":["/api/*/x"]}"#.as_slice(),
+        ] {
+            std::fs::write(dir.join("_routes.json"), bad).unwrap();
+            assert!(scan_assets_dir(&root, &assets(None)).is_err());
+        }
+        std::fs::write(
+            dir.join("_routes.json"),
+            br#"{"version":1,"include":["/*"]}"#,
+        )
+        .unwrap();
+        // Over the provider's parse cap, even though the generic asset
+        // cap is larger.
+        let mut big = String::from("/*\n");
+        while big.len() <= vrt_provider::assets_headers::MAX_FILE_BYTES {
+            big.push_str("# padding padding padding padding padding padding\n");
+        }
+        std::fs::write(dir.join("_headers"), big.as_bytes()).unwrap();
+        assert!(scan_assets_dir(&root, &assets(None)).is_err());
+        std::fs::write(dir.join("_headers"), b"/*\n  X-Ok: yes\n").unwrap();
+
+        // The upload path applies the same validation.
+        use base64::Engine;
+        let bad = b"/old /new 301\n\xff\n".to_vec();
+        let sha = hex::encode(sha2::Sha256::digest(&bad));
+        let manifest = serde_json::json!({
+            "files": [{
+                "mime": "text/plain",
+                "path": "/_redirects",
+                "sha256": sha,
+                "size": bad.len(),
+            }],
+            "htmlHandling": "auto-trailing-slash",
+            "notFoundHandling": "none",
+            "schemaVersion": 1,
+        });
+        let mut objects = BTreeMap::new();
+        objects.insert(
+            sha,
+            base64::engine::general_purpose::STANDARD.encode(&bad),
+        );
+        let upload = UploadAssets {
+            manifest: base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&manifest).unwrap()),
+            objects,
+        };
+        assert!(upload_assets_verified(&upload).is_err());
+        // A legitimate deployment still verifies (digest-keyed objects).
+        let pending_ok = upload_assets_verified(&UploadAssets {
+            manifest: base64::engine::general_purpose::STANDARD
+                .encode(&pending.manifest_bytes),
+            objects: pending
+                .objects
+                .iter()
+                .map(|(d, b)| {
+                    (
+                        d.clone(),
+                        base64::engine::general_purpose::STANDARD.encode(b),
+                    )
+                })
+                .collect(),
+        });
+        assert!(pending_ok.is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod quotas_tests {
+    use super::*;
+
+    /// `[quotas]` is a partial override: an absent dimension takes the
+    /// platform default (one shared source of truth), so
+    /// `[quotas] cpuMs = 100` never forces the author to restate memory
+    /// or subrequests.
+    #[test]
+    fn partial_quotas_normalize_to_platform_defaults() {
+        let q: QuotasToml = toml::from_str("cpuMs = 100").unwrap();
+        assert_eq!(q.memory_mb, WorkerQuotas::platform_default().memory_mb);
+        assert_eq!(q.subrequests, WorkerQuotas::platform_default().subrequests);
+        let out = normalize_quotas(Some(q)).unwrap();
+        assert_eq!(out.cpu_ms, 100);
+        assert_eq!(
+            out,
+            WorkerQuotas {
+                cpu_ms: 100,
+                ..WorkerQuotas::platform_default()
+            }
+        );
+    }
+
+    /// Absent `[quotas]` = platform defaults (stock workerd behaviour),
+    /// not a zeroed limit.
+    #[test]
+    fn absent_quotas_are_platform_defaults() {
+        assert_eq!(
+            normalize_quotas(None).unwrap(),
+            WorkerQuotas::platform_default()
+        );
+    }
+
+    /// Out-of-bounds values name the offending field — a deploy-time
+    /// error instead of a generic protocol rejection.
+    #[test]
+    fn out_of_bounds_quotas_name_the_field() {
+        for (toml_src, field) in [
+            ("cpuMs = 0", "quotas.cpuMs"),
+            ("cpuMs = 300001", "quotas.cpuMs"),
+            ("memoryMb = 0", "quotas.memoryMb"),
+            ("memoryMb = 4097", "quotas.memoryMb"),
+            ("subrequests = 10001", "quotas.subrequests"),
+            ("outboundConnections = 1025", "quotas.outboundConnections"),
+        ] {
+            let q: QuotasToml = toml::from_str(toml_src).unwrap();
+            match normalize_quotas(Some(q)) {
+                Err(LocalError::Worker(field_name)) => assert_eq!(field_name, field, "{toml_src}"),
+                other => panic!("{toml_src}: expected Worker({field}), got {other:?}"),
+            }
+        }
+    }
 }

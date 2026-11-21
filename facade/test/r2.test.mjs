@@ -13,9 +13,13 @@ import {
   r2Meta,
   streamOf,
   facadeModule,
+  distModule,
 } from "./helpers.mjs";
 
 const { R2Transport } = await import(facadeModule("facade-r2.js"));
+const { nativeR2Fetch } = await import(
+  distModule("third_party/open-compute/facade/r2/native-adapter.js")
+);
 
 function r2(handler, props = makeProps()) {
   const { fetcher, requests } = makeBackend(handler);
@@ -140,6 +144,50 @@ test("list sends options and validates response shape", async () => {
   assert.equal(requests[0].url, R2_PATH(props, "list"));
   assert.deepEqual(JSON.parse(new TextDecoder().decode(requests[0].body)), options);
   assert.deepEqual(result, listed);
+});
+
+test("native completeMultipartUpload passes stored metadata through", async () => {
+  // `complete()` is a full R2Object: workerd's non-list parser always
+  // materializes httpMetadata/customMetadata, so the adapter must not
+  // strip them (callers must not have to re-read the object).
+  const meta = r2Meta({
+    key: "mp/obj",
+    httpMetadata: { contentType: "text/plain" },
+    customMetadata: { origin: "multipart" },
+  });
+  const seen = {};
+  const bucket = {
+    async completeMultipartUpload(key, uploadId, parts) {
+      Object.assign(seen, { key, uploadId, parts });
+      return meta;
+    },
+  };
+  const input = new TextEncoder().encode(
+    JSON.stringify({
+      version: 1,
+      method: "completeMultipartUpload",
+      object: "mp/obj",
+      uploadId: "u1",
+      parts: [{ part: 1, etag: "e1" }],
+    }),
+  );
+  const response = await nativeR2Fetch(
+    new Request("http://fake-host/", {
+      method: "PUT",
+      headers: { "cf-r2-metadata-size": String(input.byteLength) },
+      body: input,
+    }),
+    bucket,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(seen, {
+    key: "mp/obj",
+    uploadId: "u1",
+    parts: [{ partNumber: 1, etag: "e1" }],
+  });
+  const result = await response.json();
+  assert.deepEqual(result.httpFields, { contentType: "text/plain" });
+  assert.deepEqual(result.customFields, [{ k: "origin", v: "multipart" }]);
 });
 
 test("backend error code maps to typed binding error", async () => {

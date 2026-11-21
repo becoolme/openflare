@@ -35,6 +35,11 @@ facadeManifest = "__VRT_ROOT__/facade/manifest.json"
 bindingBackendDir = "__VRT_ROOT__/provider/listeners"
 systemCompatDate = "2024-09-25"
 systemCompatFlags = []
+# Per-worker quotas: render the workerd `limits` block for declared
+# quotas. Default true (the pinned workerd carries the patch); set false
+# only for a stock `workerdBinary` — a tenant declaring a limit then
+# fails closed at assemble instead of running unlimited.
+# quotas = true
 secretsFile = "__VRT_ROOT__/secrets/render-secrets.json"  # 0600, {tenantId:{ref:value}}
 extraArgs = []
 
@@ -82,6 +87,15 @@ forwardedProtoTrusted = ["10.42.0.0/16"]
 # refreshIntervalSecs = 86400
 # Alternatively leave the defaults and set VRT_GEOIP_GITHUB_TOKEN in
 # the pod env to lift the anonymous API rate limit.
+
+# Analytics Engine: per-tenant ingest sockets + Parquet output under
+# `<workDir>/ae/`; enabled by default (the cell claims the
+# capability unconditionally). See standalone-vrt-host.toml for the
+# option list. Query the parts with DuckDB, or sync `ae/out/` to the
+# cell's object store and read with ClickHouse `s3(...,'Parquet')`.
+[analyticsEngine]
+# maxSpoolBytes = 268435456                          # per-tenant spool cap
+# flushIntervalSecs = 60                             # spool→Parquet cadence
 
 [baseEnv]
 # VRT_EXTRA = "value"
