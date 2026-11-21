@@ -129,6 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `tailConsumers` render ships with this generation --
         // unconditionally on (same reasoning).
         tail_consumers: true,
+        // `{"type":"json"}` bindings (version_metadata, typed vars)
+        // render ships with this generation -- unconditionally on.
+        version_metadata: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

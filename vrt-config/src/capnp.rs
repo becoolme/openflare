@@ -1595,6 +1595,16 @@ fn emit_binding(
                 WORKER_LOADER_MAX_WORKERS,
             ));
         }
+        BindingDesired::Json(j) => {
+            // workerd `json` (@6 :Text) — `env.<name>` is the parsed
+            // payload. The wire text is emitted verbatim; compute.desired
+            // already proved it parses and is bounded.
+            out.push_str(&format!(
+                "        (name = {}, json = {}),\n",
+                capnp_text(&j.name),
+                capnp_text(&j.value),
+            ));
+        }
     }
     Ok(())
 }

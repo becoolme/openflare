@@ -898,6 +898,27 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 }
                 out.insert("tailConsumers".into(), Value::Array(consumers));
             }
+            "version_metadata" => {
+                // CF `[version_metadata] binding = "X"` — a single
+                // table (not array-of-tables) whose only key names the
+                // env binding carrying `{id, tag, timestamp}` for the
+                // serving version. Any other key fails closed.
+                let t = value
+                    .as_object()
+                    .ok_or_else(|| invalid("version_metadata", "must be a table"))?;
+                for k in t.keys() {
+                    if k != "binding" {
+                        return Err(unsupported(&format!("version_metadata.{k}"), None));
+                    }
+                }
+                let binding = req_str(
+                    t.get("binding").unwrap_or(&Value::Null),
+                    "version_metadata.binding",
+                )?;
+                let mut vm = Map::new();
+                vm.insert("binding".into(), Value::from(binding));
+                out.insert("versionMetadata".into(), Value::Object(vm));
+            }
             "worker_loaders" => {
                 // Dynamic Workers (CF `[[worker_loaders]]`): a loader
                 // carries only a binding name — the tenant supplies code
@@ -1724,6 +1745,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("workflows") {
         wire.insert("workflows".into(), v.clone());
     }
+    if let Some(v) = obj.get("versionMetadata") {
+        wire.insert("versionMetadata".into(), v.clone());
+    }
 
     // W1-r1: STRUCTURAL anti-drop — every normalized top-level key
     // must reach the wire (or be an explicitly documented
@@ -1742,6 +1766,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "crons",
         "queueConsumers",
         "tailConsumers",
+        "versionMetadata",
         "durableObjectBindings",
         "durableObjectMigrations",
         "workflows",

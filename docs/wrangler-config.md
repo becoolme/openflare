@@ -70,6 +70,7 @@ environment blocks.
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:846` |
 | `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
 | `tail_consumers` | supported — Tail Workers; per-entry key `service` only (worker-level config, not a binding); resolves to a same-tenant worker at deploy, renders as capnp `tails` designators; consumer runs the standard `tail(events)` entrypoint | `project_cfg.rs:872` |
+| `version_metadata` | supported — CF `[version_metadata] binding = "X"`; `env.X` is `{id, tag, timestamp}` of the SERVING version (id = version id, tag = `""` — no standalone tag surface, timestamp = version creation epoch-ms string). Emitted as a `json` binding at desired time so rollback reports the reactivated version's own values | `project_cfg.rs:901` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
 | `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1179` |
@@ -118,7 +119,7 @@ That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
 `ai_search_namespaces`, `send_email`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
-`version_metadata`, `secrets_store_secrets`,
+`secrets_store_secrets`,
 `unsafe`, `migrations_dir`, `observability`, `streaming_tail_consumers`,
 `logpush`, `site`, `preview_id` (top level),
 `node_compat`, `route`-shaped `custom_domain` fields inside routes

@@ -70,6 +70,9 @@ pub const MAX_IDENTIFIER_LEN: usize = 128;
 pub const MAX_REF_LEN: usize = 256;
 /// Maximum worker name length (DNS label).
 pub const MAX_WORKER_NAME_LEN: usize = 63;
+/// Maximum serialized size of a `{"type":"json"}` binding payload
+/// (version_metadata objects are ~100 B; typed vars stay far under).
+pub const MAX_JSON_BINDING_BYTES: usize = 16 * 1024;
 /// Maximum binding name length (JS identifier).
 pub const MAX_BINDING_NAME_LEN: usize = 64;
 /// Maximum route hostname length (DNS).
@@ -320,6 +323,12 @@ pub enum BindingDesired {
     /// emitted service designator name IS the dataset name — workerd
     /// derives the event's `dataset` field from it.
     AnalyticsEngine(AnalyticsEngineBinding),
+    /// `{"type":"json"}` — a static JSON payload bound under
+    /// `env.<name>` (workerd `json` binding; `env.<name>` is the parsed
+    /// value). Carries CF `version_metadata` (`{id, tag, timestamp}`)
+    /// and typed `[vars]` values — the wire holds the serialized JSON
+    /// text verbatim and the renderer emits it untouched.
+    Json(JsonBinding),
 }
 
 /// `{"type":"var"}` — see [`BindingDesired::Var`].
@@ -560,6 +569,18 @@ pub struct AnalyticsEngineBinding {
     /// Dataset name — wrangler `dataset`, defaults to the binding name
     /// at project-config parse (mirrors CF).
     pub dataset: String,
+}
+
+/// `{"type":"json"}` — see [`BindingDesired::Json`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JsonBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// Serialized JSON text — must parse and stay within
+    /// [`MAX_JSON_BINDING_BYTES`]; emitted verbatim into workerd's
+    /// `json` binding so `env.<name>` is the parsed value.
+    pub value: String,
 }
 
 /// P3c-1 `durableObjectClasses[]`: one DO class declared by this worker.
@@ -1452,6 +1473,14 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.dataset"));
                     }
                 }
+                BindingDesired::Json(j) => {
+                    if j.value.len() > MAX_JSON_BINDING_BYTES {
+                        return Err(DesiredError::Capacity("jsonBindingBytes"));
+                    }
+                    if serde_json::from_str::<serde_json::Value>(&j.value).is_err() {
+                        return Err(DesiredError::Identifier("bindings.jsonValue"));
+                    }
+                }
             }
         }
         Ok(())
@@ -1623,6 +1652,7 @@ impl BindingDesired {
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
             Self::AnalyticsEngine(b) => &b.name,
+            Self::Json(b) => &b.name,
         }
     }
 
@@ -1644,7 +1674,8 @@ impl BindingDesired {
             | Self::DurableObject(_)
             | Self::Ratelimit(_)
             | Self::WorkerLoader(_)
-            | Self::AnalyticsEngine(_) => None,
+            | Self::AnalyticsEngine(_)
+            | Self::Json(_) => None,
         }
     }
 }
@@ -2260,6 +2291,45 @@ mod tests {
                     v["tenants"][0]["workers"][0]["tailConsumers"] = json!([{"workerId": "w-nope"}])
                 }),
                 "DESIRED_TAIL_TARGET_SCOPE",
+            ),
+            // `{"type":"json"}` — version_metadata / typed vars carrier.
+            (
+                "json-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({
+                            "type": "json",
+                            "name": "CF_VERSION_METADATA",
+                            "value": "{\"id\":\"v1\",\"tag\":\"\",\"timestamp\":\"1\"}"
+                        }));
+                }),
+                "",
+            ),
+            (
+                "json-invalid-payload",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({"type": "json", "name": "J", "value": "{not json"}));
+                }),
+                "DESIRED_INVALID_IDENTIFIER",
+            ),
+            (
+                "json-oversize",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!({
+                            "type": "json",
+                            "name": "J",
+                            "value": format!("\"{}\"", "x".repeat(MAX_JSON_BINDING_BYTES))
+                        }));
+                }),
+                "DESIRED_CAPACITY_EXCEEDED",
             ),
             (
                 "bad-assets-digest",

@@ -845,6 +845,47 @@
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "tail_consumers[0].environment"
    }
+  },
+  {
+   "name": "version_metadata binding",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[version_metadata]\nbinding = \"CF_VERSION_METADATA\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "versionMetadata": {
+      "binding": "CF_VERSION_METADATA"
+     }
+    }
+   }
+  },
+  {
+   "name": "version_metadata missing binding rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[version_metadata]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "version_metadata.binding"
+   }
+  },
+  {
+   "name": "version_metadata unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[version_metadata]\nbinding = \"X\"\nscope = \"all\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "version_metadata.scope"
+   }
   }
  ]
 }

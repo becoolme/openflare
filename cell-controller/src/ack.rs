@@ -165,6 +165,13 @@ pub struct AckCapabilities {
     /// false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tail_consumers: bool,
+    /// `{"type":"json"}` bindings (version_metadata, typed vars)
+    /// render to workerd `json` — a pre-json cell rejects the unknown
+    /// binding variant via `deny_unknown_fields`, so the control plane
+    /// only admits them onto cells that claim it. Omitted while false
+    /// (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub version_metadata: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

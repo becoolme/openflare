@@ -93,6 +93,12 @@ pub struct WorkerToml {
     /// (same rule as `[bindings.service]`).
     #[serde(default)]
     pub(crate) tail_consumers: Vec<TailConsumerToml>,
+    /// `versionMetadata` — CF `[version_metadata]`: `{binding}` names
+    /// the env binding that exposes `{id, tag, timestamp}` of the
+    /// serving version. Rendered as a `json` binding at to_desired
+    /// time so rollback reports the reactivated version's own values.
+    #[serde(default)]
+    pub(crate) version_metadata: Option<VersionMetadataToml>,
     /// P3c-1: `durableObjectBindings` -- DO namespace bindings
     /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
@@ -194,6 +200,15 @@ impl ServiceTargetToml {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TailConsumerToml {
     pub(crate) service: String,
+}
+
+/// `versionMetadata` — `{binding}` names the env binding for the
+/// serving version's `{id, tag, timestamp}` (CF `[version_metadata]`;
+/// `binding` is the only key CF's wrangler schema accepts).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct VersionMetadataToml {
+    pub(crate) binding: String,
 }
 
 /// T37b `[[queueConsumers]]`: fields aligned with wrangler `queues.consumers[]`
@@ -414,6 +429,9 @@ pub struct PackedWorker {
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
     /// Desired tail consumers (consumer workerIds already resolved).
     pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
+    /// `version_metadata` binding name — `to_desired` synthesizes the
+    /// `json` binding with THIS version's id/timestamp.
+    pub version_metadata_binding: Option<String>,
     /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
     /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
@@ -1252,6 +1270,7 @@ pub fn assemble(
         crons: meta.crons,
         queue_consumers,
         tail_consumers,
+        version_metadata_binding: meta.version_metadata.map(|v| v.binding),
         durable_object_classes,
         workflows,
         hostnames,

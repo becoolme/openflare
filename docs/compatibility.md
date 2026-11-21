@@ -31,6 +31,7 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | WebSockets | Partial | [bindings/websockets.md](bindings/websockets.md), [ingress-websocket.md](ingress-websocket.md) |
 | Vars / secrets | Partial | [bindings/vars-and-secrets.md](bindings/vars-and-secrets.md) |
 | Tail Workers (`tail_consumers`) | Partial | [wrangler-config.md](wrangler-config.md) |
+| Version metadata (`version_metadata`) | Partial | [wrangler-config.md](wrangler-config.md) |
 | Workers AI, Vectorize, AI Search, Pipelines, e-mail, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
 
 ## Known platform differences
@@ -121,7 +122,7 @@ Any unrecognized wrangler key fails the deploy with
 Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 (`ai`), Vectorize (`vectorize`), AI Search (`ai_search`,
 `ai_search_namespaces`),
-Tail Workers (`tail_consumers`), Secrets Store
+Secrets Store
 (`secrets_store_secrets`), Pipelines, dispatch namespaces
 (`dispatch_namespaces`), `send_email`,
 `mtls_certificates`, `browser`, `containers`, `unsafe`, raw

@@ -96,6 +96,16 @@ pub struct VersionRecord {
     /// and a rollback restores the earlier consumer set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
+    /// `version_metadata` binding name — `to_desired` synthesizes the
+    /// `{id, tag, timestamp}` `json` binding from THIS record so a
+    /// rollback reports the reactivated version's values (CF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_metadata_binding: Option<String>,
+    /// Version creation time (unix ms) — the `timestamp` field of the
+    /// synthesized version_metadata binding. `0` on pre-feature rows
+    /// (renders the epoch, never blocks a legacy rollback).
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
     /// P3c-1: the DO class set declared by this version (migrations were already
     /// resolved to the final set at pack time, `uniqueKey` is fixed; rollback restores the original declaration --
     /// the storage identity of the `renamed_classes` lineage follows the version).
@@ -216,6 +226,11 @@ impl LocalState {
                 crons: pkg.crons.clone(),
                 queue_consumers: pkg.queue_consumers.clone(),
                 tail_consumers: pkg.tail_consumers.clone(),
+                version_metadata_binding: pkg.version_metadata_binding.clone(),
+                created_at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
                 durable_object_classes: pkg.durable_object_classes.clone(),
                 workflows: pkg.workflows.clone(),
                 quotas: pkg.quotas.clone(),
@@ -307,6 +322,25 @@ impl LocalState {
                 .as_ref()
                 .and_then(|id| w.versions.iter().find(|v| &v.version_id == id))
                 .ok_or(LocalError::State("activeVersion"))?;
+            // CF `[version_metadata]`: `env.<binding>` is
+            // `{id, tag, timestamp}` of the SERVING version —
+            // synthesized here (not stored as a literal) so a rollback
+            // reports the reactivated version's own values, matching
+            // CF where metadata describes the version, not the deploy.
+            let mut bindings = active.bindings.clone();
+            if let Some(bname) = &active.version_metadata_binding {
+                bindings.push(BindingDesired::Json(
+                    snapshot_protocol::compute_desired::JsonBinding {
+                        name: bname.clone(),
+                        value: serde_json::json!({
+                            "id": active.version_id,
+                            "tag": "",
+                            "timestamp": active.created_at_unix_ms.to_string(),
+                        })
+                        .to_string(),
+                    },
+                ));
+            }
             workers.push(WorkerDesired {
                 worker_id: w.worker_id.clone(),
                 name: name.clone(),
@@ -316,7 +350,7 @@ impl LocalState {
                     compatibility_date: active.compatibility_date.clone(),
                     compatibility_flags: active.compatibility_flags.clone(),
                 },
-                bindings: active.bindings.clone(),
+                bindings,
                 routes: w
                     .hostnames
                     .iter()

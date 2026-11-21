@@ -14,7 +14,8 @@
     "workerLoader": true,
     "workflows": true,
     "workflowsCrossWorker": true,
-    "workflowsOps": true
+    "workflowsOps": true,
+    "versionMetadata": true
   },
   "envelopeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "fenceRevision": 5,

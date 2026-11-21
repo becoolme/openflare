@@ -7,7 +7,9 @@
 mod common;
 
 use common::*;
-use snapshot_protocol::compute_desired::{TailConsumerDesired, TenantDesired};
+use snapshot_protocol::compute_desired::{
+    BindingDesired, JsonBinding, TailConsumerDesired, TenantDesired,
+};
 use vrt_config::*;
 
 fn bs() -> Vec<VersionBundle> {
@@ -85,4 +87,26 @@ fn tails_dangling_consumer_skips_only_that_worker() {
     );
     assert!(!r.text.contains("worker-w-alpha-1"));
     assert!(r.text.contains("worker-w-alpha-2"));
+}
+
+/// `{"type":"json"}` — the version_metadata/typed-vars carrier renders
+/// as a workerd `json` binding with the wire text verbatim.
+#[test]
+fn json_binding_emits_verbatim() {
+    let mut t = tenant();
+    t.workers[0]
+        .bindings
+        .push(BindingDesired::Json(JsonBinding {
+            name: "CF_VERSION_METADATA".into(),
+            value: "{\"id\":\"v-1\",\"tag\":\"\",\"timestamp\":\"42\"}".into(),
+        }));
+    let params = runtime_params();
+    let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
+    assert!(
+        r.text.contains(
+            "(name = \"CF_VERSION_METADATA\", json = \"{\\\"id\\\":\\\"v-1\\\",\\\"tag\\\":\\\"\\\",\\\"timestamp\\\":\\\"42\\\"}\")"
+        ),
+        "{}",
+        r.text
+    );
 }
