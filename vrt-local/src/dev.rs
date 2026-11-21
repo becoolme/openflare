@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 
 /// Default ingress bind — loopback only; dev never listens publicly.
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
+/// CF `[dev]` default port — same as `wrangler dev`.
+const DEFAULT_PORT: u16 = 8787;
 /// Bound on waiting for `/readyz` after the children spawn.
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 /// File-watch poll cadence.
@@ -145,14 +147,22 @@ pub async fn start(opts: DevOptions) -> Result<DevSession, LocalError> {
     let root = worker_dir.join(".vrt");
     let local = ensure_root(&root, &opts, &runtime)?;
     let key = local.trusted_key()?;
-    let ports = DevPorts::alloc(&opts)?;
-
-    write_dev_configs(&root, &key, &runtime, &ports)?;
 
     // First deploy — also validates the worker dir before children
     // spawn, so config errors surface before "listening" prints.
-    let (meta, _src) =
+    let (mut meta, _src) =
         crate::project_cfg::load_worker_meta_for_env(&worker_dir, opts.env_name.as_deref())?;
+    // CF `[dev]`: `dev.host` registers an extra hostname for the
+    // session so Host-based ingress routing reaches the worker (the
+    // same host the `wrangler dev` URL would serve under).
+    if let Some(host) = meta.dev.as_ref().and_then(|d| d.host.as_ref()) {
+        if !meta.hostnames.iter().any(|h| h == host) {
+            meta.hostnames.push(host.clone());
+        }
+    }
+    let ports = DevPorts::alloc(&opts, meta.dev.as_ref())?;
+
+    write_dev_configs(&root, &key, &runtime, &ports)?;
     deploy_once(&local, &worker_dir, &meta, opts.env_name.as_deref())?;
     let summary_bindings = binding_table(&meta);
     let worker_name = meta.name.clone();
@@ -705,10 +715,26 @@ struct DevPorts {
 }
 
 impl DevPorts {
-    fn alloc(opts: &DevOptions) -> Result<Self, LocalError> {
+    fn alloc(
+        opts: &DevOptions,
+        dev: Option<&crate::worker_pkg::DevToml>,
+    ) -> Result<Self, LocalError> {
+        // `--listen` wins over `[dev]` (same precedence as wrangler's
+        // `--ip`/`--port` flags over the config table); `[dev]` wins
+        // over the default.
+        let dev_listen = dev.and_then(|d| {
+            (d.ip.is_some() || d.port.is_some()).then(|| {
+                format!(
+                    "{}:{}",
+                    d.ip.as_deref().unwrap_or("127.0.0.1"),
+                    d.port.unwrap_or(DEFAULT_PORT)
+                )
+            })
+        });
         let listen = opts
             .listen
             .clone()
+            .or(dev_listen)
             .unwrap_or_else(|| DEFAULT_LISTEN.to_string());
         // Fail fast on a busy user-facing port; internals race-safe.
         let listen_addr: std::net::SocketAddr = listen
@@ -1035,10 +1061,42 @@ mod tests {
             listen: Some("0.0.0.0:8787".into()),
             ..base
         };
-        assert!(DevPorts::alloc(&o).is_err(), "non-loopback must refuse");
+        assert!(
+            DevPorts::alloc(&o, None).is_err(),
+            "non-loopback must refuse"
+        );
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = held.local_addr().unwrap().to_string();
         o.listen = Some(busy);
-        assert!(DevPorts::alloc(&o).is_err(), "busy port must refuse");
+        assert!(DevPorts::alloc(&o, None).is_err(), "busy port must refuse");
+    }
+
+    #[test]
+    fn dev_table_listen_precedence() {
+        use crate::worker_pkg::DevToml;
+        let dev = |ip: Option<&str>, port: Option<u16>| {
+            Some(DevToml {
+                ip: ip.map(str::to_string),
+                port,
+                host: None,
+            })
+        };
+        let opts = DevOptions::default();
+        // `[dev]` wins over the default.
+        let ports = DevPorts::alloc(&opts, dev(None, Some(0)).as_ref())
+            .expect("dev port-only must allocate");
+        assert!(ports.listen.starts_with("127.0.0.1:"), "{}", ports.listen);
+        // `--listen` wins over `[dev]` (wrangler flag-over-config order).
+        let opts = DevOptions {
+            listen: Some("127.0.0.1:0".into()),
+            ..DevOptions::default()
+        };
+        let ports = DevPorts::alloc(&opts, dev(Some("127.0.0.2"), Some(9999)).as_ref())
+            .expect("explicit --listen must allocate");
+        assert!(ports.listen.starts_with("127.0.0.1:"), "{}", ports.listen);
+        // A `[dev]` public bind is refused by the same loopback gate.
+        assert!(
+            DevPorts::alloc(&DevOptions::default(), dev(Some("0.0.0.0"), None).as_ref()).is_err()
+        );
     }
 }

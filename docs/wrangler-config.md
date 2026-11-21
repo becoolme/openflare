@@ -80,6 +80,7 @@ environment blocks.
 | `assets` | supported — see [Static assets](bindings/static-assets.md); `directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first` | `project_cfg.rs:1235` |
 | `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1269` |
 | `limits` | supported — see [Per-worker quotas](quotas.md); `cpu_ms` (1..300000) and `subrequests` (0..10000); other keys rejected | `project_cfg.rs:1393` |
+| `dev` | supported (dev-only) — `ip` (loopback only; `localhost` normalizes to `127.0.0.1`), `port` (1..65535), `host` (forwarded-`Host` hostname registered for the session), `local_protocol = "http"` no-op; consumed by `vrt dev` only, never part of the desired state. `inspector_*`, `upstream_protocol`, `remote`/`experimental_remote`, `enable_containers`, `container_engine`, `generate_types` rejected | `project_cfg.rs` `normalize_dev`, `dev.rs` `DevPorts::alloc` |
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
 
 ## Accepted and ignored
@@ -91,7 +92,7 @@ but change nothing (`IGNORED_TOP_LEVEL`, `project_cfg.rs:31–57`):
 `rules`, `alias`, `tsconfig`, `jsx_factory`, `jsx_fragment`,
 `no_bundle`, `minify`, `keep_names`, `find_additional_modules`,
 `preserve_file_names`, `base_dir`, `define`, `upload_source_maps`,
-`dev`, `cwd`, `config`, `placement`.
+`cwd`, `config`, `placement`.
 
 Also type-checked then dropped inside supported blocks:
 
@@ -141,3 +142,17 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 ## Changelog
 
 - 2026-11-20: `vrt deploy`, `vrt dev`, and `vrt doctor` accept `--env` to select Wrangler named environments.
+- 2026-11-21: `[dev]` is consumed instead of ignored — `vrt dev` reads
+  `ip`/`port` for the loopback ingress bind (`--listen` still wins, same
+  flag-over-config order as wrangler) and registers `host` as a
+  forwarded-`Host` hostname for the session. `dev.ip` must be loopback:
+  wrangler permits `0.0.0.0` to share a session on the LAN, but `vrt dev`
+  never binds publicly, so a non-loopback value is `VRT_CONFIG_INVALID`
+  (same gate as `--listen`). Keys naming dev machinery vrt does not
+  implement (`inspector_*`, `upstream_protocol`, `remote`,
+  `experimental_remote`, `enable_containers`, `container_engine`,
+  `generate_types`) fail closed as `VRT_CONFIG_UNSUPPORTED_FIELD`;
+  `local_protocol` is accepted only as `"http"`, the sole mode served.
+  The deploy path never sees `[dev]` — it is stripped before desired-state
+  projection, matching wrangler where the table configures only
+  `wrangler dev`.

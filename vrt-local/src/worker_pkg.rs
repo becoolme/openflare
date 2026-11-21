@@ -128,6 +128,26 @@ pub struct WorkerToml {
     /// T21: `[assets]` directory declaration.
     #[serde(default)]
     pub(crate) assets: Option<AssetsToml>,
+    /// CF `[dev]` — wrangler dev-server settings (`ip`/`port`/`host`),
+    /// consumed by `vrt dev` for the loopback ingress; never part of
+    /// the desired state (dev-tooling config, not runtime semantics).
+    #[serde(default)]
+    pub(crate) dev: Option<DevToml>,
+}
+
+/// `[dev]` — wrangler dev-server settings (`vrt dev` only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DevToml {
+    /// Loopback ingress IP (`localhost` normalizes to 127.0.0.1).
+    #[serde(default)]
+    pub(crate) ip: Option<String>,
+    /// Loopback ingress port.
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
+    /// Extra hostname registered for the dev session (CF `dev.host`).
+    #[serde(default)]
+    pub(crate) host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

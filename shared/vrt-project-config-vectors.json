@@ -241,7 +241,7 @@
    }
   },
   {
-   "name": "documented ignore-list entries are dropped",
+   "name": "documented ignore-list entries are dropped except dev",
    "files": {
     "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\naccount_id = \"cf-acct\"\nworkers_dev = true\nkeep_vars = true\nsend_metrics = false\n\n[build]\ncommand = \"npm run build\"\n\n[dev]\nport = 8787\n"
    },
@@ -253,6 +253,19 @@
      "name": "svc",
      "main": "src/index.ts",
      "compatibilityDate": "2025-01-01"
+    }
+   },
+   "rustExpect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "dev": {
+      "port": 8787
+     }
     }
    }
   },
@@ -1068,6 +1081,79 @@
     "ok": false,
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "limits.memory_mb"
+   }
+  },
+  {
+   "name": "dev table normalized for vrt dev",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nip = \"localhost\"\nport = 9000\nhost = \"dev.example.com\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   },
+   "rustExpect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "dev": {
+      "ip": "127.0.0.1",
+      "port": 9000,
+      "host": "dev.example.com"
+     }
+    }
+   }
+  },
+  {
+   "name": "dev non-loopback ip fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nip = \"0.0.0.0\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   },
+   "rustExpect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "dev.ip"
+   }
+  },
+  {
+   "name": "dev unimplemented key fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nupstream_protocol = \"https\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   },
+   "rustExpect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "dev.upstream_protocol"
    }
   }
  ]
