@@ -15,7 +15,8 @@ use vrt_provider::error::ProviderError;
 use vrt_provider::r2::fs::FsR2Provider;
 use vrt_provider::r2::s3::{S3Config, S3R2Provider, SecretString};
 use vrt_provider::r2::wire::{
-    R2HttpMetadata, R2MultipartCreateOptions, R2UploadedPart, R2_MULTIPART_MIN_PART_BYTES,
+    R2HttpMetadata, R2MultipartCreateOptions, R2SsecKey, R2UploadedPart,
+    R2_MULTIPART_MIN_PART_BYTES,
 };
 use vrt_provider::r2::{MemoryR2Provider, R2GetResult, R2Provider};
 use vrt_provider::BindingContext;
@@ -109,9 +110,18 @@ async fn conformance(p: &dyn R2Provider) {
         .await
         .unwrap()
         .upload_id;
-    let p1 = p.upload_part(&c, "mp/obj", &up, 1, &big).await.unwrap();
-    let p2 = p.upload_part(&c, "mp/obj", &up, 2, &big).await.unwrap();
-    let p3 = p.upload_part(&c, "mp/obj", &up, 3, &small).await.unwrap();
+    let p1 = p
+        .upload_part(&c, "mp/obj", &up, 1, &big, None)
+        .await
+        .unwrap();
+    let p2 = p
+        .upload_part(&c, "mp/obj", &up, 2, &big, None)
+        .await
+        .unwrap();
+    let p3 = p
+        .upload_part(&c, "mp/obj", &up, 3, &small, None)
+        .await
+        .unwrap();
     assert!(p1.etag.len() == 32 && p1.etag.chars().all(|c| c.is_ascii_hexdigit()));
     let (e1, e2, e3) = (p1.etag.clone(), p2.etag.clone(), p3.etag.clone());
     let meta = p
@@ -144,7 +154,7 @@ async fn conformance(p: &dyn R2Provider) {
         Some("text/plain"),
         "http metadata preserved"
     );
-    match p.get(&c, "mp/obj", None, None).await.unwrap() {
+    match p.get(&c, "mp/obj", None, None, None).await.unwrap() {
         R2GetResult::Body(stored, body) => {
             assert_eq!(body.len(), 2 * PART + small.len());
             assert_eq!(&body[..4], &[0xAB; 4]);
@@ -178,7 +188,7 @@ async fn conformance(p: &dyn R2Provider) {
     // -- terminal state: complete consumed the upload --
     assert!(
         matches!(
-            p.upload_part(&c, "mp/obj", &up, 4, b"x").await,
+            p.upload_part(&c, "mp/obj", &up, 4, b"x", None).await,
             Err(ProviderError::R2MultipartInvalid)
         ),
         "uploadPart after complete"
@@ -210,7 +220,7 @@ async fn conformance(p: &dyn R2Provider) {
         .unwrap()
         .upload_id;
     let empty_part = p
-        .upload_part(&c, "mp/empty-meta", &up_empty, 1, &big)
+        .upload_part(&c, "mp/empty-meta", &up_empty, 1, &big, None)
         .await
         .unwrap();
     let empty = p
@@ -239,11 +249,13 @@ async fn conformance(p: &dyn R2Provider) {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "mp/abort", &up2, 1, b"x").await.unwrap();
+    p.upload_part(&c, "mp/abort", &up2, 1, b"x", None)
+        .await
+        .unwrap();
     p.abort_multipart(&c, "mp/abort", &up2).await.unwrap();
     assert!(
         matches!(
-            p.upload_part(&c, "mp/abort", &up2, 2, b"x").await,
+            p.upload_part(&c, "mp/abort", &up2, 2, b"x", None).await,
             Err(ProviderError::R2MultipartInvalid)
         ),
         "part after abort"
@@ -265,7 +277,7 @@ async fn conformance(p: &dyn R2Provider) {
     );
     assert!(
         matches!(
-            p.get(&c, "mp/abort", None, None).await.unwrap(),
+            p.get(&c, "mp/abort", None, None, None).await.unwrap(),
             R2GetResult::Missing
         ),
         "aborted upload must not commit"
@@ -279,14 +291,15 @@ async fn conformance(p: &dyn R2Provider) {
         .upload_id;
     assert!(
         matches!(
-            p.upload_part(&c, "mp/rules", &up3, 0, b"x").await,
+            p.upload_part(&c, "mp/rules", &up3, 0, b"x", None).await,
             Err(ProviderError::R2MultipartInvalid)
         ),
         "partNumber 0"
     );
     assert!(
         matches!(
-            p.upload_part(&c, "mp/rules", &up3, 10_001, b"x").await,
+            p.upload_part(&c, "mp/rules", &up3, 10_001, b"x", None)
+                .await,
             Err(ProviderError::R2MultipartInvalid)
         ),
         "partNumber 10001"
@@ -298,8 +311,14 @@ async fn conformance(p: &dyn R2Provider) {
         ),
         "empty parts"
     );
-    let pa = p.upload_part(&c, "mp/rules", &up3, 1, &big).await.unwrap();
-    let pb = p.upload_part(&c, "mp/rules", &up3, 2, b"t").await.unwrap();
+    let pa = p
+        .upload_part(&c, "mp/rules", &up3, 1, &big, None)
+        .await
+        .unwrap();
+    let pb = p
+        .upload_part(&c, "mp/rules", &up3, 2, b"t", None)
+        .await
+        .unwrap();
     assert!(
         matches!(
             p.complete_multipart(&c, "mp/rules", &up3, &[pb.clone(), pa.clone()])
@@ -345,11 +364,11 @@ async fn conformance(p: &dyn R2Provider) {
         .unwrap()
         .upload_id;
     let s1 = p
-        .upload_part(&c, "mp/minpart", &up4, 1, b"tiny")
+        .upload_part(&c, "mp/minpart", &up4, 1, b"tiny", None)
         .await
         .unwrap();
     let s2 = p
-        .upload_part(&c, "mp/minpart", &up4, 2, b"tail")
+        .upload_part(&c, "mp/minpart", &up4, 2, b"tail", None)
         .await
         .unwrap();
     assert!(
@@ -366,7 +385,7 @@ async fn conformance(p: &dyn R2Provider) {
         .unwrap()
         .upload_id;
     let sp = p
-        .upload_part(&c, "mp/single", &up5, 1, b"one")
+        .upload_part(&c, "mp/single", &up5, 1, b"one", None)
         .await
         .unwrap();
     assert!(
@@ -383,24 +402,25 @@ async fn conformance(p: &dyn R2Provider) {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "mp/replace", &up6, 1, b"first")
+    p.upload_part(&c, "mp/replace", &up6, 1, b"first", None)
         .await
         .unwrap();
     let second = p
-        .upload_part(&c, "mp/replace", &up6, 1, b"second")
+        .upload_part(&c, "mp/replace", &up6, 1, b"second", None)
         .await
         .unwrap();
     p.complete_multipart(&c, "mp/replace", &up6, &[second])
         .await
         .unwrap();
-    match p.get(&c, "mp/replace", None, None).await.unwrap() {
+    match p.get(&c, "mp/replace", None, None, None).await.unwrap() {
         R2GetResult::Body(_, body) => assert_eq!(body, b"second", "part replace"),
         _ => panic!("replaced part object missing"),
     }
 
     // -- unknown/cross-scope upload ids --
     assert!(matches!(
-        p.upload_part(&c, "k", "no-such-upload", 1, b"x").await,
+        p.upload_part(&c, "k", "no-such-upload", 1, b"x", None)
+            .await,
         Err(ProviderError::R2MultipartInvalid)
     ));
     let up7 = p
@@ -410,7 +430,7 @@ async fn conformance(p: &dyn R2Provider) {
         .upload_id;
     assert!(
         matches!(
-            p.upload_part(&c, "mp/keyB", &up7, 1, b"x").await,
+            p.upload_part(&c, "mp/keyB", &up7, 1, b"x", None).await,
             Err(ProviderError::R2MultipartInvalid)
         ),
         "key mismatch"
@@ -418,7 +438,8 @@ async fn conformance(p: &dyn R2Provider) {
     let other_tenant = ctx_for(OTHER_TENANT, BUCKET);
     assert!(
         matches!(
-            p.upload_part(&other_tenant, "mp/keyA", &up7, 1, b"x").await,
+            p.upload_part(&other_tenant, "mp/keyA", &up7, 1, b"x", None)
+                .await,
             Err(ProviderError::R2MultipartInvalid)
         ),
         "cross-tenant id"
@@ -426,7 +447,8 @@ async fn conformance(p: &dyn R2Provider) {
     let other_bucket = ctx_for(TENANT, BUCKET2);
     assert!(
         matches!(
-            p.upload_part(&other_bucket, "mp/keyA", &up7, 1, b"x").await,
+            p.upload_part(&other_bucket, "mp/keyA", &up7, 1, b"x", None)
+                .await,
             Err(ProviderError::R2MultipartInvalid)
         ),
         "cross-bucket id"
@@ -438,7 +460,10 @@ async fn conformance(p: &dyn R2Provider) {
         .await
         .unwrap()
         .upload_id;
-    let rp = p.upload_part(&c, "mp/race", &up8, 1, b"x").await.unwrap();
+    let rp = p
+        .upload_part(&c, "mp/race", &up8, 1, b"x", None)
+        .await
+        .unwrap();
     let parts = [rp];
     let (cres, ares) = tokio::join!(
         p.complete_multipart(&c, "mp/race", &up8, &parts),
@@ -520,9 +545,11 @@ async fn memory_staging_byte_quota() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k", &up, 1, &[0u8; 10]).await.unwrap();
+    p.upload_part(&c, "k", &up, 1, &[0u8; 10], None)
+        .await
+        .unwrap();
     assert!(matches!(
-        p.upload_part(&c, "k", &up, 2, &[0u8; 1]).await,
+        p.upload_part(&c, "k", &up, 2, &[0u8; 1], None).await,
         Err(ProviderError::R2Overloaded)
     ));
     p.abort_multipart(&c, "k", &up).await.unwrap();
@@ -531,7 +558,9 @@ async fn memory_staging_byte_quota() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k", &up2, 1, &[0u8; 10]).await.unwrap();
+    p.upload_part(&c, "k", &up2, 1, &[0u8; 10], None)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -545,7 +574,8 @@ async fn memory_total_size_cap() {
         .upload_id;
     // A part exceeding the cap outright.
     assert!(matches!(
-        p.upload_part(&c, "k", &up, 1, &vec![0u8; PART + 8]).await,
+        p.upload_part(&c, "k", &up, 1, &vec![0u8; PART + 8], None)
+            .await,
         Err(ProviderError::R2ObjectTooLarge)
     ));
     // Two parts individually legal but exceeding the cumulative cap.
@@ -554,12 +584,12 @@ async fn memory_total_size_cap() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k2", &up2, 1, &vec![0u8; PART])
+    p.upload_part(&c, "k2", &up2, 1, &vec![0u8; PART], None)
         .await
         .unwrap();
     assert!(
         matches!(
-            p.upload_part(&c, "k2", &up2, 2, &vec![0u8; 8]).await,
+            p.upload_part(&c, "k2", &up2, 2, &vec![0u8; 8], None).await,
             Err(ProviderError::R2ObjectTooLarge)
         ),
         "cumulative cap"
@@ -570,13 +600,13 @@ async fn memory_total_size_cap() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k3", &up3, 1, &vec![0u8; PART])
+    p.upload_part(&c, "k3", &up3, 1, &vec![0u8; PART], None)
         .await
         .unwrap();
-    p.upload_part(&c, "k3", &up3, 1, &vec![0u8; 4])
+    p.upload_part(&c, "k3", &up3, 1, &vec![0u8; 4], None)
         .await
         .unwrap();
-    p.upload_part(&c, "k3", &up3, 2, &vec![0u8; 4])
+    p.upload_part(&c, "k3", &up3, 2, &vec![0u8; 4], None)
         .await
         .unwrap();
 }
@@ -596,7 +626,7 @@ async fn fs_rejects_malformed_internal_id() {
     // Internal ids are provider-issued uuids; a forged/traversal id
     // reaching the backend still fails closed before any path join.
     for bad in ["../escape", "a/b", "..", "x".repeat(64).as_str(), ""] {
-        let r = p.upload_part(&c, "k", bad, 1, b"x").await;
+        let r = p.upload_part(&c, "k", bad, 1, b"x", None).await;
         assert!(
             matches!(r, Err(ProviderError::R2MultipartInvalid)),
             "accepted internal id {bad:?}"
@@ -614,7 +644,9 @@ async fn fs_gc_reaps_expired_keeps_active() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k-stale", &stale, 1, b"x").await.unwrap();
+    p.upload_part(&c, "k-stale", &stale, 1, b"x", None)
+        .await
+        .unwrap();
     // Deterministic expiry: rewrite the staged meta with a past
     // expiresMs — no wall-clock dependence under parallel tests.
     let meta_path = dir
@@ -635,7 +667,7 @@ async fn fs_gc_reaps_expired_keeps_active() {
     assert_eq!(removed, 1);
     assert!(freed > 0);
     assert!(matches!(
-        p.upload_part(&c, "k-stale", &stale, 2, b"y").await,
+        p.upload_part(&c, "k-stale", &stale, 2, b"y", None).await,
         Err(ProviderError::R2MultipartInvalid)
     ));
     // A fresh upload is untouched by the sweep.
@@ -644,7 +676,9 @@ async fn fs_gc_reaps_expired_keeps_active() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k-live", &live, 1, b"x").await.unwrap();
+    p.upload_part(&c, "k-live", &live, 1, b"x", None)
+        .await
+        .unwrap();
     assert_eq!(p.sweep_staging().unwrap().expired, 0, "active upload swept");
     p.abort_multipart(&c, "k-live", &live).await.unwrap();
 }
@@ -661,14 +695,17 @@ async fn fs_restart_resumes_staging() {
             .await
             .unwrap()
             .upload_id;
-        p.upload_part(&c, "k", &up, 1, &vec![0xAA; PART])
+        p.upload_part(&c, "k", &up, 1, &vec![0xAA; PART], None)
             .await
             .unwrap();
         up
     };
     // Provider restart: staging dirs persist; the upload resumes.
     let p2 = FsR2Provider::new(root, 64 * 1024 * 1024).unwrap();
-    let last = p2.upload_part(&c, "k", &up, 2, b"tail").await.unwrap();
+    let last = p2
+        .upload_part(&c, "k", &up, 2, b"tail", None)
+        .await
+        .unwrap();
     let expected = part_md5(&vec![0xAAu8; PART]);
     let meta = p2
         .complete_multipart(&c, "k", &up, &[part(1, &expected), last])
@@ -692,7 +729,9 @@ async fn fs_staging_bytes_gauge_source() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k", &up, 1, b"12345").await.unwrap();
+    p.upload_part(&c, "k", &up, 1, b"12345", None)
+        .await
+        .unwrap();
     let rows = p.staging_bytes().unwrap();
     let row = rows
         .iter()
@@ -730,6 +769,8 @@ struct MockMp {
     drop_next_part: bool,
     /// Drop the next HEAD once (confirmation unreachable → UNKNOWN).
     drop_next_head: bool,
+    /// Every request as `(method, path+query, headers)`.
+    log: Vec<(String, String, Vec<(String, String)>)>,
 }
 
 /// Complete-response fault modes the mock can inject (W5-r3).
@@ -839,6 +880,7 @@ fn mock_s3() -> (std::net::SocketAddr, Arc<Mutex<MockMp>>) {
                 let q = query(&path);
                 let key = physical(&path);
                 let mut g = st.lock().unwrap();
+                g.log.push((method.clone(), path.clone(), headers.clone()));
                 if method == "POST" && q.contains_key("uploads") {
                     g.next += 1;
                     let id = format!("mu-{}", g.next);
@@ -1077,7 +1119,7 @@ async fn s3_complete_embedded_error_is_typed() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k", &up, 1, b"x").await.unwrap();
+    p.upload_part(&c, "k", &up, 1, b"x", None).await.unwrap();
     // 200 + embedded InternalError → service fault, not multipart-invalid.
     state.lock().unwrap().embedded_error = Some("InternalError".into());
     assert!(matches!(
@@ -1091,7 +1133,7 @@ async fn s3_complete_embedded_error_is_typed() {
         .await
         .unwrap()
         .upload_id;
-    let pp = p.upload_part(&c, "k2", &up2, 1, b"x").await.unwrap();
+    let pp = p.upload_part(&c, "k2", &up2, 1, b"x", None).await.unwrap();
     state.lock().unwrap().embedded_error = Some("NoSuchUpload".into());
     assert!(matches!(
         p.complete_multipart(&c, "k2", &up2, &[pp]).await,
@@ -1111,7 +1153,7 @@ async fn s3_complete_ambiguous_confirmed_by_head() {
         .await
         .unwrap()
         .upload_id;
-    let pp = p.upload_part(&c, "k", &up, 1, b"data").await.unwrap();
+    let pp = p.upload_part(&c, "k", &up, 1, b"data", None).await.unwrap();
     state.lock().unwrap().drop_next_complete = Some(true);
     let meta = p
         .complete_multipart(&c, "k", &up, &[pp])
@@ -1134,7 +1176,7 @@ async fn s3_complete_ambiguous_uncommitted_is_unavailable() {
         .await
         .unwrap()
         .upload_id;
-    let pp = p.upload_part(&c, "k", &up, 1, b"data").await.unwrap();
+    let pp = p.upload_part(&c, "k", &up, 1, b"data", None).await.unwrap();
     state.lock().unwrap().drop_next_complete = Some(false);
     assert!(matches!(
         p.complete_multipart(&c, "k", &up, &[pp]).await,
@@ -1155,7 +1197,7 @@ async fn s3_complete_ambiguous_unconfirmable_is_result_unknown() {
         .await
         .unwrap()
         .upload_id;
-    let pp = p.upload_part(&c, "k", &up, 1, b"data").await.unwrap();
+    let pp = p.upload_part(&c, "k", &up, 1, b"data", None).await.unwrap();
     {
         let mut g = state.lock().unwrap();
         g.drop_next_complete = Some(true);
@@ -1181,7 +1223,7 @@ async fn s3_complete_retry_after_committed_fault_is_idempotent() {
         .await
         .unwrap()
         .upload_id;
-    let pp = p.upload_part(&c, "k", &up, 1, b"data").await.unwrap();
+    let pp = p.upload_part(&c, "k", &up, 1, b"data", None).await.unwrap();
     {
         let mut g = state.lock().unwrap();
         g.complete_fault = Some((CompleteFault::Status500, true));
@@ -1230,7 +1272,7 @@ async fn s3_complete_service_faults_route_through_head() {
             .await
             .unwrap()
             .upload_id;
-        let pp = p.upload_part(&c, "k", &up, 1, b"data").await.unwrap();
+        let pp = p.upload_part(&c, "k", &up, 1, b"data", None).await.unwrap();
         state.lock().unwrap().complete_fault = Some((fault, true));
         let meta = p
             .complete_multipart(&c, "k", &up, &[pp])
@@ -1247,7 +1289,10 @@ async fn s3_complete_service_faults_route_through_head() {
             .await
             .unwrap()
             .upload_id;
-        let pp = p.upload_part(&c, "k2", &up, 1, b"data").await.unwrap();
+        let pp = p
+            .upload_part(&c, "k2", &up, 1, b"data", None)
+            .await
+            .unwrap();
         state.lock().unwrap().complete_fault = Some((fault, false));
         let res = p.complete_multipart(&c, "k2", &up, &[pp]).await;
         assert!(
@@ -1268,7 +1313,7 @@ async fn s3_upload_part_retries_transport() {
         .unwrap()
         .upload_id;
     state.lock().unwrap().drop_next_part = true;
-    let pp = p.upload_part(&c, "k", &up, 1, b"data").await.unwrap();
+    let pp = p.upload_part(&c, "k", &up, 1, b"data", None).await.unwrap();
     assert_eq!(pp.part_number, 1);
 }
 
@@ -1409,10 +1454,12 @@ async fn fs_staging_byte_quota_boundary_and_release() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k", &up, 1, &[0u8; 10]).await.unwrap();
+    p.upload_part(&c, "k", &up, 1, &[0u8; 10], None)
+        .await
+        .unwrap();
     // +1 byte pushes the tenant ledger past the cap.
     assert!(matches!(
-        p.upload_part(&c, "k", &up, 2, &[0u8; 1]).await,
+        p.upload_part(&c, "k", &up, 2, &[0u8; 1], None).await,
         Err(ProviderError::R2Overloaded)
     ));
     // ...and a second upload's part is equally gated.
@@ -1422,12 +1469,14 @@ async fn fs_staging_byte_quota_boundary_and_release() {
         .unwrap()
         .upload_id;
     assert!(matches!(
-        p.upload_part(&c, "k2", &up2, 1, &[0u8; 1]).await,
+        p.upload_part(&c, "k2", &up2, 1, &[0u8; 1], None).await,
         Err(ProviderError::R2Overloaded)
     ));
     // abort releases the staged bytes.
     p.abort_multipart(&c, "k", &up).await.unwrap();
-    p.upload_part(&c, "k2", &up2, 1, &[0u8; 10]).await.unwrap();
+    p.upload_part(&c, "k2", &up2, 1, &[0u8; 10], None)
+        .await
+        .unwrap();
     // GC on an expired upload releases the budget too.
     let meta_path = fs_upload_dir(&root, TENANT, BUCKET, &up2).join("meta.json");
     let mut meta: serde_json::Value =
@@ -1445,6 +1494,7 @@ async fn fs_staging_byte_quota_boundary_and_release() {
             .upload_id,
         1,
         &[0u8; 9],
+        None,
     )
     .await
     .unwrap();
@@ -1467,7 +1517,9 @@ async fn fs_upload_part_self_heals_meta_drift() {
         .await
         .unwrap()
         .upload_id;
-    p.upload_part(&c, "k", &up, 1, &[0u8; 8]).await.unwrap();
+    p.upload_part(&c, "k", &up, 1, &[0u8; 8], None)
+        .await
+        .unwrap();
     // Simulate the meta-write failure: ledger on disk says 0 while a
     // real 8-byte part file exists.
     let meta_path = fs_upload_dir(&root, TENANT, BUCKET, &up).join("meta.json");
@@ -1477,7 +1529,9 @@ async fn fs_upload_part_self_heals_meta_drift() {
     std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
     // Re-uploading the SAME partNumber must not panic (replaced=8 >
     // stale total=0) and must land the correct ledger on disk.
-    p.upload_part(&c, "k", &up, 1, &[0u8; 6]).await.unwrap();
+    p.upload_part(&c, "k", &up, 1, &[0u8; 6], None)
+        .await
+        .unwrap();
     let meta2: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
     assert_eq!(meta2["totalBytes"], serde_json::json!(6));
@@ -1535,13 +1589,19 @@ async fn fs_orphan_gc_reaps_meta_less_dirs() {
         .await
         .unwrap()
         .upload_id;
-    p_live.upload_part(&c, "k", &live, 1, b"x").await.unwrap();
+    p_live
+        .upload_part(&c, "k", &live, 1, b"x", None)
+        .await
+        .unwrap();
     let report = p.sweep_staging().unwrap();
     assert_eq!(report.orphans, 2, "meta-less/corrupt dirs not reaped");
     assert_eq!(report.expired, 0, "live upload reaped as expired");
     assert!(!orphan.exists() && !corrupt.exists());
     // The live upload is still fully operational.
-    p_live.upload_part(&c, "k", &live, 2, b"y").await.unwrap();
+    p_live
+        .upload_part(&c, "k", &live, 2, b"y", None)
+        .await
+        .unwrap();
     // With a huge TTL nothing ages — a fresh orphan is kept.
     let p2 = FsR2Provider::new(root.clone(), 64 * 1024 * 1024)
         .unwrap()
@@ -1578,8 +1638,15 @@ async fn fs_spawn_blocking_keeps_runtime_responsive() {
         let p = p.clone();
         let up = up.clone();
         handles.push(tokio::spawn(async move {
-            p.upload_part(&ctx_for(TENANT, BUCKET), "k", &up, n, &[n as u8; 1024])
-                .await
+            p.upload_part(
+                &ctx_for(TENANT, BUCKET),
+                "k",
+                &up,
+                n,
+                &[n as u8; 1024],
+                None,
+            )
+            .await
         }));
     }
     // An unrelated lightweight op must not starve behind the parts.
@@ -1689,4 +1756,104 @@ async fn create_returns_backend_expiry() {
 
 fn now_ms_pub() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+fn logged_header<'a>(
+    request: &'a (String, String, Vec<(String, String)>),
+    name: &str,
+) -> Option<&'a str> {
+    request
+        .2
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// SSE-C on the S3 multipart chain: create → uploadPart → complete all
+/// present the customer key, metadata round-trips the key MD5, and a
+/// later keyed get still reads the object. ListParts is not an SSE-C
+/// operation and must stay header-free.
+#[tokio::test]
+async fn s3_multipart_ssec_headers_and_metadata() {
+    let (addr, state) = mock_s3();
+    let p = s3_provider(addr);
+    let c = ctx_for(TENANT, BUCKET);
+    let key = R2SsecKey::parse(&"ef".repeat(32)).unwrap();
+    let create = R2MultipartCreateOptions {
+        ssec_key: Some(key.clone()),
+        ..create_opts()
+    };
+    let up = p.create_multipart(&c, "mp/ssec", &create).await.unwrap();
+    let part = p
+        .upload_part(&c, "mp/ssec", &up.upload_id, 1, b"payload", Some(&key))
+        .await
+        .unwrap();
+    let meta = p
+        .complete_multipart(&c, "mp/ssec", &up.upload_id, &[part])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(meta.ssec_key_md5.as_deref(), Some(key.md5_hex().as_str()));
+
+    match p.get(&c, "mp/ssec", None, None, Some(&key)).await.unwrap() {
+        R2GetResult::Body(meta, body) => {
+            assert_eq!(body, b"payload");
+            assert_eq!(meta.ssec_key_md5.as_deref(), Some(key.md5_hex().as_str()));
+        }
+        other => panic!("expected body, got {other:?}"),
+    }
+
+    let g = state.lock().unwrap();
+    let create_req = g
+        .log
+        .iter()
+        .find(|(m, path, _)| m == "POST" && path.contains("uploads="))
+        .expect("create request");
+    let part_req = g
+        .log
+        .iter()
+        .find(|(m, path, _)| m == "PUT" && path.contains("partNumber="))
+        .expect("upload part request");
+    let complete_req = g
+        .log
+        .iter()
+        .find(|(m, path, _)| {
+            m == "POST" && path.contains("uploadId=") && !path.contains("partNumber=")
+        })
+        .expect("complete request");
+    for (name, request) in [
+        ("create", create_req),
+        ("uploadPart", part_req),
+        ("complete", complete_req),
+    ] {
+        assert_eq!(
+            logged_header(request, "x-amz-server-side-encryption-customer-algorithm"),
+            Some("AES256"),
+            "{name}: {request:?}"
+        );
+        assert_eq!(
+            logged_header(request, "x-amz-server-side-encryption-customer-key"),
+            Some(key.s3_key_b64().as_str()),
+            "{name}: {request:?}"
+        );
+        assert_eq!(
+            logged_header(request, "x-amz-server-side-encryption-customer-key-MD5"),
+            Some(key.s3_key_md5_b64().as_str()),
+            "{name}: {request:?}"
+        );
+    }
+    // ListParts must not carry SSE-C headers.
+    if let Some(list_parts) = g
+        .log
+        .iter()
+        .find(|(m, path, _)| m == "GET" && path.contains("uploadId="))
+    {
+        assert!(
+            !list_parts
+                .2
+                .iter()
+                .any(|(k, _)| k.starts_with("x-amz-server-side-encryption-customer-")),
+            "ListParts carried SSE-C headers: {list_parts:?}"
+        );
+    }
 }

@@ -26,7 +26,7 @@ pub use wire::{
     canonical_custom_metadata, hash_bytes, resolve_range, validate_object_key,
     validate_range_shape, R2ChecksumAlgorithm, R2Checksums, R2ComputedChecksums, R2Condition,
     R2CursorPayload, R2EtagMatch, R2HttpMetadata, R2ListPage, R2ObjectMetadata, R2PutOptions,
-    R2Range, R2StorageClass, R2UploadedPart,
+    R2Range, R2SsecKey, R2StorageClass, R2UploadedPart,
 };
 
 use crate::context::BindingContext;
@@ -59,12 +59,14 @@ pub trait R2Provider: Send + Sync + Debug {
 
     /// Conditional, optionally ranged read. `range` is shape-validated by
     /// the caller; `only_if` is evaluated against the current object.
+    /// `ssec_key` is the caller's SSE-C key, if any.
     async fn get(
         &self,
         ctx: &BindingContext,
         key: &str,
         range: Option<R2Range>,
         only_if: Option<&R2Condition>,
+        ssec_key: Option<&R2SsecKey>,
     ) -> Result<R2GetResult, ProviderError>;
 
     /// Atomic put. Returns `Some(metadata)` on commit, `None` when
@@ -105,7 +107,8 @@ pub trait R2Provider: Send + Sync + Debug {
     }
 
     /// Upload one part (`upload_id` = verified internal id);
-    /// re-uploading a `partNumber` replaces it.
+    /// re-uploading a `partNumber` replaces it. `ssec_key` must match the
+    /// key supplied at create on an encrypted upload.
     async fn upload_part(
         &self,
         _ctx: &BindingContext,
@@ -113,6 +116,7 @@ pub trait R2Provider: Send + Sync + Debug {
         _upload_id: &str,
         _part_number: i32,
         _body: &[u8],
+        _ssec_key: Option<&R2SsecKey>,
     ) -> Result<wire::R2UploadedPart, ProviderError> {
         Err(ProviderError::CapabilityUnsupported)
     }
