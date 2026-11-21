@@ -236,21 +236,23 @@ fn expire_manifest(store: &Arc<dyn ObjectStore>) -> Manifest {
     m
 }
 
-/// Hard-kill fuzz: `cycles` kill -9 rounds over one contiguous `1..=n_total`
-/// insert stream. Each round inserts `n_total / cycles` rows in a child,
-/// SIGKILLs it once at least half those acks are visible, then takes the
-/// database over at a newer lease epoch and asserts that every acked
-/// transaction survived, nothing un-acked leaked in, and the persisted set
-/// is still a contiguous prefix. Kill timing therefore repeats against a
+/// Hard-kill fuzz over one contiguous `1..=n_total` insert stream. Rounds
+/// insert a `n_total / slices`-row slice in a child, SIGKILL it once at least
+/// half the slice is acked (a short tail runs to completion instead), take the
+/// database over at a newer lease epoch, and assert that every acked
+/// transaction survived, nothing un-acked leaked in, and the persisted set is
+/// still a contiguous prefix. Rounds repeat until `n_total` rows are
+/// persisted, so a mid-slice kill does not shrink the budget: the rest of the
+/// slice is retried by the next round. Kill timing therefore repeats against a
 /// growing manifest chain, which the single-kill default does not cover.
-fn kill9_fuzz(n_total: u64, cycles: u32) {
+fn kill9_fuzz(n_total: u64, slices: u32) {
     if std::env::var("VRT_T36_KILL_CHILD").is_ok() {
         return; // child-process branch
     }
-    assert!(cycles >= 1, "at least one kill/recovery round");
+    assert!(slices >= 1, "at least one kill/recovery slice");
     assert!(
-        n_total >= u64::from(cycles),
-        "every round must be able to ack at least one row"
+        n_total >= u64::from(slices),
+        "every slice must be able to ack at least one row"
     );
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("dbroot");
@@ -259,19 +261,33 @@ fn kill9_fuzz(n_total: u64, cycles: u32) {
 
     let exe = std::env::current_exe().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(FsStore::new(store_root.clone()).unwrap());
-    let per_cycle = n_total.div_ceil(u64::from(cycles));
+    let per_cycle = n_total.div_ceil(u64::from(slices));
+    // Each slice needs at most a kill round (half the slice) plus a
+    // completion round (the rest); anything beyond that means a round made no
+    // progress (e.g. its deadline expired) and the run must fail loudly
+    // instead of passing with less coverage than advertised.
+    let max_rounds = 2 * u64::from(slices) + 2;
     let mut persisted = 0u64;
     let mut killed = 0u32;
-    for cycle in 0..cycles {
+    let mut round = 0u64;
+    while persisted < n_total {
+        assert!(
+            round < max_rounds,
+            "kill -9 rounds stopped making progress: {persisted}/{n_total} rows after {round} rounds"
+        );
         let first = persisted + 1;
         let last = (first + per_cycle - 1).min(n_total);
-        // Cycle 0 starts on an empty store (no manifest to hand over); every
+        // Round 0 starts on an empty store (no manifest to hand over); every
         // later round must expire the previous takeover's lease first, or the
         // child cannot claim.
-        if cycle > 0 {
+        if round > 0 {
             expire_manifest(&store);
         }
-        let progress = tmp.path().join(format!("progress-{cycle}"));
+        let progress = tmp.path().join(format!("progress-{round}"));
+        // Keep the child's output: a child that cannot claim (lease, restore)
+        // must fail the round with its stderr, never look like a short round.
+        let child_log = tmp.path().join(format!("child-{round}.log"));
+        let log_fd = std::fs::File::create(&child_log).unwrap();
         let mut child = std::process::Command::new(&exe)
             .args([
                 "kill9_child_worker",
@@ -286,14 +302,21 @@ fn kill9_fuzz(n_total: u64, cycles: u32) {
             .env("VRT_T36_PROGRESS", &progress)
             .env("VRT_T36_START", first.to_string())
             .env("VRT_T36_N", last.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(log_fd.try_clone().unwrap()))
+            .stderr(std::process::Stdio::from(log_fd))
             .spawn()
             .unwrap();
 
-        // Wait for half the round's acks (a child that finishes first is a
-        // legal outcome too -- it just leaves no kill in this round).
-        let target = ((last - first + 1) / 2).max(1);
+        // Kill only when the round has more than half a slice left to write.
+        // A short tail runs to completion instead of being killed at a
+        // fraction of itself -- otherwise each round would halve the remaining
+        // gap and the requested budget would never be reached.
+        let remaining = n_total - persisted;
+        let target = if remaining > per_cycle / 2 {
+            ((last - first + 1) / 2).max(1)
+        } else {
+            u64::MAX // let the child finish the tail
+        };
         let deadline = Instant::now() + Duration::from_secs(120);
         let mut acked = 0u64;
         loop {
@@ -306,14 +329,33 @@ fn kill9_fuzz(n_total: u64, cycles: u32) {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
+        let mut killed_now = false;
         if child.try_wait().unwrap().is_none() {
             child.kill().unwrap(); // SIGKILL -- equivalent to kill -9.
             killed += 1;
+            killed_now = true;
         }
-        let _ = child.wait();
+        let status = child.wait().unwrap();
         if let Ok(raw) = std::fs::read_to_string(&progress) {
             acked = raw.lines().count() as u64;
         }
+        let child_tail = std::fs::read_to_string(&child_log)
+            .unwrap_or_default()
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            killed_now || status.success(),
+            "round {round}: child exited with {status} before the kill:\n{child_tail}"
+        );
+        eprintln!(
+            "round {round}: rows {persisted}..{last}, acked {acked}, killed {killed_now}"
+        );
 
         // A new "process" (new registry + new holder) takes over.
         let m = expire_manifest(&store);
@@ -323,7 +365,7 @@ fn kill9_fuzz(n_total: u64, cycles: u32) {
                 PersistConfig {
                     lease_ms: 60_000,
                     clock_skew_margin_ms: 500,
-                    holder: format!("recovery-{cycle}"),
+                    holder: format!("recovery-{round}"),
                     checkpoint_every_commits: 0,
                     retention_ms: 60_000,
                     snapshot_max_bytes: 1 << 30,
@@ -334,14 +376,14 @@ fn kill9_fuzz(n_total: u64, cycles: u32) {
             ));
             let reg = EngineRegistry::new(root.clone()).with_persisters(pair(&root, p));
             let e = reg.get(D1, DB).unwrap();
-            assert_eq!(e.lease_epoch(), m.epoch + 1, "cycle {cycle}");
-            assert_eq!(e.commit_lsn(), m.lsn, "cycle {cycle}");
+            assert_eq!(e.lease_epoch(), m.epoch + 1, "round {round}");
+            assert_eq!(e.commit_lsn(), m.lsn, "round {round}");
             // Every acked k is present; no un-acked one is.
             let n_rows = read_i64(&e, "SELECT count(*) AS count FROM t");
             assert_eq!(
                 n_rows,
                 m.lsn as i64 - 1,
-                "cycle {cycle}: lsn covers DDL+inserts; manifest.lsn={} rows={n_rows}",
+                "round {round}: lsn covers DDL+inserts; manifest.lsn={} rows={n_rows}",
                 m.lsn
             );
             // progress is appended only after the ack; SIGKILL may land in the
@@ -350,27 +392,34 @@ fn kill9_fuzz(n_total: u64, cycles: u32) {
             let acked_total = persisted + acked;
             assert!(
                 n_rows as u64 >= acked_total,
-                "cycle {cycle}: acked={acked_total} rows={n_rows} -- all acked transactions must be present"
+                "round {round}: acked={acked_total} rows={n_rows} -- all acked transactions must be present"
             );
             assert!(
                 n_rows as u64 <= acked_total + 1,
-                "cycle {cycle}: acked={acked_total} rows={n_rows} -- at most one ack/append gap off"
+                "round {round}: acked={acked_total} rows={n_rows} -- at most one ack/append gap off"
             );
             let max_k = read_i64(&e, "SELECT COALESCE(MAX(k),0) AS count FROM t");
             assert_eq!(
                 max_k, n_rows,
-                "cycle {cycle}: persisted set must be a contiguous prefix"
+                "round {round}: persisted set must be a contiguous prefix"
             );
             n_rows as u64
         };
-        assert!(rows >= first, "cycle {cycle}: the round must persist progress");
+        assert!(
+            rows >= first,
+            "round {round}: the round must persist progress ({persisted} -> {rows}):\n{child_tail}"
+        );
         persisted = rows;
+        round += 1;
     }
     assert!(
         killed >= 1,
         "a kill -9 round must actually SIGKILL a live child"
     );
-    assert!(persisted >= 1, "at least one acked txn must survive");
+    assert_eq!(
+        persisted, n_total,
+        "the requested transaction budget must be fully persisted"
+    );
 }
 
 #[test]
@@ -388,7 +437,7 @@ fn kill9_fuzz_repeated() {
 }
 
 /// Manual soak: 1e5 durable transactions over 5 kill/recovery rounds
-/// (roughly 1-2 h with FsStore -- a release-branch soak, never a PR gate).
+/// (roughly 2-3 h with FsStore -- a release-branch soak, never a PR gate).
 #[test]
 #[ignore = "soak: 100k-op kill -9 fuzz; run with --ignored"]
 fn kill9_fuzz_100k() {

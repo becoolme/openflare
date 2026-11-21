@@ -186,7 +186,7 @@ jobs:
       # `kill9_fuzz_repeated` is `#[ignore]`d: five kill -9 rounds over one
       # growing insert stream, each followed by a lease takeover that must
       # prove every acked transaction survived. It stays a bounded gate
-      # (5k rows, a couple of minutes); the 100k-row soak is the separate
+      # (5k rows, a few minutes); the 100k-row soak is the separate
       # `kill9_fuzz_100k` test, far too slow for per-PR CI. Naming the test
       # keeps `--ignored` from also pulling in the unix-bind / workerd gates.
       - name: Persistence fuzz (5x kill -9)
