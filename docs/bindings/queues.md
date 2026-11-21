@@ -69,6 +69,12 @@ standalone `vrt serve` loop (1 s cadence).
 - Wire/message bounds mirror the miniflare broker: ≤ 128,000 B per
   message, ≤ 100 messages and ≤ 288,000 B per batch, delay 0–86,400 s,
   content types `text | json | bytes | v8` (`vrt-sql/src/queue.rs`).
+  `delaySeconds` (and the `X-Msg-Delay-Secs` / per-item `delaySecs`
+  wire field) follows the documented range: a negative or >86,400 value
+  fails the send with a queue error, `0` is the floor and means "no
+  delay", and a delayed message's `Message.timestamp` stays the send
+  time, so the delivery lag is the applied delay
+  (`conformance/cases/queues/queues-basic`).
 - Consumer field bounds (validated both at normalize and in the signed
   snapshot): `max_batch_size` 1–100, `max_batch_timeout` 0–60 s,
   `max_retries` 0–100, `retry_delay` 0–86,400 s, `max_concurrency`
