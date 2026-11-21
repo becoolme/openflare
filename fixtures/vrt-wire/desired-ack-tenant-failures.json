@@ -16,7 +16,8 @@
     "workflowsCrossWorker": true,
     "workflowsOps": true,
     "versionMetadata": true,
-    "serviceBindingProps": true
+    "serviceBindingProps": true,
+    "unsafeEval": true
   },
   "envelopeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "fenceRevision": 5,

@@ -185,6 +185,7 @@ fn desired_ack_fixture() {
             tail_consumers: true,
             version_metadata: true,
             service_binding_props: true,
+            unsafe_eval: true,
         }),
     };
     check(

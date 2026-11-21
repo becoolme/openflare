@@ -1620,6 +1620,16 @@ fn emit_binding(
                 capnp_text(&j.value),
             ));
         }
+        BindingDesired::UnsafeEval(u) => {
+            // CF `unsafe.bindings[type="unsafe_eval"]` — workerd's
+            // native `unsafeEval` (@23 :Void): `env.<name>` is the
+            // capability enabling `eval()`/`new Function()`/
+            // `WebAssembly` inside the isolate.
+            out.push_str(&format!(
+                "        (name = {}, unsafeEval = void),\n",
+                capnp_text(&u.name),
+            ));
+        }
     }
     Ok(())
 }
