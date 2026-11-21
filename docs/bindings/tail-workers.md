@@ -75,11 +75,22 @@ feature existed.
 
 ## Backends
 
-None. Tail delivery is workerd's native `Worker.tails` mechanism — there
-is no queue, database or platform service in the path. The consumer is a
-normal tenant Worker, so its own bindings (KV, R2, D1, service
-bindings, and so on) are available inside `tail()` exactly as they are
-in `fetch()`.
+There is no platform-side queue: events flow producer isolate → consumer
+isolate inside the tenant's workerd process. The platform's internal
+per-worker log tail (`vrt-tail-<worker>`) is just another entry in the same
+`tails` list and is unaffected by user consumers. The platform collector
+honours `[observability]`: when the worker's `enabled` or
+`logs.enabled` is `false` no collector is rendered at all (nothing is
+collected); otherwise an `OBS` text binding carries
+`{"headSamplingRate":<float>, "invocationLogs":<bool>}` and the embedded
+collector samples per invocation — a dropped invocation keeps none of its
+log/exception/outcome records (deterministic FNV-1a over the TraceItem's
+`scriptName` + `eventTimestamp` + `durableObjectId` — the pinned workerd
+exposes no `traceId`/`spanId` on `tail()` events, so a re-delivered event
+gets the same verdict), and `invocation_logs=false` drops
+only the outcome record. The wire carries the rate as integer ppm
+(`headSamplingRatePpm`, 0..1_000_000) because the signed snapshot's
+canonical JSON accepts safe integers only.
 
 ## Known differences from Cloudflare
 

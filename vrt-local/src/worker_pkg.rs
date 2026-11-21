@@ -87,6 +87,12 @@ pub struct WorkerToml {
     /// is a display name, queueId is derived at pack time as `vrt-q:{tenant}:{name}`).
     #[serde(default)]
     pub(crate) queue_consumers: Vec<QueueConsumerToml>,
+    /// `[observability]` — normalized `{enabled, logsEnabled,
+    /// invocationLogs, headSamplingRate}`; gates the platform
+    /// `vrt-tail` collector and head sampling at render time.
+    #[serde(default)]
+    pub(crate) observability:
+        Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
     /// P3c-1: `durableObjectBindings` -- DO namespace bindings
     /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
@@ -414,6 +420,9 @@ pub struct PackedWorker {
     pub crons: Vec<CronDesired>,
     /// T37b: desired queue consumers (queueId already resolved).
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
+    /// `[observability]` — version-scoped like `tail_consumers`:
+    /// rollback restores the earlier collection gates.
+    pub observability: Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
     /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
     /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
@@ -1284,6 +1293,7 @@ pub fn assemble(
         var_values,
         crons: meta.crons,
         queue_consumers,
+        observability: meta.observability,
         durable_object_classes,
         workflows,
         tail_consumers,

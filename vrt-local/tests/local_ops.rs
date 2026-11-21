@@ -115,6 +115,47 @@ fn deploy_consumer_only_change_removes_it() {
     let _ = st;
 }
 
+/// `[observability]` is version-scoped state (stored on VersionRecord,
+/// replayed by to_desired, restored by rollback) — so it MUST be part of
+/// the deploy dedup identity. A redeploy that changes only the sampling
+/// rate mints a new version id; before the fix the second deploy was
+/// silently deduped and the old gates stayed active.
+#[test]
+fn observability_is_part_of_version_identity() {
+    let root = root();
+    let local = init(&root);
+    let dir = root.join("worker-obs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("main.js"), "export default {}\n").unwrap();
+    let base =
+        "name = \"obs\"\nmain = \"main.js\"\ncompatibility_date = \"2024-09-25\"\n";
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        format!("{base}[observability.logs]\nhead_sampling_rate = 0.3\n"),
+    )
+    .unwrap();
+    let r1 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        format!("{base}[observability.logs]\nhead_sampling_rate = 0.7\n"),
+    )
+    .unwrap();
+    let r2 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    assert_ne!(
+        r1.version_id, r2.version_id,
+        "observability-only change must mint a new version"
+    );
+    // The active version carries the NEW rate on the wire.
+    let desired: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("desired").join("envelope.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        desired["payload"]["tenants"][0]["workers"][0]["observability"]
+            ["headSamplingRatePpm"],
+        serde_json::json!(700_000)
+    );
+}
+
 /// P3c-2-r2: `vrt worker-id` / `vrt do-key` typed resolution — the
 /// e2e used to grep `vrt status` JSON positionally and died silently
 /// (alphabetical serialization puts `versions` between `name` and
