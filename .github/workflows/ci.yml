@@ -169,6 +169,8 @@ jobs:
         run: npm run test:facade
       - name: Contract checks
         run: npm run test:contract
+      - name: Docs match the binding surface
+        run: npm run test:docs
       - name: Conformance runner tests
         run: npm run test:conformance
       - name: Compat flag list is up to date
