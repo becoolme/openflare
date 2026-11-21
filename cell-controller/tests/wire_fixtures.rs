@@ -188,6 +188,7 @@ fn desired_ack_fixture() {
             observability: true,
             streaming_tail_consumers: true,
             flagship: true,
+            k2: true,
         }),
     };
     check(

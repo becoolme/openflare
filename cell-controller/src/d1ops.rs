@@ -167,6 +167,28 @@ pub fn is_d1_kind(kind: &str) -> bool {
     matches!(kind, "EXECUTE" | "MIGRATIONS_APPLY" | "DROP")
 }
 
+/// K2 stream data ops on the generic channel — payload
+/// `{op, args}` forwarded to `/streams/{resourceKey}/{op}`.
+pub fn is_k2_kind(kind: &str) -> bool {
+    kind == "K2_OP"
+}
+
+/// vrt-sql `/streams/{id}/<op>` surface the cell may forward — the
+/// produce path is worker-binding traffic (provider), not ops. Ops
+/// never reach `produce`/`drop` here; drop stays a dedicated kind.
+const K2_OPS: &[&str] = &[
+    "subscribe",
+    "subscriptions",
+    "unsubscribe",
+    "consume",
+    "ack",
+    "nack",
+    "extend",
+    "config",
+    "configure",
+    "reap",
+];
+
 impl D1Op {
     /// Adapt a generic-channel op row — `resourceKey` carries the
     /// databaseId. Returns None for non-D1 kinds (caller routes first).
@@ -401,13 +423,19 @@ impl D1OpsExecutor {
         .await
         .map_err(|_| "request timeout".to_string())?
         .map_err(|e| format!("transport: {e}"))?;
+        Self::read_engine_body(resp).await
+    }
+
+    /// Shared engine response handling for the D1 and K2 namespaces:
+    /// a typed `{success:false,...}` body is an OUTCOME, not a
+    /// transport failure — its `code`/`retryable` semantics must reach
+    /// the control plane (VRT_UNAVAILABLE rides HTTP 503; RV-R68).
+    /// Oversize bodies collapse to a `{truncated,bytes}` marker;
+    /// untyped bodies stay fail-closed.
+    async fn read_engine_body(resp: reqwest::Response) -> Result<serde_json::Value, String> {
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
         if !status.is_success() {
-            // A typed `{success:false,...}` body is still an engine
-            // OUTCOME, not a transport failure — its `code`/`retryable`
-            // semantics must reach the control plane (VRT_UNAVAILABLE
-            // rides HTTP 503; RV-R68). Untyped bodies stay fail-closed.
             if bytes.len() <= MAX_RESULT_BYTES {
                 if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     if body.get("success") == Some(&serde_json::json!(false)) {
@@ -423,6 +451,103 @@ impl D1OpsExecutor {
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "vrt-sql non-JSON response".to_string())?;
         Ok(normalize_execute_body(body))
+    }
+
+    /// K2 stream op: `POST /streams/{id}/{op}` — same signed data
+    /// plane, kind-scoped path (never `/dbs/`). `op` is allowlisted by
+    /// the caller; the body is the op's `args` verbatim.
+    async fn k2_call(
+        &self,
+        op_seq: i64,
+        chan: u64,
+        stream_id: &str,
+        k2op: &str,
+        body: &[u8],
+    ) -> Result<serde_json::Value, String> {
+        let path = format!("/streams/{stream_id}/{k2op}");
+        let url = format!("{}{}", self.endpoint, path);
+        let seq = engine_seq(op_seq, 0, chan);
+        let auth = self.signer.sign("POST", &path, body, 1, seq);
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.http
+                .post(&url)
+                .header(vrt_provider::d1::SQL_AUTH_HEADER, auth)
+                .header(vrt_provider::d1::SQL_EPOCH_HEADER, "1")
+                .header(vrt_provider::d1::SQL_SEQ_HEADER, seq.to_string())
+                .header("content-type", "application/json")
+                .body(body.to_vec())
+                .send(),
+        )
+        .await
+        .map_err(|_| "request timeout".to_string())?
+        .map_err(|e| format!("transport: {e}"))?;
+        Self::read_engine_body(resp).await
+    }
+
+    /// Generic-channel entry for `K2_OP` rows — payload
+    /// `{op:<allowlisted vrt-sql stream op>, args:{…}}`, resourceKey is
+    /// the 32-hex streamId. Same deadline rule as D1 ops.
+    pub async fn execute_k2_cell(&self, op: &crate::execset::CellOp) -> D1OpAck {
+        let fail_with = |msg: &str| D1OpAck {
+            seq: op.seq,
+            status: "FAILED",
+            result: None,
+            error: Some(msg.to_string()),
+        };
+        if op.kind != "K2_OP" {
+            return fail_with("unknown op kind");
+        }
+        if !valid_k2_stream_id(&op.resource_key) {
+            return fail_with("invalid resourceId");
+        }
+        if let Some(deadline) = op.expires_at {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if now >= deadline {
+                return D1OpAck {
+                    seq: op.seq,
+                    status: "EXPIRED",
+                    result: None,
+                    error: Some("dispatch deadline passed".into()),
+                };
+            }
+        }
+        let Some(k2op) = op.payload.get("op").and_then(|v| v.as_str()) else {
+            return fail_with("k2 op payload missing op");
+        };
+        if !K2_OPS.contains(&k2op) {
+            return fail_with("k2 op not allowed");
+        }
+        let args = op
+            .payload
+            .get("args")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        if !args.is_object() {
+            return fail_with("k2 op args must be an object");
+        }
+        let body = args.to_string();
+        match self
+            .k2_call(
+                op.seq,
+                CELL_OPS_SEQ_FLAG,
+                &op.resource_key,
+                k2op,
+                body.as_bytes(),
+            )
+            .await
+        {
+            Ok(v) => D1OpAck {
+                seq: op.seq,
+                status: "DONE",
+                result: Some(v),
+                error: None,
+            },
+            Err(e) => fail_with(&e),
+        }
     }
 
     /// Read-only stats fetch for the periodic cell report. Same signed
