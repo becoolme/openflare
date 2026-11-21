@@ -24,6 +24,8 @@
 //! kv = { CACHE = "ns-1" }
 //! r2 = { BUCKET = "my-bucket" }
 //! pg = { DB = "db-01" }
+//! hyperdrive = { DB = "my-db" }    # database_tenant -> vrtpgcred:my-db
+//! ratelimit = { LIMITER = { namespaceId = "1001", limit = 1500, period = 60 } }
 //! service = { SVC = "other-worker" }   # by worker NAME → resolved to workerId
 //! assets = { SITE = "<64-hex>" }
 //!
@@ -51,8 +53,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use snapshot_protocol::compute_desired::{
     AssetsBinding, BindingDesired, BindingPermissions, CronDesired, DoBindingDesired,
-    DoClassDesired, KvBinding, PgBinding, R2Binding, RunWorkerFirst, SecretBinding, ServiceBinding,
-    VarBinding, WorkerQuotas,
+    DoClassDesired, HyperdriveBinding, KvBinding, PgBinding, R2Binding, RatelimitBinding,
+    RunWorkerFirst, SecretBinding, ServiceBinding, VarBinding, WorkerQuotas,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -119,10 +121,26 @@ pub(crate) struct BindingsToml {
     pub(crate) queue: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
+    /// `binding name -> vrt database tenant name`; credentials are resolved
+    /// from the provider-side `vrtpgcred:<database tenant>` entry.
+    #[serde(default)]
+    pub(crate) hyperdrive: BTreeMap<String, String>,
+    /// Named fixed-window rate limiters.
+    #[serde(default)]
+    pub(crate) ratelimit: BTreeMap<String, RatelimitToml>,
     #[serde(default)]
     pub(crate) service: BTreeMap<String, ServiceTargetToml>,
     #[serde(default)]
     pub(crate) assets: BTreeMap<String, String>,
+}
+
+/// `[bindings].ratelimit.<name>` normalized shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RatelimitToml {
+    pub(crate) namespace_id: String,
+    pub(crate) limit: u64,
+    pub(crate) period: u64,
 }
 
 /// `[bindings.service]` value: either the target worker name (default
@@ -815,6 +833,25 @@ pub fn assemble(
                 permissions: read_write.clone(),
             }));
         }
+        for (binding, database_tenant) in &b.hyperdrive {
+            let binding_id = format!("vrthd:{tenant_id}:{binding}");
+            let digest = hex::encode(sha2::Sha256::digest(binding_id.as_bytes()));
+            bindings.push(BindingDesired::Hyperdrive(HyperdriveBinding {
+                name: binding.clone(),
+                binding_id,
+                synthetic_host: format!("hd{}.hyperdrive.vrt.internal", &digest[..24]),
+                credential_ref: format!("vrtpgcred:{database_tenant}"),
+                permissions: read_write.clone(),
+            }));
+        }
+        for (binding, config) in &b.ratelimit {
+            bindings.push(BindingDesired::Ratelimit(RatelimitBinding {
+                name: binding.clone(),
+                namespace_id: config.namespace_id.clone(),
+                limit: config.limit,
+                period: config.period,
+            }));
+        }
         for (binding, target) in &b.service {
             let worker_id =
                 resolve_worker(target.service()).ok_or(LocalError::Worker("service target"))?;
@@ -1410,6 +1447,12 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
         }
         for name in b.pg.keys() {
             bindings.push(format!("pg:{name}"));
+        }
+        for name in b.hyperdrive.keys() {
+            bindings.push(format!("hyperdrive:{name}"));
+        }
+        for name in b.ratelimit.keys() {
+            bindings.push(format!("ratelimit:{name}"));
         }
         for name in b.service.keys() {
             bindings.push(format!("service:{name}"));

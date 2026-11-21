@@ -1577,6 +1577,8 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut queue = Map::new();
         let mut service = Map::new();
         let mut pg = Map::new();
+        let mut hyperdrive = Map::new();
+        let mut ratelimit = Map::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1635,6 +1637,22 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     let id = b.get("id").and_then(|i| i.as_str()).unwrap_or(name);
                     pg.insert(name.into(), Value::from(id));
                 }
+                "hyperdrive" => {
+                    let database_tenant = b
+                        .get("databaseTenant")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    hyperdrive.insert(name.into(), Value::from(database_tenant));
+                }
+                "ratelimit" => {
+                    let mut config = Map::new();
+                    for key in ["namespaceId", "limit", "period"] {
+                        if let Some(value) = b.get(key) {
+                            config.insert(key.into(), value.clone());
+                        }
+                    }
+                    ratelimit.insert(name.into(), Value::Object(config));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -1670,6 +1688,12 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !pg.is_empty() {
             bind.insert("pg".into(), Value::Object(pg));
+        }
+        if !hyperdrive.is_empty() {
+            bind.insert("hyperdrive".into(), Value::Object(hyperdrive));
+        }
+        if !ratelimit.is_empty() {
+            bind.insert("ratelimit".into(), Value::Object(ratelimit));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));
@@ -1822,6 +1846,28 @@ mod tests {
         // missing kv id → binding name derivation
         let bind = meta.bindings.unwrap();
         assert_eq!(bind.kv.get("K").map(|s| s.as_str()), Some("K"));
+    }
+
+    #[test]
+    fn hyperdrive_and_ratelimits_project_into_standalone_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"w","main":"m.js","compatibility_date":"2025-01-01",
+               "hyperdrive":[{"binding":"DB","database_tenant":"tenant-prod"}],
+               "ratelimits":[{"name":"RL","namespace_id":"1001","simple":{"limit":1500,"period":60}}]}"#,
+        )
+        .unwrap();
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let bindings = meta.bindings.unwrap();
+        assert_eq!(
+            bindings.hyperdrive.get("DB").map(String::as_str),
+            Some("tenant-prod")
+        );
+        let limiter = bindings.ratelimit.get("RL").expect("rate limit binding");
+        assert_eq!(limiter.namespace_id, "1001");
+        assert_eq!(limiter.limit, 1500);
+        assert_eq!(limiter.period, 60);
     }
 
     fn wrangler_services(services: &str) -> Result<WorkerToml, LocalError> {

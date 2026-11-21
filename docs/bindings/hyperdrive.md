@@ -74,6 +74,12 @@ malformed `database_tenant` → `VRT_CONFIG_INVALID`.
 - `shared/vrt-project-config-vectors.json` — golden vectors covering
   `hyperdrive` normalization (`hyperdrive binds by database_tenant`,
   `hyperdrive external id is never identity`, rejected cases).
+- `vrt-local/tests/local_ops.rs` — standalone Wrangler projection and
+  server-minted binding identity/credential reference.
 - `vrt-host/tests/common/hyperdrive.rs` — e2e harness for Hyperdrive
   paths.
 - `facade/test/pg.test.mjs` — `pg` facade contract tests.
+
+## Changelog
+
+- 2026-11-20: Standalone Wrangler projection carries Hyperdrive into the signed desired state.
