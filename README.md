@@ -56,6 +56,60 @@ its own cadence.
   storage go through a binding provider. A worker process can be restarted,
   rescheduled or scaled to zero without losing data.
 
+## Cloudflare compatibility
+
+OpenFlare runs the real `workerd`, so the JavaScript runtime APIs behave as on
+Cloudflare. The platform-level bindings differ where noted; the authoritative,
+per-binding detail (wrangler config, backends, every known difference) lives in
+[`docs/bindings/README.md`](docs/bindings/README.md), and platform-wide
+differences in [`docs/compatibility.md`](docs/compatibility.md).
+
+Legend: **Drop-in** — same API and configuration, differences limited to where
+the data lives. **Partial** — runs with the differences listed below.
+**Unsupported** — the configuration key fails the deploy with
+`VRT_CONFIG_UNSUPPORTED_FIELD`.
+
+| Service / binding | Status | Notes |
+| --- | --- | --- |
+| [KV](docs/bindings/kv.md) | ✅ Drop-in | Full `KVNamespace` on filesystem or Kvrocks; `cacheTtl` is validated but there is no edge-cache tier. |
+| [R2](docs/bindings/r2.md) | 🟡 Partial | Objects, ranges, multipart, checksums; conditional writes depend on the S3 backend. `jurisdiction`/`storage_class` rejected; no SSE-C. |
+| [D1](docs/bindings/d1.md) | 🟡 Partial | workerd's `d1-api` on `vrt-sql` (single-writer SQLite, fs/S3 persistence); no Time Travel. |
+| [Durable Objects](docs/bindings/durable-objects.md) | 🟡 Partial | SQLite + KV storage, alarms, RPC, WebSockets, same-tenant `script_name`; no hibernation, `transferred_classes` rejected. |
+| [Queues](docs/bindings/queues.md) | 🟡 Partial | Producers/consumers, retries, delay, concurrency, DLQ; no pull consumer, no queue-level default delay. |
+| [Cron Triggers](docs/bindings/cron-triggers.md) | ✅ Drop-in | 5-field `triggers.crons` → `scheduled()`, at-most-once per `(worker, version, scheduledTime)`; wakes hibernated tenants. |
+| [Workflows](docs/bindings/workflows.md) | 🟡 Partial | Cloudflare engine (miniflare lineage) as a DO; `limits.steps` capped at 100,000. |
+| [Cache API](docs/bindings/cache-api.md) | 🟡 Partial | Per-tenant in-memory `caches.default`/`caches.open`; not persistent, requires `[cache]` in host config. |
+| [Service bindings](docs/bindings/service-bindings.md) | 🟡 Partial | Worker-to-worker fetch/RPC plus named `WorkerEntrypoint` (`services[].entrypoint`), same tenant. |
+| [Hyperdrive](docs/bindings/hyperdrive.md) | 🟡 Partial | Postgres wire protocol through the egress layer; credentials never enter the isolate. PostgreSQL only. |
+| [Rate limiting](docs/bindings/rate-limiting.md) | 🟡 Partial | `[[ratelimits]]` fixed-window counter in the per-tenant process; approximate, not shared across hosts. |
+| [Static assets](docs/bindings/static-assets.md) | 🟡 Partial | All four `html_handling` modes, `not_found_handling`, `run_worker_first`; content-addressed store, 512 files / 1 MiB each / 8 MiB per deploy. |
+| [WebSockets](docs/bindings/websockets.md) | 🟡 Partial | HTTP/1.1 upgrades to workers and DOs; 300 s idle, 4 h max, 4096 per ingress, 256 per tenant. |
+| [Vars and secrets](docs/bindings/vars-and-secrets.md) | 🟡 Partial | Vars are `text` bindings (non-strings arrive JSON-encoded); secrets are `vrt secret put` name→ref maps. |
+| [Tail Workers](docs/bindings/tail-workers.md) | 🟡 Partial | `tail_consumers` render as native workerd `tails`; same-tenant, best effort, no streaming tails. |
+| [Worker loaders](docs/bindings/worker-loaders.md) | 🟡 Partial | Native `WorkerLoader` (`get`/`load`, named caches, dynamic entrypoints, DO facets); quota-bounded per loader. |
+| Workers AI (`ai`) | ⛔ Unsupported | Deploy-time rejection. |
+| Vectorize (`vectorize`) | ⛔ Unsupported | Deploy-time rejection. |
+| AI Search (`ai_search`) | ⛔ Unsupported | Deploy-time rejection. |
+| Analytics Engine (`analytics_engine_datasets`) | ⛔ Unsupported | Deploy-time rejection. |
+| Analytics SQL (`analytics`) | ⛔ Unsupported | No `env.ANALYTICS_SQL.query()`. |
+| Browser Rendering (`browser`) | ⛔ Unsupported | Deploy-time rejection. |
+| Containers (`containers`) | ⛔ Unsupported | Deploy-time rejection. |
+| Send Email (`send_email`) | ⛔ Unsupported | Deploy-time rejection. |
+| mTLS (`mtls_certificates`) | ⛔ Unsupported | Deploy-time rejection. |
+| Pipelines (`pipelines`) | ⛔ Unsupported | Deploy-time rejection. |
+| Dispatch namespaces (`dispatch_namespaces`) | ⛔ Unsupported | Workers for Platforms dispatch is not emulated. |
+| Secrets Store (`secrets_store_secrets`) | ⛔ Unsupported | Use `secrets` per worker. |
+| Version metadata (`version_metadata`) | ⛔ Unsupported | No `env.CF_VERSION_METADATA`. |
+| Images / Stream / Media Transformations | ⛔ Unsupported | Product bindings are not recognized and are rejected. |
+| Workers VPC (`vpc_networks`) | ⛔ Unsupported | No private-network egress. |
+| Flagship (`flagship`) | ⛔ Unsupported | Deploy-time rejection. |
+| `wasm_modules` / `text_blobs` / `data_blobs` | ⛔ Unsupported | Import modules instead. |
+| Python Workers | ⛔ Unsupported | The runtime hosts JavaScript/TypeScript and Wasm (bundled through wrangler), not Pyodide. |
+
+Platform-wide differences (no edge network, server-minted resource ids,
+structural scale-to-zero, a whitelisted `request.cf`, WebSocket session
+limits) are documented in [`docs/compatibility.md`](docs/compatibility.md).
+
 ## Components
 
 | crate / dir | role |
