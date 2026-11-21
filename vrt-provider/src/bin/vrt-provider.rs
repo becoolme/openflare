@@ -181,6 +181,7 @@ async fn run() -> ExitCode {
                 secret.clone(),
                 std::time::Duration::from_millis(sql.timeout_ms),
             )
+            .map(|d1| d1.with_replicas(sql.replicas.clone()))
             .map_err(|_| ())
             .and_then(|d1| {
                 // T37: queue and d1 share the same vrt-sql downstream/secret.

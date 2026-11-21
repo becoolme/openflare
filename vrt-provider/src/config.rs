@@ -330,6 +330,13 @@ pub struct VrtSqlConfig {
     /// Per-request timeout (bounded; no retry).
     #[serde(default = "default_vrt_sql_timeout_ms")]
     pub timeout_ms: u64,
+    /// Optional read-only follower addresses (`vrt-sql follower`) for D1 `query` reads.
+    ///
+    /// Only `/query` is eligible, and never when the session is `first-primary`. A replica that
+    /// cannot satisfy the bookmark (or that would write) answers with a typed 409 and the request
+    /// is retried once on `addr`. `execute` and `dump` always use `addr`.
+    #[serde(default)]
+    pub replicas: Vec<String>,
 }
 
 fn default_vrt_sql_timeout_ms() -> u64 {
@@ -498,6 +505,24 @@ impl ProviderConfig {
                 return Err(ConfigError::Invalid(
                     "vrtSql.addr must be https, or http to loopback/cluster-internal host",
                 ));
+            }
+            if sql.replicas.len() > 8 {
+                return Err(ConfigError::Invalid("vrtSql.replicas supports at most 8 entries"));
+            }
+            for replica in &sql.replicas {
+                if replica.is_empty()
+                    || replica.len() > 256
+                    || replica.ends_with('/')
+                    || vrt_objstore::endpoint::validate_internal_service_addr(
+                        replica,
+                        self.allow_dev_backend,
+                    )
+                    .is_err()
+                {
+                    return Err(ConfigError::Invalid(
+                        "vrtSql.replicas entries must be https, or http to loopback/cluster-internal host (no trailing slash)",
+                    ));
+                }
             }
         }
         Ok(())

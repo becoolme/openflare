@@ -8,6 +8,7 @@ use crate::clock::Clock;
 use crate::paths;
 use crate::seg;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vrt_objstore::{ObjectStore, StoreError};
@@ -213,6 +214,11 @@ pub enum PersistError {
 /// RV-R66: max number of objects a single `gc_orphans` deletes (including failed attempts).
 pub const MAX_GC_DELETES_PER_PASS: usize = 256;
 
+/// How many baseline snapshots GC keeps (the newest N). More than one lets a reader/follower that
+/// is one checkpoint behind continue with the segment chain instead of a full re-bootstrap.
+/// This is bounded retention, not PITR: GC still deletes everything older than the window.
+pub const SNAP_RETENTION: usize = 2;
+
 /// RV-R66: result of one GC (observable, errors not swallowed).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GcReport {
@@ -279,7 +285,8 @@ fn manifest_key(kind: crate::paths::ResourceKind, id: &str) -> String {
 }
 
 /// lsn -> epoch key-space resolution (chain ascending).
-fn epoch_for_lsn(chain: &[EpochSpan], lsn: u64) -> Option<u64> {
+/// Epoch that owns `lsn` according to the manifest chain (None when no span covers it).
+pub fn epoch_for_lsn(chain: &[EpochSpan], lsn: u64) -> Option<u64> {
     let mut hit = None;
     for span in chain {
         if span.first_lsn <= lsn {
@@ -1188,8 +1195,9 @@ impl Persister {
     ///   deleting it would leave restore without a baseline).
     /// RV-R66: per-run deletion cap (bounded); the remainder is left for the next round (deletion is idempotent).
     /// Deletion failures are no longer silent -- counted in `GcReport.failed` with a warn, retried next round.
-    /// Note: this GC only clears objects "covered by the baseline snapshot / not on the chain"; it has **no**
-    /// retention chain by time window / N generations, hence it provides no PITR (see the sql-storage doc).
+    /// Note: this GC keeps only a bounded window (the newest [`SNAP_RETENTION`] snapshots and the
+    /// segments above the older one). It is not a time-window PITR and does not retain history for
+    /// an arbitrarily lagging follower; beyond the window recovery is a fresh bootstrap.
     pub fn gc_orphans(
         &self,
         database_id: &str,
@@ -1209,18 +1217,41 @@ impl Persister {
                 return rep;
             }
         };
+        // Keep the newest SNAP_RETENTION snapshots and every segment above the oldest kept
+        // snapshot. A follower that is one checkpoint behind can then continue with the segment
+        // chain instead of re-downloading the whole database. `baseline_lsn` remains the upper
+        // bound (never delete a segment the current snapshot still needs).
+        let mut snapshots: Vec<(u64, String)> = page
+            .entries
+            .iter()
+            .filter_map(|e| parse_snap_name(&e.key).map(|lsn| (lsn, e.key.clone())))
+            .collect();
+        snapshots.sort_by(|a, b| b.0.cmp(&a.0));
+        let kept_snapshots: HashSet<&str> = snapshots
+            .iter()
+            .take(SNAP_RETENTION)
+            .map(|(_, key)| key.as_str())
+            .collect();
+        let protected_lsn = snapshots
+            .iter()
+            .take(SNAP_RETENTION)
+            .map(|(lsn, _)| *lsn)
+            .min()
+            .unwrap_or(baseline_lsn)
+            .min(baseline_lsn);
         for e in page.entries {
             let doomed = if e.key.ends_with(".seg") {
                 match parse_seg_name(&e.key) {
                     Some((ep, lsn)) => {
                         let covered =
                             epoch_for_lsn(chain, lsn) == Some(ep) && lsn <= committed_lsn;
-                        !covered || lsn <= baseline_lsn
+                        !covered || lsn <= protected_lsn
                     }
                     None => false,
                 }
             } else if e.key.ends_with(".snap") {
-                matches!(parse_snap_name(&e.key), Some(lsn) if lsn < baseline_lsn)
+                matches!(parse_snap_name(&e.key), Some(lsn)
+                    if lsn < baseline_lsn && !kept_snapshots.contains(e.key.as_str()))
             } else {
                 false
             };

@@ -27,6 +27,7 @@ fn main() -> ExitCode {
 
 fn usage() -> ExitCode {
     eprintln!("usage: vrt-sql serve --config <path>");
+    eprintln!("       vrt-sql follower --config <path>");
     ExitCode::FAILURE
 }
 
@@ -39,6 +40,17 @@ async fn run() -> ExitCode {
         )
         .init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("follower") {
+        let path = match args.as_slice() {
+            [_, flag, path] if flag == "--config" => Some(PathBuf::from(path)),
+            [_, path] if !path.starts_with('-') => Some(PathBuf::from(path)),
+            _ => std::env::var_os("VRT_SQL_FOLLOWER_CONFIG").map(PathBuf::from),
+        };
+        return match path {
+            Some(path) => run_follower(path).await,
+            None => usage(),
+        };
+    }
     let config_path = std::env::var_os("VRT_SQL_CONFIG")
         .map(PathBuf::from)
         .or_else(|| match args.as_slice() {
@@ -236,6 +248,225 @@ async fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `vrt-sql follower`: tail the object-store chain into immutable local generations.
+///
+/// The follower never takes the writer lease and never writes to the object store. It publishes
+/// `{dbRoot}/{databaseId}/follower-state.json` as its watermark; readers open the generation named
+/// there with `Follower::open_readonly` (`immutable=1`).
+async fn run_follower(config_path: PathBuf) -> ExitCode {
+    use std::sync::Arc;
+    use vrt_sql::follower::{Follower, FollowerServiceConfig};
+    use vrt_sql::paths::ResourceKind;
+
+    let raw = match std::fs::read(&config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, path = %config_path.display(), "failed to read follower config");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config: FollowerServiceConfig = match serde_json::from_slice(&raw)
+        .or_else(|_| toml::from_str::<FollowerServiceConfig>(std::str::from_utf8(&raw).unwrap_or("")))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "follower config parse failed (JSON or TOML expected)");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(field) = config.validate() {
+        tracing::error!(field, "invalid follower config");
+        return ExitCode::FAILURE;
+    }
+    let store = match vrt_sql::service::open_object_store(&config.persistence) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::error!("follower requires persistence.backend fs|s3");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "follower persistence init failed (fail closed)");
+            return ExitCode::FAILURE;
+        }
+    };
+    let clock: Arc<dyn vrt_sql::clock::Clock> = Arc::new(vrt_sql::clock::SystemClock);
+    let follower = match Follower::new(
+        store,
+        ResourceKind::D1,
+        config.follower.database_id.clone(),
+        config.db_root.clone(),
+        clock,
+    ) {
+        Ok(f) => Arc::new(f.with_retain_generations(config.follower.retain_generations)),
+        Err(e) => {
+            tracing::error!(error = %e, "follower init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    tracing::info!(
+        db = %config.follower.database_id,
+        root = %config.db_root.display(),
+        poll_ms = config.follower.poll_interval_ms,
+        "vrt-sql follower starting"
+    );
+
+    // Optional read-only D1 wire listener. Reads are served from the current immutable
+    // generation; the provider routes eligible queries here when `vrtSql.replicas` is set.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let mut server: Option<tokio::task::JoinHandle<()>> = None;
+    if config.unix_dir.is_some() || config.listen_tcp.is_some() {
+        let auth_path = config
+            .auth_secret_file
+            .as_ref()
+            .expect("validated: authSecretFile required when serving");
+        let auth_secret = match load_secret_0600(auth_path, SecretPurpose::ServiceHmac) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, path = %auth_path.display(),
+                    "follower auth secret file unusable");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut state = vrt_sql::replica::ReplicaState::new(follower.clone())
+            .with_auth(vrt_sql::service::ServiceAuth::new(auth_secret));
+        if let Some(path) = &config.bookmark_secret_file {
+            let raw = match load_secret_0600(path, SecretPurpose::ServiceHmac) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, path = %path.display(),
+                        "follower bookmark secret file unusable");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if raw.len() < 32 {
+                tracing::error!(path = %path.display(), "bookmark secret shorter than 32 bytes");
+                return ExitCode::FAILURE;
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&raw[..32]);
+            state = state.with_signer(vrt_sql::bookmark::BookmarkSigner::new(key));
+        }
+        let app = vrt_sql::replica::app(state);
+        let stop = shutdown.clone();
+        if let Some(dir) = &config.unix_dir {
+            if let Err(e) = vrt_securefs::ensure_secure_dir(dir) {
+                tracing::error!(error = %e, "follower unixDir unusable");
+                return ExitCode::FAILURE;
+            }
+            let path = dir.join("vrt-sql-replica.sock");
+            let _ = std::fs::remove_file(&path);
+            let std_listener = match vrt_securefs::bind_unix_private(&path, 0o600) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, "follower unix bind failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            std_listener.set_nonblocking(true).ok();
+            let listener = match tokio::net::UnixListener::from_std(std_listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, "follower unix listener conversion failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            tracing::info!(path = %path.display(), "follower replica listening (unix)");
+            server = Some(tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { stop.notified().await })
+                    .await;
+            }));
+        } else {
+            let addr: std::net::SocketAddr = config
+                .listen_tcp
+                .as_ref()
+                .expect("validated")
+                .parse()
+                .expect("validated");
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, %addr, "follower replica bind failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            tracing::info!(%addr, "follower replica listening (tcp)");
+            server = Some(tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { stop.notified().await })
+                    .await;
+            }));
+        }
+    }
+
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::error!("failed to install SIGTERM handler");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(
+        config.follower.poll_interval_ms,
+    ));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // consume the immediate first tick; an initial sync runs below
+
+    loop {
+        let f = follower.clone();
+        let result = tokio::task::spawn_blocking(move || f.sync_once()).await;
+        match result {
+            Ok(Ok(report)) => {
+                if report.progressed() {
+                    tracing::info!(
+                        db = %follower.database_id(),
+                        bootstrapped = report.bootstrapped,
+                        applied = report.segments_applied,
+                        from_lsn = report.from_lsn,
+                        to_lsn = report.to_lsn,
+                        head_lsn = report.head_lsn,
+                        caught_up = report.caught_up(),
+                        "follower sync"
+                    );
+                } else if !report.caught_up() {
+                    tracing::debug!(
+                        db = %follower.database_id(),
+                        head_lsn = report.head_lsn,
+                        "follower idle (no progress)"
+                    );
+                }
+            }
+            Ok(Err(e)) => tracing::warn!(
+                db = %follower.database_id(),
+                error = %e,
+                "follower sync failed; retrying on the next poll"
+            ),
+            Err(e) => tracing::warn!(
+                db = %follower.database_id(),
+                error = %e,
+                "follower sync task panicked/join failed"
+            ),
+        }
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!(db = %follower.database_id(), "SIGTERM; follower stopping");
+                break;
+            }
+            _ = tick.tick() => {}
+        }
+    }
+    shutdown.notify_waiters();
+    if let Some(task) = server {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("follower replica shutdown timed out");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
 /// T36b: shutdown sequence -- closing rejects new requests -> drain in-flight -> CAS-release all
 /// leases (the next holder takes over immediately, without waiting for the lease to expire naturally). The total
 /// lease-release budget is 5s; a stuck store also does not delay shutdown.
@@ -267,77 +498,31 @@ fn build_persister(
 ) -> Result<Option<vrt_sql::engine::PersisterPair>, String> {
     use std::sync::Arc;
     let p = &config.persistence;
-    let holder = p.holder.clone().unwrap_or_else(|| {
-        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "vrt-sql".into());
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("{host}:{}:{nanos}", std::process::id())
-    });
-    let cfg = vrt_sql::persist::PersistConfig {
-        lease_ms: p.lease_ms,
-        clock_skew_margin_ms: p.clock_skew_margin_ms,
-        holder,
-        checkpoint_every_commits: p.checkpoint_every_commits,
-        retention_ms: p.retention_ms,
-        snapshot_max_bytes: p.snapshot_max_bytes,
-    };
+    // RV-R66: persistence layer on the same device as the local db = a single copy; refuse to start unless dev.
+    if p.backend == "fs" {
+        let root = p
+            .fs
+            .as_ref()
+            .ok_or("persistence.fs missing")?
+            .root
+            .clone();
+        match vrt_sql::service::check_fs_durability_distinct(
+            &config.db_root,
+            &root,
+            p.allow_same_device_durability,
+        ) {
+            Ok(false) => {}
+            Ok(true) => tracing::warn!(
+                root = %root.display(),
+                "persistence.allowSameDeviceDurability is enabled: persistence fs root shares a device with dbRoot; this is dev mode and durability is NOT guaranteed (no disaster recovery)"
+            ),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let cfg = p.persist_config();
     let clock: Arc<dyn vrt_sql::clock::Clock> = Arc::new(vrt_sql::clock::SystemClock);
-    let store: Arc<dyn vrt_objstore::ObjectStore> = match p.backend.as_str() {
-        "none" => return Ok(None),
-        "fs" => {
-            let fs = p.fs.as_ref().ok_or("persistence.fs missing")?;
-            let root = fs.root.clone();
-            // RV-R66: persistence layer on the same device as the local db = a single copy; refuse to start unless dev.
-            match vrt_sql::service::check_fs_durability_distinct(
-                &config.db_root,
-                &root,
-                p.allow_same_device_durability,
-            ) {
-                Ok(false) => {}
-                Ok(true) => tracing::warn!(
-                    root = %root.display(),
-                    "persistence.allowSameDeviceDurability is enabled: persistence fs root shares a device with dbRoot; this is dev mode and durability is NOT guaranteed (no disaster recovery)"
-                ),
-                Err(e) => return Err(e.to_string()),
-            }
-            match vrt_objstore::FsStore::new(root.clone()) {
-                Ok(s) => {
-                    tracing::info!(root = %root.display(), "persistence backend = fs");
-                    Arc::new(s)
-                }
-                Err(e) => return Err(format!("fs store init: {e}")),
-            }
-        }
-        "s3" => {
-            let s3 = p.s3.as_ref().ok_or("persistence.s3 missing")?;
-            let access = load_secret_0600(&s3.access_key_file, SecretPurpose::Credential)
-                .map_err(|e| format!("s3 access key file: {e}"))?;
-            let secret = load_secret_0600(&s3.secret_key_file, SecretPurpose::Credential)
-                .map_err(|e| format!("s3 secret key file: {e}"))?;
-            let cfg = vrt_objstore::S3StoreConfig {
-                endpoint: s3.endpoint.clone(),
-                region: s3.region.clone(),
-                bucket: s3.bucket.clone(),
-                access_key: String::from_utf8_lossy(&access).trim().to_string(),
-                secret_key: vrt_objstore::sigv4::SecretString::new(
-                    String::from_utf8_lossy(&secret).trim().to_string(),
-                ),
-                timeout: std::time::Duration::from_millis(s3.timeout_ms),
-                conditional_writes: s3.conditional_writes,
-                retries: 2,
-                prefix: s3.prefix.clone(),
-            };
-            match vrt_objstore::S3Store::new(cfg) {
-                Ok(s) => {
-                    tracing::info!(endpoint = %s3.endpoint, bucket = %s3.bucket, "persistence backend = s3");
-                    Arc::new(s)
-                }
-                Err(e) => return Err(format!("s3 store init: {e}")),
-            }
-        }
-        other => return Err(format!("persistence.backend {other}")),
+    let Some(store) = vrt_sql::service::open_object_store(p)? else {
+        return Ok(None);
     };
     // T37r: one Persister per resource -- D1 writes `db/{id}`/`dbs/`,
     // Queue writes `q/{id}`/`queues/` (structural namespace separation).
