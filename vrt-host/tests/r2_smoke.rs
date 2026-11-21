@@ -434,10 +434,7 @@ fn render_cfg(dir: &Path, port: u16, bundle: &VersionBundle) -> (PathBuf, Vec<St
         cfg,
         vrt_host::assemble::experimental_extra_args(
             &params.system_compat_flags,
-            false,
-            false,
-            false,
-            false,
+            Default::default(),
         ),
     )
 }
