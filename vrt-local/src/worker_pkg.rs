@@ -1158,11 +1158,11 @@ pub fn assemble(
     // (never a dangling trace target). Both lists share one resolver
     // so the self-target, dedupe and cap invariants cannot drift.
     let tail_consumers =
-        resolve_tail_consumers(&meta.tail_consumers, &name, "tail consumer", resolve_worker)?;
+        resolve_tail_consumers(&meta.tail_consumers, &name, "tail_consumers", resolve_worker)?;
     let streaming_tail_consumers = resolve_tail_consumers(
         &meta.streaming_tail_consumers,
         &name,
-        "streaming tail consumer",
+        "streaming_tail_consumers",
         resolve_worker,
     )?;
     // One consumer cannot appear on both channels: workerd would call
@@ -1535,7 +1535,7 @@ fn resolve_tail_consumers(
     for c in list {
         if c.service == self_name {
             return Err(LocalError::WorkerOwned(format!(
-                "{what} cannot target the producing worker itself"
+                "{what} service must be another worker"
             )));
         }
         if !seen.insert(c.service.clone()) {
@@ -1543,12 +1543,12 @@ fn resolve_tail_consumers(
         }
         out.push(snapshot_protocol::compute_desired::TailConsumerDesired {
             worker_id: resolve_worker(&c.service)
-                .ok_or_else(|| LocalError::WorkerOwned(format!("{what} target")))?,
+                .ok_or_else(|| LocalError::WorkerOwned(format!("{what} service target")))?,
         });
     }
     if out.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
         return Err(LocalError::WorkerOwned(format!(
-            "{what} exceeds {MAX_TAIL_CONSUMERS_PER_WORKER} consumers per worker"
+            "{what} at most {MAX_TAIL_CONSUMERS_PER_WORKER} consumers per worker"
         )));
     }
     Ok(out)
@@ -2233,7 +2233,7 @@ mod tail_consumer_tests {
 
         let err =
             resolve_tail_consumers(&list(&["producer"]), "producer", "tail", &resolve).unwrap_err();
-        assert!(format!("{err:?}").contains("itself"), "{err:?}");
+        assert!(format!("{err:?}").contains("another worker"), "{err:?}");
 
         let many: Vec<TailConsumerToml> = (0..17)
             .map(|i| TailConsumerToml {
