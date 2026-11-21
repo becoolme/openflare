@@ -1371,10 +1371,12 @@ fn parse_claimed(m: &serde_json::Value) -> Option<PendingMsg> {
     })
 }
 
-/// Settle a batch -- miniflare `processResponse` semantics
-/// (broker.worker.js:220-235,354-374), calling ack/retry/dead-letter
-/// grouped by lease_id; LeaseLost abandons that group (the messages were already re-claimed
-/// by a successor -- another's batch must never be touched by mistake).
+/// Settle a batch -- explicit per-message/batch acknowledgements take
+/// precedence over batch failure/retry; otherwise miniflare
+/// `processResponse` semantics (broker.worker.js:220-235,354-374): call
+/// ack/retry/dead-letter grouped by lease_id; LeaseLost abandons that group
+/// (the messages were already re-claimed by a successor -- another's batch
+/// must never be touched by mistake).
 /// Returns which calls failed: a source-backend failure pauses the lane's
 /// claims, a dead-letter forward failure does not (see [`SettleFailure`]).
 async fn settle(
@@ -1385,7 +1387,15 @@ async fn settle(
     batch: &[PendingMsg],
     result: &QueueOutcome,
 ) -> SettleFailure {
-    let retry_all = result.outcome != "ok" || result.retry_batch.retry;
+    // workerd keeps `ackAll`/`retryAll` mutually exclusive (whichever is
+    // called first wins, queue.c++ QueueEvent::ackAll / retryAll), so
+    // `ack_all` only has to beat the *implicit* retry of a failed outcome --
+    // the batch the handler acknowledged and then threw on. An explicit
+    // `retryBatch` still wins, which is also the fail-closed reading of a
+    // contradictory envelope (never drop a message on ambiguity).
+    let retry_all = result.retry_batch.retry || (result.outcome != "ok" && !result.ack_all);
+    let explicit_ack_ids: BTreeSet<&str> =
+        result.explicit_acks.iter().map(|s| s.as_str()).collect();
     let explicit_retry: BTreeSet<&str> =
         result.explicit_retries.iter().map(|s| s.as_str()).collect();
     let msg_delay: BTreeMap<&str, u32> = result
@@ -1406,6 +1416,15 @@ async fn settle(
     let mut failure = SettleFailure::default();
     for m in batch {
         let lease = m.lease_id.as_str();
+        // Cloudflare Queues preserves a per-message ack even when a later
+        // message fails or the handler returns an error. Apply it before
+        // batch-level retryAll/outcome handling. `ack_all` needs no per-message
+        // branch: it clears the implicit failure retry above, so every message
+        // without an explicit retry mark falls through to the ack below.
+        if explicit_ack_ids.contains(m.id.as_str()) {
+            acks.entry(lease).or_default().push(m.id.clone());
+            continue;
+        }
         let retry_this = retry_all
             || explicit_retry_ids.contains(m.id.as_str())
             || msg_delay.contains_key(m.id.as_str());
@@ -2214,6 +2233,174 @@ mod tests {
         let a = &q.msgs["a"];
         assert!(a.visible_at > now_ms() + 2_000, "msg-level delay honored");
         assert_eq!(a.attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_ack_survives_batch_failure() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            let q = w.queues.entry(QID.into()).or_default();
+            q.msgs.insert(
+                "acked".into(),
+                FakeMsg {
+                    body_hex: "aa".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let inv = Arc::new(FakeInvoker {
+            result: StdMutex::new(Ok(outcome(json!({
+                "outcome": "exception",
+                "retryBatch": {"retry": true},
+                "explicitAcks": ["acked"]
+            })))),
+            calls: AtomicU64::new(0),
+            delay: None,
+            last: StdMutex::new(vec![]),
+        });
+        let d = dispatcher(&addr, inv, cfg("h1"));
+        let desired = desired_with(json!([{
+            "queueId": QID,
+            "queueName": "q",
+            "maxBatchSize": 1,
+            "retryDelaySecs": 0
+        }]));
+        tick_pair(
+            &d,
+            &desired,
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+            &assignments(),
+        )
+        .await;
+        settle_until(&world, |w| {
+            w.queues.get(QID).is_some_and(|q| q.msgs.is_empty())
+        })
+        .await;
+        let w = world.lock().unwrap();
+        let q = &w.queues[QID];
+        assert!(q.msgs.is_empty(), "explicit ack survives the batch failure");
+    }
+
+    /// workerd's `QueueEvent::ackAll` sets only `ackAll`; a handler that acks
+    /// the whole batch and then throws yields
+    /// `{outcome:"exception", ackAll:true, explicitAcks:[]}`. The implicit
+    /// retryAll of the failed outcome must not resurrect those messages.
+    #[tokio::test]
+    async fn ack_all_survives_handler_exception() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            let q = w.queues.entry(QID.into()).or_default();
+            for id in ["m1", "m2"] {
+                q.msgs.insert(
+                    id.into(),
+                    FakeMsg {
+                        body_hex: "aa".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let inv = Arc::new(FakeInvoker {
+            result: StdMutex::new(Ok(outcome(json!({
+                "outcome": "exception",
+                "ackAll": true
+            })))),
+            calls: AtomicU64::new(0),
+            delay: None,
+            last: StdMutex::new(vec![]),
+        });
+        let d = dispatcher(&addr, inv, cfg("h1"));
+        let desired = desired_with(json!([{
+            "queueId": QID,
+            "queueName": "q",
+            "maxBatchSize": 2,
+            "retryDelaySecs": 0
+        }]));
+        tick_pair(
+            &d,
+            &desired,
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+            &assignments(),
+        )
+        .await;
+        settle_until(&world, |w| {
+            w.queues.get(QID).is_some_and(|q| q.msgs.is_empty())
+        })
+        .await;
+        let w = world.lock().unwrap();
+        let q = &w.queues[QID];
+        assert!(
+            q.msgs.is_empty(),
+            "ackAll survives the handler exception: {:?}",
+            q.msgs.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            q.dead.is_empty(),
+            "acked messages must not be dead-lettered"
+        );
+    }
+
+    /// `retry()` marks recorded before `ackAll()` still win: workerd's
+    /// `ackAll()` does not clear `result->retries`, and every other message in
+    /// the batch is acknowledged (outcome=exception, ackAll=true).
+    #[tokio::test]
+    async fn ack_all_preserves_explicit_retries_before_it() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            let q = w.queues.entry(QID.into()).or_default();
+            for id in ["a1", "a2", "kept"] {
+                q.msgs.insert(
+                    id.into(),
+                    FakeMsg {
+                        body_hex: "aa".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let inv = Arc::new(FakeInvoker {
+            result: StdMutex::new(Ok(outcome(json!({
+                "outcome": "exception",
+                "ackAll": true,
+                "retryMessages": [{"msgId": "kept", "delaySeconds": 30}]
+            })))),
+            calls: AtomicU64::new(0),
+            delay: None,
+            last: StdMutex::new(vec![]),
+        });
+        let d = dispatcher(&addr, inv, cfg("h1"));
+        let desired = desired_with(json!([{
+            "queueId": QID,
+            "queueName": "q",
+            "maxBatchSize": 3,
+            "retryDelaySecs": 0
+        }]));
+        tick_pair(
+            &d,
+            &desired,
+            chrono::Utc::now() + chrono::Duration::minutes(5),
+            &assignments(),
+        )
+        .await;
+        settle_until(&world, |w| {
+            w.queues.get(QID).is_some_and(|q| q.msgs.len() == 1)
+        })
+        .await;
+        let w = world.lock().unwrap();
+        let q = &w.queues[QID];
+        assert_eq!(
+            q.msgs.keys().map(|s| s.as_str()).collect::<Vec<_>>(),
+            vec!["kept"],
+            "only the pre-ackAll retry stays"
+        );
+        assert!(
+            q.msgs["kept"].visible_at > now_ms() + 25_000,
+            "the explicit retry delay is honored"
+        );
+        assert_eq!(q.msgs["kept"].attempts, 1);
     }
 
     #[tokio::test]
