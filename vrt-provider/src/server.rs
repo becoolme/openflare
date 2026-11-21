@@ -1188,11 +1188,19 @@ async fn r2_get(
         Ok(key) => key.to_string(),
         Err(err) => return r2_err(err),
     };
-    // SSE-C is not supported by this provider release; any supplied key
-    // material is rejected rather than silently ignored.
-    if input.options.ssec_key.is_some() {
-        return r2_err(ProviderError::R2SsecInvalid);
-    }
+    // SSE-C: workerd forwards the customer key as 64 lowercase hex
+    // chars; malformed material is rejected here, valid keys are carried
+    // into the backend (which fails closed when it cannot encrypt).
+    let ssec_key = match input
+        .options
+        .ssec_key
+        .as_deref()
+        .map(r2::R2SsecKey::parse)
+        .transpose()
+    {
+        Ok(key) => key,
+        Err(err) => return r2_err(err),
+    };
     if let Some(range) = input.options.range {
         if let Err(err) = r2::validate_range_shape(range) {
             return r2_err(err);
@@ -1206,6 +1214,7 @@ async fn r2_get(
             &key,
             input.options.range,
             input.options.only_if.as_ref(),
+            ssec_key.as_ref(),
         ),
     )
     .await
@@ -2370,9 +2379,15 @@ async fn r2_upload_part(
         Ok(header) => header,
         Err(_) => return fail(ProviderError::Protocol),
     };
-    if header.ssec_key.is_some() {
-        return fail(ProviderError::R2SsecInvalid);
-    }
+    let ssec_key = match header
+        .ssec_key
+        .as_deref()
+        .map(r2::R2SsecKey::parse)
+        .transpose()
+    {
+        Ok(key) => key,
+        Err(err) => return fail(err),
+    };
     let key = match r2::validate_object_key(&header.key) {
         Ok(key) => key.to_string(),
         Err(err) => return fail(err),
@@ -2392,7 +2407,7 @@ async fn r2_upload_part(
     let remaining = ctx.remaining();
     match tokio::time::timeout(
         remaining,
-        provider.upload_part(&ctx, &key, &internal, part_number, body),
+        provider.upload_part(&ctx, &key, &internal, part_number, body, ssec_key.as_ref()),
     )
     .await
     {

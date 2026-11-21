@@ -129,10 +129,10 @@ impl<T: R2Provider> R2DataBackend for T {
             length: Some(max_bytes.saturating_add(1)),
             suffix: None,
         };
-        let result = match self.get(&ctx, key, Some(bounded), None).await {
+        let result = match self.get(&ctx, key, Some(bounded), None, None).await {
             // A range is invalid only on an empty object; an unranged read
             // of it is bounded by the size check below.
-            Err(ProviderError::R2InvalidOptions) => self.get(&ctx, key, None, None).await?,
+            Err(ProviderError::R2InvalidOptions) => self.get(&ctx, key, None, None, None).await?,
             other => other?,
         };
         match result {

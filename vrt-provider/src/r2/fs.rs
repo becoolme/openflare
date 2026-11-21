@@ -19,8 +19,8 @@ use super::wire::{
     canonical_custom_metadata, check_min_part_sizes, etag_matches, hash_bytes, multipart_etag,
     part_md5_hex, resolve_range, validate_complete_parts, validate_part_number,
     MultipartCreateResult, R2Condition, R2ListEntry, R2ListPage, R2MultipartCreateOptions,
-    R2ObjectMetadata, R2PutOptions, R2Range, R2UploadedPart, R2_MULTIPART_DEFAULT_TTL_MS,
-    R2_MULTIPART_MAX_ACTIVE_UPLOADS,
+    R2ObjectMetadata, R2PutOptions, R2Range, R2SsecKey, R2UploadedPart,
+    R2_MULTIPART_DEFAULT_TTL_MS, R2_MULTIPART_MAX_ACTIVE_UPLOADS,
 };
 use super::{R2GetResult, R2Provider};
 use serde::{Deserialize, Serialize};
@@ -607,7 +607,13 @@ impl R2Provider for FsR2Provider {
         key: &str,
         range: Option<R2Range>,
         only_if: Option<&R2Condition>,
+        ssec_key: Option<&R2SsecKey>,
     ) -> Result<R2GetResult, ProviderError> {
+        // A local store cannot honor SSE-C; fail closed rather than
+        // returning plaintext for an encrypted-object request.
+        if ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         let path = object_path(&bucket_dir(&self.inner.root, ctx), key);
         // Read metadata first; body only when needed (after onlyIf
         // passes and a body is actually requested).
@@ -656,6 +662,9 @@ impl R2Provider for FsR2Provider {
         body: &[u8],
         options: &R2PutOptions,
     ) -> Result<Option<R2ObjectMetadata>, ProviderError> {
+        if options.ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         canonical_custom_metadata(&options.custom_metadata)?;
         if body.len() as u64 > self.inner.max_object_bytes {
             return Err(ProviderError::R2ObjectTooLarge);
@@ -805,6 +814,9 @@ impl R2Provider for FsR2Provider {
         key: &str,
         options: &R2MultipartCreateOptions,
     ) -> Result<MultipartCreateResult, ProviderError> {
+        if options.ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         canonical_custom_metadata(&options.custom_metadata)?;
         let inner = self.inner.clone();
         let tdir = tenant_dir(&inner.root, ctx);
@@ -825,7 +837,11 @@ impl R2Provider for FsR2Provider {
         upload_id: &str,
         part_number: i32,
         body: &[u8],
+        ssec_key: Option<&R2SsecKey>,
     ) -> Result<R2UploadedPart, ProviderError> {
+        if ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         validate_part_number(part_number as i64)?;
         if body.len() as u64 > self.inner.max_object_bytes {
             return Err(ProviderError::R2ObjectTooLarge);
