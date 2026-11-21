@@ -54,6 +54,10 @@ standalone `vrt serve` loop (1 s cadence).
   and settlement re-delivers after the message lease (~90 s default).
 - Backend settlement errors keep the source message leased and apply a
   bounded exponential pause (up to 64 s) before the lane claims more work.
+  Only source-queue `ack`/`retry`/`dead-letter` failures pause the lane: a
+  failed dead-letter *forward* (the DLQ is a different queue) leaves the
+  exhausted message leased for redelivery and does not stall unrelated
+  claims.
 - Per-batch handler budget is ~55 s inside `facade-qconsumer`
   (`facade/facade-qconsumer.ts`); the dispatch claim TTL sits above it.
   Cloudflare's exact consumer wall-clock limits are not replicated.
