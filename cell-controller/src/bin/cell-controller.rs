@@ -149,6 +149,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // requires `facade-k2`) -- unconditionally on.
         k2: true,
         email: true,
+        // `images` bindings render with this generation (the pinned
+        // workerd ships `cloudflare-internal:images-api` and the
+        // sysmanifest requires `facade-images`) -- unconditionally on.
+        images: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

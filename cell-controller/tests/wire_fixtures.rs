@@ -190,6 +190,7 @@ fn desired_ack_fixture() {
             flagship: true,
             k2: true,
             email: true,
+            images: true,
         }),
     };
     check(

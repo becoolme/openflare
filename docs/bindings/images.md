@@ -16,6 +16,13 @@ source bytes through.
 binding = "IMAGES"
 ```
 
+Native `vrt.toml` equivalent:
+
+```toml
+[bindings]
+images = ["IMAGES"]
+```
+
 `binding` is the only accepted key besides the optional boolean
 `remote`, which is accepted and ignored — matching the local-dev
 precedent used by `kv`/`k2`/`analytics_engine_datasets` (Cloudflare
