@@ -464,16 +464,21 @@ fn real_workerd_worker_loader() {
     );
 
     // The fork's quota: held stubs keep loaded workers live, so the
-    // third load on a maxWorkers=2 namespace must throw.
+    // third load on a maxWorkers=2 namespace must throw. The bound is
+    // enforced in the loader's kj layer, so the JS caller currently
+    // sees workerd's generic `internal error; reference = <id>` rather
+    // than a descriptive message — assert the count held at 2 and that
+    // the load was rejected, not the wording (a later pin may add one).
     let (status, body) = http_get(port, "/quota");
     assert_eq!(status, 200, "quota probe must answer: {body}");
+    let (held, err) = body
+        .strip_prefix("quota:held=")
+        .and_then(|rest| rest.split_once(":err="))
+        .unwrap_or_else(|| panic!("quota probe shape: {body}"));
+    assert_eq!(held, "2", "two live workers then quota: {body}");
     assert!(
-        body.starts_with("quota:held=2"),
-        "two live workers then quota: {body}"
-    );
-    assert!(
-        body.contains("limit of 2 live workers"),
-        "quota error must be the fork's bound: {body}"
+        !err.is_empty(),
+        "the third load on maxWorkers=2 must be rejected: {body}"
     );
     drop(proc);
 }

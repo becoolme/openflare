@@ -124,8 +124,11 @@ semantics plus a platform guard:
 - A binding name colliding with another binding on the same worker →
   `DESIRED_DUPLICATE` (`bindingName`) at snapshot validation.
 - `get()`/`load()` past the live-worker quota throws in the calling
-  worker (`"worker loader '<name>' cannot load <what>: the limit of
-  32 live workers is reached"`).
+  worker. The bound is enforced in the loader's kj layer, so the JS
+  caller sees workerd's generic `internal error; reference = <id>`
+  rather than a descriptive message (observed on the pinned fork
+  binary); a held stub/entrypoint must be released before loading
+  again.
 
 ## Examples and tests
 
