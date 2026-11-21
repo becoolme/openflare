@@ -2,6 +2,8 @@ export const MAX_INDEX_ENTRIES = 8;
 export const MAX_INDEX_BYTES = 4 * 1024 * 1024;
 export const MAX_INDEX_PATHS = 4096;
 export const MAX_REDIRECTS = 2100;
+export const MAX_ROUTES_RULES = 100;
+export const MAX_ROUTE_RULE_CHARS = 100;
 const indexCache = new Map();
 let indexCacheBytes = 0;
 let clock = 0;
@@ -404,7 +406,24 @@ function redirectMatches(rules, path) {
     }
     return false;
 }
+function routeMatches(rules, path) {
+    for (const rule of rules){
+        if (rule.endsWith("*")) {
+            if (path.startsWith(rule.slice(0, -1))) return true;
+        } else if (rule === path) {
+            return true;
+        }
+    }
+    return false;
+}
+export function routesWorkerFirst(routes, path) {
+    if (routeMatches(routes.exclude, path)) return false;
+    return routeMatches(routes.include, path);
+}
 export function intentFetchable(index, path, navigate, hasStaticRouting, rawPath = path) {
+    if (!hasStaticRouting && index.routes !== null) {
+        return !routesWorkerFirst(index.routes, rawPath);
+    }
     const has = (p)=>index.paths.has(p);
     if (has(path)) return true;
     if (redirectMatches(index.redirects, rawPath)) return true;
@@ -479,6 +498,30 @@ const NOT_FOUND_HANDLINGS = new Set([
     "single-page-application"
 ]);
 const DIGEST_HEX = /^[0-9a-f]{64}$/;
+function parseRoutesWire(value) {
+    if (value === undefined || value === null) return null;
+    if (typeof value !== "object" || Array.isArray(value)) return undefined;
+    const { include, exclude } = value;
+    if (!Array.isArray(include) || include.length === 0) return undefined;
+    if (exclude !== undefined && !Array.isArray(exclude)) return undefined;
+    const inc = include;
+    const exc = exclude ?? [];
+    if (inc.length + exc.length > MAX_ROUTES_RULES) return undefined;
+    const valid = (rule)=>{
+        if (typeof rule !== "string" || rule.length === 0 || rule.length > MAX_ROUTE_RULE_CHARS) {
+            return false;
+        }
+        if (!rule.startsWith("/") || rule.includes("?") || rule.includes("#")) return false;
+        if (!/^[\x20-\x7e]+$/.test(rule)) return false;
+        const star = rule.indexOf("*");
+        return star === -1 || star === rule.length - 1;
+    };
+    if (!inc.every(valid) || !exc.every(valid)) return undefined;
+    return {
+        include: inc,
+        exclude: exc
+    };
+}
 export function parseIndex(raw) {
     if (typeof raw !== "object" || raw === null) return {
         kind: "invalid"
@@ -495,6 +538,10 @@ export function parseIndex(raw) {
         };
     }
     const md = doc.manifestDigest;
+    const routes = parseRoutesWire(doc.routes);
+    if (routes === undefined) return {
+        kind: "invalid"
+    };
     if (doc.tooLarge === true) return {
         kind: "tooLarge"
     };
@@ -537,6 +584,9 @@ export function parseIndex(raw) {
             approxBytes += source.length + 16;
         }
     }
+    if (routes !== null) {
+        approxBytes += routes.include.reduce((n, r)=>n + r.length + 4, 8) + routes.exclude.reduce((n, r)=>n + r.length + 4, 0);
+    }
     if (approxBytes > MAX_INDEX_BYTES) return {
         kind: "tooLarge"
     };
@@ -547,6 +597,7 @@ export function parseIndex(raw) {
             notFoundHandling: doc.notFoundHandling,
             paths,
             redirects,
+            routes,
             approxBytes,
             digest: "",
             manifestDigest: md

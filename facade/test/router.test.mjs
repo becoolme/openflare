@@ -252,6 +252,78 @@ test("_redirects sources route to assets before the worker", async () => {
   assert.equal(miss.headers.get(HDR), null);
 });
 
+test("_routes.json include runs the worker even when an asset exists", async () => {
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/index.html", "/api/users", "/api/public/data.txt"],
+    routes: { include: ["/api/*"], exclude: ["/api/public/*"] },
+  };
+  // include wins over asset existence.
+  const api = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/api/users"));
+  assert.equal(api.headers.get(HDR), null);
+  // exclude wins over include.
+  const excluded = await hit(
+    env({}, userWorker([]), assetsWorker([], idx)),
+    req("/api/public/data.txt"),
+  );
+  assert.equal(excluded.headers.get(HDR), "assets");
+  // Unmatched paths default to assets, with no existence probe.
+  for (const p of ["/index.html", "/missing"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("_routes.json matches the raw request path", async () => {
+  const idx = {
+    htmlHandling: "none",
+    notFoundHandling: "none",
+    paths: [],
+    routes: { include: ["/api/*"], exclude: [] },
+  };
+  const encoded = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/%61pi/x"));
+  assert.equal(encoded.headers.get(HDR), "assets"); // no decode before match
+  const plain = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/api/x"));
+  assert.equal(plain.headers.get(HDR), null);
+});
+
+test("explicit run_worker_first rules take precedence over _routes.json", async () => {
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/index.html", "/api/public/data.txt"],
+    routes: { include: ["/api/*"], exclude: ["/api/public/*"] },
+  };
+  // The user-worker rule matches even though `_routes.json` excludes it.
+  const cfg = { userWorker: ["/api/*"] };
+  const excluded = await hit(
+    env(cfg, userWorker([]), assetsWorker([], idx)),
+    req("/api/public/data.txt"),
+  );
+  assert.equal(excluded.headers.get(HDR), null);
+  // Unmatched paths no longer use the `_routes.json` default: assets
+  // still wins on existence, and a miss falls through to the worker.
+  const asset = await hit(env(cfg, userWorker([]), assetsWorker([], idx)), req("/index.html"));
+  assert.equal(asset.headers.get(HDR), "assets");
+  const miss = await hit(env(cfg, userWorker([]), assetsWorker([], idx)), req("/missing"));
+  assert.equal(miss.headers.get(HDR), null);
+});
+
+test("malformed _routes.json fails closed", async () => {
+  for (const routes of [
+    { include: [] },
+    { include: ["/api/*/x"], exclude: [] },
+    { include: ["/api/*"], exclude: ["x"] },
+    { include: ["/" + "a".repeat(101)] },
+  ]) {
+    const idx = { ...INDEX, routes };
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/app.js"));
+    assert.equal(res.status, 503, JSON.stringify(routes));
+    assert.equal(JSON.parse(await res.text()).error.code, "ASSETS_ROUTE_UNAVAILABLE");
+  }
+});
+
 test("SPA fallback only applies to navigate requests", async () => {
   const idx = { ...INDEX, notFoundHandling: "single-page-application", paths: ["/index.html"] };
   const nav = await hit(env({}, userWorker([]), assetsWorker([], idx)),req("/deep/route", { "sec-fetch-mode": "navigate" }));

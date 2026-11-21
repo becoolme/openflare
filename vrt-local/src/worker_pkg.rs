@@ -539,16 +539,18 @@ fn scan_assets_dir(worker_dir: &Path, assets: &AssetsToml) -> Result<PendingAsse
     assets_from_entries(entries, &html_handling, &not_found)
 }
 
-/// Validate an asset configuration file (`/_headers`, `/_redirects`)
-/// before it is published. The provider reads these with a smaller cap
-/// than ordinary assets and fails closed at request time, and the facade
-/// forwards `_headers` names under a bounded list — so an accepted
-/// deployment must not ship a file that can 503 every asset request or
-/// silently drop configured headers.
+/// Validate an asset configuration file (`/_headers`, `/_redirects`,
+/// `/_routes.json`) before it is published. The provider reads these
+/// with a smaller cap than ordinary assets and fails closed at request
+/// time, and the facade forwards `_headers` names under a bounded list
+/// — so an accepted deployment must not ship a file that can 503 every
+/// asset request, silently drop configured headers, or leave routing
+/// unable to decide whether the Worker runs.
 fn validate_config_asset(path: &str, bytes: &[u8]) -> Result<(), LocalError> {
     let result = match path {
         "/_headers" => vrt_provider::assets_headers::validate_file(bytes),
         "/_redirects" => vrt_provider::assets_redirects::validate_file(bytes),
+        "/_routes.json" => vrt_provider::assets_routes::validate_file(bytes),
         _ => Ok(()),
     };
     result.map_err(|e| LocalError::WorkerOwned(format!("{path}: {e}")))
@@ -1821,11 +1823,33 @@ mod assets_handling_tests {
         // Valid files deploy.
         std::fs::write(dir.join("_headers"), b"/*\n  X-Frame-Options: DENY\n").unwrap();
         std::fs::write(dir.join("_redirects"), b"/old /new 301\n").unwrap();
+        std::fs::write(
+            dir.join("_routes.json"),
+            br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+        )
+        .unwrap();
         let pending = scan_assets_dir(&root, &assets(None)).expect("valid config assets");
 
         // Non-UTF-8 `_headers` would 503 every asset request.
         std::fs::write(dir.join("_headers"), b"/*\n  X-A: \xff\n").unwrap();
         assert!(scan_assets_dir(&root, &assets(None)).is_err());
+        std::fs::write(dir.join("_headers"), b"/*\n  X-Ok: yes\n").unwrap();
+        // A `_routes.json` the provider would reject at routing time must
+        // not reach the store: no include rules, an unsupported version,
+        // and non-trailing wildcards all fail closed.
+        for bad in [
+            br#"{"version":1,"include":[]}"#.as_slice(),
+            br#"{"version":2,"include":["/*"]}"#.as_slice(),
+            br#"{"version":1,"include":["/api/*/x"]}"#.as_slice(),
+        ] {
+            std::fs::write(dir.join("_routes.json"), bad).unwrap();
+            assert!(scan_assets_dir(&root, &assets(None)).is_err());
+        }
+        std::fs::write(
+            dir.join("_routes.json"),
+            br#"{"version":1,"include":["/*"]}"#,
+        )
+        .unwrap();
         // Over the provider's parse cap, even though the generic asset
         // cap is larger.
         let mut big = String::from("/*\n");

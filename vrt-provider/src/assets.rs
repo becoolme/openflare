@@ -30,6 +30,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
 use crate::assets_headers::{self, HeaderRule};
 use crate::assets_redirects::{self, RedirectAction, RedirectRule};
+use crate::assets_routes::{self, RoutesConfig};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -222,9 +223,10 @@ pub(crate) fn substitute_placeholders(template: &str, captures: &[(String, Strin
     out
 }
 
-/// `_headers` / `_redirects` are configuration, never served.
+/// `_headers` / `_redirects` / `_routes.json` are configuration, never
+/// served as static assets.
 fn is_config_path(path: &str) -> bool {
-    path == "/_headers" || path == "/_redirects"
+    path == "/_headers" || path == "/_redirects" || path == "/_routes.json"
 }
 
 /// Encode a decoded path segment by segment (Cloudflare `encodePath`).
@@ -652,6 +654,10 @@ pub struct AssetStore {
     header_cache: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<HeaderRule>>>>,
     >,
+    /// Parsed `_routes.json` per (tenant, file digest), same policy.
+    route_cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<RoutesConfig>>>,
+    >,
 }
 
 fn is_lower_hex(value: &str, bytes: usize) -> bool {
@@ -676,6 +682,9 @@ impl AssetStore {
                 std::collections::HashMap::new(),
             )),
             header_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            route_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         })
@@ -851,6 +860,51 @@ impl AssetStore {
         }
         cache.insert(key, rules.clone());
         Ok(Some(rules))
+    }
+
+    /// Load + parse the manifest's `/_routes.json` invocation policy.
+    /// `None` when absent; unreadable/oversized/invalid is an error —
+    /// routing must never silently ignore a policy that decides whether
+    /// the user Worker runs (fail closed).
+    pub fn route_rules(
+        &self,
+        tenant: &str,
+        manifest: &AssetManifest,
+    ) -> Result<Option<std::sync::Arc<RoutesConfig>>, String> {
+        let Some(file) = manifest.files.iter().find(|f| f.path == "/_routes.json") else {
+            return Ok(None);
+        };
+        if file.size as usize > assets_routes::MAX_FILE_BYTES {
+            return Err("_routes.json exceeds the parse cap".into());
+        }
+        let key = format!("{tenant}:{}", file.sha256);
+        {
+            let cache = self
+                .route_cache
+                .lock()
+                .map_err(|_| "route cache poisoned".to_string())?;
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Some(hit.clone()));
+            }
+        }
+        let Some(bytes) = self.object(tenant, file)? else {
+            return Err("_routes.json object missing from the store".into());
+        };
+        if bytes.len() > assets_routes::MAX_FILE_BYTES {
+            return Err("_routes.json exceeds the parse cap".into());
+        }
+        let routes = std::sync::Arc::new(
+            assets_routes::parse_routes(&bytes).map_err(|e| format!("_routes.json: {e}"))?,
+        );
+        let mut cache = self
+            .route_cache
+            .lock()
+            .map_err(|_| "route cache poisoned".to_string())?;
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, routes.clone());
+        Ok(Some(routes))
     }
 
     /// Write object bytes after verifying `sha256(bytes) == digest`;
@@ -1432,6 +1486,21 @@ pub fn route_index(
             .iter()
             .map(|f| f.path.len() + 8)
             .sum::<usize>();
+    // `_routes.json` decides whether the router invokes the user Worker
+    // at all. An unreadable/invalid policy fails closed: the router must
+    // never guess a side for the request.
+    let routes = match store.route_rules(tenant, &manifest) {
+        Ok(routes) => routes,
+        Err(e) => {
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "assets route-index: _routes.json unreadable"
+            );
+            crate::metrics::assets_outcome(&worker_id, "route_error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
     let redirects = match store.redirect_rules(tenant, &manifest) {
         Ok(rules) => rules,
         Err(_) => {
@@ -1452,12 +1521,30 @@ pub fn route_index(
         + redirect_entries
             .iter()
             .map(|v| v.to_string().len())
-            .sum::<usize>();
+            .sum::<usize>()
+        + routes
+            .as_deref()
+            .map(|r| {
+                r.include
+                    .iter()
+                    .chain(r.exclude.iter())
+                    .map(|s| s.len() + 4)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
     let too_large =
         manifest.files.len() > MAX_ROUTE_INDEX_PATHS || approx_bytes > MAX_ROUTE_INDEX_BYTES;
+    // Rules are tiny compared to the path list, so they ride along even
+    // when the paths degrade to `tooLarge`: routing still needs them.
+    let routes_doc = routes.as_deref().map(|r| {
+        serde_json::json!({
+            "include": r.include,
+            "exclude": r.exclude,
+        })
+    });
     // E3: every response names the manifest it describes — the router
     // refuses an index whose digest does not match its cfg binding.
-    let body_doc = if too_large {
+    let mut body_doc = if too_large {
         serde_json::json!({
             "htmlHandling": html_wire(manifest.html_handling),
             "notFoundHandling": nfh_wire(manifest.not_found_handling),
@@ -1474,6 +1561,9 @@ pub fn route_index(
             "redirects": redirect_entries,
         })
     };
+    if let (Some(doc), Some(routes)) = (body_doc.as_object_mut(), routes_doc) {
+        doc.insert("routes".into(), routes);
+    }
     let body = match serde_json::to_vec(&body_doc) {
         Ok(b) => b,
         Err(_) => {
@@ -1542,12 +1632,13 @@ pub fn can_fetch(
                     if is_config_path(&path) {
                         false
                     } else {
-                        // Redirect rules match the raw request path, the
-                        // same input `fetch` gives them.
-                        let redirect_hit = match store.redirect_rules(tenant, &manifest) {
-                            Ok(rules) => rules.as_deref().is_some_and(|rules| {
-                                assets_redirects::match_redirect(rules, raw_path, None).is_some()
-                            }),
+                        // `_routes.json` decides invocation directly when
+                        // no explicit `run_worker_first` policy is active
+                        // (has_static_routing). It matches the raw path, the
+                        // same input the router matches; an invalid policy
+                        // fails closed instead of guessing a side.
+                        let routes = match store.route_rules(tenant, &manifest) {
+                            Ok(routes) => routes,
                             Err(_) => {
                                 crate::metrics::assets_outcome(&worker_id, "route_error");
                                 return typed(
@@ -1556,11 +1647,39 @@ pub fn can_fetch(
                                 );
                             }
                         };
-                        if redirect_hit {
-                            true
+                        let routed = if has_static_routing {
+                            None
                         } else {
-                            let nfh = probe_nfh(&manifest, has_static_routing, navigate);
-                            !matches!(resolve_with_nfh(&manifest, &path, nfh), Resolved::NotFound)
+                            routes
+                                .as_deref()
+                                .map(|routes| !routes.worker_first(raw_path))
+                        };
+                        if let Some(assets) = routed {
+                            assets
+                        } else {
+                            // Redirect rules match the raw request path, the
+                            // same input `fetch` gives them.
+                            let redirect_hit = match store.redirect_rules(tenant, &manifest) {
+                                Ok(rules) => rules.as_deref().is_some_and(|rules| {
+                                    assets_redirects::match_redirect(rules, raw_path, None).is_some()
+                                }),
+                                Err(_) => {
+                                    crate::metrics::assets_outcome(&worker_id, "route_error");
+                                    return typed(
+                                        "ASSET_STORAGE_UNAVAILABLE",
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                    );
+                                }
+                            };
+                            if redirect_hit {
+                                true
+                            } else {
+                                let nfh = probe_nfh(&manifest, has_static_routing, navigate);
+                                !matches!(
+                                    resolve_with_nfh(&manifest, &path, nfh),
+                                    Resolved::NotFound
+                                )
+                            }
                         }
                     }
                 }

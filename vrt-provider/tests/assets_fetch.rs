@@ -545,6 +545,123 @@ async fn route_index_carries_redirect_sources() {
 }
 
 #[tokio::test]
+async fn route_index_carries_routes_json() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            (
+                "/_routes.json",
+                br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = probe(&e.app, "route-index", &e.digest, &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["routes"]["include"][0], "/api/*");
+    assert_eq!(v["routes"]["exclude"][0], "/api/public/*");
+}
+
+async fn can_fetch_body(
+    app: &axum::Router,
+    digest: &str,
+    url: &str,
+    static_routing: bool,
+) -> bool {
+    let mut extra = vec![
+        ("x-open-compute-asset-method", "GET"),
+        ("x-open-compute-asset-url", url),
+    ];
+    if static_routing {
+        extra.push(("x-open-compute-asset-has-static-routing", "true"));
+    }
+    let res = probe(app, "can-fetch", digest, &extra).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    &body[..] == b"true"
+}
+
+/// `_routes.json` (Cloudflare Pages): include invokes the Worker,
+/// exclude wins and serves assets, and a path matching neither list is
+/// served by assets. An explicit `run_worker_first` policy
+/// (`has_static_routing`) takes precedence and the file is ignored.
+#[tokio::test]
+async fn can_fetch_respects_routes_policy() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            (
+                "/_routes.json",
+                br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    // include -> Worker
+    assert!(!can_fetch_body(&e.app, &e.digest, "https://w.test/api/users", false).await);
+    // exclude wins over include -> assets (even when no asset exists)
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/api/public/x", false).await);
+    // unmatched -> assets (Pages default)
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/nope", false).await);
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/index.html", false).await);
+    // explicit routing policy ignores `_routes.json`
+    assert!(!can_fetch_body(&e.app, &e.digest, "https://w.test/api/public/x", true).await);
+    assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/index.html", true).await);
+}
+
+#[tokio::test]
+async fn invalid_routes_json_fails_closed() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/_routes.json", br#"{"version":1,"include":[]}"#),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = probe(&e.app, "route-index", &e.digest, &[]).await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["error"]["code"], "ASSET_STORAGE_UNAVAILABLE");
+    let res = probe(
+        &e.app,
+        "can-fetch",
+        &e.digest,
+        &[
+            ("x-open-compute-asset-method", "GET"),
+            ("x-open-compute-asset-url", "https://w.test/api/users"),
+        ],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn routes_json_is_never_served() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/_routes.json", br#"{"version":1,"include":["/*"]}"#),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/_routes.json", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn route_index_unknown_manifest_is_typed_404() {
     let e = env(&[("/index.html", b"i")], "none", TENANT);
     let res = probe(&e.app, "route-index", &"9".repeat(64), &[]).await;
