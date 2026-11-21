@@ -206,6 +206,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  persistence-fuzz:
+    name: Persistence fuzz (5x kill -9)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # `kill9_fuzz_repeated` is `#[ignore]`d: five kill -9 rounds over one
+      # growing insert stream, each followed by a lease takeover that must
+      # prove every acked transaction survived. It stays a bounded gate
+      # (5k rows, a few minutes); the 100k-row soak is the separate
+      # `kill9_fuzz_100k` test, far too slow for per-PR CI. Naming the test
+      # keeps `--ignored` from also pulling in the unix-bind / workerd gates.
+      - name: Persistence fuzz (5x kill -9)
+        env:
+          CARGO_INCREMENTAL: '0'
+          CARGO_PROFILE_DEV_DEBUG: '0'
+          CARGO_PROFILE_TEST_DEBUG: '0'
+        run: |
+          cargo test --locked -p vrt-sql --test persist_tests kill9_fuzz_repeated \
+            -- --ignored --nocapture
+
   node:
     name: Facade and contract checks
     runs-on: ubuntu-24.04
