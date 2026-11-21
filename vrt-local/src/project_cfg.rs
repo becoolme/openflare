@@ -991,13 +991,9 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                             Some("only [[unsafe.bindings]] is supported"),
                         ));
                     }
-                    let list = v
-                        .as_array()
-                        .ok_or_else(|| unsupported("unsafe.bindings", Some("array of tables")))?;
-                    for (i, e) in list.iter().enumerate() {
-                        let et = e.as_object().ok_or_else(|| {
-                            unsupported(&format!("unsafe.bindings[{i}]"), Some("table"))
-                        })?;
+                    for (i, et) in
+                        table_list(v, "unsafe.bindings")?.iter().enumerate()
+                    {
                         let name = req_str(
                             et.get("name").unwrap_or(&Value::Null),
                             &format!("unsafe.bindings[{i}].name"),
