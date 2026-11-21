@@ -14,6 +14,32 @@ The standalone mode runs the whole stack with one `docker compose up`.
 
 > Status: early, actively developed. The wire formats and CLI may still change.
 
+## Deployment modes
+
+| | Standalone | Kubernetes + control plane |
+| --- | --- | --- |
+| Good for | local development, CI, a single owner on one machine | multi-cell, production deployments |
+| Control plane | `vrt-local` in this repo (`vrt` CLI, `docker compose`) | [`openflare-control`](https://github.com/becoolme/openflare-control): signed desired snapshots, Postgres store, cell API |
+| State | a local directory or S3 | Postgres plus S3/filesystem |
+| Deploy | `docker compose up` or `vrt dev` | kustomize manifests from the control repository |
+| Trust | one trusted owner | one owner per control plane; cells verify Ed25519-signed snapshots |
+
+Both modes run the same `vrt-host`, `vrt-provider`, `vrt-sql` and
+`cell-controller` components and the same signed-snapshot wire format.
+
+- **Standalone** — the fastest way to try the runtime: `docker compose -f
+  deploy/standalone/docker-compose.yml up --build --wait` (see
+  [Quick start](#quick-start-docker-standalone)), or `vrt dev` for a
+  no-container loop.
+- **Kubernetes** — a Postgres-backed control plane publishes signed
+  `compute.desired` documents to one or more cells. Manifests, the reference
+  plane and the cell API live in
+  [`openflare-control`](https://github.com/becoolme/openflare-control).
+
+The Kubernetes manifests are intentionally not part of this repository: the
+runtime stays a standalone-clean checkout, and the control plane releases on
+its own cadence.
+
 ## Why
 
 - **Real workerd, not an emulator.** Workers run on the same runtime
@@ -46,7 +72,7 @@ The standalone mode runs the whole stack with one `docker compose up`.
 | `facade/` | TypeScript system workers that expose bindings to user code inside workerd |
 | `contract/` | cross-language contract fixtures (TS ⇄ Rust) and drift checks |
 | `third_party/open-compute` | vendored upstream code (Apache-2.0, see its `LICENSE` and `UPSTREAM.md`) |
-| `deploy/` | Dockerfiles and the standalone Docker Compose stack |
+| `deploy/` | Dockerfiles and the standalone Docker Compose stack (Kubernetes manifests live in `openflare-control`) |
 | `examples/` | example workers: hello, KV + assets, D1, R2, queues, cron, Durable Objects, workflows, wrangler projects |
 
 ## Quick start (Docker, standalone)
