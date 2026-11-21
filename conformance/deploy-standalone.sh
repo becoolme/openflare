@@ -26,6 +26,14 @@ DC=(docker compose -f "$COMPOSE_FILE")
 [ -n "${COMPOSE_EXTRA:-}" ] && DC+=($COMPOSE_EXTRA)
 
 remote="/tmp/conformance/$CASE_ID"
-"${DC[@]}" exec -T vrt sh -c "mkdir -p /tmp/conformance && rm -rf '$remote'"
+# A previous deploy may have left root-owned files (compose cp extracts
+# as root), so clean up as root: uid 10001 cannot unlink them under the
+# sticky /tmp.
+"${DC[@]}" exec -T -u 0 vrt sh -c "mkdir -p /tmp/conformance && rm -rf '$remote'"
+# The runner stages the case in a mkdtemp dir (0700). `docker compose cp`
+# extracts the archive as root inside the container, so the non-root
+# service uid could neither read the files nor traverse the dirs. The
+# staged tree is public repo fixtures — make it readable before copying.
+chmod -R a+rX "$CASE_DIR"
 "${DC[@]}" cp "$CASE_DIR" "vrt:$remote"
 "${DC[@]}" exec -T vrt vrt deploy --root /data "$remote"
