@@ -6,6 +6,7 @@
   "requiresWorkerd": true,
   "evidence": [
     "https://developers.cloudflare.com/pages/functions/routing/",
+    "https://developers.cloudflare.com/workers/static-assets/routing/advanced/html-handling/",
     "docs/bindings/static-assets.md",
     "vrt-provider/tests/assets_fetch.rs",
     "facade/test/router.test.mjs"
@@ -36,13 +37,25 @@
     {
       "name": "unmatched paths use assets (Pages default)",
       "request": {
-        "path": "/index.html"
+        "path": "/"
       },
       "expect": {
         "status": 200,
         "bodyContains": [
           "static-index-ok"
         ]
+      }
+    },
+    {
+      "name": "unmatched non-canonical HTML path still redirects to its canonical URL",
+      "request": {
+        "path": "/index.html"
+      },
+      "expect": {
+        "status": 307,
+        "headers": {
+          "location": "/"
+        }
       }
     },
     {

@@ -617,6 +617,35 @@ async fn can_fetch_respects_routes_policy() {
     assert!(can_fetch_body(&e.app, &e.digest, "https://w.test/index.html", true).await);
 }
 
+/// `_routes.json` only decides which side answers a path; the asset side
+/// still applies `html_handling`. `/` and `/index.html` both match
+/// neither list, so both are served by assets — but only `/` is the
+/// canonical URL, and `/index.html` gets the 307 that Cloudflare
+/// documents for `auto-trailing-slash`.
+#[tokio::test]
+async fn routes_policy_keeps_html_handling_on_the_asset_side() {
+    let e = env(
+        &[
+            ("/index.html", b"index-body"),
+            (
+                "/_routes.json",
+                br#"{"version":1,"include":["/api/*"],"exclude":["/api/public/*"]}"#,
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://w.test/", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"index-body");
+    let res = fetch(&e.app, &e.digest, "GET", "https://w.test/index.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/");
+}
+
 #[tokio::test]
 async fn invalid_routes_json_fails_closed() {
     let e = env(
