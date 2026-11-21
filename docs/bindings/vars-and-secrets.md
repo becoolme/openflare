@@ -1,8 +1,9 @@
 # Vars and secrets
 
-`vars` from wrangler become workerd `text` bindings; secrets are
-`secretRef` handles resolved host-side and injected as `fromEnvironment`
-bindings — values never sit in the bundle.
+`vars` from wrangler become workerd `text` bindings (strings) or `json`
+bindings (non-string values); secrets are `secretRef` handles resolved
+host-side and injected as `fromEnvironment` bindings — values never sit
+in the bundle.
 
 **Status: Partial**
 
@@ -36,6 +37,11 @@ GREETING_SECRET = "greeting-secret"   # secretRef; value via:
   workerd `text` bindings by `vrt-config` (`vrt-config/src/capnp.rs`).
   Standalone `var_ref` is `var:{name}:{vhash8}:{binding}` — the value is
   part of the version identity (`vrt-local/src/worker_pkg.rs`).
+  Non-string `vars` values (numbers, booleans, objects, arrays) instead
+  ride `BindingDesired::Json` as literal `json` bindings — the wire
+  projection splits them into `jsonVars` at pack time
+  (`vrt-local/src/project_cfg.rs`), so `env.<name>` is the real JS
+  value exactly as Cloudflare serves it.
 - `[secrets]` → `BindingDesired::Secret`; the capnp emitter renders a
   `fromEnvironment` binding named
   `VRT_S_<enc(workerId)>__<enc(bindingName)>` and hands `vrt-host` a
@@ -51,11 +57,13 @@ reads the value from stdin only — never argv.
 
 ## Known differences from Cloudflare
 
-- `vars` values arrive as **strings**. Cloudflare injects non-string
-  `vars` (numbers, booleans, objects) as typed JSON values; OpenFlare
-  JSON-encodes them into text bindings, so `env.NUM` is `"42"` not
-  `42` — read with `JSON.parse` or coercion
-  (`vrt-local/src/project_cfg.rs` standalone var conversion).
+- `vars` values match Cloudflare: strings arrive as strings; non-string
+  values arrive as real JS values (`env.NUM` is `42`, `env.FLAG` is
+  `true`, objects parse as objects) via `json` bindings. TOML datetimes
+  are strings by construction (wrangler emits ISO text too).
+- A `--var` override is always a string and displaces a same-named
+  config `vars` entry of any type — including a non-string one, same
+  precedence as Cloudflare's flag overrides.
 - There is no `wrangler secret` CLI and no secret value in the wrangler
   file — only `secretRef` names plus `vrt secret put`.
 - `keep_vars` is accepted at top level but ignored (deploys always carry

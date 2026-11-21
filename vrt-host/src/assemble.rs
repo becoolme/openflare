@@ -733,13 +733,24 @@ impl Assembler {
         let mut spec_env = std::collections::BTreeMap::new();
         for worker in &tenant.workers {
             for binding in &worker.bindings {
-                if let snapshot_protocol::compute_desired::BindingDesired::Var(var) = binding {
-                    if let Some(value) = inputs.vars.get(&var.var_ref) {
+                match binding {
+                    snapshot_protocol::compute_desired::BindingDesired::Var(var) => {
+                        if let Some(value) = inputs.vars.get(&var.var_ref) {
+                            spec_env.insert(
+                                format!("VRT_VAR_{}", var.name),
+                                vrt_config::SecretValue::new(value.clone()),
+                            );
+                        }
+                    }
+                    // Typed `[vars]` — the serialized JSON is the closest
+                    // a process-env string can get to the JS value.
+                    snapshot_protocol::compute_desired::BindingDesired::Json(json) => {
                         spec_env.insert(
-                            format!("VRT_VAR_{}", var.name),
-                            vrt_config::SecretValue::new(value.clone()),
+                            format!("VRT_VAR_{}", json.name),
+                            vrt_config::SecretValue::new(json.value.clone()),
                         );
                     }
+                    _ => {}
                 }
             }
         }

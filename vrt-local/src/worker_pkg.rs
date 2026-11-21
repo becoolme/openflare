@@ -53,8 +53,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use snapshot_protocol::compute_desired::{
     AssetsBinding, BindingDesired, BindingPermissions, CronDesired, DoBindingDesired,
-    DoClassDesired, HyperdriveBinding, KvBinding, PgBinding, R2Binding, RatelimitBinding,
-    RunWorkerFirst, SecretBinding, ServiceBinding, VarBinding, WorkerQuotas,
+    DoClassDesired, HyperdriveBinding, JsonBinding, KvBinding, PgBinding, R2Binding,
+    RatelimitBinding, RunWorkerFirst, SecretBinding, ServiceBinding, VarBinding, WorkerQuotas,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -75,6 +75,12 @@ pub struct WorkerToml {
     pub(crate) modules: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) vars: BTreeMap<String, String>,
+    /// `jsonVars` — non-string `[vars]` values (CF: numbers, bools,
+    /// objects and arrays reach `env` as real JS values, not
+    /// JSON-encoded strings). Carried as a `json` binding literal —
+    /// no `var:` ref, no vars.json entry.
+    #[serde(default)]
+    pub(crate) json_vars: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     pub(crate) secrets: BTreeMap<String, String>,
     #[serde(default)]
@@ -817,6 +823,7 @@ pub fn assemble(
     // Caller-side non-secret var overrides (`--var`, `.dev.vars`).
     for (k, v) in &overrides.vars {
         meta.vars.insert(k.clone(), v.clone());
+        meta.json_vars.remove(k);
     }
     let name = overrides.name.clone().unwrap_or_else(|| meta.name.clone());
 
@@ -851,6 +858,15 @@ pub fn assemble(
         bindings.push(BindingDesired::Var(VarBinding {
             name: binding.clone(),
             var_ref,
+        }));
+    }
+    // CF: non-string `[vars]` values are JSON bindings — env sees the
+    // real number/bool/object/array. The literal rides inside desired
+    // state (already version-scoped), so no vars.json entry.
+    for (binding, value) in &meta.json_vars {
+        bindings.push(BindingDesired::Json(JsonBinding {
+            name: binding.clone(),
+            value: serde_json::to_string(value).map_err(|_| LocalError::Worker("jsonVars"))?,
         }));
     }
     for (binding, secret_ref) in &meta.secrets {
@@ -1562,11 +1578,12 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
     let mut meta = g.meta.clone();
     for (k, v) in &overrides.vars {
         meta.vars.insert(k.clone(), v.clone());
+        meta.json_vars.remove(k);
     }
     let (pack, _esm) = build_pack_json(&meta, &g.files)?;
     let bundle = vrt_config::VersionBundle::from_pack(&pack)?;
     let mut bindings: Vec<String> = Vec::new();
-    for name in meta.vars.keys() {
+    for name in meta.vars.keys().chain(meta.json_vars.keys()) {
         bindings.push(format!("var:{name}"));
     }
     let mut secret_bindings: Vec<String> = meta.secrets.keys().cloned().collect();

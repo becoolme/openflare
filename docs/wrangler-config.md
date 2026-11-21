@@ -58,7 +58,7 @@ environment blocks.
 | `main` | supported — entrypoint module path | `project_cfg.rs:543` |
 | `compatibility_date` | supported — passed through to workerd | `project_cfg.rs:546` |
 | `compatibility_flags` | supported — array of strings | `project_cfg.rs:552` |
-| `vars` | supported — string table; non-strings JSON-encoded as text bindings | `project_cfg.rs:565` |
+| `vars` | supported — strings → `text` bindings; non-strings (number/bool/object/array) → `json` bindings with the real JS value (CF semantics) | `project_cfg.rs:569` |
 | `kv_namespaces` | supported — see [KV](bindings/kv.md); per-entry keys `binding`, `id`, `preview_id`, `remote` | `project_cfg.rs:578` |
 | `d1_databases` | supported — see [D1](bindings/d1.md); per-entry keys `binding`, `database_name`, `database_id`, `preview_database_id`, `remote` | `project_cfg.rs:601` |
 | `hyperdrive` | supported — see [Hyperdrive](bindings/hyperdrive.md); per-entry keys `binding`, `id`, `database_tenant`, `localConnectionString`, `remote` | `project_cfg.rs:639` |

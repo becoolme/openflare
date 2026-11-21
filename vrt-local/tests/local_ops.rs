@@ -1,5 +1,6 @@
 //! vrt-local behaviour tests — all API-level, exercising real files.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use vrt_local::{DeployOverrides, InitParams, LocalError, VrtLocal};
 
@@ -834,6 +835,66 @@ fn pack_selects_wrangler_environment_from_deploy_overrides() {
         Err(err) => err,
     };
     assert!(format!("{err:?}").contains("named environments found"));
+}
+
+#[test]
+fn pack_typed_vars_become_json_bindings() {
+    use snapshot_protocol::compute_desired::BindingDesired;
+    let root = root();
+    let dir = root.join("worker-typed-vars");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"tv-worker\"\nmain = \"main.js\"\ncompatibility_date = \"2025-01-01\"\n\
+         [vars]\nMODE = \"prod\"\nLIMIT = 42\nFLAG = true\nRATIO = 1.5\nLIST = [1, 2]\n\
+         [vars.DATA]\nurl = \"x.example\"\nid = 7\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("main.js"), "export default {}\n").unwrap();
+
+    let pkg = vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &|_| None)
+        .unwrap();
+
+    // String var keeps the var_ref path (text binding + vars.json entry);
+    // every non-string becomes a literal `json` binding.
+    assert_eq!(pkg.var_values.len(), 1);
+    let mut text = Vec::new();
+    let mut json: BTreeMap<&str, &str> = BTreeMap::new();
+    for b in &pkg.bindings {
+        match b {
+            BindingDesired::Var(v) => text.push(v.name.as_str()),
+            BindingDesired::Json(j) => {
+                json.insert(j.name.as_str(), j.value.as_str());
+            }
+            other => panic!("unexpected binding {other:?}"),
+        }
+    }
+    assert_eq!(text, ["MODE"]);
+    assert_eq!(json["LIMIT"], "42");
+    assert_eq!(json["FLAG"], "true");
+    assert_eq!(json["RATIO"], "1.5");
+    assert_eq!(json["LIST"], "[1,2]");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(json["DATA"]).unwrap(),
+        serde_json::json!({"url": "x.example", "id": 7})
+    );
+
+    // A `--var` string override on a JSON-var name wins — the config
+    // entry is displaced, same as a string-vs-string override.
+    let mut overrides = DeployOverrides::default();
+    overrides.vars.insert("LIMIT".into(), "over".into());
+    let pkg2 = vrt_local::pack_with_resolver(&dir, &overrides, "local", &|_| None).unwrap();
+    assert!(
+        !pkg2
+            .bindings
+            .iter()
+            .any(|b| matches!(b, BindingDesired::Json(j) if j.name == "LIMIT")),
+        "override must displace the config's json var"
+    );
+    assert!(pkg2
+        .bindings
+        .iter()
+        .any(|b| matches!(b, BindingDesired::Var(v) if v.name == "LIMIT")));
 }
 
 // ---------- P3c-1: Durable Objects ----------

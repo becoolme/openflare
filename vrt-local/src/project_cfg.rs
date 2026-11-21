@@ -1663,15 +1663,24 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     }
     if let Some(Value::Object(vars)) = obj.get("vars") {
         let mut out_vars = Map::new();
+        let mut json_vars = Map::new();
         for (k, v) in vars {
-            let s = match v {
-                Value::String(s) => s.clone(),
-                other => serde_json::to_string(other)
-                    .map_err(|_| invalid(&format!("vars.{k}"), "cannot encode"))?,
-            };
-            out_vars.insert(k.clone(), Value::from(s));
+            match v {
+                Value::String(s) => {
+                    out_vars.insert(k.clone(), Value::from(s.clone()));
+                }
+                // CF: non-string `[vars]` values reach `env` as real
+                // JS values (number/bool/object/array) via a `json`
+                // binding — never JSON-encoded strings.
+                other => {
+                    json_vars.insert(k.clone(), other.clone());
+                }
+            }
         }
         wire.insert("vars".into(), Value::Object(out_vars));
+        if !json_vars.is_empty() {
+            wire.insert("jsonVars".into(), Value::Object(json_vars));
+        }
     }
     if let Some(Value::Object(assets)) = obj.get("assets") {
         let mut a = Map::new();
@@ -2099,7 +2108,9 @@ mod tests {
         assert_eq!(src, MetaSource::Wrangler("wrangler.json".into()));
         assert_eq!(meta.name, "w");
         assert_eq!(meta.main_module, "m.js");
-        assert_eq!(meta.vars.get("N").map(|s| s.as_str()), Some("42"));
+        // CF: non-string vars keep their JSON value — `N` lands in
+        // `json_vars` (emitted as a `json` binding), not a "42" string.
+        assert_eq!(meta.json_vars.get("N"), Some(&serde_json::json!(42)));
         assert_eq!(meta.hostnames, vec!["a.example.com"]);
         assert_eq!(meta.crons[0].expression, "*/5 * * * *");
         assert_eq!(meta.crons[0].schedule_id, "cfg:w:0");

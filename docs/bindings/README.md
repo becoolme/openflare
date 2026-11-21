@@ -34,7 +34,7 @@ host/provider configuration, not per-binding provider plug-ins.
 | [Rate limiting](rate-limiting.md) | Partial | `[[ratelimits]]` with `namespace_id` + `simple.limit`/`period`. Fixed-window counter inside the per-tenant facade worker — approximate, per process, not shared across hosts. |
 | [Static assets](static-assets.md) | Partial | `assets.directory`/`binding`/`not_found_handling`/`run_worker_first`, content-addressed store; all four `html_handling` modes (Cloudflare resolver semantics); per-deploy caps of 512 files / 1 MiB each / 8 MiB total. |
 | [WebSockets](websockets.md) | Partial | HTTP/1.1 upgrade passthrough to workers and Durable Objects. 300 s idle / 4 h max session, 4096 sessions per ingress, 256 per tenant. |
-| [Vars and secrets](vars-and-secrets.md) | Partial | `vars` become `text` bindings, so non-string values arrive JSON-encoded as strings. Secrets are `vrt secret put` + `[secrets]` name→ref maps injected as process env vars; `secrets_store_secrets` is rejected. |
+| [Vars and secrets](vars-and-secrets.md) | Partial | `vars` strings → `text` bindings; non-strings → `json` bindings with the real JS value (CF parity). Secrets are `vrt secret put` + `[secrets]` name→ref maps injected as process env vars; `secrets_store_secrets` is rejected. |
 | Workers AI (`ai`) | Unsupported | Any unrecognized top-level key fails the deploy with `VRT_CONFIG_UNSUPPORTED_FIELD`. |
 | Vectorize (`vectorize`) | Unsupported | Same typed deploy error. |
 | `ai_search` / `ai_search_namespaces` | Unsupported | Same typed deploy error. |
