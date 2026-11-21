@@ -21,7 +21,7 @@ use crate::error::SnapshotError;
 use crate::strict::MAX_SAFE_INTEGER;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 
 /// Snapshot kind this payload is carried under.
 pub const KIND: &str = "compute.desired";

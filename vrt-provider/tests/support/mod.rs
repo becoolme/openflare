@@ -107,12 +107,10 @@ pub fn worker(
         }],
         crons: vec![],
         queue_consumers: vec![],
-        tail_consumers: vec![],
-        streaming_tail_consumers: vec![],
-        observability: None,
         durable_object_classes: vec![],
         workflows: vec![],
         tail_consumers: vec![],
+        streaming_tail_consumers: vec![],
         quotas: quotas(),
     }
 }
