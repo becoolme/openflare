@@ -399,20 +399,26 @@ fn real_workerd_ae_write_to_parquet() {
     assert_eq!(col_str(0).value(0), "team-ae1"); // tenant
     assert_eq!(col_str(1).value(0), "weather"); // dataset
     assert_eq!(col_str(3).value(0), "route:/write"); // index1
-    let d1 = batch
+    let si = batch
         .column(4)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(si.value(0), 1); // _sample_interval — full fidelity
+    let d1 = batch
+        .column(5)
         .as_any()
         .downcast_ref::<arrow::array::Float64Array>()
         .unwrap();
     let d2 = batch
-        .column(5)
+        .column(6)
         .as_any()
         .downcast_ref::<arrow::array::Float64Array>()
         .unwrap();
     assert_eq!(d1.value(0), 7.5);
     assert_eq!(d2.value(0), -3.25);
-    let b1 = col_str(24);
-    let b2 = col_str(25);
+    let b1 = col_str(25);
+    let b2 = col_str(26);
     assert_eq!(b1.value(0), "hello-ae");
     assert_eq!(b2.value(0), "second-blob");
 

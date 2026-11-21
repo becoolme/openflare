@@ -6,8 +6,8 @@ ingested by the platform's per-tenant Analytics Engine service, spooled,
 and flushed to canonical Parquet files.
 
 **Status: Partial** — ingest + full-fidelity Parquet storage; query via
-DuckDB/ClickHouse (see below); no sampling, no `_sample_interval`
-semantics, no hosted SQL API yet.
+DuckDB/ClickHouse (see below); no adaptive sampling (`_sample_interval`
+is always `1`), no hosted SQL API yet.
 
 ## Wrangler configuration
 
@@ -74,10 +74,11 @@ workerd rather than pretending to ingest.
 ```
 
 Schema: `tenant Utf8`, `dataset Utf8`, `ts Timestamp(ns, UTC)`,
-`index1 Utf8?`, `double1..20 Float64?`, `blob1..20 Utf8?`.
-Datapoints are stored at full fidelity — there is no sampling and no
-`_sample_interval` column (Cloudflare's sampling exists for their
-scale; exact storage is simpler and cheaper at ours).
+`index1 Utf8?`, `_sample_interval Int64` (constant `1` — storage is
+full-fidelity, so CF-shaped queries referencing it run verbatim),
+`double1..20 Float64?`, `blob1..20 Utf8?`.
+Datapoints are stored at full fidelity — Cloudflare's adaptive sampling
+exists for their scale; exact storage is simpler and cheaper at ours.
 
 ## Querying
 
@@ -104,10 +105,22 @@ work — the layout is stable so queries written today keep working.
 
 ## Limits and differences
 
-- `dataset` charset `[A-Za-z0-9_]{1,256}` (stricter than CF's free-form
-  names — the value is also a path segment and service token).
+Identical to Cloudflare (enforced by workerd itself, same code):
+
+- ≤ 20 `doubles`, ≤ 20 `blobs`, ≤ 1 `index` per call — `TypeError`.
+- `indexes[0]` ≤ 96 bytes; cumulative blob bytes ≤ 16000 — `TypeError`.
+- ≤ 250 `writeDataPoint` calls per invocation — the fork's
+  `VrtLimitEnforcer::newAnalyticsEngineRequest` mirrors CF's fixed cap
+  and throws `Too many Analytics Engine data points.` on the 251st.
+
+Deliberate differences:
+
+- `dataset` charset `[A-Za-z0-9_]{1,256}` — matches CF's documented
+  binding-dataset charset (`[A-Za-z0-9_]`); the 256 cap is our bound
+  (the value is also a path segment and service token).
 - `remote` accepted but has no effect.
-- No sampling/extrapolation: aggregations are exact.
-- Retention/compaction/query API are operator-managed in v1.
+- No adaptive sampling/extrapolation: aggregations are exact.
+- Retention is operator-managed (CF keeps ~3 months); compaction/query
+  API are follow-up work.
 - The binding is `$experimental`-gated upstream; the platform derives
   `--experimental` automatically when any worker declares one.
