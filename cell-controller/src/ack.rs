@@ -179,6 +179,14 @@ pub struct AckCapabilities {
     /// Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub service_binding_props: bool,
+    /// `{"type":"unsafeEval"}` bindings (CF
+    /// `[[unsafe.bindings]] type="unsafe_eval"`) render to workerd's
+    /// `unsafeEval` capability — a pre-unsafe-eval cell rejects the
+    /// unknown binding variant via `deny_unknown_fields`, so the
+    /// control plane only admits them onto cells that claim it.
+    /// Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unsafe_eval: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

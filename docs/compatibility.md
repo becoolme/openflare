@@ -130,8 +130,11 @@ Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 Secrets Store
 (`secrets_store_secrets`), Pipelines, dispatch namespaces
 (`dispatch_namespaces`), `send_email`,
-`mtls_certificates`, `browser`, `containers`, `unsafe`, raw
+`mtls_certificates`, `browser`, `containers`, raw
 `wasm_modules`/`text_blobs`/`data_blobs`/`version_metadata` upload keys.
+`[unsafe]` is partially supported: `[[unsafe.bindings]]` entries with
+`type = "unsafe_eval"` bind workerd's `unsafeEval` capability; other
+`type` values and other `unsafe.*` keys fail closed.
 
 ## Error taxonomy
 

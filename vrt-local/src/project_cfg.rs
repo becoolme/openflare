@@ -78,6 +78,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "secrets",
     "secrets_store_secrets",
     "worker_loaders",
+    "unsafe",
 ];
 /// Mirrors @wdl-dev/cli TOP_LEVEL_ONLY_ENV_KEYS.
 const TOP_LEVEL_ONLY_ENV_KEYS: &[&str] = &["name", "keep_vars", "send_metrics"];
@@ -968,6 +969,59 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     bindings.push(Value::Object(b));
                 }
             }
+            "unsafe" => {
+                // CF `[unsafe]` — raw-binding escape hatch
+                // (`[[unsafe.bindings]] {name, type}`): the entry is
+                // forwarded verbatim into upload metadata, so `type`
+                // may name any binding kind. `unsafe_eval` is the ONE
+                // type with no proper wrangler key that workerd runs
+                // (native `unsafeEval` capability — eval/new Function/
+                // WebAssembly); every other type has a first-class key
+                // in this surface or no runtime support, so it fails
+                // closed with guidance. `unsafe.capnp`/`unsafe.metadata`
+                // and friends inject raw workerd/upload structures —
+                // rejected: there is no faithful platform projection.
+                let table = value
+                    .as_object()
+                    .ok_or_else(|| unsupported("unsafe", Some("table")))?;
+                for (k, v) in table {
+                    if k != "bindings" {
+                        return Err(unsupported(
+                            &format!("unsafe.{k}"),
+                            Some("only [[unsafe.bindings]] is supported"),
+                        ));
+                    }
+                    let list = v
+                        .as_array()
+                        .ok_or_else(|| unsupported("unsafe.bindings", Some("array of tables")))?;
+                    for (i, e) in list.iter().enumerate() {
+                        let et = e.as_object().ok_or_else(|| {
+                            unsupported(&format!("unsafe.bindings[{i}]"), Some("table"))
+                        })?;
+                        let name = req_str(
+                            et.get("name").unwrap_or(&Value::Null),
+                            &format!("unsafe.bindings[{i}].name"),
+                        )?;
+                        let ty = req_str(
+                            et.get("type").unwrap_or(&Value::Null),
+                            &format!("unsafe.bindings[{i}].type"),
+                        )?;
+                        if ty != "unsafe_eval" {
+                            return Err(unsupported(
+                                &format!("unsafe.bindings[{i}].type"),
+                                Some(&format!(
+                                    "`{ty}` has no unsafe-bindings support — use the first-class \
+                                     key for this binding type (only `unsafe_eval` is supported)"
+                                )),
+                            ));
+                        }
+                        let mut b = Map::new();
+                        b.insert("type".into(), Value::from("unsafeEval"));
+                        b.insert("name".into(), Value::from(name));
+                        bindings.push(Value::Object(b));
+                    }
+                }
+            }
             "pg" => {
                 // P1: `[[pg]] binding = "DB", id = "<logical tenant>"
                 // — credentials NEVER in toml (secrets/pg-credentials.json).
@@ -1829,6 +1883,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut hyperdrive = Map::new();
         let mut ratelimit = Map::new();
         let mut worker_loaders = Vec::new();
+        let mut unsafe_evals = Vec::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1927,6 +1982,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                 "workerLoader" => {
                     worker_loaders.push(Value::from(name));
                 }
+                "unsafeEval" => {
+                    unsafe_evals.push(Value::from(name));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -1971,6 +2029,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !worker_loaders.is_empty() {
             bind.insert("workerLoaders".into(), Value::Array(worker_loaders));
+        }
+        if !unsafe_evals.is_empty() {
+            bind.insert("unsafeEvals".into(), Value::Array(unsafe_evals));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));
@@ -2313,6 +2374,52 @@ mod tests {
         assert!(load_worker_meta(dir.path()).is_err());
         // Not an array of tables.
         let dir = wrangler_loader_body("worker_loaders=\"L\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn unsafe_eval_bindings_into_pack_shape() {
+        let dir = wrangler_loader_body(
+            "[unsafe]\n[[unsafe.bindings]]\nname=\"UNSAFE_EVAL\"\ntype=\"unsafe_eval\"\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(
+            meta.bindings.unwrap().unsafe_evals,
+            vec!["UNSAFE_EVAL".to_string()]
+        );
+    }
+
+    #[test]
+    fn unsafe_eval_bindings_fail_closed() {
+        // A raw binding type other than unsafe_eval is refused — every
+        // other kind either has a first-class key or no runtime support.
+        let dir =
+            wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\nname=\"Q\"\ntype=\"queue\"\n");
+        let err = load_worker_meta(dir.path()).expect_err("queue type must fail");
+        assert!(
+            format!("{err:?}").contains("unsafe.bindings[0].type"),
+            "{err:?}"
+        );
+        // Other `[unsafe]` keys (capnp/metadata raw injection) refused.
+        let dir = wrangler_loader_body("[unsafe]\ncapnp=\"x\"\n");
+        let err = load_worker_meta(dir.path()).expect_err("unsafe.capnp must fail");
+        assert!(format!("{err:?}").contains("unsafe.capnp"), "{err:?}");
+        // Missing name.
+        let dir = wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\ntype=\"unsafe_eval\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // Missing type.
+        let dir = wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\nname=\"E\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // Non-string name.
+        let dir = wrangler_loader_body(
+            "[unsafe]\n[[unsafe.bindings]]\nname=1\ntype=\"unsafe_eval\"\n",
+        );
+        assert!(load_worker_meta(dir.path()).is_err());
+        // `unsafe` not a table.
+        let dir = wrangler_loader_body("unsafe=\"x\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // `unsafe.bindings` not an array of tables.
+        let dir = wrangler_loader_body("[unsafe]\nbindings=\"x\"\n");
         assert!(load_worker_meta(dir.path()).is_err());
     }
 

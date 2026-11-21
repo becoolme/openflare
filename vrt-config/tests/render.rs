@@ -122,6 +122,29 @@ fn service_binding_props_without_entrypoint_renders() {
 }
 
 #[test]
+fn unsafe_eval_binding_renders() {
+    // CF `[[unsafe.bindings]] type="unsafe_eval"` → workerd's native
+    // `unsafeEval` (Void) binding on `env.<name>`.
+    let mut tenant = tenant();
+    tenant.workers[0].bindings.push(
+        snapshot_protocol::compute_desired::BindingDesired::UnsafeEval(
+            snapshot_protocol::compute_desired::UnsafeEvalBinding {
+                name: "UNSAFE_EVAL".to_string(),
+            },
+        ),
+    );
+    let bs = bundles();
+    let params = runtime_params();
+    let out = render_tenant_config(&input(&tenant, &bs, &params))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains("(name = \"UNSAFE_EVAL\", unsafeEval = void)"),
+        "{out}"
+    );
+}
+
+#[test]
 fn service_binding_reserved_entrypoint_is_refused() {
     let bs = bundles();
     let params = runtime_params();

@@ -135,6 +135,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `services[].props` render ships with this generation --
         // unconditionally on (same reasoning).
         service_binding_props: true,
+        // `{"type":"unsafeEval"}` bindings (unsafe_eval) render ships
+        // with this generation -- unconditionally on.
+        unsafe_eval: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,
