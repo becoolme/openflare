@@ -613,7 +613,8 @@ impl D1OpsExecutor {
 }
 
 /// Drop path selection (T37r): payload `{"kind":"queue"}` → `/queues/…`,
-/// absent/`"d1"` → `/dbs/…` (legacy in-flight ops), anything else → Err.
+/// `{"kind":"k2"}` → `/streams/…`, absent/`"d1"` → `/dbs/…` (legacy
+/// in-flight ops), anything else → Err.
 fn drop_path(database_id: &str, payload: &serde_json::Value) -> Result<String, String> {
     match payload.get("kind") {
         // Absent → legacy in-flight D1 ops (pre-T37r payloads were {}).
@@ -622,6 +623,7 @@ fn drop_path(database_id: &str, payload: &serde_json::Value) -> Result<String, S
         Some(v) => match v.as_str() {
             Some("d1") => Ok(format!("/dbs/{database_id}/drop")),
             Some("queue") => Ok(format!("/queues/{database_id}/drop")),
+            Some("k2") => Ok(format!("/streams/{database_id}/drop")),
             Some(other) => Err(format!("drop payload kind '{other}' unknown")),
             None => Err("drop payload kind must be a string".to_string()),
         },
@@ -1179,6 +1181,12 @@ mod tests {
         assert_eq!(
             drop_path(&id, &serde_json::json!({"kind":"queue"})).unwrap(),
             format!("/queues/{id}/drop")
+        );
+        // K2 streams share the drop channel — 32-hex stream ids.
+        let sid = "a".repeat(32);
+        assert_eq!(
+            drop_path(&sid, &serde_json::json!({"kind":"k2"})).unwrap(),
+            format!("/streams/{sid}/drop")
         );
         // Unknown / non-string kinds fail closed — never guess.
         assert!(drop_path(&id, &serde_json::json!({"kind":"kv"})).is_err());

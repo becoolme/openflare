@@ -1527,6 +1527,7 @@
    },
    "expect": {
     "ok": true,
+    "source": "wrangler.toml",
     "config": {
      "schemaVersion": 1,
      "name": "svc",
@@ -1558,6 +1559,7 @@
    },
    "expect": {
     "ok": true,
+    "source": "wrangler.toml",
     "config": {
      "schemaVersion": 1,
      "name": "svc",
@@ -1638,6 +1640,74 @@
     "ok": false,
     "code": "VRT_CONFIG_INVALID",
     "field": "base_dir"
+   }
+  },
+  {
+   "name": "k2 stream binding",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[k2]]\nbinding = \"EVENTS\"\nstream = \"orders\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "name": "EVENTS",
+       "stream": "orders",
+       "type": "k2"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "k2 remote accepted and ignored",
+   "files": {
+    "wrangler.json": "{ \"name\": \"svc\", \"main\": \"src/index.ts\", \"compatibility_date\": \"2025-01-01\", \"k2\": [{ \"binding\": \"K\", \"stream\": \"events_v2\", \"remote\": true }] }\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.json",
+    "config": {
+     "bindings": [
+      {
+       "name": "K",
+       "stream": "events_v2",
+       "type": "k2"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "k2 unknown sub-key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[k2]]\nbinding = \"K\"\nstream = \"orders\"\ndelivery_delay = 5\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "k2[0].delivery_delay"
+   }
+  },
+  {
+   "name": "k2 stream charset rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[k2]]\nbinding = \"K\"\nstream = \"has space\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "k2[0].stream"
    }
   }
  ]
