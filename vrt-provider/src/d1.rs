@@ -383,6 +383,52 @@ mod tests {
         assert!(matches!(r, Err(ProviderError::ResourceUnavailable)));
     }
 
+    /// Sessions (D1 `withSession`): the tenant's `x-cf-d1-*` session
+    /// header must reach vrt-sql, and vrt-sql's commit bookmark must come
+    /// back on the response — that header is what workerd's d1-api turns
+    /// into `session.getBookmark()`. Neither direction is optional: a
+    /// dropped request header loses the session constraint, a dropped
+    /// response header leaves `getBookmark()` null forever.
+    #[tokio::test]
+    async fn forward_round_trips_session_bookmark() {
+        const BM: &str = "00000000-0000002a-0123456789abcdef";
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", l.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).await.unwrap();
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_lowercase());
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n{BOOKMARK_HEADER}: {BM}\r\nconnection: close\r\n\r\n[]"
+            );
+            let _ = s.write_all(reply.as_bytes()).await;
+        });
+        let c = D1Client::new(addr, b"s".to_vec(), Duration::from_secs(30)).unwrap();
+        let (status, bookmark, body) = c
+            .forward(
+                &ctx(2_000),
+                "query",
+                "?resultsFormat=ROWS_AND_COLUMNS",
+                Bytes::from_static(br#"{"sql":"select 1"}"#),
+                vec![(
+                    BOOKMARK_HEADER.to_string(),
+                    "first-unconstrained".to_string(),
+                )],
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(bookmark.as_deref(), Some(BM));
+        assert_eq!(&body[..], b"[]");
+        let req = rx.await.unwrap();
+        assert!(
+            req.contains("x-cf-d1-session-commit-token: first-unconstrained"),
+            "session header not forwarded to vrt-sql: {req}"
+        );
+    }
+
     #[test]
     fn t35_database_id_shape() {
         let ok = |id: &str| {
