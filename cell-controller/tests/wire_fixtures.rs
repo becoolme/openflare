@@ -179,6 +179,8 @@ fn desired_ack_fixture() {
             kv: false,
             r2: false,
             service_entrypoint: true,
+            service_props: true,
+            queue_delivery_delay: true,
             worker_loader: true,
             quotas: true,
         }),

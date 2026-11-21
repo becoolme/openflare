@@ -111,6 +111,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Named service entrypoints render with this generation --
         // unconditionally on (same reasoning as `workflows_cross_worker`).
         service_entrypoint: true,
+        // Service `props` and queue-level `deliveryDelaySeconds` render with
+        // this generation; the control plane gates the optional wire fields
+        // on these bits so an older cell never rejects the whole snapshot.
+        service_props: true,
+        queue_delivery_delay: true,
         // `workerLoader` bindings render with this generation (the
         // workerd pin carries the fork's `maxWorkers` field) --
         // unconditionally on.

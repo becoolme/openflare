@@ -133,6 +133,17 @@ pub struct AckCapabilities {
     /// cells that claim it. Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub service_entrypoint: bool,
+    /// `ServiceBinding.props` (`ctx.props`) is understood by this
+    /// generation. A pre-props cell rejects the field via
+    /// `deny_unknown_fields` (the whole snapshot), so the control plane
+    /// only admits props onto cells that claim it. Omitted while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub service_props: bool,
+    /// Queue `deliveryDelaySeconds` (queue-level default send delay) is
+    /// understood by this generation; pre-delay cells reject it via
+    /// `deny_unknown_fields`. Omitted while false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub queue_delivery_delay: bool,
     /// `workerLoader` bindings render to the pinned fork's
     /// `workerLoader = (maxWorkers=N)` capnp — a cell on an older
     /// workerd pin would fail to parse the whole worker config, so the
