@@ -1582,6 +1582,7 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex as StdMutex;
 
     fn now_ms() -> i64 {
@@ -1972,6 +1973,50 @@ mod tests {
         }
     }
 
+    /// Counts concurrently running dispatches and blocks them until released --
+    /// deterministic `max_concurrency` observation, no wall-clock sleeps.
+    struct GatedInvoker {
+        started: AtomicU64,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        gate: tokio::sync::Semaphore,
+    }
+
+    impl GatedInvoker {
+        fn new() -> Self {
+            Self {
+                started: AtomicU64::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                gate: tokio::sync::Semaphore::new(0),
+            }
+        }
+        fn release_all(&self) {
+            self.gate.add_permits(64);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl QueueInvoker for GatedInvoker {
+        async fn dispatch(
+            &self,
+            _pod: &str,
+            _req: DispatchRequest,
+        ) -> Result<QueueOutcome, DeliveryError> {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            let permit = self.gate.acquire().await.expect("gate semaphore open");
+            permit.forget();
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(QueueOutcome {
+                outcome: "ok".into(),
+                ack_all: true,
+                ..Default::default()
+            })
+        }
+    }
+
     #[test]
     fn bug2_sql_client_endpoint_policy() {
         let mk = |a: &str| QueueSqlClient::new(a, b"s".to_vec(), Duration::from_secs(1));
@@ -2120,6 +2165,90 @@ mod tests {
         assert_eq!(calls[0]["queue"], "q1");
         assert_eq!(calls[0]["messages"][0]["id"], "m1");
         assert_eq!(calls[0]["messages"][0]["attempts"], 1);
+    }
+
+    #[tokio::test]
+    async fn max_concurrency_caps_inflight_batches_per_lane() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            let q = w.queues.entry(QID.into()).or_default();
+            for i in 0..6 {
+                q.msgs.insert(
+                    format!("m{i}"),
+                    FakeMsg {
+                        body_hex: "aa".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        let inv = Arc::new(GatedInvoker::new());
+        let d = dispatcher(&addr, inv.clone(), cfg("h1"));
+        // One message per batch so every claim is immediately dispatchable
+        // (no reliance on the batch timeout), two in-flight batches allowed.
+        let desired = desired_with(json!([{
+            "queueId": QID,
+            "queueName": "q",
+            "maxBatchSize": 1,
+            "maxConcurrency": 2
+        }]));
+        let exp = chrono::Utc::now() + chrono::Duration::minutes(5);
+        let assigns = assignments();
+
+        // Drive ticks until both allowed deliveries are running.
+        for _ in 0..100 {
+            if inv.started.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            d.tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
+                .await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            inv.started.load(Ordering::SeqCst),
+            2,
+            "exactly max_concurrency deliveries may start"
+        );
+        // Both slots busy: the lane must not claim or dispatch a third batch.
+        let out = d
+            .tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
+            .await;
+        assert_eq!(out.dispatched, 0);
+        assert_eq!(out.claimed, 0);
+        {
+            let lanes = d.lanes.lock().await;
+            assert_eq!(lanes.get(QID).unwrap().inflight, 2);
+        }
+        for _ in 0..100 {
+            if inv.active.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(inv.max_active.load(Ordering::SeqCst), 2);
+
+        // Open the gate and keep ticking: all six messages drain, and the cap
+        // holds for the whole run, not just the first two batches.
+        inv.release_all();
+        for _ in 0..200 {
+            d.tick(Some(&desired), Some(exp), &assigns, chrono::Utc::now())
+                .await;
+            if world.lock().unwrap().queues[QID].msgs.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            world.lock().unwrap().queues[QID].msgs.is_empty(),
+            "all messages must drain"
+        );
+        assert_eq!(inv.started.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            inv.max_active.load(Ordering::SeqCst),
+            2,
+            "in-flight batches must never exceed max_concurrency"
+        );
     }
 
     #[tokio::test]

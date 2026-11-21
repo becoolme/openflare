@@ -104,6 +104,48 @@ fn batch_bytes_boundary_288000() {
 }
 
 #[test]
+fn batch_item_failure_rejects_the_whole_call() {
+    // producer_batch renders ONE vrt-sql send request; every item is validated
+    // before that request is produced, so a failing item at any position
+    // rejects the call instead of forwarding the earlier items (the
+    // workerd sendBatch promise is likewise all-or-nothing).
+    use base64::Engine;
+    let enc = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let ok = enc(b"ok");
+    let over = enc(&vec![b'x'; QUEUE_MSG_MAX_BYTES + 1]);
+    for pos in [0usize, 1] {
+        let mut items = vec![
+            serde_json::json!({"contentType": "bytes", "body": ok}),
+            serde_json::json!({"contentType": "bytes", "body": ok}),
+        ];
+        items[pos] = serde_json::json!({"contentType": "bytes", "body": over});
+        let body = serde_json::json!({"messages": items}).to_string();
+        let (status, reason) = producer_batch(&HeaderMap::new(), body.as_bytes()).unwrap_err();
+        assert_eq!(status, 413, "position {pos}");
+        assert!(
+            reason.contains("single message size limit"),
+            "position {pos}: {reason}"
+        );
+    }
+    // Non-size violations in a later item fail the same way (400): a bad
+    // content type, an out-of-range delay, a client-supplied id/timestamp.
+    for bad in [
+        serde_json::json!({"contentType": "yaml", "body": ok}),
+        serde_json::json!({"contentType": "bytes", "body": ok, "delaySecs": 86_401}),
+        serde_json::json!({"contentType": "bytes", "body": ok, "id": "client-id"}),
+        serde_json::json!({"contentType": "bytes", "body": ok, "timestamp": 1}),
+    ] {
+        let body = serde_json::json!({"messages": [
+            {"contentType": "bytes", "body": ok},
+            bad
+        ]})
+        .to_string();
+        let (status, _) = producer_batch(&HeaderMap::new(), body.as_bytes()).unwrap_err();
+        assert_eq!(status, 400, "{body}");
+    }
+}
+
+#[test]
 fn batch_body_malformed_rejected() {
     // non-JSON / missing messages / bad base64 / bad contentType / over-limit delay / empty or overlong id.
     let bad = [

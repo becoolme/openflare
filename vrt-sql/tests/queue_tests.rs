@@ -146,6 +146,49 @@ async fn limits_boundaries() {
 // ---------- idempotence ----------
 
 #[tokio::test]
+async fn rejected_batch_enqueues_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let (_r, be) = backend(&tmp);
+    let q = qid();
+    let mut base = msg(b"baseline", "text");
+    base.id = Some("baseline".into());
+    be.send(&q, &[base], NOW).await.unwrap();
+
+    // One oversize item in an otherwise fully valid batch: the whole send is
+    // rejected before the transaction starts (no partial write).
+    let mut a = msg(b"a", "text");
+    a.id = Some("a".into());
+    let mut b = msg(b"b", "text");
+    b.id = Some("b".into());
+    let over = msg(&vec![b'x'; MSG_MAX_BYTES + 1], "bytes");
+    assert!(matches!(
+        be.send(&q, &[a, over, b], NOW).await,
+        Err(QueueError::TooLarge)
+    ));
+
+    // Same for a non-size violation in the last item.
+    let mut c = msg(b"c", "text");
+    c.id = Some("c".into());
+    let mut bad = msg(b"d", "text");
+    bad.id = Some("d".into());
+    bad.delay_secs = DELAY_MAX_SECS + 1;
+    assert!(matches!(
+        be.send(&q, &[c, bad], NOW).await,
+        Err(QueueError::InvalidInput(_))
+    ));
+
+    // Only the pre-existing message is claimable -- nothing from either
+    // rejected batch was written.
+    let got = be
+        .claim(&q, "t", 300_000, 10, None, 10_000, NOW)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = got.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["baseline"]);
+    assert_eq!(be.metrics(&q, NOW).await.unwrap().backlog_count, 1);
+}
+
+#[tokio::test]
 async fn same_timestamp_claim_orders_by_id() {
     // One sendBatch shares visible_at/created_at; the provider assigns
     // time-ordered ids, so the id tie-break is what keeps send order.
