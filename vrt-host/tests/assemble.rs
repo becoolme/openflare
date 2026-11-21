@@ -281,6 +281,10 @@ fn assemble_test_params(sys_digest: String) -> vrt_config::RuntimeParams {
                 service: "sys".into(),
                 entrypoint: "Entrypoint".into(),
             },
+            images: vrt_config::ServiceEndpoint {
+                service: "sys".into(),
+                entrypoint: "Entrypoint".into(),
+            },
         },
         system_workers: vec![vrt_config::SystemWorkerRef {
             service_name: "sys".to_string(),
@@ -700,6 +704,7 @@ fn experimental_params(sys_digest: &str) -> vrt_config::RuntimeParams {
             k2: endpoint(),
             ratelimit: endpoint(),
             email: endpoint(),
+            images: endpoint(),
         },
         system_workers: vec![vrt_config::SystemWorkerRef {
             service_name: "sys".to_string(),
@@ -946,6 +951,7 @@ fn binding_backend_dir_derives_per_tenant_socket() {
             k2: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
             ratelimit: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
             email: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
+            images: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
         },
         system_workers: vec![vrt_config::SystemWorkerRef {
             service_name: "sys".to_string(),
@@ -1052,6 +1058,7 @@ fn binding_backend_dir_rekeys_fingerprint() {
                         k2: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
                         ratelimit: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
                         email: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
+                        images: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
                     },
                     system_workers: vec![],
                     system_compat_date: "2024-01-01".to_string(),

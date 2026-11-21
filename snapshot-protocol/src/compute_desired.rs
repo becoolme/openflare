@@ -396,6 +396,13 @@ pub enum BindingDesired {
     /// Points at no provider resource; the tenant supplies code at
     /// runtime. Rendered as workerd `workerLoader` (experimental).
     WorkerLoader(WorkerLoaderBinding),
+    /// `{"type":"images"}` — CF Images binding (`env.<name>` is an
+    /// `ImagesBinding` with `.info()`/`.input().transform().output()`).
+    /// Points at no provider resource: transforms run inside the
+    /// facade worker on a vendored WASM engine (jSquash). Rendered
+    /// as workerd `wrapped` → `cloudflare-internal:images-api` —
+    /// the upstream Miniflare module name.
+    Images(ImagesBinding),
     /// `{"type":"analyticsEngine"}` — Analytics Engine dataset
     /// (`env.<name>` is a `AnalyticsEngineDataset` with
     /// `writeDataPoint()`). Rendered as workerd `analyticsEngine`
@@ -741,6 +748,17 @@ pub struct DoBindingDesired {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerLoaderBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+}
+
+/// `{"type":"images"}` — a CF Images binding. `name` is the only
+/// field: the binding carries no resource reference (the transform
+/// engine is embedded in `facade-images`; nothing is stored
+/// server-side between calls).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ImagesBinding {
     /// Binding name (`env.<name>`), JS identifier.
     pub name: String,
 }
@@ -1778,6 +1796,9 @@ impl WorkerDesired {
                 // (validated as a binding name at the match head) is
                 // the only field.
                 BindingDesired::WorkerLoader(_) => {}
+                // Images carries no resource reference — `name` is the
+                // only field (the engine lives in the facade worker).
+                BindingDesired::Images(_) => {}
                 BindingDesired::AnalyticsEngine(ae) => {
                     // `dataset` is emitted as a workerd service name
                     // AND used as a spool/parquet path segment —
@@ -1977,6 +1998,7 @@ impl BindingDesired {
             Self::SendEmail(b) => &b.name,
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
+            Self::Images(b) => &b.name,
             Self::AnalyticsEngine(b) => &b.name,
             Self::UnsafeEval(b) => &b.name,
             Self::Flagship(b) => &b.name,
@@ -2003,6 +2025,7 @@ impl BindingDesired {
             | Self::DurableObject(_)
             | Self::Ratelimit(_)
             | Self::WorkerLoader(_)
+            | Self::Images(_)
             | Self::AnalyticsEngine(_)
             | Self::UnsafeEval(_) | Self::Flagship(_) => None,
         }

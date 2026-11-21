@@ -153,6 +153,10 @@ pub struct FacadeRefs {
     /// `k2` bindings → wrapped `cloudflare-internal:k2` whose inner
     /// `fetcher` service is this facade (K2 produce wire: POST /send).
     pub k2: ServiceEndpoint,
+    /// `images` bindings → wrapped `cloudflare-internal:images-api`
+    /// whose inner `fetcher` service is this facade — transforms run
+    /// inside facade-images on the vendored WASM engine.
+    pub images: ServiceEndpoint,
     /// `ratelimit` bindings -> plain service binding to this facade's
     /// `RateLimiter` entrypoint (MIG-16; no binding-backend).
     pub ratelimit: ServiceEndpoint,
@@ -1629,6 +1633,9 @@ fn emit_binding(
         BindingDesired::SendEmail(e) => {
             emit_email_binding(out, e, worker, input)?;
         }
+        BindingDesired::Images(img) => {
+            emit_images_binding(out, img, worker, input)?;
+        }
         BindingDesired::Ratelimit(r) => {
             emit_ratelimit_binding(out, r, worker, input)?;
         }
@@ -2075,6 +2082,31 @@ fn emit_email_binding(
         capnp_text(&facade.service),
         capnp_text(&facade.entrypoint),
         capnp_text(&props),
+    ));
+    Ok(())
+}
+
+/// `images` — `wrapped` binding over `cloudflare-internal:images-api`
+/// (the upstream Miniflare module name); the inner `fetcher` points at
+/// the facade-images system worker, which runs the vendored WASM
+/// engine in-worker — no provider hop, no signed props needed (the
+/// facade holds no secrets and transforms only its input bytes).
+fn emit_images_binding(
+    out: &mut String,
+    img: &snapshot_protocol::compute_desired::ImagesBinding,
+    _worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+) -> Result<(), ConfigError> {
+    let facade = &input.params.facades.images;
+    out.push_str(&format!(
+        "        (name = {}, wrapped = (moduleName = {}, innerBindings = [
+            (name = \"fetcher\", service = (name = {}, entrypoint = {}))
+        ])),
+",
+        capnp_text(&img.name),
+        capnp_text("cloudflare-internal:images-api"),
+        capnp_text(&facade.service),
+        capnp_text(&facade.entrypoint),
     ));
     Ok(())
 }

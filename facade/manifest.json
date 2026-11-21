@@ -525,6 +525,27 @@
         }
       ]
     },
+    "facade-images": {
+      "entrypoint": "ImagesFacade",
+      "needsBindingBackend": false,
+      "mainModule": "facade/facade-images.js",
+      "modules": [
+        {
+          "name": "facade/facade-images.js",
+          "dist": "facade/dist/facade/facade-images.js",
+          "source": "facade/facade-images.ts",
+          "sourceSha256": "bf38438925220654914199fdc42d1f4c48a845f8a8171014e4aa1dc4244b2082",
+          "sha256": "10f73e528233bdc5fd00ebf0b492863ba4f2cac996d1b31f135e8eea36db1721"
+        },
+        {
+          "name": "facade/images-wire.js",
+          "dist": "facade/dist/facade/images-wire.js",
+          "source": "facade/images-wire.ts",
+          "sourceSha256": "b03ee892187fa1474462d851100edf4edab17741f4462c18b146e7f25d4cac46",
+          "sha256": "4ac999c835e8b443c0fa4ab7cb624d6cfc1f27f31624fa3efe910bc07648847d"
+        }
+      ]
+    },
     "facade-ratelimit": {
       "entrypoint": "RateLimiter",
       "needsBindingBackend": false,

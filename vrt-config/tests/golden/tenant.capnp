@@ -106,6 +106,15 @@ const config :Workerd.Config = (
       ],
       globalOutbound = (name = "vrt-no-network", entrypoint = "DenyAll"),
     )),
+    (name = "facade-images", worker = (
+      compatibilityDate = "2026-09-08",
+      compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
+      modules = [
+        (name = "facade/facade-images.js", esModule = embed "sys/10f73e528233bdc5fd00ebf0b492863ba4f2cac996d1b31f135e8eea36db1721"),
+        (name = "facade/images-wire.js", esModule = embed "sys/4ac999c835e8b443c0fa4ab7cb624d6cfc1f27f31624fa3efe910bc07648847d"),
+      ],
+      globalOutbound = (name = "vrt-no-network", entrypoint = "DenyAll"),
+    )),
     (name = "facade-k2", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],

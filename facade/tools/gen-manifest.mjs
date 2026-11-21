@@ -64,6 +64,9 @@ const WORKERS = [
   // (produce-only: POST /send → provider → vrt-sql K2Backend).
   { serviceName: "facade-k2", entrypoint: "K2Facade", entry: "facade-k2.ts", needsBindingBackend: true },
   { serviceName: "facade-email", entrypoint: "EmailFacade", entry: "facade-email.ts", needsBindingBackend: true },
+  // CF Images binding — inner `fetcher` of `cloudflare-internal:images-api`.
+  // Pure in-worker transforms (vendored WASM engine); no binding-backend.
+  { serviceName: "facade-images", entrypoint: "ImagesFacade", entry: "facade-images.ts", needsBindingBackend: false },
   // MIG-16: in-process Rate Limiting binding — pure RPC entrypoint, no
   // binding-backend (state is local to the workerd process).
   { serviceName: "facade-ratelimit", entrypoint: "RateLimiter", entry: "facade-ratelimit.ts", needsBindingBackend: false },
