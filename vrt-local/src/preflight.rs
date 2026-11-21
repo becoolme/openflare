@@ -109,6 +109,9 @@ pub(crate) fn deploy_preflight(
         // degrades to an explicit 501 (fail closed).
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        // Standalone has no AE ingest service — `analyticsEngine`
+        // bindings fail the render closed (`aeAddr`).
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         // MIG-12: mirror the production probe-socket emit so the
         // workerd load check covers the wrapped-module surface.

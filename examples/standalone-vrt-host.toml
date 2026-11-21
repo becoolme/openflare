@@ -92,6 +92,18 @@ failWindowMs = 90000
 # globalInflightBytes = 67108864
 # tenantInflightBytes = 33554432
 
+# Analytics Engine: per-tenant ingest sockets at
+# `<workDir>/ae/sock/<seg(tenant)>.sock` for `analyticsEngine`
+# bindings (`env.<binding>.writeDataPoint()`); JSONL spool +
+# canonical Parquet parts under `<workDir>/ae/`. Always on when the
+# service builds — the cell advertises the capability unconditionally,
+# so the only degrade path is a startup build failure (observable via
+# `vrt_host_ae_degraded`; AE renders then refuse, fail closed).
+[analyticsEngine]
+# maxBodyBytes = 262144                              # POST cap per event
+# maxSpoolBytes = 268435456                          # per-tenant spool cap (503 backpressure over it)
+# flushIntervalSecs = 60                             # spool→Parquet cadence, clamped 10..3600
+
 [ingress]
 requestTimeoutMs = 30000
 connectTimeoutMs = 500

@@ -132,6 +132,12 @@ pub struct Assembler {
     /// derivation). `None` ⇒ no `cacheApiOutbound` → `caches.*`
     /// throws `No Cache was configured` (explicit, fail closed).
     cache_root: Option<PathBuf>,
+    /// AE: unix-socket root for per-tenant Analytics Engine ingest —
+    /// `<root>/<seg(tenant)>.sock` drives `params.ae_addr` and the
+    /// supervisor's listener bind (`ae::tenant_socket_path`, single
+    /// derivation). `None` ⇒ `analyticsEngine` bindings fail the
+    /// render closed (`aeAddr`).
+    ae_root: Option<PathBuf>,
     /// H5-r1: provider listener directory — the binding-backend
     /// `--external-addr` is derived PER TENANT as
     /// `vrt_securefs::socket_path(dir, tenant)` (byte-identical to the
@@ -236,6 +242,7 @@ impl Assembler {
             wf_delete_addr: None,
             log_hub: None,
             cache_root: None,
+            ae_root: None,
             binding_backend_dir: None,
             quotas: true,
         }
@@ -258,6 +265,16 @@ impl Assembler {
     /// supervisor binds the same path via `cache::tenant_socket_path`).
     pub fn with_cache_root(mut self, root: PathBuf) -> Self {
         self.cache_root = Some(root);
+        self
+    }
+
+    /// AE: enable Analytics Engine ingest — tenants declaring
+    /// `analyticsEngine` bindings get per-dataset `external` services
+    /// resolving to `<root>/<seg(tenant)>.sock` (the supervisor binds
+    /// the same path via `ae::tenant_socket_path`). Unset ⇒ the
+    /// render fails closed (`aeAddr`) for AE-carrying tenants.
+    pub fn with_ae_root(mut self, root: PathBuf) -> Self {
+        self.ae_root = Some(root);
         self
     }
 
@@ -423,6 +440,10 @@ impl Assembler {
                     // fingerprint or a toggled config would reuse a
                     // stale generation digest.
                     &self.cache_root,
+                    // AE: the AE socket root rewrites every
+                    // AE-carrying tenant's `ae_addr` — same rekey
+                    // rule as cache_root.
+                    &self.ae_root,
                     // H5-r1: the binding-backend dir rewrites every
                     // tenant's `binding_backend_socket` — same rekey
                     // rule as cache_root.
@@ -858,6 +879,16 @@ impl Assembler {
             .transpose()
             .map_err(AssembleError::Io)?
             .unwrap_or_default();
+        // AE: per-tenant ingest socket — the SAME path the actor
+        // binds via `deps.ae` (`ae::tenant_socket_addr`). Empty ⇒
+        // `analyticsEngine` bindings fail the render closed.
+        params.ae_addr = self
+            .ae_root
+            .as_ref()
+            .map(|root| crate::ae::tenant_socket_addr(root, &tenant.tenant_id))
+            .transpose()
+            .map_err(AssembleError::Io)?
+            .unwrap_or_default();
         // H5-r1: per-tenant `binding-backend` external-addr. The
         // provider binds `<dir>/<seg(tenant)>.sock` and treats the
         // socket NAME as the tenant authority (listener-bound
@@ -1252,6 +1283,9 @@ fn stub_do_storage(tenant: &TenantDesired) -> Option<crate::spec::DoStorageSpec>
 /// CR1: cron-carrying workers derive `--experimental` the same way —
 /// their `facade-cron-<id>` service emits the `$experimental`
 /// `service_binding_extra_handlers` flag (Fetcher.scheduled()).
+/// AE: `analyticsEngine` bindings derive it too — workerd's
+/// `experimental_feature("AnalyticsEngine")` check refuses the
+/// binding without the argv flag.
 ///
 /// The predicate itself lives in `vrt_config::launch_args` — one
 /// implementation shared with `vrt-local`'s deploy preflight; launch

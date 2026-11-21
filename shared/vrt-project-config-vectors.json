@@ -699,6 +699,85 @@
     "code": "VRT_CONFIG_INVALID",
     "field": "ratelimits[0].simple"
    }
+  },
+  {
+   "name": "analytics_engine_datasets defaults dataset to binding",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[analytics_engine_datasets]]\nbinding = \"WEATHER\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "dataset": "WEATHER",
+       "name": "WEATHER",
+       "type": "analyticsEngine"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "analytics_engine_datasets explicit dataset and remote accepted",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[analytics_engine_datasets]]\nbinding = \"METRICS\"\ndataset = \"metrics_prod\"\nremote = true\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "dataset": "metrics_prod",
+       "name": "METRICS",
+       "type": "analyticsEngine"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "analytics_engine_datasets missing binding rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[analytics_engine_datasets]]\ndataset = \"weather\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "analytics_engine_datasets[0].binding"
+   }
+  },
+  {
+   "name": "analytics_engine_datasets bad dataset charset rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[analytics_engine_datasets]]\nbinding = \"AE\"\ndataset = \"has space\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "analytics_engine_datasets[0].dataset"
+   }
+  },
+  {
+   "name": "analytics_engine_datasets unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[analytics_engine_datasets]]\nbinding = \"AE\"\nversion = \"1\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "analytics_engine_datasets[0].version"
+   }
   }
  ]
 }

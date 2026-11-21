@@ -441,6 +441,7 @@ fn render_write(dir: &Path, port: u16, wfops_port: u16, wfdel_port: Option<u16>)
             .map(|p| format!("127.0.0.1:{p}"))
             .unwrap_or_default(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -1356,6 +1357,7 @@ fn render_write_cross(dir: &Path, x_port: u16, y_port: u16, wfops_port: u16) -> 
         wfop_pepper: "wf-smoke-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),

@@ -350,6 +350,7 @@ pub fn smoke_params() -> RuntimeParams {
         wfop_pepper: "m17-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),

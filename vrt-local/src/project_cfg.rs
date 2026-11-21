@@ -59,6 +59,7 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
 /// Mirrors @wdl-dev/cli NON_INHERITABLE_ENV_KEYS — env blocks REPLACE
 /// these keys wholesale instead of merging the top-level value.
 const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
+    "analytics_engine_datasets",
     "define",
     "vars",
     "d1_databases",
@@ -817,6 +818,54 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     {
                         b.insert("entrypoint".into(), Value::from(ep));
                     }
+                    bindings.push(Value::Object(b));
+                }
+            }
+            "analytics_engine_datasets" => {
+                // `[[analytics_engine_datasets]]` → analyticsEngine
+                // bindings. `dataset` defaults to the binding name
+                // (mirrors CF wrangler). `version` is rejected —
+                // upstream only ever shipped v1/v2 and now treats the
+                // key as deprecated; fail closed on unknown keys.
+                for (i, e) in table_list(value, "analytics_engine_datasets")?
+                    .iter()
+                    .enumerate()
+                {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "binding" | "dataset" | "remote" => {}
+                            _ => {
+                                return Err(unsupported(
+                                    &format!("analytics_engine_datasets[{i}].{k}"),
+                                    None,
+                                ))
+                            }
+                        }
+                    }
+                    let binding = req_str(
+                        e.get("binding").unwrap_or(&Value::Null),
+                        &format!("analytics_engine_datasets[{i}].binding"),
+                    )?;
+                    let dataset = opt_str(
+                        e.get("dataset"),
+                        &format!("analytics_engine_datasets[{i}].dataset"),
+                    )?
+                    .unwrap_or(binding);
+                    if dataset.is_empty()
+                        || dataset.len() > 256
+                        || !dataset
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return Err(invalid(
+                            &format!("analytics_engine_datasets[{i}].dataset"),
+                            "must match [A-Za-z0-9_]{1,256}",
+                        ));
+                    }
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("analyticsEngine"));
+                    b.insert("name".into(), Value::from(binding));
+                    b.insert("dataset".into(), Value::from(dataset));
                     bindings.push(Value::Object(b));
                 }
             }

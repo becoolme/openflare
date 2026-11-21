@@ -162,6 +162,7 @@ fn render_spec(fx: &Fixture, port: u16, hb_port: u16, gen: u64, runaway: Runaway
         wfop_pepper: "pt1-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: "sock/vrt-heartbeat.sock".into(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),

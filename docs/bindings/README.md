@@ -39,7 +39,7 @@ host/provider configuration, not per-binding provider plug-ins.
 | Vectorize (`vectorize`) | Unsupported | Same typed deploy error. |
 | `ai_search` / `ai_search_namespaces` | Unsupported | Same typed deploy error. |
 | [Tail Workers](tail-workers.md) | Partial | `tail_consumers` render as native workerd `tails` designators next to the platform log collector. Same-tenant, already-deployed consumers only; delivery is best effort and streaming tails are not supported. |
-| Analytics Engine (`analytics_engine_datasets`) | Unsupported | Same typed deploy error. |
+| [Analytics Engine](analytics-engine.md) | Partial | `[[analytics_engine_datasets]]` → a native `analyticsEngine` binding (`writeDataPoint`). Events ingest to a per-tenant socket, spool as JSONL, and flush to canonical Parquet — full fidelity, no sampling; query via DuckDB/ClickHouse. |
 | [Worker loaders](worker-loaders.md) | Partial | `[[worker_loaders]]` → a native `WorkerLoader` binding (`get`/`load`, named cache, dynamic entrypoints and Durable Object facets, `WorkerCode.limits` honoured). The tenant supplies all code at runtime; a platform quota bounds live workers per loader. |
 | `send_email`, `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`, `containers`, `wasm_modules`, `text_blobs`, `data_blobs`, `version_metadata`, `unsafe`, `placement.mode`, `secrets_store_secrets` | Unsupported | Same typed deploy error — the key names the field, e.g. `[VRT_CONFIG_UNSUPPORTED_FIELD] ai is not supported by the VRT runtime`. |
 

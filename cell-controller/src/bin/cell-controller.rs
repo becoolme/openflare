@@ -122,6 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // strict schema knows it; until then declared quota overrides
         // are refused by the control plane (409, fail closed).
         quotas: config.quotas,
+        // `analyticsEngine` bindings render AND vrt-host's AeService
+        // ships in this release -- unconditionally on (same reasoning
+        // as `worker_loader`).
+        analytics_engine: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

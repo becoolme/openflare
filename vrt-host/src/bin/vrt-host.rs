@@ -85,7 +85,7 @@ fn main() -> ExitCode {
     // setgroups/setgid/setuid). Refuse NOW rather than latching
     // every tenant SwitchFailed — a configured-but-unusable mode is
     // a startup failure, never a slow per-tenant crash loop.
-// SAFETY: geteuid(2) has no preconditions and cannot fail.
+    // SAFETY: geteuid(2) has no preconditions and cannot fail.
     if config.isolation.is_some() && unsafe { libc::geteuid() } != 0 {
         eprintln!("vrt-host: [isolation] requires euid 0 (setuid/setgid at launch)");
         return ExitCode::from(2);
@@ -359,6 +359,29 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         }
         None => None,
     };
+    // [analyticsEngine] — per-tenant AE ingest sockets under
+    // `<workDir>/ae/sock/`; spool + Parquet output under
+    // `<workDir>/ae/`. Same degrade rule as cache: an init failure
+    // downgrades the capability (tenants declaring AE bindings then
+    // fail the render closed — never a fake ingest), observable via
+    // log + `vrt_host_ae_degraded`.
+    let ae_service = {
+        let ae_dir = config.work_dir.join("ae");
+        let sock_root = ae_dir.join("sock");
+        let built = vrt_host::ae::AeService::new(
+            Some(sock_root.clone()),
+            ae_dir,
+            config.analytics_engine.limits(),
+        );
+        vrt_host::ae::record_ae_init(&built);
+        match built {
+            Ok(svc) => {
+                assembler = assembler.with_ae_root(sock_root);
+                Some(Arc::new(svc))
+            }
+            Err(_) => None,
+        }
+    };
     let assembler: Arc<dyn vrt_host::supervisor::TenantAssembler> = Arc::new(assembler);
 
     // P3c-2: DO placement authority — object-store backends build a
@@ -375,6 +398,7 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     };
     let mut deps = SupervisorDeps::default();
     deps.cache = cache_service;
+    deps.ae = ae_service.clone();
     deps.placement = placement.clone();
     // P3c-2: snapshot surface (same store + concrete manifest impl)
     // + migration coordinator shared with the control listener.
@@ -545,7 +569,10 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         let ts = vrt_host::trust_store::check();
         vrt_host::trust_store::record(ts);
         if ts.ok() {
-            tracing::info!(path = vrt_host::trust_store::CA_BUNDLE_PATH, "egress CA trust store present");
+            tracing::info!(
+                path = vrt_host::trust_store::CA_BUNDLE_PATH,
+                "egress CA trust store present"
+            );
         } else {
             tracing::error!(
                 path = vrt_host::trust_store::CA_BUNDLE_PATH,
@@ -664,6 +691,11 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         1.0,
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // [analyticsEngine]: spool→Parquet flush — exits on the shutdown
+    // watch (one final flush before exit).
+    if let Some(svc) = ae_service.clone() {
+        svc.spawn_flush(shutdown_tx.subscribe());
+    }
     let ingress_task = {
         let ingress_state = ingress_state.clone();
         tokio::spawn(ingress::serve(listener, ingress_state, async move {
@@ -717,7 +749,8 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     let budget = drain_timeout + wait_until_grace + kill_grace + Duration::from_secs(5);
     let _ = tokio::time::timeout(budget, async {
         let _ = ingress_task.await;
-        host.shutdown_all(drain_timeout + wait_until_grace + kill_grace).await;
+        host.shutdown_all(drain_timeout + wait_until_grace + kill_grace)
+            .await;
     })
     .await;
     tracing::info!("vrt-host stopped");
@@ -861,10 +894,16 @@ fn build_placement(
                 }
                 "s3" => {
                     let s3 = p.s3.as_ref().ok_or("placement.s3 missing")?;
-                    let access = vrt_sql::service::load_secret_0600(&s3.access_key_file, vrt_securefs::SecretPurpose::Credential)
-                        .map_err(|e| format!("placement s3 access key file: {e}"))?;
-                    let secret = vrt_sql::service::load_secret_0600(&s3.secret_key_file, vrt_securefs::SecretPurpose::Credential)
-                        .map_err(|e| format!("placement s3 secret key file: {e}"))?;
+                    let access = vrt_sql::service::load_secret_0600(
+                        &s3.access_key_file,
+                        vrt_securefs::SecretPurpose::Credential,
+                    )
+                    .map_err(|e| format!("placement s3 access key file: {e}"))?;
+                    let secret = vrt_sql::service::load_secret_0600(
+                        &s3.secret_key_file,
+                        vrt_securefs::SecretPurpose::Credential,
+                    )
+                    .map_err(|e| format!("placement s3 secret key file: {e}"))?;
                     let cfg = vrt_objstore::S3StoreConfig {
                         endpoint: s3.endpoint.clone(),
                         region: s3.region.clone(),
@@ -918,9 +957,7 @@ fn build_placement(
             //     backend URL (path/query) never reaches logs.
             let retry = vrt_objstore::self_check::SelfCheckRetry {
                 budget: std::time::Duration::from_millis(p.self_check_budget_ms),
-                initial_backoff: std::time::Duration::from_millis(
-                    p.self_check_initial_backoff_ms,
-                ),
+                initial_backoff: std::time::Duration::from_millis(p.self_check_initial_backoff_ms),
                 max_backoff: std::time::Duration::from_millis(p.self_check_max_backoff_ms),
             };
             vrt_host::placement_self_check::run(

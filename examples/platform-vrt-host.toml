@@ -74,5 +74,14 @@ maxBodyBytes = 1048576
 forwardedProto = "trusted-proxy-header"
 forwardedProtoTrusted = ["10.42.0.0/16"]
 
+# Analytics Engine: per-tenant ingest sockets + Parquet output under
+# `<workDir>/ae/`; enabled by default (the cell claims the
+# capability unconditionally). See standalone-vrt-host.toml for the
+# option list. Query the parts with DuckDB, or sync `ae/out/` to the
+# cell's object store and read with ClickHouse `s3(...,'Parquet')`.
+[analyticsEngine]
+# maxSpoolBytes = 268435456                          # per-tenant spool cap
+# flushIntervalSecs = 60                             # spool→Parquet cadence
+
 [baseEnv]
 # VRT_EXTRA = "value"
