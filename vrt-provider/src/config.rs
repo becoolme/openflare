@@ -105,6 +105,58 @@ pub struct ProviderConfig {
     /// equal the provider's own euid.
     #[serde(default)]
     pub isolation: Option<IsolationConfig>,
+
+    /// `send_email` bindings: the upstream adapter every send relays
+    /// through. Absent → the email route 503s (`BACKEND_UNAVAILABLE`),
+    /// never a silent drop.
+    #[serde(default)]
+    pub email: Option<EmailConfig>,
+}
+
+/// `[email]` — send_email upstream adapter. Secrets are always env-var
+/// NAMES (`apiKeyEnv` etc.), never inline values.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EmailConfig {
+    /// `log` | `resend` | `cf` | `smtp`.
+    pub backend: String,
+    /// HTTPS endpoint (resend default `https://api.resend.com`; cf
+    /// requires the full account send URL).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Env var holding the API key/token (resend/cf).
+    #[serde(default = "default_email_api_key_env")]
+    pub api_key_env: String,
+    /// SMTP relay host (required for `smtp`).
+    #[serde(default)]
+    pub host: Option<String>,
+    /// SMTP port (default 465 implicit / 587 otherwise).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// `plain` | `starttls` | `implicit`.
+    #[serde(default = "default_email_tls")]
+    pub tls: String,
+    /// Env vars holding SMTP credentials (both or neither).
+    #[serde(default)]
+    pub username_env: Option<String>,
+    #[serde(default)]
+    pub password_env: Option<String>,
+    /// EHLO name.
+    #[serde(default)]
+    pub helo: Option<String>,
+    /// Adapter round-trip bound.
+    #[serde(default = "default_email_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_email_api_key_env() -> String {
+    "VRT_EMAIL_API_KEY".to_string()
+}
+fn default_email_tls() -> String {
+    "starttls".to_string()
+}
+fn default_email_timeout_ms() -> u64 {
+    15_000
 }
 
 /// T13/M2: `[isolation]` — uid/gid assignment range (mirrors
@@ -446,8 +498,20 @@ impl ProviderConfig {
         ensure_timeout_ms!(self.operation_timeout_ms, "operationTimeoutMs", err);
         ensure_timeout_ms!(self.body_read_timeout_ms, "bodyReadTimeoutMs", err);
         ensure_timeout_ms!(self.drain_timeout_ms, "drainTimeoutMs", err);
-        ensure_range!(self.tenant_concurrency, "tenantConcurrency", 1, 100_000, err);
-        ensure_range!(self.global_concurrency, "globalConcurrency", 1, 100_000, err);
+        ensure_range!(
+            self.tenant_concurrency,
+            "tenantConcurrency",
+            1,
+            100_000,
+            err
+        );
+        ensure_range!(
+            self.global_concurrency,
+            "globalConcurrency",
+            1,
+            100_000,
+            err
+        );
         ensure_range!(self.tenant_qps, "tenantQps", 1, 10_000_000, err);
         ensure_range!(
             self.tenant_bytes_per_sec,

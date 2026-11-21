@@ -63,6 +63,10 @@ pub struct TenantService {
     pub queue: Option<Arc<crate::queue::QueueClient>>,
     /// K2 downstream (the same vrt-sql; absent -> k2 produce 503).
     pub k2: Option<Arc<crate::k2::K2Client>>,
+    /// Email upstream adapter (`[email]` config; absent -> send 503s
+    /// `BACKEND_UNAVAILABLE` — an authorized send is never dropped
+    /// silently).
+    pub email: Option<Arc<dyn crate::email::EmailBackend>>,
     /// P1: PG HTTP data plane (absent → PG ops fail closed
     /// `PG_CREDENTIAL_UNAVAILABLE` — authorized but undeliverable).
     pub pg: Option<Arc<crate::pg::PgBackend>>,
@@ -95,7 +99,10 @@ pub fn tenant_router_with_quota(
 ) -> Router {
     Router::new()
         .fallback(any(quota_dispatch))
-        .with_state(Arc::new(QuotaState { svc: service, quota }))
+        .with_state(Arc::new(QuotaState {
+            svc: service,
+            quota,
+        }))
 }
 
 async fn quota_dispatch(State(st): State<Arc<QuotaState>>, request: Request) -> Response<Body> {
@@ -170,6 +177,8 @@ async fn dispatch(State(svc): State<Arc<TenantService>>, request: Request) -> Re
         ("queue", queue_dispatch(svc, request).await)
     } else if path.starts_with("/internal/bindings/v1/k2/") {
         ("k2", k2_dispatch(svc, request).await)
+    } else if path.starts_with("/internal/bindings/v1/email/") {
+        ("email", email_dispatch(svc, request).await)
     } else if path == "/internal/assets/v1/fetch" {
         ("assets", assets_dispatch(svc, request).await)
     } else if path == "/internal/assets/v1/route-index" || path == "/internal/assets/v1/can-fetch" {
@@ -2223,12 +2232,7 @@ fn k2_wire_error(status: StatusCode, code: &str, msg: &str, retryable: bool) -> 
 
 async fn k2_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body> {
     let Some((binding_id, _op)) = parse_k2_path(request.uri().path()) else {
-        return k2_wire_error(
-            StatusCode::BAD_REQUEST,
-            "BAD_ROUTE",
-            "bad k2 route",
-            false,
-        );
+        return k2_wire_error(StatusCode::BAD_REQUEST, "BAD_ROUTE", "bad k2 route", false);
     };
     if request
         .headers()
@@ -2255,20 +2259,21 @@ async fn k2_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
             );
         }
     };
-    let ctx = match svc
-        .authorizer
-        .authorize(&svc.tenant_id, &identity, &binding_id, ResourceKind::K2)
-    {
-        Ok(ctx) => ctx,
-        Err(err) => {
-            return k2_wire_error(
-                err.status(),
-                err.code(),
-                "authorization denied",
-                err.retryable_in(ResourceKind::K2),
-            );
-        }
-    };
+    let ctx =
+        match svc
+            .authorizer
+            .authorize(&svc.tenant_id, &identity, &binding_id, ResourceKind::K2)
+        {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                return k2_wire_error(
+                    err.status(),
+                    err.code(),
+                    "authorization denied",
+                    err.retryable_in(ResourceKind::K2),
+                );
+            }
+        };
     let permissions = ctx.permissions();
     // `send` is produce → requires the signed `write` grant.
     if !permissions.write {
@@ -2317,7 +2322,11 @@ async fn k2_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
         }
     };
     match client
-        .forward(&ctx, "produce", axum::body::Bytes::from(send_body.to_string()))
+        .forward(
+            &ctx,
+            "produce",
+            axum::body::Bytes::from(send_body.to_string()),
+        )
         .await
     {
         Ok((_status, bytes)) => Response::builder()
@@ -2334,6 +2343,144 @@ async fn k2_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
             "BACKEND_UNAVAILABLE",
             "k2 backend unavailable",
             true,
+        ),
+    }
+}
+
+/// ---------- Email send (CF EmailMessageBuilder -> upstream adapter) ----------
+///
+/// `/internal/bindings/v1/email/{bindingId}/send` — POST only. The
+/// response is `{success:true,messageId}` / `{success:false,error:
+/// {code,message,retryable}}`; the shim throws `Error(message)` with
+/// `.code` on failure — the CF contract inverts K2's (email send()
+/// THROWS typed errors rather than returning them).
+fn email_wire_error(status: StatusCode, code: &str, msg: &str, retryable: bool) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            crate::k2::error_json(code, msg, retryable).to_string(),
+        ))
+        .unwrap()
+}
+
+fn parse_email_path(path: &str) -> Option<String> {
+    let rest = path.strip_prefix("/internal/bindings/v1/email/")?;
+    let (id, op) = rest.rsplit_once('/')?;
+    if id.is_empty() || op != "send" {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+async fn email_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body> {
+    let Some(binding_id) = parse_email_path(request.uri().path()) else {
+        return email_wire_error(
+            StatusCode::BAD_REQUEST,
+            "E_VALIDATION_ERROR",
+            "bad email route",
+            false,
+        );
+    };
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > crate::email::EMAIL_MAX_BODY_BYTES)
+    {
+        return email_wire_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "E_CONTENT_TOO_LARGE",
+            "request too large",
+            false,
+        );
+    }
+    let identity = match parse_request_identity(&binding_id, request.headers()) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return email_wire_error(
+                err.status(),
+                "E_VALIDATION_ERROR",
+                "identity rejected",
+                false,
+            );
+        }
+    };
+    let ctx =
+        match svc
+            .authorizer
+            .authorize(&svc.tenant_id, &identity, &binding_id, ResourceKind::Email)
+        {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                return email_wire_error(
+                    err.status(),
+                    "E_VALIDATION_ERROR",
+                    "authorization denied",
+                    false,
+                );
+            }
+        };
+    // `send` -> requires the signed `write` grant.
+    if !ctx.permissions().write {
+        return email_wire_error(
+            StatusCode::FORBIDDEN,
+            "E_SENDER_NOT_VERIFIED",
+            "binding lacks send permission",
+            false,
+        );
+    }
+    let Some(backend) = svc.email.clone() else {
+        return email_wire_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "E_INTERNAL_SERVER_ERROR",
+            "email backend unavailable",
+            true,
+        );
+    };
+    let body = match tokio::time::timeout(
+        svc.body_read_timeout,
+        to_bytes(request.into_body(), crate::email::EMAIL_MAX_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(b)) => b,
+        _ => {
+            return email_wire_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "E_CONTENT_TOO_LARGE",
+                "failed to read request body",
+                false,
+            );
+        }
+    };
+    let msg = match crate::email::validate_send(&body) {
+        Ok(m) => m,
+        Err(e) => {
+            return email_wire_error(StatusCode::BAD_REQUEST, e.code, &e.message, false);
+        }
+    };
+    if let Err(e) = crate::email::enforce_restrictions(ctx.resource(), &msg) {
+        return email_wire_error(StatusCode::FORBIDDEN, e.code, &e.message, false);
+    }
+    match backend.send(&msg).await {
+        Ok(message_id) => Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({"success": true, "messageId": message_id}).to_string(),
+            ))
+            .unwrap(),
+        Err(e) => email_wire_error(
+            if e.retryable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_GATEWAY
+            },
+            e.code,
+            &e.message,
+            e.retryable,
         ),
     }
 }

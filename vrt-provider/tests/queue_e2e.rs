@@ -104,6 +104,7 @@ fn svc_with_queue(queue_client: Option<Arc<QueueClient>>, f: &Fixture) -> Arc<Te
         d1: None,
         queue: queue_client,
         k2: None,
+        email: None,
         pg: None,
     })
 }
@@ -369,6 +370,7 @@ async fn permission_denied_read_only_binding() {
         d1: None,
         queue: Some(client),
         k2: None,
+        email: None,
         pg: None,
     });
     let (st, _) = call(

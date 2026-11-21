@@ -382,6 +382,11 @@ pub enum BindingDesired {
     /// K2 durable event-log produce binding (vrt-sql K2Backend) —
     /// `env.<name>.send(records)` per the CF K2 public contract.
     K2(K2Binding),
+    /// `{"type":"sendEmail"}` — Email Sending binding
+    /// (`env.<name>.send(msg)`): the provider relays through the
+    /// configured upstream adapter (resend/smtp/cf/log); the binding
+    /// carries CF's send-bindings restrictions only.
+    SendEmail(SendEmailBinding),
     /// Durable Object namespace binding (P3c-1) — `env.<name>` is the
     /// stub factory (`idFromName`/`get`); the namespace's SQLite
     /// storage lives under the declaring worker's `localDisk` dir.
@@ -682,6 +687,30 @@ pub struct K2Binding {
     /// Platform K2 stream id (`^[0-9a-f]{32}$`).
     pub stream_id: String,
     /// Access grant for this binding.
+    pub permissions: BindingPermissions,
+}
+
+/// `{"type":"sendEmail"}` — CF Email Sending binding. The provider
+/// relays `send()` through the configured upstream adapter; the
+/// binding carries ONLY the CF send-bindings restrictions — the
+/// upstream choice/credentials live in provider config, never in the
+/// signed desired state.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendEmailBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// CF `destination_address`: every send is forced to this single
+    /// recipient (dev/testing pin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_address: Option<String>,
+    /// CF `allowed_destination_addresses`: recipient allowlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_destination_addresses: Vec<String>,
+    /// CF `allowed_sender_addresses`: From allowlist.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sender_addresses: Vec<String>,
+    /// Access grant for this binding (`write` = send permission).
     pub permissions: BindingPermissions,
 }
 
@@ -1725,6 +1754,26 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.streamId"));
                     }
                 }
+                BindingDesired::SendEmail(se) => {
+                    // `destination_address` is the dev-pin form; it and
+                    // the allowlist are the same slot on CF — both set
+                    // is ambiguous, fail closed.
+                    if se.destination_address.is_some()
+                        && !se.allowed_destination_addresses.is_empty()
+                    {
+                        return Err(DesiredError::Identifier("bindings.destinationAddress"));
+                    }
+                    for field in se
+                        .destination_address
+                        .iter()
+                        .chain(se.allowed_destination_addresses.iter())
+                        .chain(se.allowed_sender_addresses.iter())
+                    {
+                        if !valid_email(field) {
+                            return Err(DesiredError::Identifier("bindings.address"));
+                        }
+                    }
+                }
                 // WorkerLoader carries no resource reference — `name`
                 // (validated as a binding name at the match head) is
                 // the only field.
@@ -1925,6 +1974,7 @@ impl BindingDesired {
             Self::D1(b) => &b.name,
             Self::Queue(b) => &b.name,
             Self::K2(b) => &b.name,
+            Self::SendEmail(b) => &b.name,
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
             Self::AnalyticsEngine(b) => &b.name,
@@ -1946,6 +1996,7 @@ impl BindingDesired {
             Self::D1(b) => Some(&b.permissions),
             Self::Queue(b) => Some(&b.permissions),
             Self::K2(b) => Some(&b.permissions),
+            Self::SendEmail(b) => Some(&b.permissions),
             Self::Var(_)
             | Self::Secret(_)
             | Self::Service(_)
@@ -2028,6 +2079,23 @@ fn valid_bucket_name(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         && !value.starts_with('-')
         && !value.ends_with('-')
+}
+
+/// `addr-spec` shape for send-bindings addresses: one `@`, non-empty
+/// local/domain, domain has a dot — restrictive enough for allowlist
+/// comparison (exact-match), not an RFC5322 oracle.
+fn valid_email(value: &str) -> bool {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && local.len() <= 64
+        && value.len() <= 254
+        && domain.contains('.')
+        && domain.len() <= 253
+        && value.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'-' | b'_' | b'+' | b'%')
+        })
 }
 
 /// Lowercase FQDN hostname, no wildcards, at least two labels.
@@ -2269,9 +2337,9 @@ fn valid_flagship_attribute(attribute: &str) -> bool {
     !attribute.is_empty()
         && attribute.len() <= MAX_FLAGSHIP_ATTRIBUTE_LEN
         && attribute.split('.').count() <= MAX_FLAGSHIP_SEGMENTS
-        && attribute.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
-        })
+        && attribute
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
 }
 
 /// One condition node — a `{attribute, operator, value?}` leaf or an
@@ -2366,10 +2434,7 @@ fn validate_flagship_rule(
             return Err(DesiredError::FlagshipConfig("rollout.percentage"));
         }
         if let Some(attr) = r.get("attribute") {
-            if !attr
-                .as_str()
-                .is_some_and(valid_flagship_attribute)
-            {
+            if !attr.as_str().is_some_and(valid_flagship_attribute) {
                 return Err(DesiredError::FlagshipConfig("rollout.attribute"));
             }
         }
@@ -2487,7 +2552,11 @@ pub fn validate_flagship_config(config: &str) -> Result<(), DesiredError> {
             }
         }
         if f.keys().any(|k| {
-            k != "enabled" && k != "type" && k != "variants" && k != "defaultVariant" && k != "rules"
+            k != "enabled"
+                && k != "type"
+                && k != "variants"
+                && k != "defaultVariant"
+                && k != "rules"
         }) {
             return Err(DesiredError::FlagshipConfig("flag.keys"));
         }

@@ -68,6 +68,33 @@ pub fn queue_binding(name: &str, queue_id: &str) -> BindingDesired {
     queue_binding_perms(name, queue_id, true, true)
 }
 
+pub fn email_binding_perms(
+    name: &str,
+    destination_address: Option<&str>,
+    allowed_destination_addresses: &[&str],
+    allowed_sender_addresses: &[&str],
+    read: bool,
+    write: bool,
+) -> BindingDesired {
+    BindingDesired::SendEmail(snapshot_protocol::compute_desired::SendEmailBinding {
+        name: name.to_string(),
+        destination_address: destination_address.map(str::to_string),
+        allowed_destination_addresses: allowed_destination_addresses
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        allowed_sender_addresses: allowed_sender_addresses
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        permissions: snapshot_protocol::compute_desired::BindingPermissions { read, write },
+    })
+}
+
+pub fn email_binding(name: &str) -> BindingDesired {
+    email_binding_perms(name, None, &[], &[], true, true)
+}
+
 pub fn kv_binding_perms(name: &str, namespace: &str, read: bool, write: bool) -> BindingDesired {
     BindingDesired::Kv(KvBinding {
         name: name.to_string(),

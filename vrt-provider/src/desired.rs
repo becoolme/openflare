@@ -167,6 +167,12 @@ fn binding_resource(binding: &BindingDesired) -> BindingResource {
         BindingDesired::K2(b) => BindingResource::K2Stream {
             id: b.stream_id.clone(),
         },
+        BindingDesired::SendEmail(b) => BindingResource::SendEmail {
+            name: b.name.clone(),
+            destination_address: b.destination_address.clone(),
+            allowed_destination_addresses: b.allowed_destination_addresses.clone(),
+            allowed_sender_addresses: b.allowed_sender_addresses.clone(),
+        },
         // Var/secret/service bindings have no provider-backed resource;
         // they never reach this protocol, so map them to a sentinel
         // that always mismatches on resource comparison.

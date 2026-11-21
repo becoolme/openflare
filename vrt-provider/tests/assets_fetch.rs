@@ -118,6 +118,7 @@ fn env(files: &[(&str, &[u8])], not_found: &str, store_tenant: &str) -> Env {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     Env {
@@ -886,6 +887,7 @@ async fn route_index_over_limit_returns_too_large_flag() {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     let app = tenant_router(svc);
