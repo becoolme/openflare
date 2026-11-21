@@ -180,6 +180,10 @@ fn kill9_child_worker() {
     let root = PathBuf::from(std::env::var("VRT_T36_ROOT").unwrap());
     let store_root = PathBuf::from(std::env::var("VRT_T36_STORE").unwrap());
     let progress = PathBuf::from(std::env::var("VRT_T36_PROGRESS").unwrap());
+    // `[VRT_T36_START, VRT_T36_N]`: a repeated-kill run resumes the same
+    // table at the persisted prefix, so the child re-enters instead of
+    // recreating it (the FK/PK keeps a replayed insert a hard failure).
+    let start: u64 = std::env::var("VRT_T36_START").unwrap().parse().unwrap();
     let n: u64 = std::env::var("VRT_T36_N").unwrap().parse().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(FsStore::new(store_root).unwrap());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -199,8 +203,9 @@ fn kill9_child_worker() {
     ));
     let reg = EngineRegistry::new(root.clone()).with_persisters(pair(&root, p));
     let e = reg.get(D1, DB).unwrap();
-    write(&e, "CREATE TABLE t(k INTEGER PRIMARY KEY)").unwrap();
-    for k in 1..=n {
+    // A resumed cycle finds the table from the previous one.
+    write(&e, "CREATE TABLE IF NOT EXISTS t(k INTEGER PRIMARY KEY)").unwrap();
+    for k in start..=n {
         write(&e, &format!("INSERT INTO t VALUES ({k})")).unwrap();
         // progress is recorded only after the ack -- the parent asserts by the ack count.
         std::fs::OpenOptions::new()
@@ -215,116 +220,179 @@ fn kill9_child_worker() {
     }
 }
 
-#[test]
-fn kill9_recovers_acked_and_drops_unacked() {
-    if std::env::var("VRT_T36_KILL_CHILD").is_ok() {
-        return; // child-process branch
-    }
-    const N: u64 = 1_000;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().join("dbroot");
-    let store_root = tmp.path().join("store");
-    let progress = tmp.path().join("progress");
-    std::fs::create_dir_all(&root).unwrap();
-
-    let exe = std::env::current_exe().unwrap();
-    let mut child = std::process::Command::new(exe)
-        .args([
-            "kill9_child_worker",
-            "--exact",
-            "--nocapture",
-            "--test-threads",
-            "1",
-        ])
-        .env("VRT_T36_KILL_CHILD", "1")
-        .env("VRT_T36_ROOT", &root)
-        .env("VRT_T36_STORE", &store_root)
-        .env("VRT_T36_PROGRESS", &progress)
-        .env("VRT_T36_N", N.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-
-    // Wait for the first batch of acks (the child may finish all N -- both outcomes are legal).
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let mut acked = 0u64;
-    loop {
-        if let Ok(raw) = std::fs::read_to_string(&progress) {
-            acked = raw.lines().count() as u64;
-        }
-        let alive = child.try_wait().unwrap().is_none();
-        if acked >= N / 2 || !alive || Instant::now() > deadline {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    if child.try_wait().unwrap().is_none() {
-        child.kill().unwrap(); // SIGKILL -- equivalent to kill -9.
-    }
-    let _ = child.wait();
-    if let Ok(raw) = std::fs::read_to_string(&progress) {
-        acked = raw.lines().count() as u64;
-    }
-    assert!(acked >= 1, "child must have acked at least one txn");
-
-    // A new "process" (new registry + new holder) takes over: wait for the lease to expire.
-    // With SystemClock: waiting out the child's lease_ms (120s) is impractical -- simulate lease expiry by directly
-    // rewriting the manifest expiry time (equivalent to advancing the clock).
-    let store: Arc<dyn ObjectStore> = Arc::new(FsStore::new(store_root.clone()).unwrap());
+/// Force the manifest lease to expire so the next "process" (the next child
+/// or the takeover) claims at epoch+1. With SystemClock, waiting out the
+/// lease (60-120 s) is impractical, so rewrite the expiry -- the equivalent
+/// of advancing the clock past it.
+fn expire_manifest(store: &Arc<dyn ObjectStore>) -> Manifest {
     let mkey = seg::manifest_key(D1, DB);
     let obj = vrt_objstore::block_on_store(store.get(&mkey))
         .unwrap()
         .expect("manifest exists");
     let mut m: Manifest = serde_json::from_slice(&obj.body).unwrap();
-    m.expires_at_ms = 0; // force expiry
+    m.expires_at_ms = 0;
     let body = serde_json::to_vec(&m).unwrap();
     vrt_objstore::block_on_store(store.put_if_match(&mkey, &obj.meta.etag, &body)).unwrap();
-
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
-    let p = Arc::new(Persister::new(
-        store.clone(),
-        PersistConfig {
-            lease_ms: 60_000,
-            clock_skew_margin_ms: 500,
-            holder: "recovery".into(),
-            checkpoint_every_commits: 0,
-            retention_ms: 60_000,
-            snapshot_max_bytes: 1 << 30,
-        },
-        clock,
-        root.clone(),
-        D1,
-    ));
-    let reg2 = EngineRegistry::new(root.clone()).with_persisters(pair(&root, p));
-    let e2 = reg2.get(D1, DB).unwrap();
-    assert_eq!(e2.lease_epoch(), m.epoch + 1);
-    assert_eq!(e2.commit_lsn(), m.lsn);
-
-    // Every acked k is present; no un-acked one is (max==count==acked).
-    let n_rows = read_i64(&e2, "SELECT count(*) AS count FROM t");
-    assert_eq!(
-        n_rows,
-        m.lsn as i64 - 1,
-        "lsn covers DDL+inserts; manifest.lsn={} rows={n_rows}",
-        m.lsn
-    );
-    // progress is appended only after the ack; SIGKILL may land in the gap between "after ack, before append"
-    // -> rows in {acked, acked+1}, and never < acked (a lost ack).
-    assert!(
-        n_rows == acked as i64 || n_rows == acked as i64 + 1,
-        "acked={acked} rows={n_rows} -- all acked transactions must be present, at most one ack/append gap off"
-    );
-    let max_k = read_i64(&e2, "SELECT COALESCE(MAX(k),0) AS count FROM t");
-    assert_eq!(max_k, n_rows, "persisted set must be a contiguous prefix");
+    m
 }
 
-/// >=1e5 transaction fuzz (ignored by default; run with `--ignored`).
+/// Hard-kill fuzz: `cycles` kill -9 rounds over one contiguous `1..=n_total`
+/// insert stream. Each round inserts `n_total / cycles` rows in a child,
+/// SIGKILLs it once at least half those acks are visible, then takes the
+/// database over at a newer lease epoch and asserts that every acked
+/// transaction survived, nothing un-acked leaked in, and the persisted set
+/// is still a contiguous prefix. Kill timing therefore repeats against a
+/// growing manifest chain, which the single-kill default does not cover.
+fn kill9_fuzz(n_total: u64, cycles: u32) {
+    if std::env::var("VRT_T36_KILL_CHILD").is_ok() {
+        return; // child-process branch
+    }
+    assert!(cycles >= 1, "at least one kill/recovery round");
+    assert!(
+        n_total >= u64::from(cycles),
+        "every round must be able to ack at least one row"
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("dbroot");
+    let store_root = tmp.path().join("store");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let exe = std::env::current_exe().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(FsStore::new(store_root.clone()).unwrap());
+    let per_cycle = n_total.div_ceil(u64::from(cycles));
+    let mut persisted = 0u64;
+    let mut killed = 0u32;
+    for cycle in 0..cycles {
+        let first = persisted + 1;
+        let last = (first + per_cycle - 1).min(n_total);
+        // Cycle 0 starts on an empty store (no manifest to hand over); every
+        // later round must expire the previous takeover's lease first, or the
+        // child cannot claim.
+        if cycle > 0 {
+            expire_manifest(&store);
+        }
+        let progress = tmp.path().join(format!("progress-{cycle}"));
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "kill9_child_worker",
+                "--exact",
+                "--nocapture",
+                "--test-threads",
+                "1",
+            ])
+            .env("VRT_T36_KILL_CHILD", "1")
+            .env("VRT_T36_ROOT", &root)
+            .env("VRT_T36_STORE", &store_root)
+            .env("VRT_T36_PROGRESS", &progress)
+            .env("VRT_T36_START", first.to_string())
+            .env("VRT_T36_N", last.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Wait for half the round's acks (a child that finishes first is a
+        // legal outcome too -- it just leaves no kill in this round).
+        let target = ((last - first + 1) / 2).max(1);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut acked = 0u64;
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(&progress) {
+                acked = raw.lines().count() as u64;
+            }
+            let alive = child.try_wait().unwrap().is_none();
+            if acked >= target || !alive || Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap(); // SIGKILL -- equivalent to kill -9.
+            killed += 1;
+        }
+        let _ = child.wait();
+        if let Ok(raw) = std::fs::read_to_string(&progress) {
+            acked = raw.lines().count() as u64;
+        }
+
+        // A new "process" (new registry + new holder) takes over.
+        let m = expire_manifest(&store);
+        let rows = {
+            let p = Arc::new(Persister::new(
+                store.clone(),
+                PersistConfig {
+                    lease_ms: 60_000,
+                    clock_skew_margin_ms: 500,
+                    holder: format!("recovery-{cycle}"),
+                    checkpoint_every_commits: 0,
+                    retention_ms: 60_000,
+                    snapshot_max_bytes: 1 << 30,
+                },
+                Arc::new(SystemClock),
+                root.clone(),
+                D1,
+            ));
+            let reg = EngineRegistry::new(root.clone()).with_persisters(pair(&root, p));
+            let e = reg.get(D1, DB).unwrap();
+            assert_eq!(e.lease_epoch(), m.epoch + 1, "cycle {cycle}");
+            assert_eq!(e.commit_lsn(), m.lsn, "cycle {cycle}");
+            // Every acked k is present; no un-acked one is.
+            let n_rows = read_i64(&e, "SELECT count(*) AS count FROM t");
+            assert_eq!(
+                n_rows,
+                m.lsn as i64 - 1,
+                "cycle {cycle}: lsn covers DDL+inserts; manifest.lsn={} rows={n_rows}",
+                m.lsn
+            );
+            // progress is appended only after the ack; SIGKILL may land in the
+            // gap between "after ack, before append" -> rows in
+            // {acked, acked+1}, and never < acked (a lost ack).
+            let acked_total = persisted + acked;
+            assert!(
+                n_rows as u64 >= acked_total,
+                "cycle {cycle}: acked={acked_total} rows={n_rows} -- all acked transactions must be present"
+            );
+            assert!(
+                n_rows as u64 <= acked_total + 1,
+                "cycle {cycle}: acked={acked_total} rows={n_rows} -- at most one ack/append gap off"
+            );
+            let max_k = read_i64(&e, "SELECT COALESCE(MAX(k),0) AS count FROM t");
+            assert_eq!(
+                max_k, n_rows,
+                "cycle {cycle}: persisted set must be a contiguous prefix"
+            );
+            n_rows as u64
+        };
+        assert!(rows >= first, "cycle {cycle}: the round must persist progress");
+        persisted = rows;
+    }
+    assert!(
+        killed >= 1,
+        "a kill -9 round must actually SIGKILL a live child"
+    );
+    assert!(persisted >= 1, "at least one acked txn must survive");
+}
+
 #[test]
-#[ignore = "slow: 100k-op kill -9 fuzz; run with --include-ignored"]
+fn kill9_recovers_acked_and_drops_unacked() {
+    // The regular gate: one kill, small default so the workspace suite stays fast.
+    kill9_fuzz(1_000, 1);
+}
+
+/// Repeated kill/recovery rounds. `#[ignore]`d: it costs minutes, so the CI
+/// job names it explicitly (`--ignored`) and the workspace suite does not.
+#[test]
+#[ignore = "slow: repeated kill -9 rounds; run with --ignored"]
+fn kill9_fuzz_repeated() {
+    kill9_fuzz(5_000, 5);
+}
+
+/// Manual soak: 1e5 durable transactions over 5 kill/recovery rounds
+/// (roughly 1-2 h with FsStore -- a release-branch soak, never a PR gate).
+#[test]
+#[ignore = "soak: 100k-op kill -9 fuzz; run with --ignored"]
 fn kill9_fuzz_100k() {
-    std::env::set_var("VRT_T36_N", "100000");
-    kill9_recovers_acked_and_drops_unacked();
+    kill9_fuzz(100_000, 5);
 }
 
 /// ---------- segment corruption / sha mismatch / seq gap -> restore fails closed ----------
