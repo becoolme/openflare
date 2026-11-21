@@ -12414,6 +12414,7 @@ sleep 10
             crons: vec![],
             queue_consumers: vec![],
             tail_consumers: vec![],
+            observability: None,
             durable_object_classes: if has_do {
                 vec![DoClassDesired {
                     class_name: "C".into(),

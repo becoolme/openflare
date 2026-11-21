@@ -78,6 +78,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "secrets",
     "secrets_store_secrets",
     "worker_loaders",
+    "observability",
     "unsafe",
 ];
 /// Mirrors @wdl-dev/cli TOP_LEVEL_ONLY_ENV_KEYS.
@@ -480,6 +481,24 @@ fn opt_u64(v: Option<&Value>, field: &str) -> Result<Option<u64>, ProjectConfigE
         Some(v) => match v.as_u64() {
             Some(n) => Ok(Some(n)),
             None => Err(invalid(field, "must be a non-negative integer")),
+        },
+    }
+}
+fn opt_bool(v: Option<&Value>, field: &str) -> Result<Option<bool>, ProjectConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| invalid(field, "must be a boolean")),
+    }
+}
+fn opt_rate(v: Option<&Value>, field: &str) -> Result<Option<f64>, ProjectConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_f64().filter(|f| f.is_finite()) {
+            Some(f) => Ok(Some(f)),
+            None => Err(invalid(field, "must be a finite number")),
         },
     }
 }
@@ -968,6 +987,96 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     );
                     bindings.push(Value::Object(b));
                 }
+            }
+            "observability" => {
+                // CF `[observability]` — Worker Logs gates + head
+                // sampling, enforced by the platform `vrt-tail`
+                // collector per worker. `enabled`/`logs.enabled`
+                // false => the cell renders NO collector (nothing is
+                // collected); `logs.head_sampling_rate` (or the
+                // deprecated top-level alias) keeps that fraction of
+                // INVOCATIONS whole — a dropped invocation keeps none
+                // of its records; `logs.invocation_logs` gates just
+                // the outcome record. `traces`/`persist`/`destinations`
+                // have no counterpart here and fail closed.
+                let t = value
+                    .as_object()
+                    .ok_or_else(|| invalid("observability", "must be a table"))?;
+                let mut enabled = None;
+                let mut rate_top = None;
+                let mut rate_logs = None;
+                let mut logs_enabled = None;
+                let mut invocation_logs = None;
+                for (k, v) in t {
+                    match k.as_str() {
+                        "enabled" => enabled = opt_bool(Some(v), "observability.enabled")?,
+                        "head_sampling_rate" => {
+                            rate_top = opt_rate(Some(v), "observability.head_sampling_rate")?
+                        }
+                        "logs" => {
+                            let lt = v
+                                .as_object()
+                                .ok_or_else(|| invalid("observability.logs", "must be a table"))?;
+                            for (lk, lv) in lt {
+                                match lk.as_str() {
+                                    "enabled" => {
+                                        logs_enabled =
+                                            opt_bool(Some(lv), "observability.logs.enabled")?
+                                    }
+                                    "head_sampling_rate" => {
+                                        rate_logs = opt_rate(
+                                            Some(lv),
+                                            "observability.logs.head_sampling_rate",
+                                        )?
+                                    }
+                                    "invocation_logs" => {
+                                        invocation_logs = opt_bool(
+                                            Some(lv),
+                                            "observability.logs.invocation_logs",
+                                        )?
+                                    }
+                                    _ => {
+                                        return Err(unsupported(
+                                            &format!("observability.logs.{lk}"),
+                                            None,
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                        _ => return Err(unsupported(&format!("observability.{k}"), None)),
+                    }
+                }
+                let rate = match (rate_logs, rate_top) {
+                    (Some(_), Some(_)) => {
+                        return Err(invalid(
+                            "observability.head_sampling_rate",
+                            "conflicts with observability.logs.head_sampling_rate",
+                        ))
+                    }
+                    (r, t) => r.or(t).unwrap_or(1.0),
+                };
+                if !(0.0..=1.0).contains(&rate) {
+                    return Err(invalid(
+                        "observability.head_sampling_rate",
+                        "must be in [0,1]",
+                    ));
+                }
+                // PPM integer — the signed wire's canonical JSON is
+                // safe-integer-only (deterministic across Rust/TS).
+                let ppm = (rate * 1_000_000.0).round() as u64;
+                let mut o = Map::new();
+                o.insert("enabled".into(), Value::from(enabled.unwrap_or(true)));
+                o.insert(
+                    "logsEnabled".into(),
+                    Value::from(logs_enabled.unwrap_or(true)),
+                );
+                o.insert(
+                    "invocationLogs".into(),
+                    Value::from(invocation_logs.unwrap_or(true)),
+                );
+                o.insert("headSamplingRatePpm".into(), Value::from(ppm));
+                out.insert("observability".into(), Value::Object(o));
             }
             "unsafe" => {
                 // CF `[unsafe]` — raw-binding escape hatch
@@ -1830,6 +1939,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("versionMetadata") {
         wire.insert("versionMetadata".into(), v.clone());
     }
+    if let Some(v) = obj.get("observability") {
+        wire.insert("observability".into(), v.clone());
+    }
 
     // W1-r1: STRUCTURAL anti-drop — every normalized top-level key
     // must reach the wire (or be an explicitly documented
@@ -1849,6 +1961,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "queueConsumers",
         "tailConsumers",
         "versionMetadata",
+        "observability",
         "durableObjectBindings",
         "durableObjectMigrations",
         "workflows",
@@ -2417,6 +2530,64 @@ mod tests {
         // `unsafe.bindings` not an array of tables.
         let dir = wrangler_loader_body("[unsafe]\nbindings=\"x\"\n");
         assert!(load_worker_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn observability_into_pack_shape() {
+        let dir = wrangler_loader_body(
+            "[observability]\nenabled=true\nhead_sampling_rate=0.3\n[observability.logs]\ninvocation_logs=false\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.expect("observability parsed");
+        assert!(obs.enabled);
+        assert!(obs.logs_enabled);
+        assert!(!obs.invocation_logs);
+        assert_eq!(obs.head_sampling_rate_ppm, 300_000);
+        // `logs.head_sampling_rate` is the modern slot; folded the same.
+        let dir =
+            wrangler_loader_body("[observability.logs]\nhead_sampling_rate=0.5\nenabled=false\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.unwrap();
+        assert_eq!(obs.head_sampling_rate_ppm, 500_000);
+        assert!(!obs.logs_enabled);
+    }
+
+    #[test]
+    fn observability_defaults_and_fail_closed() {
+        // An empty table folds to CF defaults: all gates on, rate 1.
+        let dir = wrangler_loader_body("[observability]\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.unwrap();
+        assert_eq!(obs.head_sampling_rate_ppm, 1_000_000);
+        assert!(obs.enabled && obs.logs_enabled && obs.invocation_logs);
+        // Deprecated alias AND `logs.head_sampling_rate` together is
+        // ambiguous — fail closed rather than guess precedence.
+        let dir = wrangler_loader_body(
+            "[observability]\nhead_sampling_rate=0.5\n[observability.logs]\nhead_sampling_rate=0.5\n",
+        );
+        assert!(load_worker_meta(dir.path()).is_err());
+        // Rate bounds.
+        for toml in [
+            "[observability.logs]\nhead_sampling_rate=1.5\n",
+            "[observability]\nhead_sampling_rate=-0.1\n",
+            "[observability]\nhead_sampling_rate=\"half\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+        // No counterpart in this pipeline — every one fails closed.
+        for toml in [
+            "[observability.traces]\nenabled=true\n",
+            "[observability.logs]\npersist=true\n",
+            "[observability.logs]\ndestinations=[\"x\"]\n",
+            "[observability]\ninvocation_logs=false\n",
+            "[observability]\nenabled=\"yes\"\n",
+            "observability=\"x\"\n",
+            "[observability]\nlogs=\"x\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
     }
 
     /// wrangler `[limits]` → internal `quotas` — the CF surface maps onto

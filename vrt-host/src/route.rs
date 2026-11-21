@@ -210,6 +210,7 @@ mod tests {
                     crons: vec![],
                     queue_consumers: vec![],
                     tail_consumers: vec![],
+                    observability: None,
                     durable_object_classes: vec![],
                     workflows: vec![],
                     quotas: snapshot_protocol::compute_desired::WorkerQuotas {

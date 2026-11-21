@@ -106,6 +106,12 @@ pub struct WorkerToml {
     /// time so rollback reports the reactivated version's own values.
     #[serde(default)]
     pub(crate) version_metadata: Option<VersionMetadataToml>,
+    /// `[observability]` — normalized `{enabled, logsEnabled,
+    /// invocationLogs, headSamplingRate}`; gates the platform
+    /// `vrt-tail` collector and head sampling at render time.
+    #[serde(default)]
+    pub(crate) observability:
+        Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
     /// P3c-1: `durableObjectBindings` -- DO namespace bindings
     /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
@@ -459,6 +465,9 @@ pub struct PackedWorker {
     /// `version_metadata` binding name — `to_desired` synthesizes the
     /// `json` binding with THIS version's id/timestamp.
     pub version_metadata_binding: Option<String>,
+    /// `[observability]` — version-scoped like `tail_consumers`:
+    /// rollback restores the earlier collection gates.
+    pub observability: Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
     /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
     /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
@@ -1330,6 +1339,7 @@ pub fn assemble(
         queue_consumers,
         tail_consumers,
         version_metadata_binding: meta.version_metadata.map(|v| v.binding),
+        observability: meta.observability,
         durable_object_classes,
         workflows,
         hostnames,

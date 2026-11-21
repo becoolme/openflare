@@ -46,6 +46,53 @@ fn assets_binding_props_carry_tenant_namespaced_key() {
     );
 }
 
+#[test]
+fn observability_gates_tail_collector() {
+    use snapshot_protocol::compute_desired::ObservabilityDesired;
+    let obs = |enabled, logs_enabled, rate_ppm, il| ObservabilityDesired {
+        enabled,
+        logs_enabled,
+        head_sampling_rate_ppm: rate_ppm,
+        invocation_logs: il,
+    };
+    let mut params = runtime_params();
+    params.log_tail.sink_addr = "127.0.0.1:9109".into();
+    params.log_tail.pepper = "log-pepper".into();
+    let bs = bundles();
+
+    // `enabled = false` / `logs.enabled = false` — no collector at all.
+    for o in [
+        obs(false, true, 1_000_000, true),
+        obs(true, false, 1_000_000, true),
+    ] {
+        let mut t = tenant();
+        t.workers[0].observability = Some(o.clone());
+        let out = render_tenant_config(&input(&t, &bs, &params)).unwrap().text;
+        assert!(
+            !out.contains("vrt-tail-w-alpha-1"),
+            "disabled observability must render no collector: {o:?}"
+        );
+    }
+
+    // Enabled with sampling: collector emits with the OBS settings.
+    let mut t = tenant();
+    t.workers[0].observability = Some(obs(true, true, 300_000, false));
+    let out = render_tenant_config(&input(&t, &bs, &params)).unwrap().text;
+    assert!(out.contains("vrt-tail-w-alpha-1"));
+    assert!(
+        out.contains("(name = \"OBS\""),
+        "OBS settings binding must render"
+    );
+    assert!(out.contains("headSamplingRate"));
+    assert!(out.contains("invocationLogs"));
+    // No `observability` — the collector renders byte-identical to
+    // legacy (no OBS binding).
+    let t = tenant();
+    let out = render_tenant_config(&input(&t, &bs, &params)).unwrap().text;
+    assert!(out.contains("vrt-tail-w-alpha-1"));
+    assert!(!out.contains("name = \"OBS\""));
+}
+
 fn with_auth_entrypoint(ep: &str) -> snapshot_protocol::compute_desired::TenantDesired {
     let mut tenant = tenant();
     let auth = tenant.workers[0]

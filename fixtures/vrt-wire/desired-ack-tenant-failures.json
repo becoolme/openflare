@@ -17,7 +17,8 @@
     "workflowsOps": true,
     "versionMetadata": true,
     "serviceBindingProps": true,
-    "unsafeEval": true
+    "unsafeEval": true,
+    "observability": true
   },
   "envelopeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "fenceRevision": 5,
