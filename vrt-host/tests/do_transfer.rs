@@ -912,23 +912,28 @@ async fn quarantine_respects_retention_window() {
     let qdir = tenant_dir.join("w1").join(format!("{key}.xfer-quarantine"));
     std::fs::create_dir_all(&qdir).unwrap();
     std::fs::write(qdir.join("payload.bin"), b"fenced-provenance").unwrap();
-    vrt_host::do_transfer::mark_quarantine(
-        &tenant_dir.join("w1"),
-        &format!("{key}.xfer-quarantine"),
-    );
-
     let (store, plc) = placement_pair("cell:test:holder-a");
     let mut deps = deps_with(store, plc, &fx.dir.path().join("snap-tmp"));
     // Tight retention for the test — still inside the [1h,30d] clamp
     // at config level; deps is the raw field so any ms value applies.
+    // 3 s, not sub-second: the mark→sweep gap includes spawn latency,
+    // which a loaded runner can stretch past a smaller window.
     Arc::get_mut(deps.do_snap.as_mut().unwrap())
         .unwrap()
-        .xfer_quarantine_ms = 700;
+        .xfer_quarantine_ms = 3_000;
     let mut spec = fx.stub_spec("t1", &["w1"], &[]);
     spec.do_storage = Some(do_spec(&tenant_dir, &[], &[]));
     let runtime = TenantRuntime::new("t1");
     let handle = vrt_host::supervisor::spawn_supervisor(runtime.clone(), spec, deps, test_params());
     wait_state(&runtime, TenantState::Ready, Duration::from_secs(8)).await;
+
+    // Mark AFTER Ready so the wall-clock window starts where the
+    // asserts measure it — a marker written before spawn ages through
+    // the whole bringup.
+    vrt_host::do_transfer::mark_quarantine(
+        &tenant_dir.join("w1"),
+        &format!("{key}.xfer-quarantine"),
+    );
 
     // Within retention the quarantine must survive the sweep.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -937,9 +942,16 @@ async fn quarantine_respects_retention_window() {
         "in-window quarantine kept"
     );
 
-    // Past the window the sweep may reclaim it.
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    assert!(!qdir.exists(), "expired quarantine reclaimed");
+    // Past the window the sweep must reclaim it — bounded poll, not a
+    // bare sleep, so a slow monitor tick can't fake the outcome.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while qdir.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expired quarantine never reclaimed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     handle.send(SupervisorCmd::Stop).await;
 }
 
@@ -1551,11 +1563,31 @@ async fn transient_restore_failure_recovers_at_later_epoch() {
         vrt_host::supervisor::spawn_supervisor(runtime_b.clone(), spec_b, deps_b, test_params());
 
     // Epoch-2 attempt: gate passes (Final@1 == writer_epoch 1) but the
-    // manifest GET fails → release → retry. Give it one full acquire/
-    // fail/release cycle before unblocking.
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // manifest GET fails → release → retry. Wait for one full acquire/
+    // fail/release cycle to land before unblocking — a fixed sleep is a
+    // race on a loaded runner: zero completed cycles lets the FIRST
+    // unblocked attempt claim epoch 2 and the `epoch >= 3` check below
+    // can never hold. The released record (empty holder, epoch advanced
+    // past the dead-marker) is the proof a cycle ran.
+    let cycle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Keep the snapshot the loop matched: re-reading after the wait can
+    // observe the NEXT attempt already holding the lease (restore-failure
+    // retries re-acquire after 5 s), which would fail the holder check
+    // even though the supervisor behaved correctly.
+    let rec_mid;
+    loop {
+        let rec = plc_a.record(&scope).unwrap();
+        if let Some(r) = rec.as_ref().filter(|r| r.epoch >= 2 && r.holder.is_empty()) {
+            rec_mid = r.clone();
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < cycle_deadline,
+            "blocked attempt never completed an acquire/release cycle: {rec:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_ne!(runtime_b.state(), TenantState::Ready);
-    let rec_mid = plc_a.record(&scope).unwrap().unwrap();
     assert!(
         rec_mid.epoch >= 2 && rec_mid.holder.is_empty() && rec_mid.writer_epoch == 1,
         "acquire-only epochs must NOT advance writer_epoch: {rec_mid:?}"
@@ -1713,7 +1745,24 @@ async fn sibling_fail_closed_recovers_transfer_class() {
     let runtime_b = TenantRuntime::new("t1");
     let handle_b =
         vrt_host::supervisor::spawn_supervisor(runtime_b.clone(), spec_b, deps_b, test_params());
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // Same cycle wait as above: a completed acquire/fail/release round
+    // is what bumps the victim lease past the dead-marker epoch — a bare
+    // sleep leaves it to scheduler luck on a loaded runner.
+    let cycle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rec = plc_a.record(&scope_b).unwrap();
+        if rec
+            .as_ref()
+            .is_some_and(|r| r.epoch >= 2 && r.holder.is_empty())
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < cycle_deadline,
+            "blocked sibling attempt never completed an acquire/release cycle: {rec:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert_ne!(runtime_b.state(), TenantState::Ready);
 
     // Sibling's outage clears → retry acquires both at later epochs;
