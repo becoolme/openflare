@@ -148,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // workerd ships `cloudflare-internal:k2` and the sysmanifest
         // requires `facade-k2`) -- unconditionally on.
         k2: true,
+        email: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

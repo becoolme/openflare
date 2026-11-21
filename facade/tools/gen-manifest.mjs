@@ -63,6 +63,7 @@ const WORKERS = [
   // K2 durable event log — inner `fetcher` of the k2 wrapped binding
   // (produce-only: POST /send → provider → vrt-sql K2Backend).
   { serviceName: "facade-k2", entrypoint: "K2Facade", entry: "facade-k2.ts", needsBindingBackend: true },
+  { serviceName: "facade-email", entrypoint: "EmailFacade", entry: "facade-email.ts", needsBindingBackend: true },
   // MIG-16: in-process Rate Limiting binding — pure RPC entrypoint, no
   // binding-backend (state is local to the workerd process).
   { serviceName: "facade-ratelimit", entrypoint: "RateLimiter", entry: "facade-ratelimit.ts", needsBindingBackend: false },

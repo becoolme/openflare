@@ -1,6 +1,6 @@
 {
  "version": 1,
- "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here — that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
+ "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here \u2014 that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
  "vectors": [
   {
    "name": "toml full mapping",
@@ -1708,6 +1708,80 @@
     "ok": false,
     "code": "VRT_CONFIG_INVALID",
     "field": "k2[0].stream"
+   }
+  },
+  {
+   "name": "send_email binding with restriction lists",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[send_email]]\nname = \"EMAIL\"\nallowed_sender_addresses = [\"a@x.com\", \"b@x.com\"]\nallowed_destination_addresses = [\"u@x.com\"]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "allowedDestinationAddresses": [
+        "u@x.com"
+       ],
+       "allowedSenderAddresses": [
+        "a@x.com",
+        "b@x.com"
+       ],
+       "name": "EMAIL",
+       "type": "send_email"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "send_email destination pin",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[send_email]]\nname = \"PIN\"\ndestination_address = \"t@x.com\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "destinationAddress": "t@x.com",
+       "name": "PIN",
+       "type": "send_email"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "send_email pin and allowlist rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[send_email]]\nname = \"E\"\ndestination_address = \"t@x.com\"\nallowed_destination_addresses = [\"a@x.com\"]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "send_email[0]"
+   }
+  },
+  {
+   "name": "send_email unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[send_email]]\nname = \"E\"\nextra = 1\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED",
+    "field": "send_email[0].extra"
    }
   }
  ]

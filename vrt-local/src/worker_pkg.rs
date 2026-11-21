@@ -165,6 +165,20 @@ pub(crate) struct DevToml {
     pub(crate) host: Option<String>,
 }
 
+/// CF `[[send_email]]` restriction set (send-bindings): the
+/// destination pin and the allowlists travel through signed desired
+/// state; the provider enforces them at send time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SendEmailToml {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) destination_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allowed_destination_addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) allowed_sender_addresses: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct BindingsToml {
@@ -187,6 +201,9 @@ pub(crate) struct BindingsToml {
     /// from `vrt-k2:{tenant}:{name}` — first 32 hex chars of sha256).
     #[serde(default)]
     pub(crate) k2: BTreeMap<String, String>,
+    /// `send_email` bindings: `name -> CF send-bindings restriction set`.
+    #[serde(default)]
+    pub(crate) send_email: BTreeMap<String, SendEmailToml>,
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
     /// `binding name -> vrt database tenant name`; credentials are resolved
@@ -1161,6 +1178,22 @@ pub fn assemble(
                 snapshot_protocol::compute_desired::K2Binding {
                     name: binding.clone(),
                     stream_id,
+                    permissions: read_write.clone(),
+                },
+            ));
+        }
+        for (binding, restriction) in &b.send_email {
+            // CF send binding — produce-only write grant; the
+            // restriction set is signed into desired state and
+            // enforced provider-side on every send.
+            bindings.push(BindingDesired::SendEmail(
+                snapshot_protocol::compute_desired::SendEmailBinding {
+                    name: binding.clone(),
+                    destination_address: restriction.destination_address.clone(),
+                    allowed_destination_addresses: restriction
+                        .allowed_destination_addresses
+                        .clone(),
+                    allowed_sender_addresses: restriction.allowed_sender_addresses.clone(),
                     permissions: read_write.clone(),
                 },
             ));
@@ -2183,6 +2216,9 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
         }
         for name in b.k2.keys() {
             bindings.push(format!("k2:{name}"));
+        }
+        for name in b.send_email.keys() {
+            bindings.push(format!("send_email:{name}"));
         }
         for name in b.pg.keys() {
             bindings.push(format!("pg:{name}"));
