@@ -1051,18 +1051,29 @@ pub fn assemble(
     // THIS tenant/project, and an unresolvable name fails closed
     // (never a dangling trace target). Both lists share one resolver
     // so the self-target, dedupe and cap invariants cannot drift.
-    let tail_consumers = resolve_tail_consumers(
-        &meta.tail_consumers,
-        &name,
-        "tail consumer",
-        resolve_worker,
-    )?;
+    let tail_consumers =
+        resolve_tail_consumers(&meta.tail_consumers, &name, "tail consumer", resolve_worker)?;
     let streaming_tail_consumers = resolve_tail_consumers(
         &meta.streaming_tail_consumers,
         &name,
         "streaming tail consumer",
         resolve_worker,
     )?;
+    // One consumer cannot appear on both channels: workerd would call
+    // its `tail()` AND `tailStream()` for the same event, doubling
+    // delivery with no way for the consumer to tell the copies apart.
+    // The signed-desired validator enforces the same rule on delivered
+    // snapshots; this is the fail-early config error.
+    if let Some(dup) = tail_consumers.iter().find(|c| {
+        streaming_tail_consumers
+            .iter()
+            .any(|s| s.worker_id == c.worker_id)
+    }) {
+        return Err(LocalError::WorkerOwned(format!(
+            "worker {} cannot be both a tail consumer and a streaming tail consumer",
+            dup.worker_id
+        )));
+    }
 
     // Deterministic worker-id material: hash the worker name so a
     // re-deployed directory keeps its identity without stored state.
@@ -1423,12 +1434,10 @@ fn resolve_tail_consumers(
         if !seen.insert(c.service.clone()) {
             continue;
         }
-        out.push(
-            snapshot_protocol::compute_desired::TailConsumerDesired {
-                worker_id: resolve_worker(&c.service)
-                    .ok_or_else(|| LocalError::WorkerOwned(format!("{what} target")))?,
-            },
-        );
+        out.push(snapshot_protocol::compute_desired::TailConsumerDesired {
+            worker_id: resolve_worker(&c.service)
+                .ok_or_else(|| LocalError::WorkerOwned(format!("{what} target")))?,
+        });
     }
     if out.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
         return Err(LocalError::WorkerOwned(format!(
@@ -1918,8 +1927,7 @@ mod assets_handling_tests {
         ] {
             let pending = scan_assets_dir(&root, &assets(Some(mode)))
                 .unwrap_or_else(|e| panic!("{mode}: {e:?}"));
-            let doc: serde_json::Value =
-                serde_json::from_slice(&pending.manifest_bytes).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&pending.manifest_bytes).unwrap();
             assert_eq!(doc["htmlHandling"], mode);
         }
         assert!(scan_assets_dir(&root, &assets(Some("force"))).is_err());
@@ -1994,10 +2002,7 @@ mod assets_handling_tests {
             "schemaVersion": 1,
         });
         let mut objects = BTreeMap::new();
-        objects.insert(
-            sha,
-            base64::engine::general_purpose::STANDARD.encode(&bad),
-        );
+        objects.insert(sha, base64::engine::general_purpose::STANDARD.encode(&bad));
         let upload = UploadAssets {
             manifest: base64::engine::general_purpose::STANDARD
                 .encode(serde_json::to_vec(&manifest).unwrap()),
@@ -2006,8 +2011,7 @@ mod assets_handling_tests {
         assert!(upload_assets_verified(&upload).is_err());
         // A legitimate deployment still verifies (digest-keyed objects).
         let pending_ok = upload_assets_verified(&UploadAssets {
-            manifest: base64::engine::general_purpose::STANDARD
-                .encode(&pending.manifest_bytes),
+            manifest: base64::engine::general_purpose::STANDARD.encode(&pending.manifest_bytes),
             objects: pending
                 .objects
                 .iter()
@@ -2076,5 +2080,49 @@ mod quotas_tests {
                 other => panic!("{toml_src}: expected Worker({field}), got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tail_consumer_tests {
+    use super::*;
+
+    fn list(names: &[&str]) -> Vec<TailConsumerToml> {
+        names
+            .iter()
+            .map(|s| TailConsumerToml {
+                service: (*s).to_string(),
+            })
+            .collect()
+    }
+
+    fn resolve(name: &str) -> Option<String> {
+        Some(format!("w-{name}"))
+    }
+
+    /// Both lists share this resolver: self-targets are refused (no
+    /// recursion bound), duplicates collapse, and the cap is enforced
+    /// on the RESOLVED list.
+    #[test]
+    fn shared_invariants_hold_for_both_lists() {
+        let got =
+            resolve_tail_consumers(&list(&["a", "a", "b"]), "producer", "tail", &resolve).unwrap();
+        assert_eq!(
+            got.iter().map(|c| c.worker_id.as_str()).collect::<Vec<_>>(),
+            vec!["w-a", "w-b"]
+        );
+
+        let err =
+            resolve_tail_consumers(&list(&["producer"]), "producer", "tail", &resolve).unwrap_err();
+        assert!(format!("{err:?}").contains("itself"), "{err:?}");
+
+        let many: Vec<TailConsumerToml> = (0..17)
+            .map(|i| TailConsumerToml {
+                service: format!("c{i}"),
+            })
+            .collect();
+        let err =
+            resolve_tail_consumers(&many, "producer", "streaming tail", &resolve).unwrap_err();
+        assert!(format!("{err:?}").contains("16"), "{err:?}");
     }
 }
