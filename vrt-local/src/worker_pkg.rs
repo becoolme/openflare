@@ -313,13 +313,35 @@ fn default_assets_binding() -> String {
     "ASSETS".into()
 }
 
+/// `[quotas]` — per-worker resource limits. Every field is optional and
+/// defaults to the platform default, so a partial declaration is
+/// normalized instead of rejected; `WorkerQuotas::platform_default()` is the single
+/// source of truth shared with `vrt-config` (a default that disagreed
+/// would silently become an enforced limit).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct QuotasToml {
+    #[serde(default = "default_cpu_ms")]
     pub(crate) cpu_ms: u32,
+    #[serde(default = "default_memory_mb")]
     pub(crate) memory_mb: u32,
+    #[serde(default = "default_subrequests")]
     pub(crate) subrequests: u32,
+    #[serde(default = "default_outbound_connections")]
     pub(crate) outbound_connections: u32,
+}
+
+fn default_cpu_ms() -> u32 {
+    WorkerQuotas::platform_default().cpu_ms
+}
+fn default_memory_mb() -> u32 {
+    WorkerQuotas::platform_default().memory_mb
+}
+fn default_subrequests() -> u32 {
+    WorkerQuotas::platform_default().subrequests
+}
+fn default_outbound_connections() -> u32 {
+    WorkerQuotas::platform_default().outbound_connections
 }
 
 /// P3c-1: DO packing context -- the deploy key (uniqueKey HMAC derivation) and
@@ -1202,23 +1224,45 @@ pub fn assemble(
         durable_object_classes,
         workflows,
         hostnames,
-        quotas: meta
-            .quotas
-            .map(|q| WorkerQuotas {
-                cpu_ms: q.cpu_ms,
-                memory_mb: q.memory_mb,
-                subrequests: q.subrequests,
-                outbound_connections: q.outbound_connections,
-            })
-            .unwrap_or(WorkerQuotas {
-                cpu_ms: 50,
-                memory_mb: 128,
-                subrequests: 50,
-                outbound_connections: 16,
-            }),
+        quotas: normalize_quotas(meta.quotas)?,
         first_deploy_id: id_material[..16].to_string(),
         pending_assets,
     })
+}
+
+/// Normalize `[quotas]`: absent → platform defaults (stock behaviour);
+/// present → every field is bounds-checked and the FIRST offender is
+/// named in a deploy-time error (`VRT_CONFIG_INVALID` on the wrangler
+/// path, `LocalError::Worker` here). `compute.desired::validate` runs the
+/// same bounds again before signing — defense in depth, but this layer
+/// owns the human-readable field name.
+fn normalize_quotas(quotas: Option<QuotasToml>) -> Result<WorkerQuotas, LocalError> {
+    use snapshot_protocol::compute_desired::{
+        MAX_CPU_MS, MAX_MEMORY_MB, MAX_OUTBOUND_CONNECTIONS, MAX_SUBREQUESTS, MIN_CPU_MS,
+        MIN_MEMORY_MB,
+    };
+    let Some(q) = quotas else {
+        return Ok(WorkerQuotas::platform_default());
+    };
+    let quotas = WorkerQuotas {
+        cpu_ms: q.cpu_ms,
+        memory_mb: q.memory_mb,
+        subrequests: q.subrequests,
+        outbound_connections: q.outbound_connections,
+    };
+    if !(MIN_CPU_MS..=MAX_CPU_MS).contains(&quotas.cpu_ms) {
+        return Err(LocalError::Worker("quotas.cpuMs"));
+    }
+    if !(MIN_MEMORY_MB..=MAX_MEMORY_MB).contains(&quotas.memory_mb) {
+        return Err(LocalError::Worker("quotas.memoryMb"));
+    }
+    if quotas.subrequests > MAX_SUBREQUESTS {
+        return Err(LocalError::Worker("quotas.subrequests"));
+    }
+    if quotas.outbound_connections > MAX_OUTBOUND_CONNECTIONS {
+        return Err(LocalError::Worker("quotas.outboundConnections"));
+    }
+    Ok(quotas)
 }
 
 fn type_for_extension(path: &Path) -> Option<&'static str> {
@@ -1835,5 +1879,60 @@ mod assets_handling_tests {
         });
         assert!(pending_ok.is_ok());
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod quotas_tests {
+    use super::*;
+
+    /// `[quotas]` is a partial override: an absent dimension takes the
+    /// platform default (one shared source of truth), so
+    /// `[quotas] cpuMs = 100` never forces the author to restate memory
+    /// or subrequests.
+    #[test]
+    fn partial_quotas_normalize_to_platform_defaults() {
+        let q: QuotasToml = toml::from_str("cpuMs = 100").unwrap();
+        assert_eq!(q.memory_mb, WorkerQuotas::platform_default().memory_mb);
+        assert_eq!(q.subrequests, WorkerQuotas::platform_default().subrequests);
+        let out = normalize_quotas(Some(q)).unwrap();
+        assert_eq!(out.cpu_ms, 100);
+        assert_eq!(
+            out,
+            WorkerQuotas {
+                cpu_ms: 100,
+                ..WorkerQuotas::platform_default()
+            }
+        );
+    }
+
+    /// Absent `[quotas]` = platform defaults (stock workerd behaviour),
+    /// not a zeroed limit.
+    #[test]
+    fn absent_quotas_are_platform_defaults() {
+        assert_eq!(
+            normalize_quotas(None).unwrap(),
+            WorkerQuotas::platform_default()
+        );
+    }
+
+    /// Out-of-bounds values name the offending field — a deploy-time
+    /// error instead of a generic protocol rejection.
+    #[test]
+    fn out_of_bounds_quotas_name_the_field() {
+        for (toml_src, field) in [
+            ("cpuMs = 0", "quotas.cpuMs"),
+            ("cpuMs = 300001", "quotas.cpuMs"),
+            ("memoryMb = 0", "quotas.memoryMb"),
+            ("memoryMb = 4097", "quotas.memoryMb"),
+            ("subrequests = 10001", "quotas.subrequests"),
+            ("outboundConnections = 1025", "quotas.outboundConnections"),
+        ] {
+            let q: QuotasToml = toml::from_str(toml_src).unwrap();
+            match normalize_quotas(Some(q)) {
+                Err(LocalError::Worker(field_name)) => assert_eq!(field_name, field, "{toml_src}"),
+                other => panic!("{toml_src}: expected Worker({field}), got {other:?}"),
+            }
+        }
     }
 }

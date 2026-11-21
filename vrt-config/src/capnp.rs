@@ -41,7 +41,7 @@ use crate::manifest::{valid_compat_date, valid_compat_flag, valid_module_name, M
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use snapshot_protocol::compute_desired::{
-    BindingDesired, RunWorkerFirst, TenantDesired, WorkerDesired, MAX_IDENTIFIER_LEN,
+    BindingDesired, RunWorkerFirst, TenantDesired, WorkerDesired, WorkerQuotas, MAX_IDENTIFIER_LEN,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -967,6 +967,64 @@ fn emit_worker_surface(
     Ok(())
 }
 
+/// Emit the workerd `limits` group (`Worker.limits` — a VRT fork
+/// extension) for a worker's declared quotas.
+///
+/// Semantics (see `doc/platform/workers-runtime-quotas.md`):
+/// - Only dimensions this generation can enforce are emitted:
+///   `cpuMs`, `memoryMb`, `subRequests`.
+/// - A dimension equal to the platform default is "not declared" and is
+///   omitted, so a worker without explicit limits renders byte-for-byte
+///   like stock workerd (no behaviour change on upgrade).
+/// - `0` is never emitted (workerd reads an absent dimension as
+///   unlimited; `subrequests = 0` is the protocol's "no budget").
+/// - `outboundConnections` has no workerd hook yet and is rejected by
+///   [`validate_tenant`] instead of being silently dropped.
+fn emit_worker_limits(out: &mut String, quotas: &WorkerQuotas) {
+    let mut dims: Vec<String> = Vec::new();
+    if quotas.cpu_ms > 0 && quotas.cpu_ms != snapshot_protocol::compute_desired::DEFAULT_CPU_MS {
+        dims.push(format!("cpuMs = {}", quotas.cpu_ms));
+    }
+    if quotas.memory_mb > 0
+        && quotas.memory_mb != snapshot_protocol::compute_desired::DEFAULT_MEMORY_MB
+    {
+        dims.push(format!("memoryMb = {}", quotas.memory_mb));
+    }
+    if quotas.subrequests > 0
+        && quotas.subrequests != snapshot_protocol::compute_desired::DEFAULT_SUBREQUESTS
+    {
+        dims.push(format!("subRequests = {}", quotas.subrequests));
+    }
+    if !dims.is_empty() {
+        out.push_str(&format!("      limits = ({}),\n", dims.join(", ")));
+    }
+}
+
+/// Fail closed when the target cell cannot enforce per-worker quotas.
+///
+/// A worker that declares an enforceable limit (`cpuMs`/`memoryMb`/
+/// `subRequests` away from the platform default) on a cell whose
+/// `quotas` capability is absent must not be served: rendering would
+/// either omit the declared limit silently or hand workerd a config it
+/// rejects. Callers (vrt-host assemble, vrt-local preflight) pass the
+/// cell capability bit; `vrt-config` itself cannot know it.
+pub fn ensure_quotas_enforceable(
+    tenant: &TenantDesired,
+    enforced: bool,
+) -> Result<(), ConfigError> {
+    if enforced {
+        return Ok(());
+    }
+    for worker in &tenant.workers {
+        if worker.quotas.declares_enforceable_limit() {
+            return Err(ConfigError::Quotas(
+                worker.quotas.declared_deviation().unwrap_or("quotas"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Emit the `sock-*` socket entries for one worker (main + optional
 /// qconsumer/wfops endpoints) — extracted so the dry-run surface can
 /// cover them too (capnp_text identifier failures).
@@ -1100,6 +1158,7 @@ fn emit_tenant_worker(
                 .join(", ")
         ));
     }
+    emit_worker_limits(out, &worker.quotas);
     // Modules: main module first (workerd treats modules[0] as the entry),
     // the rest sorted by name for deterministic output.
     let mut modules: Vec<&crate::manifest::Module> = bundle.manifest().modules.iter().collect();
@@ -2461,6 +2520,34 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
         }
         if !valid_identifier(&version.version_id, MAX_IDENTIFIER_LEN) {
             return Err(ConfigError::Identifier("versionId"));
+        }
+        // Per-worker quotas: bounds are re-checked at emit depth
+        // (compute.desired validation is the first gate) and
+        // `outboundConnections` is refused outright — the pinned workerd
+        // fork has no connection-counter hook, so a declared value would
+        // be silently ignored (fail closed, never a fake limit).
+        let quotas = &worker.quotas;
+        if !(snapshot_protocol::compute_desired::MIN_CPU_MS
+            ..=snapshot_protocol::compute_desired::MAX_CPU_MS)
+            .contains(&quotas.cpu_ms)
+        {
+            return Err(ConfigError::Quotas("cpuMs"));
+        }
+        if !(snapshot_protocol::compute_desired::MIN_MEMORY_MB
+            ..=snapshot_protocol::compute_desired::MAX_MEMORY_MB)
+            .contains(&quotas.memory_mb)
+        {
+            return Err(ConfigError::Quotas("memoryMb"));
+        }
+        if quotas.subrequests > snapshot_protocol::compute_desired::MAX_SUBREQUESTS {
+            return Err(ConfigError::Quotas("subrequests"));
+        }
+        if quotas.outbound_connections > snapshot_protocol::compute_desired::MAX_OUTBOUND_CONNECTIONS
+        {
+            return Err(ConfigError::Quotas("outboundConnections"));
+        }
+        if quotas.declares_unenforceable_limit() {
+            return Err(ConfigError::Quotas("outboundConnections"));
         }
         let mut names = HashSet::new();
         for binding in &worker.bindings {

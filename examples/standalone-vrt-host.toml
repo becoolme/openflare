@@ -37,6 +37,13 @@ facadeManifest = "__VRT_ROOT__/facade/manifest.json"
 bindingBackendSocket = "__VRT_BACKEND_SOCK__"
 systemCompatDate = "2024-09-25"
 systemCompatFlags = []
+# Per-worker quotas: render the workerd `limits` block (cpuMs /
+# memoryMb / subRequests) for quotas a worker declares. The image's
+# workerd comes from `deploy/docker/workerd.lock` (the VRT fork), which
+# carries the limits patch. A STOCK workerd must set this to false (and
+# then a tenant declaring a limit fails closed instead of running
+# unlimited). 0 / platform-default dimensions are never rendered.
+quotas = true
 secretsFile = "__VRT_ROOT__/secrets/secrets.json"         # maintained by vrt-local secret put (0600)
 varsFile = "__VRT_ROOT__/vars/vars.json"                  # maintained by vrt-local deploy (0600)
 # T17/F1: both files are re-read + permission-checked on every converge -- secret/var changes

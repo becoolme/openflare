@@ -180,6 +180,15 @@ pub struct WorkerStatus {
     pub versions: Vec<String>,
     /// Routed hostnames.
     pub hostnames: Vec<String>,
+    /// Declared per-worker quotas (platform defaults when the worker
+    /// never declared `limits`/`[quotas]`).
+    pub quotas: snapshot_protocol::compute_desired::WorkerQuotas,
+    /// True only when the host renders/enforces `limits` for this worker
+    /// (`render.quotas` on AND at least one enforceable dimension was
+    /// declared). A declared limit on a quota-incapable host fails the
+    /// deploy, so `false` here always means "nothing to enforce", never
+    /// "declared but silently ignored".
+    pub quotas_enforced: bool,
 }
 
 /// Report from `init`.
@@ -710,7 +719,7 @@ impl VrtLocal {
             tenant_id: st.tenant_id().to_string(),
             revision: st.revision,
             published_revision: published,
-            workers: st.worker_status(),
+            workers: st.worker_status(crate::preflight::host_quotas_enforced(&self.root)),
             secret_refs: secrets
                 .get(st.tenant_id())
                 .map(|m| m.keys().cloned().collect())

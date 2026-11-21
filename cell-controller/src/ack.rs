@@ -140,6 +140,16 @@ pub struct AckCapabilities {
     /// it. Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worker_loader: bool,
+    /// Per-worker quotas: this cell's vrt-host renders the workerd
+    /// `limits` block (`cpuMs`/`memoryMb`/`subRequests`) for declared
+    /// quotas, i.e. its workerd is the VRT fork with the limits patch.
+    /// The control plane rejects deploys that declare a non-default
+    /// quota (409 `VRT_CAPABILITY_UNSUPPORTED`) unless this is claimed.
+    /// Omitted while false so an older strict control plane keeps
+    /// accepting acks (rolling upgrade); the control plane must learn
+    /// the bit BEFORE any cell enables it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub quotas: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

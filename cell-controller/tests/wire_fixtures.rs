@@ -180,6 +180,7 @@ fn desired_ack_fixture() {
             r2: false,
             service_entrypoint: true,
             worker_loader: true,
+            quotas: true,
         }),
     };
     check(
@@ -291,9 +292,19 @@ fn kv_capability_wire_shape() {
     })
     .unwrap();
     assert_eq!(wl_on["workerLoader"], serde_json::json!(true));
+    // Per-worker quotas: same omit-while-false shape — a cell on a stock
+    // workerd must never make the control plane admit declared limits.
+    assert!(off.get("quotas").is_none());
+    let q_on = serde_json::to_value(AckCapabilities {
+        quotas: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(q_on["quotas"], serde_json::json!(true));
     let back: AckCapabilities =
         serde_json::from_value(serde_json::json!({"cron": true, "assets": true})).unwrap();
     assert!(!back.kv);
     assert!(!back.service_entrypoint);
     assert!(!back.worker_loader);
+    assert!(!back.quotas);
 }

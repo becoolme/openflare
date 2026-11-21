@@ -35,6 +35,11 @@ facadeManifest = "__VRT_ROOT__/facade/manifest.json"
 bindingBackendDir = "__VRT_ROOT__/provider/listeners"
 systemCompatDate = "2024-09-25"
 systemCompatFlags = []
+# Per-worker quotas: render the workerd `limits` block for declared
+# quotas. Default true (the pinned workerd carries the patch); set false
+# only for a stock `workerdBinary` — a tenant declaring a limit then
+# fails closed at assemble instead of running unlimited.
+# quotas = true
 secretsFile = "__VRT_ROOT__/secrets/render-secrets.json"  # 0600, {tenantId:{ref:value}}
 extraArgs = []
 

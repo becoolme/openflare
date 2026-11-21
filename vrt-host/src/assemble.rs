@@ -141,6 +141,12 @@ pub struct Assembler {
     /// the verbatim `params.binding_backend_socket` (standalone
     /// single-tenant contract only).
     binding_backend_dir: Option<PathBuf>,
+    /// Per-worker quotas capability (`render.quotas`): when false, a
+    /// worker declaring an enforceable limit fails the assemble
+    /// (`CONFIG_QUOTA_UNSUPPORTED`) — the old generation keeps serving,
+    /// never a silently unlimited new one. Defaults ON (the pinned
+    /// workerd carries the limits patch); see [`Self::with_quotas`].
+    quotas: bool,
 }
 
 /// T13/M2: deterministic per-tenant uid/gid assignment from a
@@ -231,6 +237,7 @@ impl Assembler {
             log_hub: None,
             cache_root: None,
             binding_backend_dir: None,
+            quotas: true,
         }
     }
 
@@ -271,6 +278,14 @@ impl Assembler {
 
     pub fn with_wf_delete_addr(mut self, addr: impl Into<String>) -> Self {
         self.wf_delete_addr = Some(addr.into());
+        self
+    }
+
+    /// Per-worker quotas capability (`render.quotas`): only a host whose
+    /// `workerdBinary` carries the VRT limits patch may keep it on
+    /// (default). See the field doc.
+    pub fn with_quotas(mut self, enabled: bool) -> Self {
+        self.quotas = enabled;
         self
     }
 
@@ -483,6 +498,11 @@ impl Assembler {
         generation: u64,
         gen_dir: &std::path::Path,
     ) -> Result<TenantLaunchSpec, AssembleError> {
+        // Per-worker quotas: a cell whose workerd has no `limits`
+        // enforcement must never host a tenant that declared one. The
+        // check runs before any generation bytes are written, so the
+        // previous generation keeps serving (fail closed).
+        vrt_config::ensure_quotas_enforceable(tenant, self.quotas)?;
         // T21: ASSETS bindings must be materialized BEFORE launch —
         // manifest + every object verified into the provider-shared
         // store. Any gap (missing bytes, digest mismatch, poisoned

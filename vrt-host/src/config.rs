@@ -805,6 +805,17 @@ pub struct RenderConfig {
     /// absent → the restrictive default policy.
     #[serde(default)]
     pub egress_policy_file: Option<PathBuf>,
+    /// Per-worker quotas: render the workerd `limits` block for quotas a
+    /// worker declares (capnp mode only). The pinned workerd
+    /// (`deploy/docker/workerd.lock`) carries the VRT limits patch, so
+    /// this defaults ON like the other pin-derived capabilities. Set it
+    /// to `false` only when `workerdBinary` is a STOCK workerd: a tenant
+    /// declaring a limit then fails closed at assemble
+    /// (`CONFIG_QUOTA_UNSUPPORTED`) instead of running unlimited. (With
+    /// the flag on and a stock binary, the config dry-run rejects the
+    /// generation loudly — workerd does not understand `limits`.)
+    #[serde(default = "default_true")]
+    pub quotas: bool,
 }
 
 /// Supervisor tunables — milliseconds unless stated.

@@ -337,15 +337,27 @@ impl LocalState {
 })
     }
 
-    pub fn worker_status(&self) -> Vec<WorkerStatus> {
+    pub fn worker_status(&self, quotas_enforced: bool) -> Vec<WorkerStatus> {
         self.workers
             .iter()
-            .map(|(name, w)| WorkerStatus {
-                name: name.clone(),
-                worker_id: w.worker_id.clone(),
-                active_version_id: w.active_version_id.clone(),
-                versions: w.versions.iter().map(|v| v.version_id.clone()).collect(),
-                hostnames: w.hostnames.clone(),
+            .map(|(name, w)| {
+                let quotas = w
+                    .active_version_id
+                    .as_ref()
+                    .and_then(|id| w.versions.iter().find(|v| &v.version_id == id))
+                    .map(|v| v.quotas.clone())
+                    .unwrap_or_else(WorkerQuotas::platform_default);
+                WorkerStatus {
+                    name: name.clone(),
+                    worker_id: w.worker_id.clone(),
+                    active_version_id: w.active_version_id.clone(),
+                    versions: w.versions.iter().map(|v| v.version_id.clone()).collect(),
+                    hostnames: w.hostnames.clone(),
+                    // Enforced only when the cell can render limits AND
+                    // this worker actually declared an enforceable one.
+                    quotas_enforced: quotas_enforced && quotas.declares_enforceable_limit(),
+                    quotas,
+                }
             })
             .collect()
     }

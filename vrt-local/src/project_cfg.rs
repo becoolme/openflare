@@ -562,6 +562,9 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     .collect();
                 out.insert("compatibilityFlags".into(), Value::Array(flags?));
             }
+            "limits" => {
+                out.insert("quotas".into(), normalize_limits(value)?);
+            }
             "vars" => {
                 let vars = value
                     .as_object()
@@ -1380,6 +1383,64 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
     Ok(Value::Object(out))
 }
 
+/// Normalize wrangler `[limits]` into the internal `quotas` doc.
+///
+/// Cloudflare's `Limits` type exposes `cpu_ms` and `subrequests`; both
+/// map onto the signed snapshot's `WorkerQuotas`. Unspecified dimensions
+/// keep the platform default (never rendered as a `limits` entry), so a
+/// worker that only declares `cpu_ms` behaves exactly like today for
+/// memory/subrequests. Unknown keys and out-of-bounds values are
+/// rejected with the failing path — never silently clamped.
+fn normalize_limits(value: &Value) -> Result<Value, ProjectConfigError> {
+    use snapshot_protocol::compute_desired::{
+        DEFAULT_CPU_MS, DEFAULT_MEMORY_MB, DEFAULT_OUTBOUND_CONNECTIONS, DEFAULT_SUBREQUESTS,
+        MAX_CPU_MS, MAX_SUBREQUESTS, MIN_CPU_MS,
+    };
+    let table = value
+        .as_object()
+        .ok_or_else(|| invalid("limits", "must be a table"))?;
+    let mut cpu_ms = DEFAULT_CPU_MS;
+    let mut subrequests = DEFAULT_SUBREQUESTS;
+    for (k, v) in table {
+        match k.as_str() {
+            "cpu_ms" => {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| invalid("limits.cpu_ms", "must be an integer"))?;
+                if !(u64::from(MIN_CPU_MS)..=u64::from(MAX_CPU_MS)).contains(&n) {
+                    return Err(invalid(
+                        "limits.cpu_ms",
+                        &format!("must be within {MIN_CPU_MS}..={MAX_CPU_MS} milliseconds"),
+                    ));
+                }
+                cpu_ms = n as u32;
+            }
+            "subrequests" => {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| invalid("limits.subrequests", "must be an integer"))?;
+                // The platform cap is far below Cloudflare's paid
+                // 10M: vrt rejects what it cannot account for instead
+                // of accepting a limit it will never reach.
+                if n > u64::from(MAX_SUBREQUESTS) {
+                    return Err(invalid(
+                        "limits.subrequests",
+                        &format!("must be <= {MAX_SUBREQUESTS} on the VRT runtime"),
+                    ));
+                }
+                subrequests = n as u32;
+            }
+            other => return Err(unsupported(&format!("limits.{other}"), None)),
+        }
+    }
+    Ok(serde_json::json!({
+        "cpuMs": cpu_ms,
+        "memoryMb": DEFAULT_MEMORY_MB,
+        "subrequests": subrequests,
+        "outboundConnections": DEFAULT_OUTBOUND_CONNECTIONS,
+    }))
+}
+
 /// T31c: normalize `run_worker_first` — Wrangler semantics:
 /// boolean, or a list of `/`-prefixed globs with `!`-prefixed
 /// asset-first exclusions. Bounds and rule syntax mirror
@@ -1495,6 +1556,12 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("compatibilityFlags") {
         wire.insert("compatibilityFlags".into(), v.clone());
     }
+    // Per-worker quotas: the wrangler `[limits]` block was normalized
+    // into the internal `quotas` shape (all four dimensions, defaults
+    // filled) — project it verbatim into the pack-time document.
+    if let Some(v) = obj.get("quotas") {
+        wire.insert("quotas".into(), v.clone());
+    }
     if let Some(Value::Object(vars)) = obj.get("vars") {
         let mut out_vars = Map::new();
         for (k, v) in vars {
@@ -1596,6 +1663,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "durableObjectBindings",
         "durableObjectMigrations",
         "workflows",
+        "quotas",
         "bindings",
     ];
     // Normalized-internal keys that legitimately do not carry to the
@@ -2051,6 +2119,71 @@ mod tests {
         // Not an array of tables.
         let dir = wrangler_loader_body("worker_loaders=\"L\"\n");
         assert!(load_worker_meta(dir.path()).is_err());
+    }
+
+    /// wrangler `[limits]` → internal `quotas` — the CF surface maps onto
+    /// the signed snapshot's `WorkerQuotas`; unspecified dimensions keep the
+    /// platform default (never rendered as a workerd `limits` entry) and
+    /// out-of-bounds / unknown keys are refused with the exact path.
+    #[test]
+    fn wrangler_limits_normalize_into_quotas() {
+        let one =
+            normalize_limits(&serde_json::json!({"cpu_ms": 300})).expect("partial limits accepted");
+        assert_eq!(one["cpuMs"], 300);
+        assert_eq!(
+            one["memoryMb"],
+            snapshot_protocol::compute_desired::DEFAULT_MEMORY_MB
+        );
+        assert_eq!(
+            one["subrequests"],
+            snapshot_protocol::compute_desired::DEFAULT_SUBREQUESTS
+        );
+        assert_eq!(
+            one["outboundConnections"],
+            snapshot_protocol::compute_desired::DEFAULT_OUTBOUND_CONNECTIONS
+        );
+
+        let both =
+            normalize_limits(&serde_json::json!({"cpu_ms": 100, "subrequests": 150})).unwrap();
+        assert_eq!(both["cpuMs"], 100);
+        assert_eq!(both["subrequests"], 150);
+
+        // Bounds: below the isolate minimum, above the 5-minute CPU cap, and
+        // above the platform subrequest cap.
+        for (input, path) in [
+            (serde_json::json!({"cpu_ms": 0}), "limits.cpu_ms"),
+            (serde_json::json!({"cpu_ms": 300_001}), "limits.cpu_ms"),
+            (serde_json::json!({"cpu_ms": "100"}), "limits.cpu_ms"),
+            (
+                serde_json::json!({"subrequests": 10_001}),
+                "limits.subrequests",
+            ),
+            (serde_json::json!({"subrequests": -1}), "limits.subrequests"),
+        ] {
+            let err = normalize_limits(&input).expect_err("out of bounds must fail");
+            assert_eq!(err.code, "VRT_CONFIG_INVALID", "{input}: {err:?}");
+            assert_eq!(err.field.as_deref(), Some(path), "{input}: {err:?}");
+        }
+        // Unknown keys fail closed (CF `limits` has only cpu_ms/subrequests).
+        let err = normalize_limits(&serde_json::json!({"memory_mb": 256}))
+            .expect_err("unknown key must fail");
+        assert_eq!(err.code, "VRT_CONFIG_UNSUPPORTED_FIELD");
+        assert_eq!(err.field.as_deref(), Some("limits.memory_mb"));
+    }
+
+    /// The normalized `limits` block must survive the anti-drop projection
+    /// (`CARRIED`) and deserialize into the pack-time `[quotas]` shape.
+    #[test]
+    fn wrangler_limits_reach_the_pack_shape() {
+        let dir = wrangler_loader_body("[limits]\ncpu_ms = 250\nsubrequests = 120\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let quotas = meta.quotas.expect("quotas projected from limits");
+        assert_eq!(quotas.cpu_ms, 250);
+        assert_eq!(quotas.subrequests, 120);
+        assert_eq!(
+            quotas.memory_mb,
+            snapshot_protocol::compute_desired::DEFAULT_MEMORY_MB
+        );
     }
 }
 

@@ -219,6 +219,8 @@ summary in [`docs/compatibility.md`](docs/compatibility.md). Platform error
 codes returned by the ingress are listed in
 [`docs/log-codes.md`](docs/log-codes.md). WebSocket upgrade passthrough is
 described in [`docs/ingress-websocket.md`](docs/ingress-websocket.md).
+Per-worker CPU/memory/subrequest quotas (`limits`) and their cell capability
+bit are described in [`docs/quotas.md`](docs/quotas.md).
 
 ## License
 

@@ -65,7 +65,7 @@ fn worker_with_digest(worker_id: &str, digest: &str) -> serde_json::Value {
             "compatibilityFlags": []
         },
         "bindings": [], "crons": [], "routes": [],
-        "quotas": {"cpuMs": 10, "memoryMb": 32, "outboundConnections": 4, "subrequests": 10}
+        "quotas": {"cpuMs": 50, "memoryMb": 128, "outboundConnections": 16, "subrequests": 50}
     })
 }
 fn publish(cell: &str, revision: u64, workers: &[serde_json::Value]) -> SignedSnapshot {
@@ -232,6 +232,7 @@ async fn rig_with_opts(
         d1sql: None,
         queue_dispatch: None,
         storage_purge: None,
+        quotas: true,
     };
     let channel: Arc<dyn PodChannel> = cell_controller::prod::pod_channel(&config).unwrap();
     let snap = publish("cell-1", 1, workers);
@@ -498,6 +499,7 @@ async fn probe_failure_never_acks_applied() {
         d1sql: None,
         queue_dispatch: None,
         storage_purge: None,
+        quotas: true,
     };
     let channel = cell_controller::prod::pod_channel(&config).unwrap();
     let snap = publish("cell-1", 1, &[worker("w1")]);

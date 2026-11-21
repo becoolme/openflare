@@ -6,6 +6,12 @@ token_file = "__VRT_ROOT__/secrets/cell-token"       # 0600, scoped ingest token
 health_listen = "0.0.0.0:9090"
 poll_interval_secs = 10
 fence_file = "__VRT_ROOT__/state/fence.json"          # persisted revision fence (required)
+# Per-worker quotas: the ACK capability bit. Enable ONLY after the control
+# plane's ACK schema knows `quotas` (the key is omitted from the wire while
+# false). Then: quotas = true. Deploys declaring a non-default quota are 409
+# until then (the host renders `limits` by default with the pinned workerd).
+# quotas = true
+
 # egress_required = true is the default and must stay true in production: tenants are not delivered until the
 # NetworkPolicy apply + read-back is confirmed. Only set it to false explicitly for local development (it emits a
 # structured warn and healthz always reports egressPolicyDisabled; see workers-runtime-cell-controller.md).

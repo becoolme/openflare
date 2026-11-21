@@ -60,7 +60,7 @@ fn desired() -> snapshot_protocol::compute_desired::ComputeDesired {
                 },
                 "bindings": [],
                 "crons": [],
-                "quotas": {"cpuMs": 10, "memoryMb": 32, "outboundConnections": 4, "subrequests": 10},
+                "quotas": {"cpuMs": 50, "memoryMb": 128, "outboundConnections": 16, "subrequests": 50},
                 "routes": [],
                 "workflows": [{
                     "name": "order-pipe",

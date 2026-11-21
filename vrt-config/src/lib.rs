@@ -35,10 +35,11 @@ pub mod workflows;
 
 pub use bundle::{ModuleDigest, VersionBundle, BUNDLE_KEY_PREFIX, SCHEMA_VERSION};
 pub use capnp::{
-    render_tenant_config, resolve_secret, resolve_tenant_env, resolve_var, secret_env_name,
-    EmbedKind, EmbedRef, ExternalAddr, FacadeRefs, RenderedConfig, RuntimeParams, SecretValue,
-    ServiceEndpoint, SystemModuleRef, SystemWorkerRef, TenantRenderInput, BINDING_BACKEND_SERVICE,
-    BUNDLE_DIR_PREFIX, CACHE_SERVICE, MAX_VALUE_LEN, OUTBOUND_NETWORK_SERVICE, SYS_DIR_PREFIX,
+    ensure_quotas_enforceable, render_tenant_config, resolve_secret, resolve_tenant_env,
+    resolve_var, secret_env_name, EmbedKind, EmbedRef, ExternalAddr, FacadeRefs, RenderedConfig,
+    RuntimeParams, SecretValue, ServiceEndpoint, SystemModuleRef, SystemWorkerRef,
+    TenantRenderInput, BINDING_BACKEND_SERVICE, BUNDLE_DIR_PREFIX, CACHE_SERVICE, MAX_VALUE_LEN,
+    OUTBOUND_NETWORK_SERVICE, SYS_DIR_PREFIX,
 };
 pub use compat_flags::{is_experimental_compat_flag, is_tenant_allowed_compat_flag};
 pub use logs::{log_token, tail_service_name, LogTailParams, LOGSINK_SERVICE};
