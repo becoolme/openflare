@@ -126,6 +126,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // ships in this release -- unconditionally on (same reasoning
         // as `worker_loader`).
         analytics_engine: true,
+        // `tailConsumers` render ships with this generation --
+        // unconditionally on (same reasoning).
+        tail_consumers: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

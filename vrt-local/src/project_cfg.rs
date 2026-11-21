@@ -869,6 +869,35 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     bindings.push(Value::Object(b));
                 }
             }
+            "tail_consumers" => {
+                // CF `tail_consumers = [{service = "..."}]` — worker-
+                // level (not a binding): the consumer is another worker
+                // of the SAME tenant, referenced by name here and
+                // resolved to a workerId at deploy (same rule as
+                // `services[].service`). `{service}` is the only key
+                // CF's wrangler schema accepts — `environment`/
+                // `namespace`/`remote` have no counterpart here and
+                // fail closed.
+                let mut consumers: Vec<Value> = Vec::new();
+                for (i, e) in table_list(value, "tail_consumers")?.iter().enumerate() {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "service" => {}
+                            _ => {
+                                return Err(unsupported(&format!("tail_consumers[{i}].{k}"), None))
+                            }
+                        }
+                    }
+                    let service = req_str(
+                        e.get("service").unwrap_or(&Value::Null),
+                        &format!("tail_consumers[{i}].service"),
+                    )?;
+                    let mut c = Map::new();
+                    c.insert("service".into(), Value::from(service));
+                    consumers.push(Value::Object(c));
+                }
+                out.insert("tailConsumers".into(), Value::Array(consumers));
+            }
             "worker_loaders" => {
                 // Dynamic Workers (CF `[[worker_loaders]]`): a loader
                 // carries only a binding name — the tenant supplies code
@@ -1683,6 +1712,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("queueConsumers") {
         wire.insert("queueConsumers".into(), v.clone());
     }
+    if let Some(v) = obj.get("tailConsumers") {
+        wire.insert("tailConsumers".into(), v.clone());
+    }
     if let Some(v) = obj.get("durableObjectBindings") {
         wire.insert("durableObjectBindings".into(), v.clone());
     }
@@ -1709,6 +1741,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "routeHostnames",
         "crons",
         "queueConsumers",
+        "tailConsumers",
         "durableObjectBindings",
         "durableObjectMigrations",
         "workflows",

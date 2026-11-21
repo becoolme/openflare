@@ -10,6 +10,7 @@
     "quotas": true,
     "serviceEntrypoint": true,
     "storagePurge": true,
+    "tailConsumers": true,
     "workerLoader": true,
     "workflows": true,
     "workflowsCrossWorker": true,

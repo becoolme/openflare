@@ -87,6 +87,12 @@ pub struct WorkerToml {
     /// is a display name, queueId is derived at pack time as `vrt-q:{tenant}:{name}`).
     #[serde(default)]
     pub(crate) queue_consumers: Vec<QueueConsumerToml>,
+    /// `tailConsumers` -- workers whose `tail(events)` handler receives
+    /// this worker's trace events. Named like wrangler
+    /// `tail_consumers[].service`; resolved to a workerId at pack time
+    /// (same rule as `[bindings.service]`).
+    #[serde(default)]
+    pub(crate) tail_consumers: Vec<TailConsumerToml>,
     /// P3c-1: `durableObjectBindings` -- DO namespace bindings
     /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
@@ -179,6 +185,15 @@ impl ServiceTargetToml {
             Self::Named(n) => Some(&n.entrypoint),
         }
     }
+}
+
+/// `tailConsumers[]` entry — `{service}` names the consumer worker;
+/// resolved to a workerId at pack time (CF wrangler accepts `service`
+/// as the only key).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TailConsumerToml {
+    pub(crate) service: String,
 }
 
 /// T37b `[[queueConsumers]]`: fields aligned with wrangler `queues.consumers[]`
@@ -397,6 +412,8 @@ pub struct PackedWorker {
     pub crons: Vec<CronDesired>,
     /// T37b: desired queue consumers (queueId already resolved).
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
+    /// Desired tail consumers (consumer workerIds already resolved).
+    pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
     /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
@@ -989,6 +1006,17 @@ pub fn assemble(
         });
     }
 
+    // `tailConsumers` — same name→id rule as `[bindings.service]`:
+    // the consumer is a sibling worker of THIS tenant/project, and an
+    // unresolvable name fails closed (never a dangling trace target).
+    let mut tail_consumers = Vec::with_capacity(meta.tail_consumers.len());
+    for c in &meta.tail_consumers {
+        tail_consumers.push(snapshot_protocol::compute_desired::TailConsumerDesired {
+            worker_id: resolve_worker(&c.service)
+                .ok_or(LocalError::Worker("tail consumer target"))?,
+        });
+    }
+
     // Deterministic worker-id material: hash the worker name so a
     // re-deployed directory keeps its identity without stored state.
     // (DO uniqueKey derivation needs it too -- hoisted before assets.)
@@ -1223,6 +1251,7 @@ pub fn assemble(
         var_values,
         crons: meta.crons,
         queue_consumers,
+        tail_consumers,
         durable_object_classes,
         workflows,
         hostnames,

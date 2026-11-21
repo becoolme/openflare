@@ -232,6 +232,26 @@ pub struct WorkerDesired {
 
     /// Per-isolate/per-request resource limits enforced by the runtime.
     pub quotas: WorkerQuotas,
+
+    /// Tail Workers (`tail_consumers`) — same-tenant workers whose
+    /// `tail(events)` handler receives this worker's trace events.
+    /// workerIds are resolved server-side at deploy like service
+    /// bindings; skipped when empty so snapshots without consumers
+    /// stay byte-identical (old cells reject the field via
+    /// `deny_unknown_fields` — fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail_consumers: Vec<TailConsumerDesired>,
+}
+
+/// One `tail_consumers[]` entry — the CONSUMER of this worker's tail
+/// events. Points at a worker of the same tenant by `workerId`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TailConsumerDesired {
+    /// Consumer worker identifier; must resolve to a worker in the
+    /// SAME tenant's `workers` list — cross-tenant consumers fail
+    /// closed (a worker's traces never leave its tenant).
+    pub worker_id: String,
 }
 
 /// An immutable, content-addressed worker version.
@@ -899,6 +919,12 @@ pub enum DesiredError {
     #[error("workflow script_name target is not in the same tenant")]
     WorkflowTarget,
 
+    /// A `tailConsumers[]` entry targets a worker outside this tenant
+    /// — tail events carry request internals and must never cross the
+    /// tenant boundary (fail closed). Same rule as `ServiceTarget`.
+    #[error("tail consumer target is not in the same tenant")]
+    TailTarget,
+
     /// A cron expression is not a valid 5-field schedule.
     #[error("invalid cron expression")]
     CronExpression,
@@ -943,6 +969,7 @@ impl DesiredError {
             Self::ServiceCycle => "DESIRED_SERVICE_CYCLE",
             Self::DoClass => "DESIRED_DO_CLASS_UNDECLARED",
             Self::WorkflowTarget => "DESIRED_WORKFLOW_TARGET_SCOPE",
+            Self::TailTarget => "DESIRED_TAIL_TARGET_SCOPE",
         }
     }
 }
@@ -1078,6 +1105,18 @@ impl ComputeDesired {
 
             // Service bindings may only target workers of the same tenant.
             for worker in &tenant.workers {
+                // Tail consumers: same-tenant rule — trace events carry
+                // request internals (headers, bodies, outcomes) and must
+                // never reach a foreign tenant's worker. Tail edges are
+                // observability-only: they do NOT join the service-call
+                // cycle check below (a consumer never invokes back).
+                for consumer in &worker.tail_consumers {
+                    if !valid_identifier(&consumer.worker_id, MAX_IDENTIFIER_LEN)
+                        || !tenant_worker_ids.contains(&consumer.worker_id)
+                    {
+                        return Err(DesiredError::TailTarget);
+                    }
+                }
                 for binding in &worker.bindings {
                     if let BindingDesired::Service(service) = binding {
                         if !valid_identifier(&service.worker_id, MAX_IDENTIFIER_LEN)
@@ -2181,6 +2220,46 @@ mod tests {
                         json!("E".repeat(MAX_BINDING_NAME_LEN + 1))
                 }),
                 "DESIRED_INVALID_IDENTIFIER",
+            ),
+            // Tail Workers — same-tenant rule mirrors the service-target
+            // rule (trace events carry request internals; never cross a
+            // tenant boundary). Self-tail is legal.
+            (
+                "tail-ok-same-tenant",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}, {"workerId": "w-alpha-1"}])
+                }),
+                "",
+            ),
+            (
+                "tail-cross-tenant",
+                Box::new(|v| {
+                    let av = v["tenants"][0]["workers"][0]["activeVersion"].clone();
+                    let q = v["tenants"][0]["workers"][0]["quotas"].clone();
+                    v["tenants"].as_array_mut().unwrap().push(json!({
+                        "tenantId": "team-beta",
+                        "workers": [{
+                            "workerId": "w-beta-1",
+                            "name": "beta",
+                            "activeVersion": av,
+                            "bindings": [],
+                            "routes": [],
+                            "crons": [],
+                            "quotas": q
+                        }]
+                    }));
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-beta-1"}]);
+                }),
+                "DESIRED_TAIL_TARGET_SCOPE",
+            ),
+            (
+                "tail-missing-target",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] = json!([{"workerId": "w-nope"}])
+                }),
+                "DESIRED_TAIL_TARGET_SCOPE",
             ),
             (
                 "bad-assets-digest",

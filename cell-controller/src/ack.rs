@@ -158,6 +158,13 @@ pub struct AckCapabilities {
     /// claim it. Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub analytics_engine: bool,
+    /// `tailConsumers` renders to workerd `tails` designators — a
+    /// pre-tail cell rejects the `tailConsumers` wire field via
+    /// `deny_unknown_fields`, so the control plane only admits
+    /// consumer declarations onto cells that claim it. Omitted while
+    /// false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tail_consumers: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

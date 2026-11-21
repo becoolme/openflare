@@ -30,7 +30,8 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | Static assets | Partial | [bindings/static-assets.md](bindings/static-assets.md) |
 | WebSockets | Partial | [bindings/websockets.md](bindings/websockets.md), [ingress-websocket.md](ingress-websocket.md) |
 | Vars / secrets | Partial | [bindings/vars-and-secrets.md](bindings/vars-and-secrets.md) |
-| Workers AI, Vectorize, AI Search, Tail Workers, Analytics Engine, Pipelines, e-mail, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
+| Tail Workers (`tail_consumers`) | Partial | [wrangler-config.md](wrangler-config.md) |
+| Workers AI, Vectorize, AI Search, Pipelines, e-mail, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
 
 ## Known platform differences
 

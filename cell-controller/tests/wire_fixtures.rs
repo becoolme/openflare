@@ -182,6 +182,7 @@ fn desired_ack_fixture() {
             worker_loader: true,
             quotas: true,
             analytics_engine: true,
+            tail_consumers: true,
         }),
     };
     check(
@@ -312,6 +313,14 @@ fn kv_capability_wire_shape() {
     })
     .unwrap();
     assert_eq!(ae_on["analyticsEngine"], serde_json::json!(true));
+    // Tail consumers: same omit-while-false shape.
+    assert!(off.get("tailConsumers").is_none());
+    let tc_on = serde_json::to_value(AckCapabilities {
+        tail_consumers: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(tc_on["tailConsumers"], serde_json::json!(true));
     let back: AckCapabilities =
         serde_json::from_value(serde_json::json!({"cron": true, "assets": true})).unwrap();
     assert!(!back.kv);
@@ -319,4 +328,5 @@ fn kv_capability_wire_shape() {
     assert!(!back.worker_loader);
     assert!(!back.quotas);
     assert!(!back.analytics_engine);
+    assert!(!back.tail_consumers);
 }

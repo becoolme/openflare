@@ -1326,11 +1326,34 @@ fn emit_tenant_worker(
             capnp_text(CACHE_SERVICE)
         ));
     }
-    if input.params.log_tail.enabled() {
-        out.push_str(&format!(
-            "      tails = [(name = {})],\n",
-            capnp_text(&crate::logs::tail_service_name(&worker.worker_id)),
-        ));
+    // `tails` designators: the platform log collector first, then the
+    // worker's declared `tailConsumers` (same-tenant consumer services,
+    // `workerId` validated upstream — a dangling designator would fail
+    // the whole config load, so re-check the id resolves here too).
+    {
+        let mut tail_names: Vec<String> = Vec::new();
+        if input.params.log_tail.enabled() {
+            tail_names.push(crate::logs::tail_service_name(&worker.worker_id));
+        }
+        for consumer in &worker.tail_consumers {
+            if !input
+                .tenant
+                .workers
+                .iter()
+                .any(|w| w.worker_id == consumer.worker_id)
+            {
+                return Err(ConfigError::Identifier("tailConsumers.workerId"));
+            }
+            tail_names.push(worker_service_name(&consumer.worker_id));
+        }
+        if !tail_names.is_empty() {
+            let designators = tail_names
+                .iter()
+                .map(|n| format!("(name = {})", capnp_text(n)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("      tails = [{designators}],\n"));
+        }
     }
     out.push_str(&format!(
         "      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",

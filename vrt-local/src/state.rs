@@ -91,6 +91,11 @@ pub struct VersionRecord {
     /// consumer relations follow the version, and rollback restores the original consumption relations).
     #[serde(default)]
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
+    /// Tail consumers of this version — CF treats `tail_consumers` as a
+    /// deploy-time setting, so it is version-scoped like queue consumers
+    /// and a rollback restores the earlier consumer set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// P3c-1: the DO class set declared by this version (migrations were already
     /// resolved to the final set at pack time, `uniqueKey` is fixed; rollback restores the original declaration --
     /// the storage identity of the `renamed_classes` lineage follows the version).
@@ -210,6 +215,7 @@ impl LocalState {
                 var_values: pkg.var_values.clone(),
                 crons: pkg.crons.clone(),
                 queue_consumers: pkg.queue_consumers.clone(),
+                tail_consumers: pkg.tail_consumers.clone(),
                 durable_object_classes: pkg.durable_object_classes.clone(),
                 workflows: pkg.workflows.clone(),
                 quotas: pkg.quotas.clone(),
@@ -320,6 +326,7 @@ impl LocalState {
                     .collect(),
                 crons: active.crons.clone(),
                 queue_consumers: active.queue_consumers.clone(),
+                tail_consumers: active.tail_consumers.clone(),
                 durable_object_classes: active.durable_object_classes.clone(),
                 workflows: active.workflows.clone(),
                 quotas: active.quotas.clone(),

@@ -1,6 +1,6 @@
 {
  "version": 1,
- "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here \u2014 that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
+ "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here — that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
  "vectors": [
   {
    "name": "toml full mapping",
@@ -777,6 +777,73 @@
     "ok": false,
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "analytics_engine_datasets[0].version"
+   }
+  },
+  {
+   "name": "tail_consumers normalized",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\ntail_consumers = [{service = \"tail-a\"}, {service = \"tail-b\"}]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "tailConsumers": [
+      {
+       "service": "tail-a"
+      },
+      {
+       "service": "tail-b"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "tail_consumers array-of-tables form",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[tail_consumers]]\nservice = \"tail-a\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "tailConsumers": [
+      {
+       "service": "tail-a"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "tail_consumers missing service rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\ntail_consumers = [{}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "tail_consumers[0].service"
+   }
+  },
+  {
+   "name": "tail_consumers unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\ntail_consumers = [{service = \"tail-a\", environment = \"production\"}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "tail_consumers[0].environment"
    }
   }
  ]
