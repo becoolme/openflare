@@ -119,6 +119,23 @@ fn code(j: &serde_json::Value) -> &str {
     j["error"]["code"].as_str().unwrap_or("")
 }
 
+/// The supervisor publishes `wake_failures` just after it resolves the
+/// wake flight, so the released waiter can observe the typed error a
+/// scheduling tick before the counter lands. Poll briefly instead of
+/// asserting on the exact interleaving.
+async fn wait_wake_failures(rt: &TenantRuntime, min: u64) {
+    for _ in 0..100 {
+        if rt.stats().wake_failures.load(Ordering::Relaxed) >= min {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        rt.stats().wake_failures.load(Ordering::Relaxed) >= min,
+        "wake_failures never reached {min}"
+    );
+}
+
 fn app_for(rt: &Arc<TenantRuntime>) -> axum::Router {
     let registry = TenantRegistry::new();
     registry.insert("t1".to_string(), rt.clone());
@@ -171,7 +188,7 @@ async fn wfops_wake_failure_is_typed_503_then_recovers() {
     assert_eq!(code(&j), "VRT_WFOPS_WAKE_FAILED", "{j}");
     assert_eq!(retry.as_deref(), Some("1"));
     assert!(log_lines(rec.path()).is_empty(), "op must not be forwarded");
-    assert!(rt.stats().wake_failures.load(Ordering::Relaxed) >= 1);
+    wait_wake_failures(&rt, 1).await;
 
     let good = wf_spec(&mut fx, rec.path(), &[]);
     h.send(SupervisorCmd::Apply(Box::new(good))).await;

@@ -1293,11 +1293,45 @@ fn emit_tenant_worker(
             capnp_text(CACHE_SERVICE)
         ));
     }
+    // One `tails` list per worker: the platform log collector (when
+    // enabled) shares it with user-declared Tail Workers
+    // (`tail_consumers`). workerd accepts a list, so declaring a user
+    // consumer never replaces the internal collector. The internal one
+    // is always first; user entries keep declaration order (validated
+    // unique, resolved to same-tenant worker ids at pack time).
+    let mut tails: Vec<String> = Vec::new();
     if input.params.log_tail.enabled() {
-        out.push_str(&format!(
-            "      tails = [(name = {})],\n",
-            capnp_text(&crate::logs::tail_service_name(&worker.worker_id)),
-        ));
+        tails.push(crate::logs::tail_service_name(&worker.worker_id));
+    }
+    for tail in &worker.tail_consumers {
+        // Per-worker fault isolation (`skipped_workers`) can remove a
+        // worker AFTER `validate_tenant`; emitting a designator to it
+        // would fail the whole generation. Treat a dropped consumer as
+        // a render error so the fixpoint also drops its producers
+        // instead of handing workerd a dangling `tails` entry.
+        if !input
+            .tenant
+            .workers
+            .iter()
+            .any(|w| w.worker_id == tail.worker_id)
+        {
+            return Err(ConfigError::ServiceReference("tailConsumers"));
+        }
+        let name = worker_service_name(&tail.worker_id);
+        if !tails.contains(&name) {
+            tails.push(name);
+        }
+    }
+    if !tails.is_empty() {
+        out.push_str("      tails = [");
+        out.push_str(
+            &tails
+                .iter()
+                .map(|name| format!("(name = {})", capnp_text(name)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str("],\n");
     }
     out.push_str(&format!(
         "      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
@@ -2600,6 +2634,30 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
                 if !declares {
                     return Err(ConfigError::ServiceReference("durableObject"));
                 }
+            }
+        }
+    }
+    // Tail consumers (`tail_consumers`): same-tenant, different worker,
+    // unique per producer. workerd rejects a `tails` designator that
+    // names no service, so any dangling/self entry fails the render
+    // before a config is written (the snapshot layer already rejects it;
+    // this is the last trusted boundary).
+    for worker in &tenant.workers {
+        if worker.tail_consumers.len()
+            > snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER
+        {
+            return Err(ConfigError::Capacity("tailConsumers"));
+        }
+        let mut targets = HashSet::new();
+        for tail in &worker.tail_consumers {
+            if !valid_identifier(&tail.worker_id, MAX_IDENTIFIER_LEN)
+                || tail.worker_id == worker.worker_id
+                || !worker_ids.contains(tail.worker_id.as_str())
+            {
+                return Err(ConfigError::ServiceReference("tailConsumers"));
+            }
+            if !targets.insert(tail.worker_id.as_str()) {
+                return Err(ConfigError::Identifier("tailConsumers"));
             }
         }
     }

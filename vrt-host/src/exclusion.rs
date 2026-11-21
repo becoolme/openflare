@@ -23,9 +23,10 @@
 //! - eligibility is structural: a worker that declares DO classes or
 //!   workflows (its storage identity lives under the worker's own
 //!   segment) or is referenced by a sibling (service binding, DO
-//!   `serviceWorkerId`, workflow `script_name`, DO transfer source)
-//!   is NEVER excluded — removing it would break innocent workers or
-//!   orphan provisioned storage, i.e. GROW the blast radius.
+//!   `serviceWorkerId`, workflow `script_name`, DO transfer source,
+//!   tail consumer) is NEVER excluded — removing it would break
+//!   innocent workers or orphan provisioned storage, i.e. GROW the
+//!   blast radius.
 
 use snapshot_protocol::compute_desired::{BindingDesired, TenantDesired};
 use std::collections::BTreeSet;
@@ -170,6 +171,14 @@ pub fn exclusion_verdict(
                 .durable_object_classes
                 .iter()
                 .any(|c| c.from_worker_id.as_deref() == Some(worker_id))
+            // Tail consumers are designators in the producer's rendered
+            // `tails` list: excluding the consumer would make the
+            // producer's config fail (`tails refers to a service ... no
+            // such service is defined`), growing the blast radius.
+            || other
+                .tail_consumers
+                .iter()
+                .any(|t| t.worker_id == worker_id)
     };
     for other in &tenant.workers {
         if other.worker_id == worker_id || already_excluded.contains(&other.worker_id) {
@@ -224,8 +233,8 @@ mod tests {
     }
 
     use snapshot_protocol::compute_desired::{
-        BindingDesired, DoClassDesired, ServiceBinding, TenantDesired, VersionDesired,
-        WorkerDesired, WorkerQuotas, WorkflowDesired,
+        BindingDesired, DoClassDesired, ServiceBinding, TailConsumerDesired, TenantDesired,
+        VersionDesired, WorkerDesired, WorkerQuotas, WorkflowDesired,
     };
 
     fn w(id: &str) -> WorkerDesired {
@@ -244,6 +253,7 @@ mod tests {
             queue_consumers: Vec::new(),
             durable_object_classes: Vec::new(),
             workflows: Vec::new(),
+            tail_consumers: Vec::new(),
             quotas: WorkerQuotas {
                 cpu_ms: 10,
                 memory_mb: 32,
@@ -341,6 +351,18 @@ mod tests {
         // (its references die with it).
         let excluded: BTreeSet<String> = ["caller".to_string()].into_iter().collect();
         assert_eq!(exclusion_verdict(&t, "bad", &excluded), Ok(()));
+        // Tail consumer reference: excluding `bad` would leave the
+        // producer's `tails` designator dangling and fail its config.
+        let mut t = tenant(&["producer", "tail"]);
+        t.workers[0].tail_consumers.push(TailConsumerDesired {
+            worker_id: "tail".to_string(),
+        });
+        assert_eq!(
+            exclusion_verdict(&t, "tail", &BTreeSet::new()),
+            Err(Ineligible::ReferencedBySibling)
+        );
+        // The producer itself remains excludable (no sibling references it).
+        assert_eq!(exclusion_verdict(&t, "producer", &BTreeSet::new()), Ok(()));
     }
 
     #[test]
