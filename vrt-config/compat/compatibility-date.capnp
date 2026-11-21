@@ -1815,7 +1815,62 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # its request ends. A session whose top-level call was canceled reports a `canceled` outcome,
   # like a fetch handler whose client went away.
   #
+  # A Durable Object's pending I/O belongs to the object, not to the request that started it, so a
+  # canceled call doesn't stop it: the method runs to completion, as a Durable Object's fetch
+  # handler does when its client disconnects. To have a Durable Object stop early, pass it an
+  # `AbortSignal` (`enable_abortsignal_rpc`) and abort the signal when disposing the call. The
+  # object still receives the abort after the call is canceled.
+  #
   # The promises returned by a service binding's `scheduled()` and `queue()` methods, available
   # with `service_binding_extra_handlers`, are disposable the same way: disposing one while the
   # event is in flight cancels the event and ends the callee's request.
+
+  exposeSerializationTestClass @205 :Bool
+      $compatEnableFlag("expose_serialization_test_class")
+      $experimental;
+  # Exposes the internal CloneableTestBox and CloneableTestError classes on globalThis: classes
+  # implemented in the per-isolate bootstrap that are structured cloneable, for testing the
+  # protocol by which such classes are serialized (src/per_isolate/serialization.ts), such as over
+  # RPC. This flag is intended for internal testing only and may never have its experimental
+  # annotation removed.
+
+  pythonDedicatedSnapshotKeepImportCaches @206 :Bool
+      $compatEnableFlag("python_dedicated_snapshot_keep_import_caches")
+      $compatDisableFlag("no_python_dedicated_snapshot_keep_import_caches");
+  # When enabled, a Python Worker restored from a dedicated memory snapshot keeps the import system's
+  # caches as the snapshot recorded them, instead of invalidating them at startup. The snapshot is
+  # collected with the Worker's files and packages already in place, so the caches still describe
+  # them, and rebuilding them is a large part of startup.
+
+  websocketStandardUrlAndExtensions @207 :Bool
+      $compatEnableFlag("websocket_standard_url_and_extensions")
+      $compatDisableFlag("websocket_legacy_url_and_extensions");
+  # Makes the WebSocket constructor and attributes follow the WHATWG WebSockets spec. The URL is
+  # parsed with the WHATWG URL parser, `http:` and `https:` URLs are accepted and mapped to `ws:` and
+  # `wss:`, and `url` returns the parsed URL serialized, not the string passed in. The URL the
+  # connection requests is built from that serialization, so its path is normalized by the WHATWG
+  # rules rather than by the KJ URL parser alone, which follows neither those nor RFC 3986. Relative
+  # URLs still throw a SyntaxError, because a Worker has no base URL. Once the connection is open,
+  # `protocol` and `extensions` are the empty string when the server selected none, not null.
+
+  fetchInvalidResponseTypeError @208 :Bool
+      $compatEnableFlag("fetch_invalid_response_type_error")
+      $compatDisableFlag("fetch_invalid_response_legacy_error");
+  # When a server's response head doesn't parse, for example because a header value contains a NUL
+  # byte or the status line is malformed, `fetch()` rejects with a TypeError, as the Fetch spec
+  # requires for a network error. Without the flag it rejects with an Error. The message is
+  # "Server returned invalid HTTP response: " followed by the reason either way.
+
+  connectHandlerImmediateTls @209 :Bool
+      $compatEnableFlag("connect_handler_immediate_tls")
+      $experimental;
+  # Lets a connect() handler serve a connection whose peer asked for TLS from the start, as another
+  # Worker does by calling `connect()` on a service binding with `secureTransport: 'on'`. The
+  # handler can't run the handshake itself, so it makes the connection secure further along, for
+  # example by opening its own upstream socket with `secureTransport: 'on'`. It then calls
+  # `socket.accept()`, and only then does the peer's `opened` resolve and its writes start flowing.
+  # The handler's socket reports such a connection as `socket.secureTransport` 'on', even though
+  # it carries plaintext between the peer and the handler. A handler that returns, throws or
+  # closes its socket before calling accept() fails the connection, and the peer's `opened`
+  # rejects. Without the flag, such connections are refused before the handler runs.
 }

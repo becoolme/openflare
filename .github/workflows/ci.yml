@@ -109,6 +109,8 @@ jobs:
           set -euo pipefail
           echo "${{ steps.lock.outputs.sha256 }}  .ci/workerd/workerd" | sha256sum -c -
           .ci/workerd/workerd --version
+      - name: Verify generated compatibility flags against pinned workerd
+        run: python3 vrt-config/compat/gen_compat_flags.py --check --check-workerd .ci/workerd/workerd
       # d1_smoke locates target/debug/vrt-sql itself — build bins once.
       - name: cargo build --bins
         env:

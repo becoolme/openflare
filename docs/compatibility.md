@@ -15,7 +15,7 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | Area | Status | Anchor |
 | --- | --- | --- |
 | Workers modules / service-worker syntax | workerd | runs the real workerd `worker` definition |
-| Compatibility dates & flags | workerd | `compatibility_date`, `compatibility_flags` pass through to workerd |
+| Compatibility dates & flags | workerd | `compatibility_date`, `compatibility_flags` pass through to workerd; generated flags are checked against the pinned binary in CI |
 | KV | Drop-in | [bindings/kv.md](bindings/kv.md) |
 | R2 | Partial | [bindings/r2.md](bindings/r2.md) |
 | D1 | Partial | [bindings/d1.md](bindings/d1.md) |
@@ -124,3 +124,12 @@ All deploy-time rejections are typed (`vrt-local/src/project_cfg.rs`):
 
 Runtime failures visible at ingress carry platform codes documented in
 [`docs/log-codes.md`](log-codes.md).
+
+## Changelog
+
+- 2026-11-20: Re-vendored the compatibility flag schema
+  (`vrt-config/compat/compatibility-date.capnp`) from the pinned workerd
+  release in `workerd.lock` and added a CI check that loads every
+  generated stable and experimental flag in the checksum-verified pinned
+  binary, so a flag the runtime does not know fails the build instead of
+  a tenant deploy.
