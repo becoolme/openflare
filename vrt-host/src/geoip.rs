@@ -107,6 +107,21 @@ pub struct GeoIp {
     checked_at: AtomicU64,
 }
 
+/// Read-only lookup surface used by ingress: [`GeoIp`] in production,
+/// a fixed table in tests. Hiding the reader behind a trait keeps the
+/// whole injection chain (`policy → lookup IP → record → cf-* headers
+/// + request.cf blob`) testable without shipping a 100 MB MMDB
+/// fixture, while both sides stay typed.
+pub trait GeoLookup: Send + Sync {
+    fn lookup(&self, ip: IpAddr) -> Option<GeoRecord>;
+}
+
+impl GeoLookup for GeoIp {
+    fn lookup(&self, ip: IpAddr) -> Option<GeoRecord> {
+        GeoIp::lookup(self, ip)
+    }
+}
+
 impl GeoIp {
     /// Open `path` if a valid database is already there; absent or
     /// unreadable starts empty (the sync task will fill it).
@@ -174,7 +189,7 @@ impl GeoIp {
 
     /// Stat the path at most once per [`RELOAD_CHECK_SECS`]; reload
     /// when the mtime moved. One `AtomicU64` load per request, one
-    /// stat per minute — the mmap swap itself is lock-free.
+    /// stat per minute — the reader swap itself is lock-free.
     fn maybe_reload(&self) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

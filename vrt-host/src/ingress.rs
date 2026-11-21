@@ -1337,7 +1337,10 @@ async fn handle_routed(
         peer,
         &state.forwarded_proto,
         &state.client_ip,
-        state.geoip.as_deref(),
+        state
+            .geoip
+            .as_deref()
+            .map(|g| g as &dyn crate::geoip::GeoLookup),
         parts.version,
         is_ws,
     );
@@ -1854,7 +1857,7 @@ fn scrubbed_headers(
     peer: SocketAddr,
     proto_policy: &ForwardedProto,
     client_ip_policy: &ClientIpPolicy,
-    geoip: Option<&crate::geoip::GeoIp>,
+    geoip: Option<&dyn crate::geoip::GeoLookup>,
     version: axum::http::Version,
     ws_upgrade: bool,
 ) -> HeaderMap {
@@ -2774,6 +2777,101 @@ mod ws_tests {
         let s = st(1, 1);
         std::mem::forget(WsPermit::try_acquire(&s, "other", "w").unwrap());
         s
+    }
+
+    /// Fixed-table GeoIP for the injection proof — the real reader
+    /// needs a 100 MB MMDB fixture, but everything downstream of
+    /// `lookup` (IP selection, gap-filling, header/blob emission) is
+    /// the production path.
+    struct FakeGeo {
+        record: crate::geoip::GeoRecord,
+        asked: std::sync::Mutex<Vec<std::net::IpAddr>>,
+    }
+
+    impl crate::geoip::GeoLookup for FakeGeo {
+        fn lookup(&self, ip: std::net::IpAddr) -> Option<crate::geoip::GeoRecord> {
+            self.asked.lock().unwrap().push(ip);
+            Some(self.record.clone())
+        }
+    }
+
+    fn scrub_with_geo(
+        inbound: &HeaderMap,
+        peer: &str,
+        geo: Option<&dyn crate::geoip::GeoLookup>,
+    ) -> HeaderMap {
+        let target = crate::route::RouteTarget {
+            tenant_id: "t".into(),
+            worker_id: "w".into(),
+            assets_first: false,
+        };
+        scrubbed_headers(
+            inbound,
+            "app.example.com",
+            &target,
+            peer.parse().unwrap(),
+            &ForwardedProto::FixedHttp,
+            &ClientIpPolicy::None,
+            geo,
+            Version::HTTP_11,
+            false,
+        )
+    }
+
+    /// End to end: no trusted upstream chain (direct ingress) + a local
+    /// record ⇒ the worker receives `cf-ipcountry`/`cf-ipcontinent`/
+    /// `request.cf` geo+ASN for the TCP peer, and the lookup subject is
+    /// that peer (never a client-supplied header). With NO local record
+    /// the same request carries no geo at all — the degrade path.
+    #[test]
+    fn local_geoip_injects_cf_headers_and_blob() {
+        use std::sync::Mutex;
+        let geo = FakeGeo {
+            record: crate::geoip::GeoRecord {
+                country: Some("JP".into()),
+                continent: Some("AS".into()),
+                city: Some("Tokyo".into()),
+                region: Some("Tokyo".into()),
+                region_code: Some("13".into()),
+                timezone: Some("Asia/Tokyo".into()),
+                latitude: Some("35.68950".into()),
+                longitude: Some("139.69170".into()),
+                asn: Some(2516),
+                as_org: Some("KDDI CORPORATION".into()),
+                ..Default::default()
+            },
+            asked: Mutex::new(Vec::new()),
+        };
+        // A hostile client tries to steer the lookup with XFF; with no
+        // trusted proxy the peer is the client (policy `none`).
+        let inbound = hm(&[("x-forwarded-for", "198.51.100.7")]);
+        let out = scrub_with_geo(&inbound, "203.0.113.9:4000", Some(&geo));
+        assert_eq!(
+            geo.asked.lock().unwrap().as_slice(),
+            &["203.0.113.9".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(out.get("cf-ipcountry").unwrap(), "JP");
+        assert_eq!(out.get("cf-ipcontinent").unwrap(), "AS");
+        assert_eq!(out.get("cf-ipcity").unwrap(), "Tokyo");
+        assert_eq!(out.get("cf-region-code").unwrap(), "13");
+        assert_eq!(out.get("cf-timezone").unwrap(), "Asia/Tokyo");
+        let blob: serde_json::Value =
+            serde_json::from_str(out.get(CF_BLOB_HEADER).unwrap().to_str().unwrap()).unwrap();
+        assert_eq!(blob["country"], "JP");
+        assert_eq!(blob["city"], "Tokyo");
+        assert_eq!(blob["asn"], 2516);
+        assert!(blob["asn"].is_u64());
+        assert_eq!(blob["asOrganization"], "KDDI CORPORATION");
+        // Local geo never fabricates the CF-only identity fields.
+        assert!(out.get("cf-connecting-ip").is_none());
+        assert!(out.get("cf-ray").is_none());
+
+        // No lookup surface ⇒ exactly the pre-GeoIP behaviour.
+        let plain = scrub_with_geo(&inbound, "203.0.113.9:4000", None);
+        assert!(plain.get("cf-ipcountry").is_none());
+        let blob: serde_json::Value =
+            serde_json::from_str(plain.get(CF_BLOB_HEADER).unwrap().to_str().unwrap()).unwrap();
+        assert!(blob.get("country").is_none() && blob.get("asn").is_none());
     }
 
     #[test]

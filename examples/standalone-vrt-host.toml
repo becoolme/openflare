@@ -102,6 +102,11 @@ failWindowMs = 90000
 # -- mirror / air-gap: point both URLs at your own https mirror --
 # releasesApiUrl = ""                                # empty = mirror mode (no GitHub API; refreshes on file age)
 # downloadUrl = "https://mirror.example.com/Merged-IP.mmdb"
+# API-supplied asset links are untrusted: only the exact
+# github.com / objects.githubusercontent.com hosts (https, :443, no
+# userinfo) are accepted, redirects must stay on them, the body is
+# capped at 512 MiB, and the installed file's SHA-256 is re-checked
+# before a "same tag" restart trusts it.
 # Optional env: VRT_GEOIP_GITHUB_TOKEN raises the GitHub API rate
 # limit for cells behind a shared NAT (never written to config/logs).
 
