@@ -25,6 +25,20 @@ fn tmp_root() -> TmpDir {
 }
 
 fn provider_text(raw: &str, root: &Path) -> String {
+    // examples/*.toml use `__VRT_*__` placeholders, deployment TOMLs use
+    // absolute paths — substitute one dialect, never both (`/data` would
+    // rewrite an example's own `.../provider/data/...`).
+    if raw.contains("__VRT_ROOT__") {
+        return raw
+            // sun_path bound: keep the listener dir short.
+            .replace("__VRT_ROOT__/provider/listeners", "/vrt-test/listeners")
+            .replace("__VRT_CELL__", "cell-1")
+            .replace("__VRT_KEY_ID__", "deploy-key")
+            .replace("__VRT_PUBKEY__", "MCowBQYDK2VwAyEAO4cbNjsO7FQzisOvZshKKMa67lIim3ikig7RdntOAZM=")
+            .replace("__VRT_PROVIDER_METRICS__", "127.0.0.1:19094")
+            .replace("__VRT_SQL_ADDR__", "http://127.0.0.1:19432")
+            .replace("__VRT_ROOT__", &root.to_string_lossy());
+    }
     raw.replace("/run/vrt", &root.join("run").to_string_lossy())
         .replace("/data", &root.join("data").to_string_lossy())
         .replace("REPLACE_ME_CELL_ID", "cell-1")
