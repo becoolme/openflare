@@ -8,7 +8,8 @@ use support::*;
 use vrt_provider::context::ResourceKind;
 use vrt_provider::error::ProviderError;
 use vrt_provider::r2::wire::{
-    R2ChecksumAlgorithm, R2Condition, R2EtagMatch, R2PutOptions, R2Range,
+    R2ChecksumAlgorithm, R2Condition, R2EtagMatch, R2MultipartCreateOptions, R2PutOptions, R2Range,
+    R2SsecKey,
 };
 use vrt_provider::r2::{MemoryR2Provider, R2GetResult, R2Provider};
 
@@ -61,7 +62,7 @@ async fn put_head_get_delete_cycle() {
     let head = provider.head(&ctx, "k1").await.unwrap().unwrap();
     assert_eq!(head, meta);
 
-    match provider.get(&ctx, "k1", None, None).await.unwrap() {
+    match provider.get(&ctx, "k1", None, None, None).await.unwrap() {
         R2GetResult::Body(m, bytes) => {
             assert_eq!(m.key, "k1");
             assert_eq!(bytes, b"body-bytes");
@@ -72,7 +73,7 @@ async fn put_head_get_delete_cycle() {
 
     provider.delete(&ctx, &["k1".to_string()]).await.unwrap();
     assert!(provider.head(&ctx, "k1").await.unwrap().is_none());
-    match provider.get(&ctx, "k1", None, None).await.unwrap() {
+    match provider.get(&ctx, "k1", None, None, None).await.unwrap() {
         R2GetResult::Missing => {}
         _ => panic!("expected missing"),
     }
@@ -145,7 +146,11 @@ async fn conditional_get() {
         etag_matches: vec![R2EtagMatch::Wildcard],
         ..Default::default()
     };
-    match provider.get(&ctx, "k", None, Some(&ok)).await.unwrap() {
+    match provider
+        .get(&ctx, "k", None, Some(&ok), None)
+        .await
+        .unwrap()
+    {
         R2GetResult::Body(..) => {}
         _ => panic!("expected body"),
     }
@@ -156,7 +161,11 @@ async fn conditional_get() {
         }],
         ..Default::default()
     };
-    match provider.get(&ctx, "k", None, Some(&fail)).await.unwrap() {
+    match provider
+        .get(&ctx, "k", None, Some(&fail), None)
+        .await
+        .unwrap()
+    {
         R2GetResult::Precondition(m) => assert_eq!(m.etag, meta.etag),
         _ => panic!("expected precondition"),
     }
@@ -175,7 +184,11 @@ async fn ranged_get() {
         length: Some(4),
         suffix: None,
     };
-    match provider.get(&ctx, "k", Some(range), None).await.unwrap() {
+    match provider
+        .get(&ctx, "k", Some(range), None, None)
+        .await
+        .unwrap()
+    {
         R2GetResult::Body(m, bytes) => {
             assert_eq!(bytes, b"2345");
             assert_eq!(m.range.unwrap().offset, Some(2));
@@ -188,7 +201,11 @@ async fn ranged_get() {
         length: None,
         suffix: Some(3),
     };
-    match provider.get(&ctx, "k", Some(suffix), None).await.unwrap() {
+    match provider
+        .get(&ctx, "k", Some(suffix), None, None)
+        .await
+        .unwrap()
+    {
         R2GetResult::Body(m, bytes) => {
             assert_eq!(bytes, b"789");
             assert_eq!(m.range.unwrap().offset, Some(7));
@@ -202,7 +219,7 @@ async fn ranged_get() {
         suffix: None,
     };
     assert!(matches!(
-        provider.get(&ctx, "k", Some(bad), None).await,
+        provider.get(&ctx, "k", Some(bad), None, None).await,
         Err(ProviderError::R2InvalidOptions)
     ));
 }
@@ -348,12 +365,53 @@ async fn buckets_are_isolated() {
         .put(&c2, "k", b"bbb", &R2PutOptions::default())
         .await
         .unwrap();
-    match provider.get(&c1, "k", None, None).await.unwrap() {
+    match provider.get(&c1, "k", None, None, None).await.unwrap() {
         R2GetResult::Body(_, bytes) => assert_eq!(bytes, b"aaa"),
         _ => panic!(),
     }
-    match provider.get(&c2, "k", None, None).await.unwrap() {
+    match provider.get(&c2, "k", None, None, None).await.unwrap() {
         R2GetResult::Body(_, bytes) => assert_eq!(bytes, b"bbb"),
         _ => panic!(),
     }
+}
+
+/// SSE-C needs a remote encrypted store: the local backend must reject
+/// every key-bearing operation rather than store plaintext.
+#[tokio::test]
+async fn ssec_fails_closed() {
+    let provider = MemoryR2Provider::new();
+    let ctx = ctx();
+    let key = R2SsecKey::parse(&"ab".repeat(32)).unwrap();
+    let put = R2PutOptions {
+        ssec_key: Some(key.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        provider.put(&ctx, "k", b"v", &put).await,
+        Err(ProviderError::R2SsecInvalid)
+    );
+    assert!(matches!(
+        provider.get(&ctx, "k", None, None, Some(&key)).await,
+        Err(ProviderError::R2SsecInvalid)
+    ));
+    let create = R2MultipartCreateOptions {
+        ssec_key: Some(key.clone()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        provider.create_multipart(&ctx, "k", &create).await,
+        Err(ProviderError::R2SsecInvalid)
+    ));
+    assert_eq!(
+        provider
+            .upload_part(&ctx, "k", "upload", 1, b"x", Some(&key))
+            .await,
+        Err(ProviderError::R2SsecInvalid)
+    );
+    // Plain requests still work on the same provider.
+    assert!(provider
+        .put(&ctx, "k", b"v", &R2PutOptions::default())
+        .await
+        .unwrap()
+        .is_some());
 }

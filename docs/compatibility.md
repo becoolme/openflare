@@ -91,7 +91,8 @@ These are not tied to one binding.
 - **Rate limiting** is a per-process fixed window — approximate, not
   shared across hosts.
 - **R2 `onlyIf`** depends on the backend (`s3.conditionalWrites`);
-  `jurisdiction`/`storage_class` rejected.
+  `jurisdiction`/`storage_class` rejected. SSE-C works on the S3 backend
+  only; the fs/memory backends fail closed with `R2_SSEC_INVALID`.
 - **Static assets** caps: 20,000 files and 25 MiB per file (Cloudflare's free-plan limits; overridable with `VRT_ASSET_MAX_FILES` / `VRT_ASSET_MAX_FILE_BYTES`), plus a 512 MiB total guard by default (Cloudflare documents no total; override with `VRT_ASSET_MAX_TOTAL_BYTES`).
   all four `html_handling` modes, with Cloudflare's per-request-form
   candidate order and 307 canonical redirects.

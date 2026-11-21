@@ -771,7 +771,8 @@ async fn r2_denials_and_protocol_errors() {
         "R2_INVALID_OPTIONS"
     );
 
-    // ssecKey in get options → R2_SSEC_INVALID
+    // SSE-C against the in-memory backend → R2_SSEC_INVALID (fail closed;
+    // only the S3 backend can honor customer-provided keys).
     let (status, _, body) = http_post(
         socket,
         &r2_path("get"),
@@ -1546,8 +1547,9 @@ impl vrt_provider::r2::R2Provider for HangingCompleteR2 {
         key: &str,
         range: Option<vrt_provider::r2::wire::R2Range>,
         only_if: Option<&vrt_provider::r2::wire::R2Condition>,
+        ssec_key: Option<&vrt_provider::r2::wire::R2SsecKey>,
     ) -> Result<vrt_provider::r2::R2GetResult, vrt_provider::ProviderError> {
-        self.0.get(ctx, key, range, only_if).await
+        self.0.get(ctx, key, range, only_if, ssec_key).await
     }
     async fn put(
         &self,
@@ -1590,9 +1592,10 @@ impl vrt_provider::r2::R2Provider for HangingCompleteR2 {
         upload_id: &str,
         part_number: i32,
         body: &[u8],
+        ssec_key: Option<&vrt_provider::r2::wire::R2SsecKey>,
     ) -> Result<vrt_provider::r2::wire::R2UploadedPart, vrt_provider::ProviderError> {
         self.0
-            .upload_part(ctx, key, upload_id, part_number, body)
+            .upload_part(ctx, key, upload_id, part_number, body, ssec_key)
             .await
     }
     async fn complete_multipart(

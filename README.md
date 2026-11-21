@@ -73,7 +73,7 @@ bindings) is in [`docs/bindings/README.md`](docs/bindings/README.md).
 | Service / binding | Status | Notes |
 | --- | --- | --- |
 | [KV](docs/bindings/kv.md) | ✅ Drop-in | Full `KVNamespace` on filesystem or Kvrocks; `cacheTtl` is validated but there is no edge-cache tier. |
-| [R2](docs/bindings/r2.md) | 🟡 Partial | Objects, ranges, multipart, checksums; conditional writes depend on the S3 backend. `jurisdiction`/`storage_class` rejected; no SSE-C. |
+| [R2](docs/bindings/r2.md) | 🟡 Partial | Objects, ranges, multipart, checksums; conditional writes depend on the S3 backend. `jurisdiction`/`storage_class` rejected; SSE-C on the S3 backend only (fs/memory fail closed). |
 | [D1](docs/bindings/d1.md) | 🟡 Partial | workerd's `d1-api` on `vrt-sql` (single-writer SQLite, fs/S3 persistence); no Time Travel. |
 | [Durable Objects](docs/bindings/durable-objects.md) | 🟡 Partial | SQLite + KV storage, alarms, RPC, WebSockets, same-tenant `script_name`; no hibernation, `transferred_classes` rejected. |
 | [Queues](docs/bindings/queues.md) | 🟡 Partial | Producers/consumers, retries, delay (including queue-level defaults), concurrency, DLQ; no pull consumer. |

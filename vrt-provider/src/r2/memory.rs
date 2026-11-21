@@ -14,8 +14,8 @@ use super::wire::{
     canonical_custom_metadata, check_min_part_sizes, etag_matches, hash_bytes, multipart_etag,
     part_md5_hex, resolve_range, validate_complete_parts, validate_part_number,
     MultipartCreateResult, R2Condition, R2ListEntry, R2ListPage, R2MultipartCreateOptions,
-    R2ObjectMetadata, R2PutOptions, R2Range, R2UploadedPart, R2_MULTIPART_DEFAULT_TTL_MS,
-    R2_MULTIPART_MAX_ACTIVE_UPLOADS,
+    R2ObjectMetadata, R2PutOptions, R2Range, R2SsecKey, R2UploadedPart,
+    R2_MULTIPART_DEFAULT_TTL_MS, R2_MULTIPART_MAX_ACTIVE_UPLOADS,
 };
 use super::{R2GetResult, R2Provider};
 
@@ -133,7 +133,13 @@ impl R2Provider for MemoryR2Provider {
         key: &str,
         range: Option<R2Range>,
         only_if: Option<&R2Condition>,
+        ssec_key: Option<&R2SsecKey>,
     ) -> Result<R2GetResult, ProviderError> {
+        // SSE-C is only meaningful for a remote encrypted store; a local
+        // backend cannot honor it and must never pretend to.
+        if ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         let guard = self.buckets.lock().unwrap_or_else(|e| e.into_inner());
         let Some(object) = guard.get(&bucket_key(ctx)).and_then(|b| b.get(key)) else {
             return Ok(R2GetResult::Missing);
@@ -169,6 +175,9 @@ impl R2Provider for MemoryR2Provider {
         body: &[u8],
         options: &R2PutOptions,
     ) -> Result<Option<R2ObjectMetadata>, ProviderError> {
+        if options.ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         canonical_custom_metadata(&options.custom_metadata)?;
         if body.len() as u64 > self.max_object_bytes {
             return Err(ProviderError::R2ObjectTooLarge);
@@ -300,6 +309,9 @@ impl R2Provider for MemoryR2Provider {
         key: &str,
         options: &R2MultipartCreateOptions,
     ) -> Result<MultipartCreateResult, ProviderError> {
+        if options.ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         canonical_custom_metadata(&options.custom_metadata)?;
         let mut guard = self.uploads.lock().unwrap_or_else(|e| e.into_inner());
         // Bounded lazy GC — expired uploads are reaped on create so a
@@ -358,7 +370,11 @@ impl R2Provider for MemoryR2Provider {
         upload_id: &str,
         part_number: i32,
         body: &[u8],
+        ssec_key: Option<&R2SsecKey>,
     ) -> Result<R2UploadedPart, ProviderError> {
+        if ssec_key.is_some() {
+            return Err(ProviderError::R2SsecInvalid);
+        }
         validate_part_number(part_number as i64)?;
         if body.len() as u64 > self.max_object_bytes {
             return Err(ProviderError::R2ObjectTooLarge);

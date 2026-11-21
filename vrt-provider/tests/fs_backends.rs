@@ -8,7 +8,11 @@ use support::*;
 use vrt_provider::context::ResourceKind;
 use vrt_provider::error::ProviderError;
 use vrt_provider::kv::{fs::FsKvProvider, KvProvider, KvPutOptions};
-use vrt_provider::r2::{fs::FsR2Provider, wire::R2PutOptions, R2Provider};
+use vrt_provider::r2::{
+    fs::FsR2Provider,
+    wire::{R2MultipartCreateOptions, R2PutOptions, R2SsecKey},
+    R2Provider,
+};
 
 fn root() -> support::TestDir {
     support::TestDir::new()
@@ -189,8 +193,8 @@ async fn r2_put_head_get_range_list_and_isolation() {
     p.put(&a, "dir/../obj", b"hello-a", &opt).await.unwrap();
     p.put(&b, "dir/../obj", b"hello-b", &opt).await.unwrap();
     // Same key, different tenant → isolated bodies (digest-named files).
-    let ga = p.get(&a, "dir/../obj", None, None).await.unwrap();
-    let gb = p.get(&b, "dir/../obj", None, None).await.unwrap();
+    let ga = p.get(&a, "dir/../obj", None, None, None).await.unwrap();
+    let gb = p.get(&b, "dir/../obj", None, None, None).await.unwrap();
     match (ga, gb) {
         (
             vrt_provider::r2::R2GetResult::Body(_, ba),
@@ -215,6 +219,7 @@ async fn r2_put_head_get_range_list_and_isolation() {
                 length: Some(5),
                 suffix: None,
             }),
+            None,
             None,
         )
         .await
@@ -292,4 +297,44 @@ async fn kv_get_many_declared_size_trips_budget_on_header() {
         matches!(err, vrt_provider::error::ProviderError::KvResponseTooLarge),
         "declared oversize must trip the aggregate budget: {err:?}"
     );
+}
+
+/// SSE-C needs a remote encrypted store: the filesystem backend must
+/// reject every key-bearing operation rather than pretend to encrypt.
+#[tokio::test]
+async fn r2_ssec_fails_closed_on_fs() {
+    let dir = root();
+    let p = FsR2Provider::new(dir.path().join("r2"), 8 * 1024).unwrap();
+    let c = r2_ctx(TENANT, "bucket-1");
+    let key = R2SsecKey::parse(&"cd".repeat(32)).unwrap();
+    let put = R2PutOptions {
+        ssec_key: Some(key.clone()),
+        ..Default::default()
+    };
+    assert_eq!(
+        p.put(&c, "k", b"v", &put).await,
+        Err(ProviderError::R2SsecInvalid)
+    );
+    assert!(matches!(
+        p.get(&c, "k", None, None, Some(&key)).await,
+        Err(ProviderError::R2SsecInvalid)
+    ));
+    let create = R2MultipartCreateOptions {
+        ssec_key: Some(key.clone()),
+        ..Default::default()
+    };
+    assert!(matches!(
+        p.create_multipart(&c, "k", &create).await,
+        Err(ProviderError::R2SsecInvalid)
+    ));
+    assert_eq!(
+        p.upload_part(&c, "k", "upload", 1, b"x", Some(&key)).await,
+        Err(ProviderError::R2SsecInvalid)
+    );
+    // Plain requests still work on the same provider.
+    assert!(p
+        .put(&c, "k", b"v", &R2PutOptions::default())
+        .await
+        .unwrap()
+        .is_some());
 }
