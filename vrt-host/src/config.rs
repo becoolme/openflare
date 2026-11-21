@@ -118,6 +118,17 @@ pub struct HostConfig {
     /// leaves every tenant's lifecycle byte-identical to before.
     #[serde(default)]
     pub scale_to_zero: ScaleToZeroConfig,
+    /// `[analyticsEngine]` — per-tenant Analytics Engine ingest
+    /// (`env.<binding>.writeDataPoint()`). Default-enabled: the
+    /// cell-controller advertises the `analyticsEngine` capability
+    /// unconditionally, so a default-off host would admit dataset
+    /// bindings then fail their render — enabled keeps the capability
+    /// bit honest. Sockets live under `<workDir>/ae/sock/`, spool +
+    /// Parquet under `<workDir>/ae/`; a startup build failure
+    /// degrades observably (`record_ae_init`) and AE renders then
+    /// fail closed (`aeAddr`).
+    #[serde(default = "AnalyticsEngineConfig::enabled_default")]
+    pub analytics_engine: AnalyticsEngineConfig,
 }
 
 /// `[scaleToZero]` — tenant-level hibernate/wake (design:
@@ -302,6 +313,82 @@ fn default_cache_global_inflight() -> usize {
 }
 fn default_cache_tenant_inflight() -> usize {
     32 * 1024 * 1024
+}
+
+/// `[analyticsEngine]` — AE ingest bounds. Default-enabled (see
+/// `HostConfig::analytics_engine`); every bound must be >0 and the
+/// flush cadence is clamped to [10, 3600] seconds — a zero cap would
+/// fake the feature while dropping every event.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnalyticsEngineConfig {
+    /// Serve per-tenant ingest sockets + flush spool to Parquet.
+    /// Default true (the cell claims the capability unconditionally —
+    /// default-off would admit bindings then fail their render).
+    #[serde(default = "ae_enabled")]
+    pub enabled: bool,
+    /// POST body cap — workerd's `AnalyticsEngineEvent` is
+    /// schema-bounded (~64 KiB worst); the default leaves headroom.
+    #[serde(default = "default_ae_max_body")]
+    pub max_body_bytes: usize,
+    /// Per-tenant total spool bytes across datasets. Exceeding it
+    /// back-pressures writes with 503 — workerd logs internally and
+    /// the JS API stays fire-and-forget (CF's lossy contract).
+    #[serde(default = "default_ae_max_spool")]
+    pub max_spool_bytes: u64,
+    /// Spool→Parquet flush cadence in seconds; clamped to [10, 3600].
+    #[serde(default = "default_ae_flush_secs")]
+    pub flush_interval_secs: u64,
+}
+
+fn ae_enabled() -> bool {
+    true
+}
+
+impl AnalyticsEngineConfig {
+    /// Default when `[analyticsEngine]` is absent entirely.
+    pub fn enabled_default() -> Self {
+        Self {
+            enabled: true,
+            max_body_bytes: default_ae_max_body(),
+            max_spool_bytes: default_ae_max_spool(),
+            flush_interval_secs: default_ae_flush_secs(),
+        }
+    }
+
+    /// Startup validation — bounds must be >0 when enabled (a zero
+    /// cap would fake the feature while dropping every event; the
+    /// flush cadence itself is clamped, not rejected).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_body_bytes == 0 || self.max_spool_bytes == 0 {
+            return Err(ConfigError::Invalid("analyticsEngine bounds must be > 0"));
+        }
+        Ok(())
+    }
+
+    /// Typed limits view for `ae::AeLimits`.
+    pub fn limits(&self) -> crate::ae::AeLimits {
+        crate::ae::AeLimits {
+            max_body_bytes: self.max_body_bytes,
+            max_spool_bytes: self.max_spool_bytes,
+            flush_interval: std::time::Duration::from_secs(
+                self.flush_interval_secs.clamp(10, 3600),
+            ),
+        }
+    }
+}
+
+fn default_ae_max_body() -> usize {
+    256 * 1024
+}
+fn default_ae_max_spool() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_ae_flush_secs() -> u64 {
+    60
 }
 
 /// P3c-2: `[doSnapshots]` cadence config.
@@ -2029,6 +2116,7 @@ impl HostConfig {
         // — readyTimeoutMs + backoffMaxMs each — must fit the window.
         self.supervisor.validate()?;
         self.scale_to_zero.validate()?;
+        self.analytics_engine.validate()?;
         {
             let t = self.supervisor.fail_threshold.max(1) as u64;
             let cycle = self
@@ -2241,6 +2329,7 @@ impl RenderParamsFile {
             wfop_pepper: String::new(),      // per-process (assemble fills)
             wf_delete_addr: String::new(),   // per-process (assemble fills)
             cache_addr: String::new(),       // per-tenant (assemble fills)
+            ae_addr: String::new(),          // per-tenant (assemble fills)
             heartbeat_socket: String::new(), // per-tenant (assemble fills)
             waituntil_socket: String::new(), // per-tenant (assemble fills)
             log_tail: vrt_config::LogTailParams::default(),
@@ -2566,6 +2655,56 @@ mod tests {
             toml::from_str("enabled = true\nidleMs = 5000\nmaxConcurrentWakes = 2").unwrap();
         assert!(c.enabled && c.idle_ms == 5000 && c.max_concurrent_wakes == 2);
         assert!(toml::from_str::<ScaleToZeroConfig>("bogus = 1").is_err());
+    }
+
+    #[test]
+    fn analytics_engine_default_on_and_bounds_validated() {
+        // Absent section ⇒ enabled with defaults (the cell advertises
+        // the capability unconditionally — see HostConfig field doc).
+        let d = AnalyticsEngineConfig::enabled_default();
+        assert!(d.enabled);
+        d.validate().unwrap();
+        let l = d.limits();
+        assert_eq!(l.flush_interval, Duration::from_secs(60));
+
+        // Disabled ignores nonsense bounds (byte-identical absence).
+        AnalyticsEngineConfig {
+            enabled: false,
+            max_body_bytes: 0,
+            max_spool_bytes: 0,
+            flush_interval_secs: 0,
+        }
+        .validate()
+        .unwrap();
+
+        // Enabled + zero bound ⇒ a fake feature that drops every
+        // event — rejected at startup.
+        for c in [
+            AnalyticsEngineConfig {
+                max_body_bytes: 0,
+                ..d.clone()
+            },
+            AnalyticsEngineConfig {
+                max_spool_bytes: 0,
+                ..d.clone()
+            },
+        ] {
+            assert!(c.validate().is_err(), "{c:?} must be rejected");
+        }
+
+        // Flush cadence clamps, not rejects (operator typo ≠ fatal).
+        let hi = AnalyticsEngineConfig {
+            flush_interval_secs: 99_999,
+            ..d.clone()
+        }
+        .limits();
+        assert_eq!(hi.flush_interval, Duration::from_secs(3600));
+        let lo = AnalyticsEngineConfig {
+            flush_interval_secs: 1,
+            ..d
+        }
+        .limits();
+        assert_eq!(lo.flush_interval, Duration::from_secs(10));
     }
 
     /// RV-R72: ingress numeric ranges — defaults pass, each out-of-range

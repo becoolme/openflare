@@ -227,6 +227,7 @@ fn render_do(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf) {
         wfop_pepper: "poc-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
@@ -287,7 +288,8 @@ fn render_do(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf) {
             .any(|w| !w.durable_object_classes.is_empty()),
         false,
         false,
-    );
+            false,
+        );
     argv.extend(vrt_host::launch::external_addr_args(&out.external_addrs));
     (cfg, argv, do_root)
 }

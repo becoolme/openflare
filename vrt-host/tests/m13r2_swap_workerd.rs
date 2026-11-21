@@ -99,6 +99,7 @@ fn params(do_dir: &Path) -> RuntimeParams {
         wfop_pepper: "m13r2-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         // H0 contract: the marker lives in THIS socket's dir.
         waituntil_socket: "sock/vrt-wu.sock".into(),

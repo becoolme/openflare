@@ -103,6 +103,11 @@ These are not tied to one binding.
   loading worker's own limits group). Live workers per loader are
   bounded by a platform quota (32); there is no per-tenant
   `dispatch_namespaces` counterpart.
+- **Analytics Engine** (`[[analytics_engine_datasets]]`): native
+  `writeDataPoint()` ingests into a per-tenant spool that flushes to
+  canonical Parquet under `<work>/ae/out/`. Full-fidelity storage (no
+  sampling/`_sample_interval`); query via DuckDB or ClickHouse
+  `s3(...,'Parquet')` — see [Analytics Engine](bindings/analytics-engine.md).
 - **No D1 migrations runner** — `migrations_dir` is an unsupported key.
 - **Routes**: only plain hostnames and `<fqdn>/*` patterns; no zone
   management, no `custom_domain`.
@@ -114,7 +119,7 @@ Any unrecognized wrangler key fails the deploy with
 [`docs/wrangler-config.md`](wrangler-config.md) for the full table.
 Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 (`ai`), Vectorize (`vectorize`), AI Search (`ai_search`,
-`ai_search_namespaces`), Analytics Engine (`analytics_engine_datasets`),
+`ai_search_namespaces`),
 Tail Workers (`tail_consumers`), Secrets Store
 (`secrets_store_secrets`), Pipelines, dispatch namespaces
 (`dispatch_namespaces`), `send_email`,
@@ -134,6 +139,12 @@ Runtime failures visible at ingress carry platform codes documented in
 [`docs/log-codes.md`](log-codes.md).
 
 ## Changelog
+
+- 2026-11-20: Analytics Engine (`[[analytics_engine_datasets]]` → native
+  `analyticsEngine` bindings) ingests `writeDataPoint()` events to a
+  per-tenant socket, spools JSONL, and flushes to canonical Parquet
+  (`ae/out/<seg>/<dataset>/dt=<date>/part-*.parquet`). Query via
+  DuckDB/ClickHouse; no sampling or hosted SQL API yet.
 
 - 2026-11-20: Worker loaders (`[[worker_loaders]]` → native `WorkerLoader`
   bindings, `get`/`load`, named cache, dynamic entrypoints and DO facets)

@@ -150,6 +150,14 @@ pub struct AckCapabilities {
     /// the bit BEFORE any cell enables it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quotas: bool,
+    /// `analyticsEngine` bindings render AND the per-tenant AE ingest
+    /// socket is served by this generation's vrt-host (`AeService`
+    /// ships in the same release). A pre-AE cell would reject the
+    /// `analyticsEngine` wire field via `deny_unknown_fields` — the
+    /// control plane only admits dataset bindings onto cells that
+    /// claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub analytics_engine: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized
