@@ -1570,12 +1570,15 @@ async fn transient_restore_failure_recovers_at_later_epoch() {
     // can never hold. The released record (empty holder, epoch advanced
     // past the dead-marker) is the proof a cycle ran.
     let cycle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Keep the snapshot the loop matched: re-reading after the wait can
+    // observe the NEXT attempt already holding the lease (restore-failure
+    // retries re-acquire after 5 s), which would fail the holder check
+    // even though the supervisor behaved correctly.
+    let rec_mid;
     loop {
         let rec = plc_a.record(&scope).unwrap();
-        if rec
-            .as_ref()
-            .is_some_and(|r| r.epoch >= 2 && r.holder.is_empty())
-        {
+        if let Some(r) = rec.as_ref().filter(|r| r.epoch >= 2 && r.holder.is_empty()) {
+            rec_mid = r.clone();
             break;
         }
         assert!(
@@ -1585,7 +1588,6 @@ async fn transient_restore_failure_recovers_at_later_epoch() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_ne!(runtime_b.state(), TenantState::Ready);
-    let rec_mid = plc_a.record(&scope).unwrap().unwrap();
     assert!(
         rec_mid.epoch >= 2 && rec_mid.holder.is_empty() && rec_mid.writer_epoch == 1,
         "acquire-only epochs must NOT advance writer_epoch: {rec_mid:?}"

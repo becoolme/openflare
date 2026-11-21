@@ -110,7 +110,15 @@ test("bindings coverage: implemented binding areas are represented", () => {
 
 test("review gaps without runnable fixtures stay explicitly unverified", async () => {
   const unverified = await readFile(path.join(CONF, "UNVERIFIED.md"), "utf8");
-  for (const area of ["Service bindings", "Hyperdrive", "Secrets", "WebSockets", "Workflows"])
+  for (const area of [
+    "Service bindings",
+    "Hyperdrive",
+    "Rate limiting",
+    "Secrets",
+    "WebSockets",
+    "Workflows",
+    "Assets",
+  ])
     assert.match(unverified, new RegExp(`\\| ${area} \\|`), `${area} should be tracked`);
 });
 
