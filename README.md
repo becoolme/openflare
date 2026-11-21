@@ -72,6 +72,13 @@ WORKERD_SOURCE=file WORKERD_SHA256=$WORKERD_SHA256 \
   docker compose -f deploy/standalone/docker-compose.yml up --build --wait
 ```
 
+The compose stack is a single-machine quick start (dev/CI), not the
+production topology. Because Docker named volumes share one device, it
+passes the dev-only `vrt init --dev-allow-same-device-durability`
+exemption; production must keep the D1 object store on a separate device
+or use the s3 backend. Use `deploy/standalone/up.sh` in place of the bare
+compose command to get per-service logs when the stack fails to boot.
+
 Deploy the hello example. The management API reads a path local to the
 server, so copy the project into the container first (or deploy from the
 host — see "Local development and remote deploy" below). The example

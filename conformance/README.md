@@ -48,7 +48,7 @@ Against the standalone compose stack (real workerd):
 ```sh
 cp /path/to/workerd deploy/standalone/workerd   # pinned, digest-checked
 WORKERD_SOURCE=file WORKERD_SHA256=<from deploy/docker/workerd.lock> \
-  docker compose -f deploy/standalone/docker-compose.yml up --build --wait
+  deploy/standalone/up.sh
 
 node conformance/run.mjs \
   --url http://127.0.0.1:8080 \
@@ -93,6 +93,25 @@ workerd binary pinned in `deploy/docker/workerd.lock`, deploys every
 case, and runs with `--fail-on-skip`. A release must cite a green run of
 that workflow (attach the `conformance-report` artifact); the per-PR
 `ci` job only runs the runner's unit tests, which never touch a stack.
+
+### When the stack will not come up
+
+`docker compose up --wait` reports only `container … is unhealthy`; it
+does not say why. Two layers now surface the cause:
+
+- `deploy/standalone/up.sh` wraps the bring-up and dumps
+  `docker compose ps -a` plus each unhealthy/non-zero service's last
+  200 log lines (use it in place of the bare compose command).
+- `conformance/deploy-standalone.sh` runs the same check before every
+  case deploy, so a stack that degraded mid-run fails with logs instead
+  of a readiness timeout.
+
+The weekly workflow file is maintained separately; switching its
+bring-up step to `deploy/standalone/up.sh` gives the job log the same
+diagnostics. `vrt-sql` exiting with `VRT_SQL_DURABILITY_SAME_DEVICE`
+means the dev-only exemption documented in
+[`deploy/standalone/README.md`](../deploy/standalone/README.md#durability-in-this-stack-devci-only)
+is missing from the generated `vrt-sql.toml`.
 
 ## Adding a case
 
@@ -181,6 +200,12 @@ stack), not that it passed.
 
 ## Changelog
 
+- 2026-11-21: Standalone bring-up now opts into the dev-only
+  `allowSameDeviceDurability` exemption (Docker named volumes share one
+  device), so the weekly gate can actually boot `vrt-sql`; added
+  `deploy/standalone/up.sh` and a health preflight in
+  `deploy-standalone.sh` that dump the failing service's logs instead of
+  only `container … is unhealthy`.
 - 2026-11-20: Added restart steps (`restart: {services, waitReady}`)
   and the `restart-standalone.sh` hook, so a case can restart the runtime
   in place and gate the next step on a readiness probe. `do-alarm-restart`

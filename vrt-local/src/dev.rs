@@ -807,11 +807,7 @@ fn write_dev_configs(
     // Dev-only: the object store lives next to the db under `.vrt/`, so
     // vrt-sql's same-device durability guard (fail closed by default)
     // would refuse to start. Production configs never carry this key.
-    let sql = sql.replacen(
-        "[persistence]\n",
-        "[persistence]\n# `vrt dev` only: single device, no disaster recovery.\nallowSameDeviceDurability = true\n",
-        1,
-    );
+    let sql = crate::templates::dev_allow_same_device_durability(&sql);
     let cfg = crate::layout::config_dir(root);
     std::fs::create_dir_all(&cfg).map_err(|_| LocalError::Layout("config dir"))?;
     for (name, doc) in [

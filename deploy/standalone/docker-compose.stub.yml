@@ -35,6 +35,9 @@ services:
       - /usr/local/bin/workerd
       - --ingress-listen
       - 0.0.0.0:8080
+      # Same dev-only exemption as the base file: the stub smoke stack
+      # also keeps db + object store on one Docker device.
+      - --dev-allow-same-device-durability
   vrt: {<<: *stub-image}
   vrt-host: {<<: *stub-image}
   vrt-provider: {<<: *stub-image}
