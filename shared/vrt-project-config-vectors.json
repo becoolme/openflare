@@ -413,6 +413,23 @@
     "ok": false,
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "queues.producers[0].delivery_delay"
+   },
+   "rustExpect": {
+    "ok": true,
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "bindings": [
+      {
+       "type": "queue",
+       "name": "Q",
+       "queue": "q1",
+       "deliveryDelaySeconds": 5
+      }
+     ]
+    }
    }
   },
   {

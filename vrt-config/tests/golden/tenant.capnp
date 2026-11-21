@@ -126,10 +126,10 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-queue.js", esModule = embed "sys/4aa49686b6ece747f1d25b2a29eeb6c6d9bd42eebaa8aaee328c112d8eccb643"),
+        (name = "facade/facade-queue.js", esModule = embed "sys/f1f5e707bb17e4a2fe208294a869735a08f36fc0539a827cfd3bf2e24393ac6d"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
-        (name = "facade/queue-wire.js", esModule = embed "sys/f22d35fa0051d3576af9f56efae17d2f79e66dca674ae018ea322acbfc0e2508"),
+        (name = "facade/queue-wire.js", esModule = embed "sys/03e39f43d67f734985a7ac5681d6c01f5790b568fddace60c9f0f4c6c0f72290"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
         (name = "third_party/open-compute/facade/loader/python-snapshot.js", esModule = embed "sys/97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"),
         (name = "third_party/open-compute/facade/loader/shared.js", esModule = embed "sys/ad6ec6871acd01776f6fe414510e0126266f15f95480ce1172c3fa34babfef6e"),

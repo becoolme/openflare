@@ -899,7 +899,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 {
                     for k in e.keys() {
                         match k.as_str() {
-                            "binding" | "queue" => {}
+                            "binding" | "queue" | "delivery_delay" => {}
                             _ => {
                                 return Err(unsupported(
                                     &format!("queues.producers[{i}].{k}"),
@@ -924,6 +924,22 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                             &format!("queues.producers[{i}].queue"),
                         )?),
                     );
+                    // Cloudflare `delivery_delay`: queue-level default
+                    // send delay in seconds. Preserved on the normalized
+                    // binding so the standalone packer can carry it into
+                    // the signed snapshot.
+                    if let Some(n) = opt_u64(
+                        e.get("delivery_delay"),
+                        &format!("queues.producers[{i}].delivery_delay"),
+                    )? {
+                        if n > 86_400 {
+                            return Err(invalid(
+                                &format!("queues.producers[{i}].delivery_delay"),
+                                "must be in 0..=86400 seconds",
+                            ));
+                        }
+                        b.insert("deliveryDelaySeconds".into(), Value::from(n));
+                    }
                     bindings.push(Value::Object(b));
                 }
                 let mut consumers = Vec::new();
@@ -1798,7 +1814,19 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     // User-side queue name (wrangler `queue`); the real queueId
                     // is derived at pack time from vrt-q:{tenant}:{name}.
                     let qn = b.get("queue").and_then(|i| i.as_str()).unwrap_or(name);
-                    queue.insert(name.into(), Value::from(qn));
+                    match b.get("deliveryDelaySeconds") {
+                        // Legacy plain-string wire shape when no queue-level
+                        // default is declared — existing packages keep their bytes.
+                        None => {
+                            queue.insert(name.into(), Value::from(qn));
+                        }
+                        Some(delay) => {
+                            let mut q = Map::new();
+                            q.insert("queue".into(), Value::from(qn));
+                            q.insert("deliveryDelaySeconds".into(), delay.clone());
+                            queue.insert(name.into(), Value::Object(q));
+                        }
+                    }
                 }
                 "pg" => {
                     // P1: `id` is the logical tenant id — credentials
@@ -2296,6 +2324,104 @@ mod tests {
             quotas.memory_mb,
             snapshot_protocol::compute_desired::DEFAULT_MEMORY_MB
         );
+    }
+
+    /// Cloudflare `queues.producers[].delivery_delay`: accepted, bounded
+    /// 0..=86400, and carried into the pack-time `[bindings.queue]` table
+    /// form — the legacy string form stays byte-identical.
+    #[test]
+    fn wrangler_queue_delivery_delay_normalizes_and_validates() {
+        use crate::worker_pkg::QueueTargetToml;
+
+        let dir = wrangler_loader_body(
+            "[[queues.producers]]\nbinding = \"Q\"\nqueue = \"q1\"\ndelivery_delay = 30\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let queue = meta.bindings.unwrap().queue;
+        let target = queue.get("Q").expect("queue binding");
+        assert_eq!(target.queue(), "q1");
+        assert_eq!(target.delivery_delay_seconds(), Some(30));
+        assert_eq!(
+            serde_json::to_value(target).unwrap(),
+            serde_json::json!({"queue": "q1", "deliveryDelaySeconds": 30})
+        );
+
+        // Upper bound is inclusive.
+        let dir = wrangler_loader_body(
+            "[[queues.producers]]\nbinding = \"Q\"\nqueue = \"q1\"\ndelivery_delay = 86400\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(
+            meta.bindings
+                .unwrap()
+                .queue
+                .get("Q")
+                .unwrap()
+                .delivery_delay_seconds(),
+            Some(86_400)
+        );
+
+        // Absent keeps the legacy plain-string wire shape.
+        let dir = wrangler_loader_body("[[queues.producers]]\nbinding = \"Q\"\nqueue = \"q1\"\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let target = meta.bindings.unwrap().queue.remove("Q").unwrap();
+        assert_eq!(target, QueueTargetToml::Name("q1".into()));
+        assert_eq!(serde_json::to_string(&target).unwrap(), "\"q1\"");
+
+        // Out-of-range / non-integer values are rejected with the field path.
+        for (value, field) in [
+            ("86401", "queues.producers[0].delivery_delay"),
+            ("-1", "queues.producers[0].delivery_delay"),
+            ("\"5\"", "queues.producers[0].delivery_delay"),
+        ] {
+            let dir = wrangler_loader_body(&format!(
+                "[[queues.producers]]\nbinding = \"Q\"\nqueue = \"q1\"\ndelivery_delay = {value}\n"
+            ));
+            let err = load_worker_meta(dir.path()).expect_err("must fail closed");
+            assert!(
+                format!("{err:?}").contains(field),
+                "value {value}: {err:?}"
+            );
+        }
+    }
+
+    /// Native `vrt.toml` equivalent: `NAME = { queue, deliveryDelaySeconds }`
+    /// (camelCase like the rest of the native shape). Unknown keys fail closed
+    /// and the legacy string form keeps serializing as a string.
+    #[test]
+    fn vrt_toml_queue_delay_table_shape() {
+        use crate::worker_pkg::{BindingsToml, QueueTargetToml};
+
+        let b: BindingsToml = toml::from_str(
+            "[queue]\nQ = \"q1\"\nR = { queue = \"q2\", deliveryDelaySeconds = 5 }\n",
+        )
+        .unwrap();
+        assert_eq!(b.queue.get("Q"), Some(&QueueTargetToml::Name("q1".into())));
+        let r = b.queue.get("R").unwrap();
+        assert_eq!(r.queue(), "q2");
+        assert_eq!(r.delivery_delay_seconds(), Some(5));
+
+        // Decode accepts the raw u32; the 0..=86400 bound is enforced by
+        // the packer (covered in local_ops) and the signed protocol.
+        let over: BindingsToml =
+            toml::from_str("[queue]\nR = { queue = \"q2\", deliveryDelaySeconds = 86401 }\n")
+                .unwrap();
+        assert_eq!(
+            over.queue.get("R").unwrap().delivery_delay_seconds(),
+            Some(86_401)
+        );
+
+        // Unknown / snake_case / negative fails closed at decode.
+        for bad in [
+            "[queue]\nR = { queue = \"q2\", deliveryDelay = 5 }\n",
+            "[queue]\nR = { queue = \"q2\", delivery_delay = 5 }\n",
+            "[queue]\nR = { queue = \"q2\", deliveryDelaySeconds = -1 }\n",
+        ] {
+            assert!(
+                toml::from_str::<BindingsToml>(bad).is_err(),
+                "must reject {bad:?}"
+            );
+        }
     }
 }
 

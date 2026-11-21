@@ -12,13 +12,35 @@ From `examples/standalone-queue/wrangler.jsonc`:
 ```jsonc
 {
   "queues": {
-    "producers": [{ "binding": "Q", "queue": "e2e-queue" }],
+    "producers": [
+      { "binding": "Q", "queue": "e2e-queue", "delivery_delay": 30 }
+    ],
     "consumers": [
       { "queue": "e2e-queue", "max_batch_size": 5, "max_batch_timeout": 1 }
     ]
   }
 }
 ```
+
+The native standalone shape is:
+
+```toml
+[bindings.queue]
+# Legacy plain form: no queue-level default delay.
+LEGACY = "e2e-queue"
+# Table form with a queue-level default delay, 0..=86400 seconds.
+Q = { queue = "e2e-queue", deliveryDelaySeconds = 30 }
+```
+
+`delivery_delay` (wrangler) / `deliveryDelaySeconds` (native `vrt.toml`) is a
+queue-level default send delay: a `send()`/`sendBatch()` call that does not
+pass its own `delaySeconds` inherits it. The queue-level value only applies
+when the caller omits a delay — workerd only emits `X-Msg-Delay-Secs` when
+`delaySeconds` is present, so `facade-queue` fills the header with the
+queue-level default only when it is absent. An explicit per-message (or
+per-batch) `delaySeconds` always wins, including an explicit `0` (which
+means "no delay", Cloudflare's documented floor). Values outside `0..=86400`
+are rejected at config load.
 
 ## Where it runs
 
@@ -75,6 +97,11 @@ standalone `vrt serve` loop (1 s cadence).
   delay", and a delayed message's `Message.timestamp` stays the send
   time, so the delivery lag is the applied delay
   (`conformance/cases/queues/queues-basic`).
+- Queue-level default delay: `delivery_delay` (wrangler) /
+  `deliveryDelaySeconds` (native `vrt.toml`) rides in the signed queue
+  binding and `facade-queue` applies it only when workerd sent no
+  `X-Msg-Delay-Secs` header. Explicit `send`/`sendBatch` delays always
+  win, including an explicit `0`.
 - `sendBatch` is all-or-nothing. The provider validates every item
   (message count, per-message and batch bytes, content type, delay,
   client-supplied id/timestamp) before it renders the single vrt-sql
@@ -100,8 +127,9 @@ standalone `vrt serve` loop (1 s cadence).
 
 - `queues` may only contain `producers` and `consumers` — anything else
   → `VRT_CONFIG_UNSUPPORTED_FIELD`.
-- Producer entries accept only `binding` and `queue` (so
-  `delivery_delay` etc. → `VRT_CONFIG_UNSUPPORTED_FIELD`).
+- Producer entries accept `binding`, `queue`, and `delivery_delay`
+  (0–86,400 seconds; anything else, e.g. `max_ack`, →
+  `VRT_CONFIG_UNSUPPORTED_FIELD`).
 - Consumer entries accept only `queue`, `max_batch_size`,
   `max_batch_timeout`, `max_retries`, `dead_letter_queue`,
   `retry_delay`, `max_concurrency` — anything else (e.g. `max_ack`) →

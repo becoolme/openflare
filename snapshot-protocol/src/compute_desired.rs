@@ -485,6 +485,10 @@ fn default_d1_epoch() -> u64 {
     1
 }
 
+/// Cloudflare `delivery_delay` bound — a queue-level default send delay
+/// of 0..=86,400 seconds (24 hours).
+pub const MAX_QUEUE_DELIVERY_DELAY_SECS: u32 = 86_400;
+
 /// `{"type":"queue"}` — server-assigned queue identity (T37). `queueId`
 /// is minted by the control plane (same `^[a-z0-9]{26}$` namespace as
 /// databaseId); `queueName` is the worker-facing broker name — routing
@@ -500,6 +504,16 @@ pub struct QueueBinding {
     pub queue_name: String,
     /// Access grant for this binding.
     pub permissions: BindingPermissions,
+    /// Queue-level default delivery delay (wrangler `delivery_delay`),
+    /// 0..=[`MAX_QUEUE_DELIVERY_DELAY_SECS`] seconds. A producer send
+    /// without an explicit `delaySeconds` inherits it; an explicit
+    /// per-message (or per-batch) delay always wins, including `0`.
+    /// Absent = no queue-level default and omitted from the wire, so
+    /// legacy snapshots keep their canonical bytes. Old cells reject
+    /// the field via `deny_unknown_fields` (fail closed, never silently
+    /// drop a declared delay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_delay_seconds: Option<u32>,
 }
 
 /// `{"type":"durableObject"}` (P3c-1) — binds one DO class. The class
@@ -1425,6 +1439,12 @@ impl WorkerDesired {
                     }
                     if !valid_identifier(&q.queue_name, MAX_IDENTIFIER_LEN) {
                         return Err(DesiredError::Identifier("bindings.queueName"));
+                    }
+                    if !q
+                        .delivery_delay_seconds
+                        .map_or(true, |v| v <= MAX_QUEUE_DELIVERY_DELAY_SECS)
+                    {
+                        return Err(DesiredError::Identifier("bindings.deliveryDelaySeconds"));
                     }
                 }
                 // WorkerLoader carries no resource reference — `name`
@@ -2862,6 +2882,72 @@ mod tests {
         }
         assert!(!valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN + 1)));
         assert!(valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN)));
+    }
+
+    #[test]
+    fn queue_delivery_delay_wire_shape_and_validation() {
+        // Absent stays absent: legacy snapshots keep their canonical bytes.
+        let legacy = serde_json::json!({
+            "type": "queue", "name": "JOBS",
+            "queueId": "qqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "queueName": "jobs",
+            "permissions": {"read": true, "write": true}
+        });
+        let b: BindingDesired = serde_json::from_value(legacy.clone()).unwrap();
+        let BindingDesired::Queue(q) = &b else { panic!() };
+        assert_eq!(q.delivery_delay_seconds, None);
+        assert_eq!(serde_json::to_value(&b).unwrap(), legacy);
+        assert_eq!(
+            serde_json::to_string(&b).unwrap(),
+            r#"{"type":"queue","name":"JOBS","queueId":"qqqqqqqqqqqqqqqqqqqqqqqqqq","queueName":"jobs","permissions":{"read":true,"write":true}}"#
+        );
+
+        // Set round-trips; explicit 0 is a real value (present on the wire).
+        for delay in [0u32, 5, MAX_QUEUE_DELIVERY_DELAY_SECS] {
+            let with_delay = serde_json::json!({
+                "type": "queue", "name": "JOBS",
+                "queueId": "qqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "queueName": "jobs",
+                "permissions": {"read": true, "write": true},
+                "deliveryDelaySeconds": delay
+            });
+            let b: BindingDesired = serde_json::from_value(with_delay.clone()).unwrap();
+            let BindingDesired::Queue(q) = &b else { panic!() };
+            assert_eq!(q.delivery_delay_seconds, Some(delay));
+            assert_eq!(serde_json::to_value(&b).unwrap(), with_delay);
+        }
+
+        // Unknown fields still fail closed.
+        let unknown = serde_json::json!({
+            "type": "queue", "name": "JOBS",
+            "queueId": "qqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "queueName": "jobs",
+            "permissions": {"read": true, "write": true},
+            "deliveryDelay": 5
+        });
+        assert!(serde_json::from_value::<BindingDesired>(unknown).is_err());
+
+        // Bounds: 0..=86400 accepted, 86401 rejected by semantic validate.
+        let queue = |delay: Option<u32>| {
+            serde_json::json!({
+                "type": "queue", "name": "JOBS",
+                "queueId": "qqqqqqqqqqqqqqqqqqqqqqqqqq",
+                "queueName": "jobs",
+                "permissions": {"read": true, "write": true},
+                "deliveryDelaySeconds": delay
+            })
+        };
+        let value = payload_with_binding(queue(None));
+        assert!(desired(&value).unwrap().validate().is_ok());
+        for delay in [Some(0u32), Some(MAX_QUEUE_DELIVERY_DELAY_SECS)] {
+            let value = payload_with_binding(queue(delay));
+            assert!(desired(&value).unwrap().validate().is_ok(), "{delay:?}");
+        }
+        let value = payload_with_binding(queue(Some(MAX_QUEUE_DELIVERY_DELAY_SECS + 1)));
+        assert_eq!(
+            desired(&value).unwrap().validate(),
+            Err(DesiredError::Identifier("bindings.deliveryDelaySeconds"))
+        );
     }
 
     #[test]

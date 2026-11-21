@@ -252,3 +252,114 @@ test("drainToBuffer is exercised even for a rejected route (404)", async () => {
   assert.equal(resp.status, 404);
   assert.equal(pulls, 3, "route rejection must still drain first");
 });
+
+// ---------------------------------------------------------------------------
+// Queue-level default delivery delay (`delivery_delay`): workerd only emits
+// `X-Msg-Delay-Secs` when the caller passed delaySeconds (including 0), so
+// the facade fills the queue default only when the header is absent. An
+// explicit per-send / per-message delay therefore always wins.
+// ---------------------------------------------------------------------------
+
+test("queue-level default delay fills an absent message delay header", async () => {
+  let seen;
+  const backend = makeBackend(async (record) => {
+    seen = record;
+    return new Response('{"metadata":{}}');
+  });
+  const facade = makeFacade({ deliveryDelaySeconds: 30 }, backend.fetcher);
+  const resp = await facade.fetch(queueRequest("/message"));
+  assert.equal(resp.status, 200);
+  assert.equal(new Headers(seen.headers).get("x-msg-delay-secs"), "30");
+});
+
+test("explicit delaySeconds wins over the queue-level default", async () => {
+  let seen;
+  const backend = makeBackend(async (record) => {
+    seen = record;
+    return new Response('{"metadata":{}}');
+  });
+  const facade = makeFacade({ deliveryDelaySeconds: 30 }, backend.fetcher);
+  const resp = await facade.fetch(
+    queueRequest("/message", { headers: { "x-msg-delay-secs": "5" } }),
+  );
+  assert.equal(resp.status, 200);
+  assert.equal(new Headers(seen.headers).get("x-msg-delay-secs"), "5");
+});
+
+test("explicit delaySeconds 0 wins (no delay) over the queue-level default", async () => {
+  let seen;
+  const backend = makeBackend(async (record) => {
+    seen = record;
+    return new Response('{"metadata":{}}');
+  });
+  const facade = makeFacade({ deliveryDelaySeconds: 30 }, backend.fetcher);
+  await facade.fetch(queueRequest("/message", { headers: { "x-msg-delay-secs": "0" } }));
+  assert.equal(new Headers(seen.headers).get("x-msg-delay-secs"), "0");
+});
+
+test("no queue-level default leaves the broker header untouched", async () => {
+  let seen;
+  const backend = makeBackend(async (record) => {
+    seen = record;
+    return new Response('{"metadata":{}}');
+  });
+  const facade = makeFacade({}, backend.fetcher);
+  await facade.fetch(queueRequest("/message"));
+  assert.equal(new Headers(seen.headers).get("x-msg-delay-secs"), null);
+});
+
+test("batch default delay is filled, per-item delaySecs remains in the body", async () => {
+  let seen;
+  const backend = makeBackend(async (record) => {
+    seen = record;
+    return new Response('{"metadata":{}}');
+  });
+  const facade = makeFacade({ deliveryDelaySeconds: 12 }, backend.fetcher);
+  const body = JSON.stringify({
+    messages: [
+      { contentType: "text", body: "aW1wbGljaXQ=" },
+      { contentType: "text", body: "ZXhwbGljaXQ=", delaySecs: 3 },
+      { contentType: "text", body: "emVybw==", delaySecs: 0 },
+    ],
+  });
+  const resp = await facade.fetch(queueRequest("/batch", { body }));
+  assert.equal(resp.status, 200);
+  assert.equal(new Headers(seen.headers).get("x-msg-delay-secs"), "12");
+  // The provider merges header default + per-item delaySecs; the facade
+  // must not rewrite the body (an explicit item delay survives).
+  const forwarded = JSON.parse(new TextDecoder().decode(seen.body));
+  assert.equal(forwarded.messages[1].delaySecs, 3);
+  assert.equal(forwarded.messages[2].delaySecs, 0);
+});
+
+test("metrics never receives a queue-level default delay header", async () => {
+  let seen;
+  const backend = makeBackend(async (record) => {
+    seen = record;
+    return new Response('{"metrics":{}}');
+  });
+  const facade = makeFacade({ deliveryDelaySeconds: 30 }, backend.fetcher);
+  const resp = await facade.fetch(
+    new Request("http://queue/metrics", { method: "GET" }),
+  );
+  assert.equal(resp.status, 200);
+  assert.equal(new Headers(seen.headers).get("x-msg-delay-secs"), null);
+});
+
+test("malformed queue-level default delay fails closed with a bounded error", async () => {
+  let backendCalled = false;
+  const backend = {
+    async fetch() {
+      backendCalled = true;
+      return new Response("{}");
+    },
+  };
+  for (const bad of [-1, 86_401, 1.5, "5", Number.MAX_SAFE_INTEGER + 1]) {
+    const facade = makeFacade({ deliveryDelaySeconds: bad }, backend);
+    const resp = await facade.fetch(queueRequest("/message"));
+    assert.equal(resp.status, 500, `delay ${String(bad)}`);
+    assert.ok("error" in (await resp.json()));
+    assert.equal(backendCalled, false, `delay ${String(bad)} must not reach the provider`);
+  }
+  assert.equal(wire.QUEUE_HDR_MSG_DELAY, "x-msg-delay-secs");
+});

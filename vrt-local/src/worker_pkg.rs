@@ -119,10 +119,14 @@ pub(crate) struct BindingsToml {
     /// `name -> user-side database_id` (the server derives the real id at pack time).
     #[serde(default)]
     pub(crate) d1: BTreeMap<String, String>,
-    /// T37: `name -> user-side queue name` (queueId is derived at pack time from
-    /// `vrt-q:{tenant}:{name}` -- standalone has no control-plane provisioning).
+    /// T37: queue producer bindings. The value is the user-side queue
+    /// name (queueId is derived at pack time from
+    /// `vrt-q:{tenant}:{name}` -- standalone has no control-plane
+    /// provisioning), either as the legacy plain-string form or the
+    /// `{ queue, deliveryDelaySeconds }` table form carrying a
+    /// queue-level default send delay.
     #[serde(default)]
-    pub(crate) queue: BTreeMap<String, String>,
+    pub(crate) queue: BTreeMap<String, QueueTargetToml>,
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
     /// `binding name -> vrt database tenant name`; credentials are resolved
@@ -149,6 +153,45 @@ pub(crate) struct RatelimitToml {
     pub(crate) namespace_id: String,
     pub(crate) limit: u64,
     pub(crate) period: u64,
+}
+
+/// `[bindings.queue]` value: either the legacy plain queue name or
+/// `{ queue, deliveryDelaySeconds }`. The string form serializes exactly
+/// as before, so existing packages keep their bytes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum QueueTargetToml {
+    /// Legacy `NAME = "queue-name"`.
+    Name(String),
+    /// `NAME = { queue = "queue-name", deliveryDelaySeconds = 5 }`.
+    Options(QueueOptionsToml),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct QueueOptionsToml {
+    /// User-side queue name (id derived at pack time).
+    pub(crate) queue: String,
+    /// Queue-level default send delay, 0..=86,400 seconds. Absent = no
+    /// default (Cloudflare's own default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delivery_delay_seconds: Option<u32>,
+}
+
+impl QueueTargetToml {
+    pub(crate) fn queue(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Options(options) => &options.queue,
+        }
+    }
+
+    pub(crate) fn delivery_delay_seconds(&self) -> Option<u32> {
+        match self {
+            Self::Name(_) => None,
+            Self::Options(options) => options.delivery_delay_seconds,
+        }
+    }
 }
 
 /// `[bindings.service]` value: either the target worker name (default
@@ -443,10 +486,52 @@ pub struct PendingAssets {
     pub objects: Vec<(String, Vec<u8>)>,
 }
 
-/// Per-manifest caps — mirror the platform upload API.
-const MAX_ASSET_FILES: usize = 512;
-const MAX_ASSET_FILE_BYTES: u64 = 1024 * 1024;
-const MAX_ASSET_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+/// Per-manifest asset caps.
+///
+/// The file count and per-file size follow Cloudflare Workers' documented
+/// limits (20,000 files on the free plan, 100,000 paid; 25 MiB per file).
+/// We default to the conservative free-plan count. Cloudflare documents no
+/// total-size limit; the total here is a local memory/disk guard for the
+/// packer (the bundle is materialized in memory), overridable for large
+/// sites through the environment variables below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AssetLimits {
+    max_files: usize,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl Default for AssetLimits {
+    fn default() -> Self {
+        Self {
+            max_files: 20_000,
+            max_file_bytes: 25 * 1024 * 1024,
+            max_total_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+fn env_limit(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|v| *v != 0)
+        .unwrap_or(default)
+}
+
+/// Caps for this process. Read once; invalid or zero values fall back to the
+/// default for that dimension (a typo must not disable a guard).
+fn asset_limits() -> AssetLimits {
+    static LIMITS: std::sync::OnceLock<AssetLimits> = std::sync::OnceLock::new();
+    *LIMITS.get_or_init(|| {
+        let defaults = AssetLimits::default();
+        AssetLimits {
+            max_files: env_limit("VRT_ASSET_MAX_FILES", defaults.max_files as u64) as usize,
+            max_file_bytes: env_limit("VRT_ASSET_MAX_FILE_BYTES", defaults.max_file_bytes),
+            max_total_bytes: env_limit("VRT_ASSET_MAX_TOTAL_BYTES", defaults.max_total_bytes),
+        }
+    })
+}
 
 /// Extension→MIME whitelist (mirrors the platform table; unknown
 /// extensions map to `application/octet-stream` — never client input).
@@ -581,18 +666,19 @@ fn assets_from_entries(
     html_handling: &str,
     not_found: &str,
 ) -> Result<PendingAssets, LocalError> {
+    let limits = asset_limits();
     let mut files: Vec<(String, String, u64, String, Vec<u8>)> = Vec::new();
     let mut total: u64 = 0;
     for (req_path, bytes) in entries {
         let size = bytes.len() as u64;
-        if size > MAX_ASSET_FILE_BYTES {
+        if size > limits.max_file_bytes {
             return Err(LocalError::Worker("asset file too large"));
         }
         total += size;
-        if total > MAX_ASSET_TOTAL_BYTES {
+        if total > limits.max_total_bytes {
             return Err(LocalError::Worker("assets total too large"));
         }
-        if files.len() >= MAX_ASSET_FILES {
+        if files.len() >= limits.max_files {
             return Err(LocalError::Worker("too many asset files"));
         }
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
@@ -885,18 +971,29 @@ pub fn assemble(
                 },
             ));
         }
-        for (binding, queue_name) in &b.queue {
+        for (binding, target) in &b.queue {
             // T37: queueId derivation -- the first 26 hex chars of sha256("vrt-q:{tenant}:{name}")
             // (hex is a subset of [a-z0-9], same rule as database_id).
             // Multiple producers with the same name in the same instance share the same queue (CF semantics);
             // a worker never gets an arbitrary id -- the signed snapshot covers the derived value.
-            let digest = derive_queue_id(tenant_id, queue_name)?;
+            let digest = derive_queue_id(tenant_id, target.queue())?;
+            if let Some(delay) = target.delivery_delay_seconds() {
+                // Cloudflare `delivery_delay` bound; also enforced by
+                // snapshot-protocol, but rejected here with a config-side
+                // error before a deploy document is built.
+                if delay > snapshot_protocol::compute_desired::MAX_QUEUE_DELIVERY_DELAY_SECS {
+                    return Err(LocalError::Worker(
+                        "queue delivery delay must be 0..=86400 seconds",
+                    ));
+                }
+            }
             bindings.push(BindingDesired::Queue(
                 snapshot_protocol::compute_desired::QueueBinding {
                     name: binding.clone(),
                     queue_id: digest,
                     queue_name: binding.clone(),
                     permissions: read_write.clone(),
+                    delivery_delay_seconds: target.delivery_delay_seconds(),
                 },
             ));
         }
@@ -1766,7 +1863,8 @@ fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError>
     let files = manifest["files"]
         .as_array()
         .ok_or(LocalError::Worker("assets manifest"))?;
-    if files.len() > MAX_ASSET_FILES {
+    let limits = asset_limits();
+    if files.len() > limits.max_files {
         return Err(LocalError::Worker("too many asset files"));
     }
     let mut declared = std::collections::BTreeSet::new();
@@ -1797,11 +1895,11 @@ fn upload_assets_verified(a: &UploadAssets) -> Result<PendingAssets, LocalError>
         if hex::encode(sha2::Sha256::digest(&bytes)) != sha {
             return Err(LocalError::Worker("assets digest"));
         }
-        if size > MAX_ASSET_FILE_BYTES {
+        if size > limits.max_file_bytes {
             return Err(LocalError::Worker("asset file too large"));
         }
         total += size;
-        if total > MAX_ASSET_TOTAL_BYTES {
+        if total > limits.max_total_bytes {
             return Err(LocalError::Worker("assets total too large"));
         }
         validate_config_asset(path, &bytes)?;
@@ -1851,8 +1949,7 @@ mod assets_handling_tests {
         ] {
             let pending = scan_assets_dir(&root, &assets(Some(mode)))
                 .unwrap_or_else(|e| panic!("{mode}: {e:?}"));
-            let doc: serde_json::Value =
-                serde_json::from_slice(&pending.manifest_bytes).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&pending.manifest_bytes).unwrap();
             assert_eq!(doc["htmlHandling"], mode);
         }
         assert!(scan_assets_dir(&root, &assets(Some("force"))).is_err());
@@ -1927,10 +2024,7 @@ mod assets_handling_tests {
             "schemaVersion": 1,
         });
         let mut objects = BTreeMap::new();
-        objects.insert(
-            sha,
-            base64::engine::general_purpose::STANDARD.encode(&bad),
-        );
+        objects.insert(sha, base64::engine::general_purpose::STANDARD.encode(&bad));
         let upload = UploadAssets {
             manifest: base64::engine::general_purpose::STANDARD
                 .encode(serde_json::to_vec(&manifest).unwrap()),
@@ -1939,8 +2033,7 @@ mod assets_handling_tests {
         assert!(upload_assets_verified(&upload).is_err());
         // A legitimate deployment still verifies (digest-keyed objects).
         let pending_ok = upload_assets_verified(&UploadAssets {
-            manifest: base64::engine::general_purpose::STANDARD
-                .encode(&pending.manifest_bytes),
+            manifest: base64::engine::general_purpose::STANDARD.encode(&pending.manifest_bytes),
             objects: pending
                 .objects
                 .iter()
@@ -1989,6 +2082,17 @@ mod quotas_tests {
             normalize_quotas(None).unwrap(),
             WorkerQuotas::platform_default()
         );
+    }
+
+    /// Default asset caps follow Cloudflare's documented Workers limits
+    /// (20,000 files on the free plan, 25 MiB per file). The total is a
+    /// local packer guard, not a Cloudflare limit.
+    #[test]
+    fn asset_limits_default_to_cloudflare_limits() {
+        let limits = AssetLimits::default();
+        assert_eq!(limits.max_files, 20_000);
+        assert_eq!(limits.max_file_bytes, 25 * 1024 * 1024);
+        assert_eq!(limits.max_total_bytes, 512 * 1024 * 1024);
     }
 
     /// Out-of-bounds values name the offending field — a deploy-time

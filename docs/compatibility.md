@@ -92,7 +92,7 @@ These are not tied to one binding.
   shared across hosts.
 - **R2 `onlyIf`** depends on the backend (`s3.conditionalWrites`);
   `jurisdiction`/`storage_class` rejected.
-- **Static assets** caps: 512 files / 1 MiB each / 8 MiB per deploy;
+- **Static assets** caps: 20,000 files and 25 MiB per file (Cloudflare's free-plan limits; overridable with `VRT_ASSET_MAX_FILES` / `VRT_ASSET_MAX_FILE_BYTES`), plus a 512 MiB total guard by default (Cloudflare documents no total; override with `VRT_ASSET_MAX_TOTAL_BYTES`).
   all four `html_handling` modes, with Cloudflare's per-request-form
   candidate order and 307 canonical redirects.
 - **`vars` non-string values arrive as JSON-encoded strings**, not

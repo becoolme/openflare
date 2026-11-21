@@ -403,7 +403,7 @@ fn binding_table(meta: &crate::WorkerToml) -> Vec<String> {
             out.push(format!("d1       {name} -> {db}"));
         }
         for (name, q) in &b.queue {
-            out.push(format!("queue    {name} -> {q}"));
+            out.push(format!("queue    {name} -> {}", q.queue()));
         }
         for (name, db) in &b.pg {
             out.push(format!("pg       {name} -> {db}"));
