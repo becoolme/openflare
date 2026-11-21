@@ -136,10 +136,11 @@ impl AeService {
             crate::cache::ensure_traverse_dir(r, "ae socket root")?;
         }
         // Tenant datapoints — 0700 like every other tenant-data dir in
-        // the crate (the AeService doc's "host-only 0700" claim was
-        // previously only true under a strict umask).
-        vrt_securefs::ensure_secure_dir(&data_root.join("spool"))?;
-        vrt_securefs::ensure_secure_dir(&data_root.join("out"))?;
+        // the crate, set explicitly (never left to the process umask).
+        // `ensure_private_dir` also narrows a 0755 dir left by an older
+        // release instead of failing every append after an upgrade.
+        vrt_securefs::ensure_private_dir(&data_root.join("spool"))?;
+        vrt_securefs::ensure_private_dir(&data_root.join("out"))?;
         Ok(Self {
             sock_root,
             inner: Arc::new(AeInner {
@@ -226,10 +227,14 @@ impl AeService {
 
     /// `<data_root>/spool/<seg(tenant)>/` — created lazily on first
     /// write AND at listener bind (a tenant with a bound socket but
-    /// zero writes still has a predictable dir).
+    /// zero writes still has a predictable dir). Must be 0700 from
+    /// birth: the umask is not part of the contract, and a dir left
+    /// 0755 by an older release is narrowed (the append path
+    /// re-validates the same way).
     fn ensure_tenant_dir(&self, tenant_id: &str) -> std::io::Result<()> {
-        std::fs::create_dir_all(
-            self.inner
+        vrt_securefs::ensure_private_dir(
+            &self
+                .inner
                 .data_root
                 .join("spool")
                 .join(vrt_securefs::segment_encode(tenant_id)),
@@ -509,7 +514,7 @@ enum AppendError {
 fn append(inner: &AeInner, tenant: &str, dataset: &str, body: &[u8]) -> Result<(), AppendError> {
     let seg = vrt_securefs::segment_encode(tenant);
     let dir = inner.data_root.join("spool").join(&seg);
-    vrt_securefs::ensure_secure_dir(&dir).map_err(AppendError::Io)?;
+    vrt_securefs::ensure_private_dir(&dir).map_err(AppendError::Io)?;
     let path = dir.join(format!("{dataset}.jsonl"));
 
     let mut guard = inner.write.lock().unwrap_or_else(|p| p.into_inner());
@@ -579,6 +584,12 @@ fn flush_all(inner: &AeInner) {
         let Ok(files) = std::fs::read_dir(&dir) else {
             continue;
         };
+        // Collect claims BEFORE converting any of them: a budget-capped
+        // claim restores its unread tail as a fresh `<ds>.jsonl` in this
+        // same directory, and that tail belongs to the NEXT pass, not
+        // this one (the per-pass byte budget must actually bound one
+        // pass). Read errors on an entry are skipped like before.
+        let mut claims: Vec<(String, PathBuf)> = Vec::new();
         for f in files.flatten() {
             let path = f.path();
             let name = f.file_name();
@@ -594,23 +605,46 @@ fn flush_all(inner: &AeInner) {
                 name.strip_suffix(".flushing")
                     .map(|ds| (ds.to_string(), path.clone()))
             };
-            let Some((dataset, claim_path)) = claim else {
-                continue;
-            };
+            if let Some(claim) = claim {
+                claims.push(claim);
+            }
+        }
+        for (dataset, claim_path) in claims {
             let claim_len = std::fs::metadata(&claim_path).map(|m| m.len()).unwrap_or(0);
             match flush_one(inner, &tenant, &dataset, &claim_path) {
-                Ok(rows) => {
-                    let _ = std::fs::remove_file(&claim_path);
-                    let mut g = inner.write.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(t) = g.get_mut(seg_name) {
-                        *t = t.saturating_sub(claim_len);
-                    }
-                    if rows > 0 {
-                        crate::metrics::registry().inc(
-                            "vrt_host_ae_flushed_events_total",
-                            &[("tenant", &*tenant), ("dataset", &*dataset)],
-                            rows as f64,
-                        );
+                Ok((rows, tail)) => {
+                    // Budget-capped claim: hand the unread tail back to
+                    // the spool BEFORE deleting the claim. A restore
+                    // failure keeps the claim (retry next tick) instead
+                    // of losing the tail.
+                    let restored = match tail {
+                        None => Ok(0u64),
+                        Some(mut t) => restore_spool_tail(inner, &tenant, &dataset, &mut t),
+                    };
+                    match restored {
+                        Ok(restored) => {
+                            let _ = std::fs::remove_file(&claim_path);
+                            let mut g = inner.write.lock().unwrap_or_else(|p| p.into_inner());
+                            if let Some(t) = g.get_mut(seg_name) {
+                                *t = t.saturating_sub(claim_len).saturating_add(restored);
+                            }
+                            if rows > 0 {
+                                crate::metrics::registry().inc(
+                                    "vrt_host_ae_flushed_events_total",
+                                    &[("tenant", &*tenant), ("dataset", &*dataset)],
+                                    rows as f64,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            crate::metrics::registry().inc(
+                                "vrt_host_ae_flush_errors_total",
+                                &[("tenant", &*tenant), ("dataset", &*dataset)],
+                                1.0,
+                            );
+                            tracing::warn!(%tenant, %dataset, %e,
+                                "ae flush tail restore failed; claim retained for retry");
+                        }
                     }
                 }
                 Err(e) => {
@@ -640,6 +674,14 @@ const MAX_PARTITIONS_PER_CLAIM: usize = 128;
 /// Bound on rows per part file — a multi-MB day writes several
 /// bounded parts instead of one giant batch.
 const MAX_ROWS_PER_PART: usize = 1_000_000;
+/// Spool bytes decoded per claim per tick. The blocking pool already
+/// keeps this off the async workers, but an unbounded pass over a full
+/// 256 MiB tenant spool would still be a multi-second block and a
+/// multi-hundred-MB decoded-event spike (the events, not the raw
+/// bytes, are what the Arrow build holds). The unread tail is restored
+/// to the spool instead of dropped, so the budget caps THROUGHPUT, not
+/// data — the next tick continues where this one stopped.
+const MAX_CLAIM_BYTES_PER_FLUSH: u64 = 32 * 1024 * 1024;
 
 fn partition_day(now: chrono::DateTime<chrono::Utc>, ts_ns: i64) -> String {
     let ts = chrono::DateTime::from_timestamp_nanos(ts_ns);
@@ -653,12 +695,33 @@ fn partition_day(now: chrono::DateTime<chrono::Utc>, ts_ns: i64) -> String {
 }
 
 /// Convert one claimed spool file into per-day Parquet part files.
-/// Returns the number of converted events. Runs on the blocking pool
-/// (`spawn_flush` wraps it) — decoding + Arrow/Parquet must not stall
-/// the async worker that also serves ingress.
-fn flush_one(inner: &AeInner, tenant: &str, dataset: &str, claim: &Path) -> std::io::Result<usize> {
-    // Stream line-by-line: the whole claim is hashed for idempotent
-    // part names without holding it plus the decoded events in memory.
+/// Returns the number of converted events plus, when
+/// [`MAX_CLAIM_BYTES_PER_FLUSH`] stopped the pass early, the reader
+/// positioned at the unread tail (the caller restores it to the
+/// spool). Runs on the blocking pool (`spawn_flush` wraps it) —
+/// decoding + Arrow/Parquet must not stall the async worker that also
+/// serves ingress.
+fn flush_one(
+    inner: &AeInner,
+    tenant: &str,
+    dataset: &str,
+    claim: &Path,
+) -> std::io::Result<(usize, Option<std::io::BufReader<std::fs::File>>)> {
+    flush_one_with_budget(inner, tenant, dataset, claim, MAX_CLAIM_BYTES_PER_FLUSH)
+}
+
+/// [`flush_one`] with an explicit byte budget — the budget is a
+/// constant in production and a test knob for the truncation path.
+fn flush_one_with_budget(
+    inner: &AeInner,
+    tenant: &str,
+    dataset: &str,
+    claim: &Path,
+    budget: u64,
+) -> std::io::Result<(usize, Option<std::io::BufReader<std::fs::File>>)> {
+    // Stream line-by-line: the processed prefix is hashed for
+    // idempotent part names without holding the raw file plus the
+    // decoded events in memory.
     let file = std::fs::File::open(claim)?;
     let mut reader = std::io::BufReader::new(file);
     let mut hasher = sha2::Sha256::new();
@@ -666,27 +729,35 @@ fn flush_one(inner: &AeInner, tenant: &str, dataset: &str, claim: &Path) -> std:
     let now = chrono::Utc::now();
     let mut by_day: BTreeMap<String, Vec<AeEvent>> = BTreeMap::new();
     let mut bad = 0usize;
+    let mut read_bytes = 0u64;
+    let mut budget_hit = false;
     loop {
         line.clear();
         let n = std::io::BufRead::read_until(&mut reader, b'\n', &mut line)?;
         if n == 0 {
             break;
         }
+        read_bytes += n as u64;
         hasher.update(&line);
         let trimmed = if line.last() == Some(&b'\n') {
             &line[..line.len() - 1]
         } else {
             &line[..]
         };
-        if trimmed.is_empty() {
-            continue;
-        }
-        match AeEvent::from_json(trimmed) {
-            Some(ev) => {
-                let day = partition_day(now, ev.timestamp_ns);
-                by_day.entry(day).or_default().push(ev);
+        if !trimmed.is_empty() {
+            match AeEvent::from_json(trimmed) {
+                Some(ev) => {
+                    let day = partition_day(now, ev.timestamp_ns);
+                    by_day.entry(day).or_default().push(ev);
+                }
+                None => bad += 1,
             }
-            None => bad += 1,
+        }
+        // Stop on a line boundary: the tail is restored verbatim, so
+        // a partial line can never be produced.
+        if read_bytes >= budget {
+            budget_hit = true;
+            break;
         }
     }
     if bad > 0 {
@@ -716,7 +787,7 @@ fn flush_one(inner: &AeInner, tenant: &str, dataset: &str, claim: &Path) -> std:
             .join(vrt_securefs::segment_encode(tenant))
             .join(dataset)
             .join(format!("dt={day}"));
-        vrt_securefs::ensure_secure_dir(&out_dir)?;
+        vrt_securefs::ensure_private_dir(&out_dir)?;
         // Content-derived name → a crashed/repeated flush of the SAME
         // bytes lands on the same part files (idempotent rewrite).
         for (i, chunk) in events.chunks(MAX_ROWS_PER_PART).enumerate() {
@@ -730,7 +801,30 @@ fn flush_one(inner: &AeInner, tenant: &str, dataset: &str, claim: &Path) -> std:
             );
         }
     }
-    Ok(written)
+    Ok((written, budget_hit.then_some(reader)))
+}
+
+/// Hand the unprocessed tail of a budget-capped claim back to the
+/// spool (`<spool>/<seg>/<dataset>.jsonl`, append-only) and return the
+/// restored byte count. Called before the claim is removed, under the
+/// caller's accounting update — the tail is data, never a drop.
+fn restore_spool_tail(
+    inner: &AeInner,
+    tenant: &str,
+    dataset: &str,
+    tail: &mut std::io::BufReader<std::fs::File>,
+) -> std::io::Result<u64> {
+    let dir = inner
+        .data_root
+        .join("spool")
+        .join(vrt_securefs::segment_encode(tenant));
+    vrt_securefs::ensure_private_dir(&dir)?;
+    let path = dir.join(format!("{dataset}.jsonl"));
+    let mut out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    std::io::copy(tail, &mut out)
 }
 
 // ============================ parquet ============================
@@ -1074,6 +1168,52 @@ mod tests {
         assert_eq!(partition_day(now, -1), "_invalid");
     }
 
+    /// The per-pass byte budget stops mid-file on a line boundary and
+    /// hands the unread tail back to the spool: no partial line, no
+    /// dropped event, and the next pass continues from there.
+    #[test]
+    fn flush_budget_caps_one_pass_and_restores_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AeService::new(
+            None,
+            dir.path().join("ae"),
+            AeLimits {
+                max_body_bytes: 1 << 20,
+                max_spool_bytes: 1 << 20,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&event_json()).unwrap();
+        for _ in 0..5 {
+            append(&svc.inner, "t1", "weather", &body).unwrap();
+        }
+        let spool_dir = dir
+            .path()
+            .join("ae/spool")
+            .join(vrt_securefs::segment_encode("t1"));
+        let claim = spool_dir.join("weather.flushing");
+        std::fs::rename(spool_dir.join("weather.jsonl"), &claim).unwrap();
+
+        // budget = 1 byte ⇒ exactly one line per pass.
+        let (rows, tail) = flush_one_with_budget(&svc.inner, "t1", "weather", &claim, 1).unwrap();
+        assert_eq!(rows, 1);
+        let mut tail = tail.expect("budget must stop the pass");
+        let restored = restore_spool_tail(&svc.inner, "t1", "weather", &mut tail).unwrap();
+        assert_eq!(restored, (body.len() as u64 + 1) * 4);
+        std::fs::remove_file(&claim).unwrap();
+        let rest = std::fs::read_to_string(spool_dir.join("weather.jsonl")).unwrap();
+        assert_eq!(rest.lines().count(), 4);
+        assert!(rest.ends_with('\n'), "restored tail must stay line-framed");
+
+        // Unbounded pass consumes the remainder and stops cleanly.
+        let claim2 = spool_dir.join("weather2.flushing");
+        std::fs::rename(spool_dir.join("weather.jsonl"), &claim2).unwrap();
+        let (rows2, tail2) = flush_one(&svc.inner, "t1", "weather", &claim2).unwrap();
+        assert_eq!(rows2, 4);
+        assert!(tail2.is_none());
+    }
+
     #[test]
     fn data_dirs_are_owner_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1098,5 +1238,91 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o700, "{sub} must be owner-only");
         }
+    }
+
+    /// Binding the listener pre-creates `spool/<seg>`; that dir must
+    /// already be 0700 AND still accept appends. It used to be created
+    /// with `create_dir_all` (0755 under the default umask), which made
+    /// the fail-closed `ensure_secure_dir` in `append` reject every
+    /// write with a 500 — the real-workerd smoke caught it.
+    #[test]
+    fn listener_bind_dir_accepts_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AeService::new(
+            None,
+            dir.path().join("ae"),
+            AeLimits {
+                max_body_bytes: 1 << 20,
+                max_spool_bytes: 1 << 20,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = rt
+            .block_on(svc.serve_tenant_tcp("t1", "127.0.0.1:0".parse().unwrap()))
+            .unwrap();
+        let tenant_dir = dir
+            .path()
+            .join("ae/spool")
+            .join(vrt_securefs::segment_encode("t1"));
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&tenant_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let body = serde_json::to_vec(&event_json()).unwrap();
+        append(&svc.inner, "t1", "weather", &body).expect("append after bind");
+        drop(listener);
+    }
+
+    /// Upgrade path: an older release created the spool/subdirs with
+    /// `create_dir_all` (0755). The first append after the upgrade must
+    /// narrow them (and keep working), not fail.
+    #[test]
+    fn legacy_wide_spool_dir_is_narrowed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AeService::new(
+            None,
+            dir.path().join("ae"),
+            AeLimits {
+                max_body_bytes: 1 << 20,
+                max_spool_bytes: 1 << 20,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        let tenant_dir = dir
+            .path()
+            .join("ae/spool")
+            .join(vrt_securefs::segment_encode("t1"));
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::set_permissions(&tenant_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A legacy 0755 out-day dir is healed by the flush too. The
+        // snapshot event is from 2023 → outside the partition window,
+        // so it lands in the single `dt=_invalid` bucket.
+        let legacy_day = dir
+            .path()
+            .join("ae/out")
+            .join(vrt_securefs::segment_encode("t1"))
+            .join("weather/dt=_invalid");
+        std::fs::create_dir_all(&legacy_day).unwrap();
+        std::fs::set_permissions(&legacy_day, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let body = serde_json::to_vec(&event_json()).unwrap();
+        append(&svc.inner, "t1", "weather", &body).expect("append into a legacy-wide dir");
+        assert_eq!(
+            std::fs::metadata(&tenant_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        flush_all(&svc.inner);
+        assert_eq!(
+            std::fs::metadata(&legacy_day).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 }

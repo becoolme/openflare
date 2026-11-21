@@ -316,29 +316,81 @@ fn ensure_dir_mode(dir: &Path, mode: u32) -> io::Result<()> {
             }
             Ok(())
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // Split into the deepest existing ancestor + missing tail.
-            let mut missing: Vec<PathBuf> = Vec::new();
-            let mut cur = dir.to_path_buf();
-            while !cur.exists() {
-                missing.push(cur.clone());
-                if !cur.pop() {
-                    break;
-                }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_missing_dirs(dir, mode),
+        Err(error) => Err(error),
+    }
+}
+
+/// Create `dir` and every missing parent with exactly `mode` (missing
+/// ancestors are validated first: a world-writable, non-sticky ancestor
+/// would let another principal replace the path we are about to create).
+fn create_missing_dirs(dir: &Path, mode: u32) -> io::Result<()> {
+    // Split into the deepest existing ancestor + missing tail.
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut cur = dir.to_path_buf();
+    while !cur.exists() {
+        missing.push(cur.clone());
+        if !cur.pop() {
+            break;
+        }
+    }
+    for ancestor in cur.ancestors() {
+        // Relative paths end at "" — nothing to validate.
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        validate_ancestor(ancestor)?;
+    }
+    for path in missing.iter().rev() {
+        // EEXIST here means another process (or a parallel test
+        // creating a sibling under the same new parent) won the race
+        // after our `exists()` probe — the goal state is "a directory
+        // with mode", so fall through to the chmod. Anything that is
+        // not a dir still errors via set_permissions.
+        match std::fs::create_dir(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+/// [`ensure_secure_dir`] for host-owned DATA directories: create `dir`
+/// 0700, or NARROW an existing euid-owned dir to 0700.
+///
+/// [`ensure_secure_dir`] fails closed when an existing dir's mode
+/// differs — correct for socket dirs, where a wider mode means another
+/// principal may already have planted entries. Tenant data dirs need
+/// the opposite trade-off across upgrades: an older release created
+/// them with `create_dir_all`, so a 0755 dir surviving an upgrade must
+/// be tightened, not rejected (rejecting would make every append fail
+/// after a rollout). Ownership is still enforced and the mode only ever
+/// moves TOWARD 0700 — never away. Special bits (setgid inherited from
+/// a k8s volume root) are cleared the same way.
+pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
+    match std::fs::metadata(dir) {
+        Ok(meta) => {
+            if !meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "path is not a directory",
+                ));
             }
-            for ancestor in cur.ancestors() {
-                // Relative paths end at "" — nothing to validate.
-                if ancestor.as_os_str().is_empty() {
-                    break;
-                }
-                validate_ancestor(ancestor)?;
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
+            if meta.uid() != unsafe { libc::geteuid() } {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "directory is owned by another uid",
+                ));
             }
-            for path in missing.iter().rev() {
-                std::fs::create_dir(path)?;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+            if meta.permissions().mode() & 0o7777 != 0o700 {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
             }
             Ok(())
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_missing_dirs(dir, 0o700),
         Err(error) => Err(error),
     }
 }
@@ -664,6 +716,47 @@ mod tests {
         let file = dir.join("file");
         std::fs::write(&file, b"x").unwrap();
         assert!(ensure_secure_dir(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ensure_private_dir` (host-owned data dirs) narrows an existing
+    /// wider dir instead of failing — the upgrade path from a release
+    /// that created data dirs with `create_dir_all` (0755 under the
+    /// common umask). Ownership/type checks stay identical, the mode
+    /// only ever moves toward 0700, and missing parents are created
+    /// 0700.
+    #[test]
+    fn ensure_private_dir_narrows_existing_data_dirs() {
+        let dir = unique_test_dir("private");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("spool/t1");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&old).unwrap();
+        assert_eq!(
+            std::fs::metadata(&old).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Missing tail (and parents) created private.
+        let nested = dir.join("out/t1/weather/dt=2026-11-21");
+        ensure_private_dir(&nested).unwrap();
+        for p in [
+            "out",
+            "out/t1",
+            "out/t1/weather",
+            "out/t1/weather/dt=2026-11-21",
+        ] {
+            assert_eq!(
+                std::fs::metadata(dir.join(p)).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{p}"
+            );
+        }
+        // Idempotent, and a non-dir still refuses.
+        ensure_private_dir(&nested).unwrap();
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(ensure_private_dir(&file).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

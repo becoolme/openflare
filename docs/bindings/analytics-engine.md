@@ -69,8 +69,27 @@ recovers. Layout:
 
 ```
 <work>/ae/spool/<seg(tenant)>/<dataset>.jsonl        # crash-recoverable buffer
-<work>/ae/out/<seg(tenant)>/<dataset>/dt=<YYYY-MM-DD>/part-<digest>.parquet
+<work>/ae/out/<seg(tenant)>/<dataset>/dt=<YYYY-MM-DD>/part-<digest>-<n>.parquet
 ```
+
+Partitioning is bounded on purpose: the event `timestamp` is
+tenant-controlled (workerd stamps `Date.now()`, but a hand-crafted
+socket peer can send anything `> 0`), so an event outside
+`now - 92 days .. now + 2 days` lands in the single `dt=_invalid`
+bucket instead of minting an arbitrary `dt=` directory (a 21 MiB spool
+would otherwise be enough to create ~100k directories — inode DoS —
+and break the `dt=*` glob contract). Data is preserved, never dropped.
+Even inside the window a single flush pass writes at most 128
+partitions; the overflow days merge into `dt=_invalid`. One day is
+split into `MAX_ROWS_PER_PART` (1M row) parts, and one pass decodes at
+most 32 MiB of a claim — the unread tail is appended back to the spool
+and continues on the next tick, so a large backlog costs ticks, never
+memory or ingress latency (flush runs on the blocking pool).
+
+All `spool/` and `out/` levels are `0700`, set explicitly (never left
+to the process umask). A directory left wider by an older release is
+narrowed on first use, so an upgrade neither fails every append nor
+keeps the old mode.
 
 Schema: `tenant Utf8`, `dataset Utf8`, `ts Timestamp(ns, UTC)`,
 `index1 Utf8?`, `_sample_interval Int64` (constant `1` — storage is
@@ -142,7 +161,10 @@ Deliberate differences:
 
 - `vrt-host/src/ae.rs` — wire-shape decode (capnp Int64-as-string,
   `Data` byte arrays), reject paths, spool cap, Parquet roundtrip,
-  append/flush/recover lifecycle.
+  append/flush/recover lifecycle, partition-window bounds, the
+  per-pass byte budget + tail restore, and 0700 dir creation/healing
+  (including the listener-created tenant dir that used to block every
+  append).
 - `vrt-config/tests/ae_emit.rs` — binding + per-dataset external
   service + `--external-addr` emit, missing-address fail-closed,
   multi-dataset and shared-dataset render.
