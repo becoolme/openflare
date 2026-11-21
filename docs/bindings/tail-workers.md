@@ -98,9 +98,11 @@ canonical JSON accepts safe integers only.
   runtime. If the consumer fails to load, is mid-deploy or the process
   is shutting down, events are dropped. Do not use Tail Workers for
   billing, audit trails or any record that must be complete.
-- **No streaming tail consumers.** `streamingTails` / streaming
-  `tailStream()` delivery is not supported; only the batched
-  `tail(events)` contract is rendered.
+- **Two channels, one consumer each.** A consumer may appear in
+  `tail_consumers` (batched `tail()`) or `streaming_tail_consumers`
+  (`tailStream()`), never both. The same worker on both channels would
+  receive every event twice with no way to tell the copies apart, so
+  both pack and desired validation refuse it.
 - **Same tenant only.** The consumer must be a Worker of the deploying
   team and must already exist. Cloudflare can attach any Worker of the
   account; OpenFlare resolves inside the tenant to keep the signed

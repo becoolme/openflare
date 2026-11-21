@@ -135,6 +135,7 @@ mod tests {
             workflows: Vec::new(),
             tail_consumers: Vec::new(),
             observability: None,
+            streaming_tail_consumers: Vec::new(),
             quotas: WorkerQuotas::platform_default(),
         }
     }
