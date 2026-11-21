@@ -692,6 +692,10 @@ struct Lane {
     dispatch_epoch: u64,
     /// Earliest retry time after the previous batch's settlement failed (settlement failure backoff).
     settle_not_before_ms: i64,
+    /// Consecutive backend settlement failures; advances the bounded claim backoff.
+    settle_streak: u32,
+    /// Fences concurrent completions from resetting a newer settlement failure backoff.
+    settle_generation: u64,
 }
 
 /// Queue dispatcher -- `tick` is driven by the controller loop about every ~1s.
@@ -850,6 +854,8 @@ impl QueueDispatcher {
                     release_retry: Vec::new(),
                     dispatch_epoch: 0,
                     settle_not_before_ms: 0,
+                    settle_streak: 0,
+                    settle_generation: 0,
                 });
                 // Refresh in place when desired changes (pod migration / config update) -- inflight
                 // batches keep settling against the old pod (lease semantics guarantee correctness).
@@ -1037,6 +1043,7 @@ impl QueueDispatcher {
         let tenant = lane.tenant_id.clone();
         let worker = lane.worker_id.clone();
         let cfg = lane.cfg.clone();
+        let settle_generation = lane.settle_generation;
         let delivery_timeout = self.cfg.delivery_timeout;
         let throttle = self.log_throttle.clone();
         #[cfg(test)]
@@ -1198,10 +1205,23 @@ impl QueueDispatcher {
                         "error" => "error",
                         _ => "other",
                     });
-                    settle(&sql, &throttle, &queue_id, &cfg, &batch, &result).await;
+                    let settle_failure =
+                        settle(&sql, &throttle, &queue_id, &cfg, &batch, &result).await;
                     let mut lanes = lanes.lock().await;
                     if let Some(l) = lanes.get_mut(&qid2) {
                         l.inflight = l.inflight.saturating_sub(1);
+                        if settle_failure.backs_off_source_lane() {
+                            l.settle_generation = l.settle_generation.wrapping_add(1);
+                            l.settle_streak = l.settle_streak.saturating_add(1);
+                            let delay_secs = settlement_backoff_secs(l.settle_streak, &qid2);
+                            l.settle_not_before_ms = unix_ms_now() + i64::from(delay_secs) * 1000;
+                        } else if l.settle_generation == settle_generation {
+                            // Includes a DLQ-only failure: the source queue answered, so
+                            // unrelated claims must not pause (the exhausted message's own
+                            // lease bounds its forwarding retry).
+                            l.settle_streak = 0;
+                            l.settle_not_before_ms = 0;
+                        }
                         // Well-formed response = platform reachable -- reset the backoff.
                         l.platform_streak = 0;
                         l.platform_not_before_ms = 0;
@@ -1228,10 +1248,9 @@ fn consumer_ran(r: &QueueOutcome) -> bool {
         || !r.retry_messages.is_empty()
 }
 
-/// T37b-r5 platform-side lane backoff: after `streak` failures, starts at 1s and doubles exponentially, capped at
-/// 60s, plus <=base/4 jitter (qid+nanos mix). Bounded => no hot loop; any
-/// well-formed response resets it.
-fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
+/// Bounded exponential backoff: starts at 1s, doubles to a 60s base, then
+/// adds <=base/4 jitter (seed+nanos mix). The final cap is 64s.
+fn bounded_backoff_secs(streak: u32, seed: &str) -> u32 {
     let base = 1u64
         .checked_shl(streak.saturating_sub(1).min(6))
         .map(|v| v.min(60))
@@ -1242,6 +1261,49 @@ fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
         h = h.wrapping_mul(31).wrapping_add(u64::from(b));
     }
     (base + h % (jitter_span + 1)).min(64) as u32
+}
+
+/// T37b-r5 platform-side lane backoff. Any well-formed response resets it.
+fn platform_backoff_secs(streak: u32, seed: &str) -> u32 {
+    bounded_backoff_secs(streak, seed)
+}
+
+/// Settlement errors leave claimed rows leased until expiry. Pause new
+/// claims briefly so a failing backend does not receive a hot loop of writes.
+fn settlement_backoff_secs(streak: u32, seed: &str) -> u32 {
+    bounded_backoff_secs(streak, seed)
+}
+
+/// Which source-queue settlement calls of a batch failed. A dead-letter
+/// *forward* failure is kept apart from a source-backend failure on purpose:
+/// the exhausted message keeps its lease (expiry bounds the retry), while the
+/// batch's acks and retries reached the source queue -- pausing the whole lane
+/// would stall unrelated healthy traffic behind an unavailable DLQ.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SettleFailure {
+    #[default]
+    None,
+    /// `dlq_send` failed (the DLQ is a different queue id).
+    DeadLetter,
+    /// `ack` / `retry` / `dead_letter` on the source queue failed.
+    Source,
+}
+
+impl SettleFailure {
+    /// Only a source-backend failure justifies the claim backoff.
+    fn backs_off_source_lane(self) -> bool {
+        matches!(self, Self::Source)
+    }
+
+    /// A batch can fail on both sides: the source failure is the one that
+    /// gates claims, so it wins.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Source, _) | (_, Self::Source) => Self::Source,
+            (Self::DeadLetter, _) | (_, Self::DeadLetter) => Self::DeadLetter,
+            _ => Self::None,
+        }
+    }
 }
 
 /// T37b-r5 platform-side give-back: calls `release` grouped by lease_id -- visible_at
@@ -1313,6 +1375,8 @@ fn parse_claimed(m: &serde_json::Value) -> Option<PendingMsg> {
 /// (broker.worker.js:220-235,354-374), calling ack/retry/dead-letter
 /// grouped by lease_id; LeaseLost abandons that group (the messages were already re-claimed
 /// by a successor -- another's batch must never be touched by mistake).
+/// Returns which calls failed: a source-backend failure pauses the lane's
+/// claims, a dead-letter forward failure does not (see [`SettleFailure`]).
 async fn settle(
     sql: &QueueSqlClient,
     throttle: &Arc<LogThrottle>,
@@ -1320,7 +1384,7 @@ async fn settle(
     cfg: &ResolvedConsumer,
     batch: &[PendingMsg],
     result: &QueueOutcome,
-) {
+) -> SettleFailure {
     let retry_all = result.outcome != "ok" || result.retry_batch.retry;
     let explicit_retry: BTreeSet<&str> =
         result.explicit_retries.iter().map(|s| s.as_str()).collect();
@@ -1339,6 +1403,7 @@ async fn settle(
     let mut acks: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     let mut retries: BTreeMap<&str, Vec<(String, u32)>> = BTreeMap::new();
     let mut dlq: BTreeMap<&str, Vec<&PendingMsg>> = BTreeMap::new();
+    let mut failure = SettleFailure::default();
     for m in batch {
         let lease = m.lease_id.as_str();
         let retry_this = retry_all
@@ -1381,6 +1446,7 @@ async fn settle(
                 }
             }
             Err(e) => {
+                failure = failure.merge(SettleFailure::Source);
                 crate::metrics::queue_settle_blocked("backend", n);
                 if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                     tracing::warn!(
@@ -1408,6 +1474,7 @@ async fn settle(
                 }
             }
             Err(e) => {
+                failure = failure.merge(SettleFailure::Source);
                 crate::metrics::queue_settle_blocked("backend", n);
                 if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                     tracing::warn!(
@@ -1429,6 +1496,7 @@ async fn settle(
                 // re-delivered after expiry => takes the DLQ path again and is deduplicated idempotently by id.
                 // "When the DLQ is unavailable the message stays in the original queue" (task acceptance semantics).
                 Err(e) => {
+                    failure = failure.merge(SettleFailure::DeadLetter);
                     crate::metrics::queue_settle_blocked("dlq_send", n);
                     if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                         tracing::warn!(
@@ -1465,6 +1533,7 @@ async fn settle(
                 }
             }
             Err(e) => {
+                failure = failure.merge(SettleFailure::Source);
                 crate::metrics::queue_settle_blocked("backend", n);
                 if throttle.allow(&format!("settle:{queue_id}"), LOG_WARN_INTERVAL) {
                     tracing::warn!(
@@ -1475,6 +1544,7 @@ async fn settle(
             }
         }
     }
+    failure
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,6 +1596,12 @@ mod tests {
     struct FakeWorld {
         queues: HashMap<String, FakeQueue>,
         sent: Vec<(String, String)>, // (queue_id, msg_id) audit
+        fail_ack: bool,
+        /// Queue id whose `send` (the DLQ forward) fails with a retryable 503.
+        fail_send_for: Option<String>,
+        /// Forward attempts that actually failed -- lets a test wait for the
+        /// failed `dlq_send` before inspecting the lane.
+        failed_sends: u64,
     }
 
     type Shared = Arc<StdMutex<FakeWorld>>;
@@ -1537,6 +1613,27 @@ mod tests {
     ) -> (axum::http::StatusCode, Json<Value>) {
         let mut world = w.lock().unwrap();
         let now = now_ms();
+        if op == "ack" && world.fail_ack {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "success": false,
+                    "code": "VRT_UNAVAILABLE",
+                    "retryable": true
+                })),
+            );
+        }
+        if op == "send" && world.fail_send_for.as_deref() == Some(qid.as_str()) {
+            world.failed_sends += 1;
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "success": false,
+                    "code": "VRT_UNAVAILABLE",
+                    "retryable": true
+                })),
+            );
+        }
         let q = world.queues.entry(qid.clone()).or_default();
         match op.as_str() {
             "send" => {
@@ -2007,6 +2104,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settlement_backend_failure_backs_off_new_claims() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            w.fail_ack = true;
+            let q = w.queues.entry(QID.into()).or_default();
+            q.msgs.insert(
+                "m1".into(),
+                FakeMsg {
+                    body_hex: "aa".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let inv = Arc::new(FakeInvoker {
+            result: StdMutex::new(Ok(outcome(json!({"outcome":"ok"})))),
+            calls: AtomicU64::new(0),
+            delay: None,
+            last: StdMutex::new(vec![]),
+        });
+        let d = dispatcher(&addr, inv, cfg("h1"));
+        let desired = desired_with(json!([{"queueId": QID, "queueName": "q1"}]));
+        let exp = chrono::Utc::now() + chrono::Duration::minutes(5);
+        tick_pair(&d, &desired, exp, &assignments()).await;
+
+        let deadline = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                {
+                    let lanes = d.lanes.lock().await;
+                    if let Some(lane) = lanes.get(QID) {
+                        if lane.inflight == 0 && lane.settle_streak == 1 {
+                            return lane.settle_not_before_ms;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("settlement failure should update the lane backoff");
+        let remaining_ms = deadline - now_ms();
+        assert!(remaining_ms > 0, "backoff deadline must be in the future");
+        assert!(remaining_ms <= 64_000, "backoff must remain bounded");
+        assert!(world.lock().unwrap().queues[QID].msgs.contains_key("m1"));
+
+        let seq_before = world.lock().unwrap().queues[QID].seq;
+        let out = d
+            .tick(
+                Some(&desired),
+                Some(exp),
+                &assignments(),
+                chrono::Utc::now(),
+            )
+            .await;
+        assert_eq!(
+            out.claimed, 0,
+            "the lane must wait through settlement backoff"
+        );
+        assert_eq!(world.lock().unwrap().queues[QID].seq, seq_before);
+    }
+
+    #[tokio::test]
     async fn explicit_retry_mixed_and_delay_precedence() {
         let (addr, world) = spawn_fake_sql().await;
         {
@@ -2166,30 +2325,19 @@ mod tests {
         let (addr, world) = spawn_fake_sql().await;
         {
             let mut w = world.lock().unwrap();
-            // DLQID does not exist in the fake world? -- the fake creates it via or_default!
-            // Use another meaning of "DLQ unreachable": dlq_send pointing at an id that really does not exist
-            // still creates the table in the fake. Switch to simulating send failure -- make the DLQ's
-            // send always duplicate? No. Simplest: point the dlq at a
-            // non-26-char id? The fake does not validate ids. Here, switch to directly verifying "send failure
-            // does not dead-letter": first make dlq_send succeed (idempotent), a dead_letter
-            // failure afterwards is a different path. A real "DLQ write failure" is produced in the fake:
-            // adding a send_fail switch to FakeQueue would be cleaner.
+            // The DLQ forward (a `send` to a different queue id) fails for real.
+            w.fail_send_for = Some(DLQID.into());
             let q = w.queues.entry(QID.into()).or_default();
+            // attempts=2 + claim +1 => 3 = maxRetries+1 -> the DLQ path.
             q.msgs.insert(
                 "m1".into(),
                 FakeMsg {
                     body_hex: "aa".into(),
-                    attempts: 5,
+                    attempts: 2,
                     ..Default::default()
                 },
             );
         }
-        // Use a dlq id whose "send must fail" -- the fake world has no failure switch,
-        // switching to a non-queue id still lets fake_op's or_default create the table -- another approach:
-        // a dlq_send failure is equivalent to transport -- QueueSqlClient calls
-        // /queues/{dlq}/send; point the dispatcher's dlq id at a
-        // nonexistent SECOND fake? Only one fake per process. Cleanest: give the fake
-        // a global "send_fail_for" set.
         let inv = Arc::new(FakeInvoker {
             result: StdMutex::new(Ok(outcome(
                 json!({"outcome":"ok","explicitRetries":["m1"]}),
@@ -2201,7 +2349,7 @@ mod tests {
         let d = dispatcher(&addr, inv, cfg("h1"));
         let desired = desired_with(json!([{
             "queueId": QID, "queueName": "q", "maxRetries": 2,
-            "deadLetterQueueId": "nonexistent00000000000x"
+            "deadLetterQueueId": DLQID
         }]));
         tick_pair(
             &d,
@@ -2210,18 +2358,121 @@ mod tests {
             &assignments(),
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        // The fake creates the table for that id (dlq_send succeeds) -> this test actually covers
-        // "dead-letter after a successful forward". The real DLQ write failure path is
-        // covered by dlq_send Err -> continue + queue_settle_blocked inside
-        // settle() -- verified with a wire-level unit test: directly assert the source message is still there (dead-letter
-        // did not happen), which requires send to truly fail; where the fake cannot do that it is noted in a comment.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while world.lock().unwrap().failed_sends == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the DLQ forward was never attempted"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         let w = world.lock().unwrap();
+        // No dead-letter happened: the source row keeps its lease and the next
+        // attempt after expiry forwards again (idempotent by msg id).
         assert!(
-            w.queues["nonexistent00000000000x"].msgs.contains_key("m1"),
-            "transferred"
+            w.queues[QID].msgs.contains_key("m1"),
+            "source message retained"
         );
-        assert!(w.queues[QID].msgs.is_empty(), "source dead-lettered");
+        assert!(
+            !w.queues[QID].dead.contains(&"m1".to_string()),
+            "no dead-letter after a failed forward"
+        );
+    }
+
+    /// The DLQ is a different queue: a failing forward must not pause claims of
+    /// unrelated healthy messages on the source lane, and must not advance the
+    /// settlement-failure streak. The exhausted message's own lease bounds its
+    /// forwarding retry.
+    #[tokio::test]
+    async fn dlq_forward_failure_does_not_pause_source_claims() {
+        let (addr, world) = spawn_fake_sql().await;
+        {
+            let mut w = world.lock().unwrap();
+            w.fail_send_for = Some(DLQID.into());
+            let q = w.queues.entry(QID.into()).or_default();
+            q.msgs.insert(
+                "exhausted".into(),
+                FakeMsg {
+                    body_hex: "aa".into(),
+                    attempts: 2,
+                    ..Default::default()
+                },
+            );
+        }
+        let inv = Arc::new(FakeInvoker {
+            result: StdMutex::new(Ok(outcome(json!({
+                "outcome": "ok",
+                "explicitRetries": ["exhausted"]
+            })))),
+            calls: AtomicU64::new(0),
+            delay: None,
+            last: StdMutex::new(vec![]),
+        });
+        let d = dispatcher(&addr, inv, cfg("h1"));
+        let desired = desired_with(json!([{
+            "queueId": QID, "queueName": "q", "maxRetries": 2,
+            "deadLetterQueueId": DLQID
+        }]));
+        let exp = chrono::Utc::now() + chrono::Duration::minutes(5);
+        tick_pair(&d, &desired, exp, &assignments()).await;
+
+        // Wait for the failed forward *and* the lane update that follows settle.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let failed_send = world.lock().unwrap().failed_sends >= 1;
+            let inflight = d
+                .lanes
+                .lock()
+                .await
+                .get(QID)
+                .map(|l| l.inflight)
+                .unwrap_or(0);
+            if failed_send && inflight == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the DLQ forward never completed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let lanes = d.lanes.lock().await;
+            let lane = lanes.get(QID).expect("lane exists");
+            assert_eq!(
+                lane.settle_streak, 0,
+                "a DLQ-only failure must not advance the settlement streak"
+            );
+            assert_eq!(
+                lane.settle_not_before_ms, 0,
+                "a DLQ-only failure must not pause source claims"
+            );
+        }
+
+        // A message that arrives after the failed forward is still claimed on the
+        // very next tick (the exhausted one stays leased until expiry).
+        {
+            let mut w = world.lock().unwrap();
+            w.queues.entry(QID.into()).or_default().msgs.insert(
+                "later".into(),
+                FakeMsg {
+                    body_hex: "bb".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        let out = d
+            .tick(
+                Some(&desired),
+                Some(exp),
+                &assignments(),
+                chrono::Utc::now(),
+            )
+            .await;
+        assert_eq!(
+            out.claimed, 1,
+            "healthy traffic must not be paused by an unavailable DLQ"
+        );
     }
 
     #[tokio::test]
