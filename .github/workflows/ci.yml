@@ -49,6 +49,27 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: '0'
         run: cargo test --locked --workspace --no-fail-fast
 
+  clippy:
+    name: Unsafe blocks are documented
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The only clippy gate: every production `unsafe` block carries a
+      # `// SAFETY:` comment. Other clippy lints stay warnings so a
+      # toolchain bump cannot fail the job on style.
+      - name: Clippy (unsafe blocks are documented)
+        env:
+          CARGO_INCREMENTAL: '0'
+          CARGO_PROFILE_DEV_DEBUG: '0'
+        run: |
+          cargo clippy --locked --workspace --lib --bins -- \
+            -D clippy::undocumented_unsafe_blocks
+
   # The repo never downloads workerd for build/runtime images (README
   # "Quick start": you supply the pinned binary yourself). This job is
   # the sanctioned exception: a TEST-ONLY helper that fetches the

@@ -406,6 +406,7 @@ async fn kill_children(children: &mut [Child]) {
     // `vrt dev` Ctrl+C never orphans a runtime.
     for c in children.iter_mut() {
         if let Some(pid) = c.proc.id() {
+// SAFETY: the pid comes from a Child this process spawned; SIGTERM has no further preconditions.
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }

@@ -108,6 +108,7 @@ fn main() {
         std::process::exit(3);
     }
     if std::env::var("VRT_STUB_IGNORE_SIGTERM").as_deref() == Ok("1") {
+// SAFETY: signal(2) sets a process-global disposition in the test stub before it services anything; SIG_IGN is a constant handler.
         unsafe {
             libc::signal(libc::SIGTERM, libc::SIG_IGN);
         }

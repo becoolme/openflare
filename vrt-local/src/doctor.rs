@@ -243,7 +243,9 @@ fn check_disk(root: &Path) -> Check {
             .unwrap_or_else(|| PathBuf::from("."))
     };
     let path = std::ffi::CString::new(target.as_os_str().as_encoded_bytes()).unwrap_or_default();
+// SAFETY: statvfs is plain old data; an all-zero value is a valid initializer.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+// SAFETY: path is a valid NUL-terminated CString and the out-pointer is a live, correctly sized statvfs.
     let rc = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
     if rc != 0 {
         return Check::fail(id, "statvfs failed", "check the root filesystem");

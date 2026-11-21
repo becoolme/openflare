@@ -92,6 +92,7 @@ fn sample_os(pid: u32) -> ResourceUsage {
     let cpu_seconds = std::fs::read_to_string(format!("/proc/{pid}/stat"))
         .ok()
         .and_then(|text| {
+// SAFETY: sysconf(_SC_CLK_TCK) has no preconditions.
             let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
             if hz <= 0 {
                 return None;
@@ -123,6 +124,7 @@ extern "C" {
 #[cfg(target_os = "macos")]
 fn sample_os(pid: u32) -> ResourceUsage {
     use std::mem::size_of;
+// SAFETY: proc_taskinfo is plain old data; proc_pidinfo writes at most size_of::<proc_taskinfo>() bytes into a live buffer and its return value is checked.
     let rss = unsafe {
         let mut info: libc::proc_taskinfo = std::mem::zeroed();
         let wrote = libc::proc_pidinfo(
@@ -138,6 +140,7 @@ fn sample_os(pid: u32) -> ResourceUsage {
             None
         }
     };
+// SAFETY: the size query may pass a null buffer with len 0; the second call writes at most `needed` bytes into a live Vec and its return value is checked.
     let fds = unsafe {
         let needed = libc::proc_pidinfo(
             pid as i32,
@@ -164,6 +167,7 @@ fn sample_os(pid: u32) -> ResourceUsage {
             }
         }
     };
+// SAFETY: proc_taskinfo is plain old data; proc_pidinfo writes at most size_of::<proc_taskinfo>() bytes into a live buffer and its return value is checked.
     let cpu_seconds = unsafe {
         let mut info: libc::proc_taskinfo = std::mem::zeroed();
         let wrote = libc::proc_pidinfo(

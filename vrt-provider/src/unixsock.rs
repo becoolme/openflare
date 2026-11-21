@@ -139,6 +139,7 @@ pub fn bind_listener_guarded(
     let listener = bind_listener_inner(dir, tenant_id, isolated)?;
     Ok(PeerGuardListener {
         inner: listener,
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
         expected_uid: expected_uid.unwrap_or_else(|| unsafe { libc::geteuid() }),
     })
 }

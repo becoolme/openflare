@@ -251,6 +251,7 @@ impl WorkerdLauncher for ProcessWorkerdLauncher {
         // if vrt-host dies between fork and pre_exec, `getppid()`
         // already differs and the child must not exec orphaned.
         let host_pid = std::process::id();
+// SAFETY: pre_exec runs only async-signal-safe libc calls (fcntl/dup2/setgroups/setgid/setuid/prctl) on captured POD values, allocates nothing, and returns io::Error on failure.
         unsafe {
             cmd.pre_exec(move || {
                 if child_raw == CONTROL_FD {
@@ -313,11 +314,13 @@ impl WorkerdLauncher for ProcessWorkerdLauncher {
         }
         // Keep the child fd alive across spawn: wrap in an OwnedFd held
         // until after `cmd.spawn` returns.
+// SAFETY: the fd is a freshly created socketpair end that has not been wrapped or closed; from_raw_fd takes sole ownership, so it closes exactly once.
         let child_owned = unsafe { OwnedFd::from_raw_fd(child_end.into_raw_fd()) };
         // T13/M2 fail closed: applying a uid/gid identity requires
         // euid 0 (setgroups/setgid/setuid). If isolation is demanded
         // and we cannot apply it, refuse the launch rather than run
         // the tenant with host privileges.
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
         if spec.isolation.is_some() && unsafe { libc::geteuid() } != 0 {
             return Err(LaunchError::Spec(
                 "tenant isolation requires euid 0 to apply uid/gid",
@@ -598,6 +601,7 @@ impl Drop for GroupChild {
 /// group leader). Errors are swallowed by callers that proceed to the
 /// next escalation step anyway.
 pub fn signal_process_group(pid: u32, sig: libc::c_int) {
+// SAFETY: kill(2) with a negative pid signals the process group led by that pid; callers only pass groups they spawned. The return value is deliberately ignored: escalation continues (or the group is already gone, ESRCH) regardless.
     unsafe {
         libc::kill(-(pid as i32), sig);
     }
@@ -621,6 +625,7 @@ pub async fn terminate_child(child: &mut Child, pid: u32, grace: Duration) {
 /// (already reaped or never existed), `true` when it lives or when the
 /// signal is merely denied (EPERM means a live foreign process).
 pub fn pid_alive(pid: u32) -> bool {
+// SAFETY: signal 0 performs only the existence/permission probe; it has no preconditions beyond the pid value.
     unsafe {
         if libc::kill(pid as i32, 0) == 0 {
             return true;

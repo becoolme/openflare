@@ -43,6 +43,7 @@ pub fn load_signing_key(root: &Path) -> Result<SigningKey, LocalError> {
         if meta.mode() & 0o777 != 0o600 {
             return Err(LocalError::Layout("key mode"));
         }
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
         let euid = unsafe { libc::geteuid() };
         if meta.uid() != euid {
             return Err(LocalError::Layout("key owner"));
@@ -121,6 +122,7 @@ pub fn load_token_file(path: &std::path::Path) -> Result<Vec<u8>, LocalError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
         if meta.mode() & 0o777 != 0o600 || meta.uid() != unsafe { libc::geteuid() } {
             return Err(LocalError::Layout("token mode"));
         }

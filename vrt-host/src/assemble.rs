@@ -562,6 +562,7 @@ pub(crate) fn chown_gen_dir(
     if isolation.is_none() {
         return Ok(());
     }
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } == 0 {
         chown_isolated(dir, isolation)?;
     }
@@ -589,9 +590,11 @@ pub(crate) fn chown_isolated(
     let Some(iso) = isolation else {
         return Ok(());
     };
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
     if unsafe { libc::geteuid() } == 0 {
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|_| AssembleError::Io(io_err("isolated path")))?;
+// SAFETY: path is a valid NUL-terminated CString; uid/gid are plain integers and the result is checked.
         if unsafe { libc::chown(c.as_ptr(), iso.uid, iso.gid) } != 0 {
             return Err(AssembleError::Io(std::io::Error::last_os_error()));
         }

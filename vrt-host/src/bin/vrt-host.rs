@@ -85,6 +85,7 @@ fn main() -> ExitCode {
     // setgroups/setgid/setuid). Refuse NOW rather than latching
     // every tenant SwitchFailed — a configured-but-unusable mode is
     // a startup failure, never a slow per-tenant crash loop.
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
     if config.isolation.is_some() && unsafe { libc::geteuid() } != 0 {
         eprintln!("vrt-host: [isolation] requires euid 0 (setuid/setgid at launch)");
         return ExitCode::from(2);

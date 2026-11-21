@@ -184,6 +184,7 @@ pub fn load_service_secret(
     if meta.mode() & 0o777 != 0o600 {
         return Err(SecretError::BadMode);
     }
+// SAFETY: geteuid(2) has no preconditions and cannot fail.
     if meta.uid() != unsafe { libc::geteuid() } {
         return Err(SecretError::BadOwner);
     }
