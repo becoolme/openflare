@@ -1228,6 +1228,30 @@ fn worker_limits_render_declared_dimensions_only() {
         !out.contains("limits = ("),
         "platform defaults / 0 must not render a limits block:\n{out}"
     );
+
+    // Mixed declaration: an explicit `subrequests = 0` is "no budget" on
+    // the protocol side and must be omitted from a block that still
+    // renders the non-default `cpu_ms` — never `subRequests = 0`, which
+    // workerd would read as a real zero/unlimited budget.
+    for worker in &mut tenant.workers {
+        worker.quotas = WorkerQuotas {
+            cpu_ms: 200,
+            memory_mb: 128,
+            subrequests: 0,
+            outbound_connections: 16,
+        };
+    }
+    let out = render_tenant_config(&input(&tenant, &bundles(), &runtime_params()))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains("limits = (cpuMs = 200),"),
+        "non-default dimension renders alone:\n{out}"
+    );
+    assert!(
+        !out.contains("subRequests"),
+        "explicit 0 must never render as a limit:\n{out}"
+    );
 }
 
 /// `outboundConnections` has no workerd enforcement hook yet: a
