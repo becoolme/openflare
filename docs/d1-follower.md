@@ -210,11 +210,11 @@ cannot damage the primary.
   read-only).
 - **No failover.** Promotion of a follower to writer still requires the
   existing lease/epoch takeover; the follower is not a consensus member.
-- **No GC watermark yet.** If the writer checkpoints and GCs faster than the
-  follower polls, the follower re-bootstraps from the snapshot. Keep
-  `pollIntervalMs` well below the writer's effective snapshot interval, or
-  increase snapshot retention when that changes. Reporting follower watermarks
-  to the writer (to retain segments a live replica still needs) is next.
+- **Bounded GC retention, no per-replica watermark.** GC keeps the newest two
+  snapshots and the segments above the older one, so a follower that is one
+  checkpoint behind can continue incrementally. A follower further behind (or
+  one that misses the window) re-bootstraps from the current snapshot. Per-replica
+  watermark reporting (retain exactly what live followers still need) is next.
 - **Full snapshot download on re-bootstrap.** A large database re-downloads the
   snapshot when it cannot tail from its watermark.
 - **Per-request engine open.** Each replica query opens the immutable generation
