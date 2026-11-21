@@ -134,6 +134,78 @@ fn service_binding_reserved_entrypoint_is_refused() {
     }
 }
 
+fn with_auth_props(
+    entrypoint: Option<&str>,
+    props: serde_json::Value,
+) -> snapshot_protocol::compute_desired::TenantDesired {
+    let mut tenant = tenant();
+    let auth = tenant.workers[0]
+        .bindings
+        .iter_mut()
+        .find_map(|b| match b {
+            snapshot_protocol::compute_desired::BindingDesired::Service(s) => Some(s),
+            _ => None,
+        })
+        .expect("fixture has a service binding");
+    auth.entrypoint = entrypoint.map(str::to_string);
+    auth.props = Some(props);
+    tenant
+}
+
+#[test]
+fn service_binding_props_render_only_when_declared() {
+    let bs = bundles();
+    let params = runtime_params();
+    let render = |tenant| {
+        render_tenant_config(&input(&tenant, &bs, &params))
+            .unwrap()
+            .text
+    };
+
+    // Absent props: the default-export designator keeps its exact bytes.
+    let base = render(tenant());
+    assert!(base.contains(
+        "        (name = \"AUTH\", service = (name = \"worker-w-alpha-2\")),\n"
+    ));
+
+    // Default export + props.
+    let out = render(with_auth_props(
+        None,
+        json!({"z": {"b": [true, null]}, "a": 1}),
+    ));
+    assert!(out.contains(
+        r#"        (name = "AUTH", service = (name = "worker-w-alpha-2", props = (json = "{\"a\":1,\"z\":{\"b\":[true,null]}}"))),"#
+    ));
+
+    // Named entrypoint + props: both ride the same designator, in order.
+    let out = render(with_auth_props(
+        Some("Greeter"),
+        json!({"region": "eu"}),
+    ));
+    assert!(out.contains(
+        r#"        (name = "AUTH", service = (name = "worker-w-alpha-2", entrypoint = "Greeter", props = (json = "{\"region\":\"eu\"}"))),"#
+    ));
+}
+
+#[test]
+fn service_binding_invalid_props_is_refused_at_render() {
+    let bs = bundles();
+    let params = runtime_params();
+    for props in [
+        json!([1, 2]),
+        json!({"padding": "x".repeat(snapshot_protocol::compute_desired::MAX_SERVICE_PROPS_BYTES)}),
+    ] {
+        let tenant = with_auth_props(Some("Greeter"), props.clone());
+        let rendered = render_tenant_config(&input(&tenant, &bs, &params)).unwrap();
+        assert_eq!(rendered.skipped_workers, vec!["w-alpha-1".to_string()], "{props}");
+        assert_eq!(
+            rendered.skipped_reasons[0].code, "CONFIG_CAPACITY_EXCEEDED",
+            "{props}"
+        );
+        assert!(!rendered.text.contains("(name = \"AUTH\""), "{props}");
+    }
+}
+
 /// PT1: the watchdog heartbeat worker + private socket appear iff
 /// `params.heartbeat_socket` is set — and are the ONLY delta vs the
 /// legacy shape (byte-compat when unset is pinned by golden.rs).

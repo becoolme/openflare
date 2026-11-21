@@ -342,6 +342,7 @@ mod tests {
             name: "SVC".to_string(),
             worker_id: "bad".to_string(),
             entrypoint: None,
+            props: None,
         }));
         assert_eq!(
             exclusion_verdict(&t, "bad", &BTreeSet::new()),

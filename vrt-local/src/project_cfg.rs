@@ -792,7 +792,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 for (i, e) in table_list(value, "services")?.iter().enumerate() {
                     for k in e.keys() {
                         match k.as_str() {
-                            "binding" | "service" | "entrypoint" => {}
+                            "binding" | "service" | "entrypoint" | "props" => {}
                             _ => return Err(unsupported(&format!("services[{i}].{k}"), None)),
                         }
                     }
@@ -816,6 +816,15 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         opt_str(e.get("entrypoint"), &format!("services[{i}].entrypoint"))?
                     {
                         b.insert("entrypoint".into(), Value::from(ep));
+                    }
+                    if let Some(props) = e.get("props") {
+                        if !snapshot_protocol::compute_desired::valid_service_props(props) {
+                            return Err(invalid(
+                                &format!("services[{i}].props"),
+                                "must be a JSON object of at most 8 KiB",
+                            ));
+                        }
+                        b.insert("props".into(), props.clone());
                     }
                     bindings.push(Value::Object(b));
                 }
@@ -1609,7 +1618,8 @@ pub fn load_wrangler_project_config(
 /// Standalone derivations (documented in workers-runtime-project-config.md):
 ///   * missing KV id / R2 bucket → the binding name (the local store
 ///     treats declaration as creation);
-///   * service `entrypoint` → `{ service, entrypoint }` table (validated);
+///   * service `entrypoint`/`props` → `{ service, entrypoint, props }`
+///     table (validated);
 ///   * crons get deterministic `scheduleId`s (`cfg:{name}:{i}`);
 ///   * non-string vars are JSON-encoded (vrt vars are string→string).
 fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectConfigError> {
@@ -1788,10 +1798,8 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                         .get("service")
                         .and_then(|s| s.as_str())
                         .unwrap_or_default();
-                    match b.get("entrypoint") {
-                        None => {
-                            service.insert(name.into(), Value::from(target));
-                        }
+                    let entrypoint = match b.get("entrypoint") {
+                        None => None,
                         Some(ep) => {
                             let ep = ep.as_str().unwrap_or_default();
                             if !snapshot_protocol::compute_desired::valid_service_entrypoint(ep) {
@@ -1803,11 +1811,24 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                                     ),
                                 ));
                             }
-                            let mut t = Map::new();
-                            t.insert("service".into(), Value::from(target));
-                            t.insert("entrypoint".into(), Value::from(ep));
-                            service.insert(name.into(), Value::Object(t));
+                            Some(ep)
                         }
+                    };
+                    let props = b.get("props").cloned();
+                    if entrypoint.is_none() && props.is_none() {
+                        // Legacy plain-string wire shape when neither a
+                        // named entrypoint nor props are declared.
+                        service.insert(name.into(), Value::from(target));
+                    } else {
+                        let mut t = Map::new();
+                        t.insert("service".into(), Value::from(target));
+                        if let Some(ep) = entrypoint {
+                            t.insert("entrypoint".into(), Value::from(ep));
+                        }
+                        if let Some(props) = props {
+                            t.insert("props".into(), props);
+                        }
+                        service.insert(name.into(), Value::Object(t));
                     }
                 }
                 "queue" => {
@@ -2181,7 +2202,9 @@ mod tests {
         use crate::worker_pkg::ServiceTargetToml;
         let meta = wrangler_services(
             r#"[{"binding":"A","service":"t"},
-                {"binding":"B","service":"t","entrypoint":"Greeter"}]"#,
+                {"binding":"B","service":"t","entrypoint":"Greeter"},
+                {"binding":"C","service":"t","props":{"a":1,"nested":{"b":true}}},
+                {"binding":"D","service":"t","entrypoint":"Api","props":{"region":"eu"}}]"#,
         )
         .unwrap();
         let svc = meta.bindings.unwrap().service;
@@ -2190,6 +2213,38 @@ mod tests {
         let b = svc.get("B").unwrap();
         assert_eq!(b.service(), "t");
         assert_eq!(b.entrypoint(), Some("Greeter"));
+        assert_eq!(b.props(), None);
+        let c = svc.get("C").unwrap();
+        assert_eq!(c.service(), "t");
+        assert_eq!(c.entrypoint(), None);
+        assert_eq!(c.props(), Some(&serde_json::json!({"a":1,"nested":{"b":true}})));
+        let d = svc.get("D").unwrap();
+        assert_eq!(d.entrypoint(), Some("Api"));
+        assert_eq!(d.props(), Some(&serde_json::json!({"region":"eu"})));
+    }
+
+    #[test]
+    fn service_props_fail_closed() {
+        // Non-object props are rejected at normalization with an exact field.
+        let err = wrangler_services(r#"[{"binding":"B","service":"t","props":[1]}]"#)
+            .expect_err("array props");
+        assert!(
+            format!("{err:?}").contains("VRT_CONFIG_INVALID"),
+            "{err:?}"
+        );
+        assert!(format!("{err:?}").contains("services[0].props"), "{err:?}");
+
+        // The serialized bound is enforced.
+        let big = "x".repeat(snapshot_protocol::compute_desired::MAX_SERVICE_PROPS_BYTES);
+        let err = wrangler_services(&format!(
+            r#"[{{"binding":"B","service":"t","props":{{"padding":"{big}"}}}}]"#
+        ))
+        .expect_err("oversized props");
+        assert!(
+            format!("{err:?}").contains("VRT_CONFIG_INVALID"),
+            "{err:?}"
+        );
+        assert!(format!("{err:?}").contains("services[0].props"), "{err:?}");
     }
 
     #[test]
@@ -2207,19 +2262,83 @@ mod tests {
     fn vrt_toml_service_table_shape() {
         use crate::worker_pkg::{BindingsToml, ServiceTargetToml};
         let b: BindingsToml = toml::from_str(
-            "[service]\nA = \"t\"\nB = { service = \"t\", entrypoint = \"Greeter\" }\n",
+            "[service]\nA = \"t\"\nB = { service = \"t\", entrypoint = \"Greeter\" }\nC = { service = \"t\", props = { a = 1, nested = { b = true } } }\nD = { service = \"t\", entrypoint = \"Api\", props = { region = \"eu\" } }\n",
         )
         .unwrap();
         assert_eq!(b.service.get("A"), Some(&ServiceTargetToml::Worker("t".into())));
         assert_eq!(b.service.get("B").unwrap().entrypoint(), Some("Greeter"));
+        let c = b.service.get("C").unwrap();
+        assert_eq!(c.entrypoint(), None);
+        assert_eq!(c.props(), Some(&serde_json::json!({"a":1,"nested":{"b":true}})));
+        let d = b.service.get("D").unwrap();
+        assert_eq!(d.entrypoint(), Some("Api"));
+        assert_eq!(d.props(), Some(&serde_json::json!({"region":"eu"})));
         // Unknown keys inside the table fail closed.
         assert!(toml::from_str::<BindingsToml>(
             "[service]\nB = { service = \"t\", entrypoint = \"G\", ns = \"x\" }\n"
         )
         .is_err());
+        assert!(toml::from_str::<BindingsToml>(
+            "[service]\nB = { service = \"t\", props = { a = 1 }, ns = \"x\" }\n"
+        )
+        .is_err());
         // Plain string serializes exactly as before.
         let json = serde_json::to_string(&b.service.get("A").unwrap()).unwrap();
         assert_eq!(json, "\"t\"");
+        // The entrypoint-only table keeps its pre-props serialization.
+        let json = serde_json::to_string(&b.service.get("B").unwrap()).unwrap();
+        assert_eq!(json, r#"{"service":"t","entrypoint":"Greeter"}"#);
+    }
+
+    #[test]
+    fn native_service_props_reach_pack_and_fail_closed() {
+        use crate::worker_pkg::{pack_with_resolver, DeployOverrides};
+        use snapshot_protocol::compute_desired::BindingDesired;
+
+        let pack = |props: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(
+                dir.path().join("vrt.toml"),
+                format!(
+                    "name = \"w\"\nmainModule = \"m.js\"\ncompatibilityDate = \"2025-01-01\"\n\n[bindings.service]\nS = {{ service = \"t\", {props} }}\n"
+                ),
+            )
+            .unwrap();
+            fs::write(dir.path().join("m.js"), "export default {}").unwrap();
+            let overrides = DeployOverrides {
+                name: None,
+                env_name: None,
+                bindings: vec![],
+                hostnames: vec![],
+                vars: BTreeMap::new(),
+            };
+            pack_with_resolver(dir.path(), &overrides, "tenant", &|_| Some("w-target".into()))
+        };
+
+        let pkg = pack("props = { a = 1, nested = { b = true } }").unwrap();
+        let service = pkg
+            .bindings
+            .iter()
+            .find_map(|b| match b {
+                BindingDesired::Service(s) => Some(s),
+                _ => None,
+            })
+            .expect("service binding packed");
+        assert_eq!(service.entrypoint, None);
+        assert_eq!(
+            service.props,
+            Some(serde_json::json!({"a":1,"nested":{"b":true}}))
+        );
+
+        for bad in ["props = 1", "props = [1, 2]"] {
+            let err = pack(bad).err().unwrap_or_else(|| panic!("{bad}"));
+            assert!(format!("{err:?}").contains("service props"), "{bad}: {err:?}");
+        }
+        let big = "x".repeat(snapshot_protocol::compute_desired::MAX_SERVICE_PROPS_BYTES);
+        let err = pack(&format!("props = {{ padding = \"{big}\" }}"))
+            .err()
+            .expect("oversized");
+        assert!(format!("{err:?}").contains("service props"), "{err:?}");
     }
 
     fn wrangler_loader_body(extra: &str) -> tempfile::TempDir {
