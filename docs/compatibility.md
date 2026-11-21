@@ -30,7 +30,7 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | Static assets | Partial | [bindings/static-assets.md](bindings/static-assets.md) |
 | WebSockets | Partial | [bindings/websockets.md](bindings/websockets.md), [ingress-websocket.md](ingress-websocket.md) |
 | Vars / secrets | Partial | [bindings/vars-and-secrets.md](bindings/vars-and-secrets.md) |
-| Tail Workers (`tail_consumers`) | Partial | [wrangler-config.md](wrangler-config.md) |
+| Tail Workers (`tail_consumers`, `streaming_tail_consumers`) | Partial | [wrangler-config.md](wrangler-config.md), [bindings/tail-workers.md](bindings/tail-workers.md) |
 | Version metadata (`version_metadata`) | Partial | [wrangler-config.md](wrangler-config.md) |
 | Observability (`[observability]` Worker Logs gates + head sampling) | Partial | [wrangler-config.md](wrangler-config.md) |
 | Workers AI, Vectorize, AI Search, Pipelines, e-mail, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |

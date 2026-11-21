@@ -235,4 +235,8 @@ fn worker_tails_is_service_designator_list() {
         schema.contains("tails @14 :List(ServiceDesignator)"),
         "workerd.capnp must declare `tails @14 :List(ServiceDesignator)`"
     );
+    assert!(
+        schema.contains("streamingTails @15 :List(ServiceDesignator)"),
+        "workerd.capnp must declare `streamingTails @15 :List(ServiceDesignator)`"
+    );
 }

@@ -70,6 +70,7 @@ environment blocks.
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:846` |
 | `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
 | `tail_consumers` | supported — Tail Workers; per-entry key `service` only (worker-level config, not a binding); resolves to a same-tenant worker at deploy, renders as capnp `tails` designators; consumer runs the standard `tail(events)` entrypoint | `project_cfg.rs:872` |
+| `streaming_tail_consumers` | supported — Streaming Tail Workers; per-entry key `service` only; resolves to a same-tenant worker at deploy, renders as capnp `streamingTails` designators; consumer runs the `tailStream(event)` entrypoint (upstream marks the channel for future rework; wired and serving today) | `project_cfg.rs` `streaming_tail_consumers` arm |
 | `version_metadata` | supported — CF `[version_metadata] binding = "X"`; `env.X` is `{id, tag, timestamp}` of the SERVING version (id = version id, tag = `""` — no standalone tag surface, timestamp = version creation epoch-ms string). Emitted as a `json` binding at desired time so rollback reports the reactivated version's own values | `project_cfg.rs:901` |
 | `observability` | partial — Worker Logs gates + head sampling applied by the platform `vrt-tail` collector: `enabled`/`logs.enabled` `false` renders NO collector (nothing collected); `logs.head_sampling_rate` (or the deprecated top-level `head_sampling_rate` alias — both set is refused as ambiguous) keeps that fraction of INVOCATIONS whole, decided per invocation (a dropped invocation keeps none of its records; deterministic over `traceId`/`spanId` when present); the rate crosses the signed wire as integer ppm `headSamplingRatePpm` (0..1_000_000 — canonical JSON is safe-integer-only), so effective granularity is 1e-6; `logs.invocation_logs` `false` drops only the outcome record. `traces`, `persist`, `destinations` and other keys fail closed | `project_cfg.rs:991` |
 | `unsafe` | partial — `[[unsafe.bindings]]` with `type = "unsafe_eval"` only: `env.<name>` is workerd's native `unsafeEval` capability (`eval()`, `new Function()`, `WebAssembly`). Other `type` values fail closed (every other binding kind has a first-class key or no runtime support); other `[unsafe]` keys (`capnp`, `metadata`, …) inject raw workerd/upload structures and are refused | `project_cfg.rs:1081` |
@@ -123,7 +124,7 @@ That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
 `secrets_store_secrets`,
-`migrations_pattern`, `streaming_tail_consumers`,
+`migrations_pattern`,
 `logpush`, `site`, `preview_id` (top level),
 `node_compat`, `route`-shaped `custom_domain` fields inside routes
 objects (`zone_name`, `zone_id`, `custom_domain` on `routes[]` entries
@@ -156,3 +157,10 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
   The deploy path never sees `[dev]` — it is stripped before desired-state
   projection, matching wrangler where the table configures only
   `wrangler dev`.
+- 2026-11-21: `streaming_tail_consumers` is supported — same `{service}`
+  table shape as `tail_consumers` (the only key CF's schema accepts),
+  resolved to same-tenant worker ids at deploy and rendered as workerd
+  `streamingTails` designators so the consumer's `tailStream(event)`
+  entrypoint receives a live event stream. Version-scoped like
+  `tail_consumers`; admission requires the `streamingTailConsumers` cell
+  capability.

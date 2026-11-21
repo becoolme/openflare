@@ -187,6 +187,7 @@ fn desired_ack_fixture() {
             service_binding_props: true,
             unsafe_eval: true,
             observability: true,
+            streaming_tail_consumers: true,
         }),
     };
     check(

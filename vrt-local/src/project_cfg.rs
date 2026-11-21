@@ -74,6 +74,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "queues",
     "workflows",
     "tail_consumers",
+    "streaming_tail_consumers",
     "secrets",
     "secrets_store_secrets",
     "worker_loaders",
@@ -945,6 +946,37 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     consumers.push(Value::Object(c));
                 }
                 out.insert("tailConsumers".into(), Value::Array(consumers));
+            }
+            "streaming_tail_consumers" => {
+                // CF `streaming_tail_consumers = [{service = "..."}]` —
+                // same-table shape as `tail_consumers` (worker-level,
+                // same-tenant consumer referenced by name) but the
+                // consumer receives TailStream events via its
+                // `tailStream()` handler instead of batched `tail()`
+                // calls — workerd `streamingTails` designators.
+                // `{service}` is the only key CF's schema accepts.
+                let mut consumers: Vec<Value> = Vec::new();
+                for (i, e) in table_list(value, "streaming_tail_consumers")?
+                    .iter()
+                    .enumerate()
+                {
+                    for k in e.keys() {
+                        if k.as_str() != "service" {
+                            return Err(unsupported(
+                                &format!("streaming_tail_consumers[{i}].{k}"),
+                                None,
+                            ));
+                        }
+                    }
+                    let service = req_str(
+                        e.get("service").unwrap_or(&Value::Null),
+                        &format!("streaming_tail_consumers[{i}].service"),
+                    )?;
+                    let mut c = Map::new();
+                    c.insert("service".into(), Value::from(service));
+                    consumers.push(Value::Object(c));
+                }
+                out.insert("streamingTailConsumers".into(), Value::Array(consumers));
             }
             "version_metadata" => {
                 // CF `[version_metadata] binding = "X"` — a single
@@ -2005,6 +2037,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("tailConsumers") {
         wire.insert("tailConsumers".into(), v.clone());
     }
+    if let Some(v) = obj.get("streamingTailConsumers") {
+        wire.insert("streamingTailConsumers".into(), v.clone());
+    }
     if let Some(v) = obj.get("durableObjectBindings") {
         wire.insert("durableObjectBindings".into(), v.clone());
     }
@@ -2038,6 +2073,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "crons",
         "queueConsumers",
         "tailConsumers",
+        "streamingTailConsumers",
         "versionMetadata",
         "observability",
         "durableObjectBindings",
@@ -2663,6 +2699,34 @@ mod tests {
             "[observability]\nenabled=\"yes\"\n",
             "observability=\"x\"\n",
             "[observability]\nlogs=\"x\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+    }
+
+    #[test]
+    fn streaming_tail_consumers_into_pack_shape() {
+        // CF `streaming_tail_consumers = [{service}]` — same shape as
+        // `tail_consumers`, projected to its own pack key.
+        let dir = wrangler_loader_body(
+            "streaming_tail_consumers = [{service=\"t1\"},{service=\"t2\"}]\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let services: Vec<&str> = meta
+            .streaming_tail_consumers
+            .iter()
+            .map(|c| c.service.as_str())
+            .collect();
+        assert_eq!(services, ["t1", "t2"]);
+
+        // Only `service` is accepted — unknown keys fail closed.
+        for toml in [
+            "streaming_tail_consumers = [{service=\"t1\",environment=\"prod\"}]\n",
+            "streaming_tail_consumers = [{service=\"t1\",remote=true}]\n",
+            "streaming_tail_consumers = [{namespace=\"ns\"}]\n",
+            "streaming_tail_consumers = \"svc\"\n",
+            "streaming_tail_consumers = [1]\n",
         ] {
             let dir = wrangler_loader_body(toml);
             assert!(load_worker_meta(dir.path()).is_err(), "{toml}");

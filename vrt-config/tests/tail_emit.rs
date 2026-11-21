@@ -89,6 +89,46 @@ fn tails_dangling_consumer_skips_only_that_worker() {
     assert!(r.text.contains("worker-w-alpha-2"));
 }
 
+fn tenant_with_streaming(consumers: &[&str]) -> TenantDesired {
+    let mut t = tenant();
+    t.workers[0].streaming_tail_consumers = consumers
+        .iter()
+        .map(|id| TailConsumerDesired {
+            worker_id: (*id).into(),
+        })
+        .collect();
+    t
+}
+
+#[test]
+fn streaming_tails_emit_consumer_designators() {
+    // `streamingTailConsumers[]` render as `streamingTails` designators —
+    // TailStream events via `tailStream()`, never merged into `tails`.
+    let t = tenant_with_streaming(&["w-alpha-2"]);
+    let params = runtime_params();
+    let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
+    let out = &r.text;
+    assert!(
+        out.contains("streamingTails = [(name = \"worker-w-alpha-2\")]"),
+        "{out}"
+    );
+    // Not mixed into the batched `tails` list.
+    assert!(
+        !out.contains("tails = [(name = \"worker-w-alpha-2\")]"),
+        "{out}"
+    );
+}
+
+#[test]
+fn streaming_tails_dangling_consumer_skips_worker() {
+    // Same per-worker fault isolation as `tails`.
+    let t = tenant_with_streaming(&["w-nope"]);
+    let params = runtime_params();
+    let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
+    assert_eq!(r.skipped_workers, vec!["w-alpha-1".to_string()]);
+    assert!(!r.text.contains("streamingTails"));
+}
+
 /// `{"type":"json"}` — the version_metadata/typed-vars carrier renders
 /// as a workerd `json` binding with the wire text verbatim.
 #[test]
