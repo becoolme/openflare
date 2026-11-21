@@ -141,6 +141,60 @@ test("drop-trailing-slash: every HTML form still routes to assets", async () => 
   }
 });
 
+test("dotted HTML stems route to their .html alias", async () => {
+  // `/release-1.2` → `/release-1.2.html`: a dot does not make the
+  // path a concrete asset, and the redirect destination must stay
+  // fetchable (matches vrt-provider resolve()).
+  const idx = { ...INDEX, paths: ["/release-1.2.html", "/app.js"] };
+  for (const p of ["/release-1.2", "/release-1.2.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("overlapping page and directory routes both route to assets", async () => {
+  const idx = { ...INDEX, paths: ["/both.html", "/both/index.html"] };
+  for (const p of ["/both", "/both/", "/both.html", "/both/index", "/both/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("shadowed canonical forms fall through to the user worker", async () => {
+  // `/file-bin` exists, so the `/file-bin.html` rewrite has no free
+  // destination: the provider 404s `/file-bin/`, `/file-bin/index` and
+  // `/file-bin/index.html` in auto/drop mode. The router must not claim
+  // them for assets (worker fallback instead of a 404 from assets).
+  for (const htmlHandling of ["auto-trailing-slash", "drop-trailing-slash"]) {
+    const idx = { htmlHandling, notFoundHandling: "none", paths: ["/file-bin", "/file-bin.html"] };
+    for (const p of ["/file-bin", "/file-bin.html"]) {
+      const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+      assert.equal(res.headers.get(HDR), "assets", `${htmlHandling} ${p}`);
+    }
+    for (const p of ["/file-bin/", "/file-bin/index", "/file-bin/index.html"]) {
+      const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
+      assert.equal(res.headers.get(HDR), null, `${htmlHandling} ${p}`);
+    }
+  }
+  // force mode serves/redirects `/file-bin.html` at `/file-bin/`, so all
+  // forms stay on the assets side.
+  const force = {
+    htmlHandling: "force-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/file-bin", "/file-bin.html"],
+  };
+  for (const p of ["/file-bin", "/file-bin.html", "/file-bin/", "/file-bin/index", "/file-bin/index.html"]) {
+    const res = await hit(env({}, userWorker([]), assetsWorker([], force)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+});
+
+test("exact extensionless /index file routes to assets", async () => {
+  const idx = { ...INDEX, paths: ["/api/index"] };
+  const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req("/api/index"));
+  assert.equal(res.headers.get(HDR), "assets");
+});
+
 test("html_handling none: only exact asset paths route to assets", async () => {
   const idx = {
     htmlHandling: "none",

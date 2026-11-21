@@ -143,32 +143,242 @@ export function normalizePath(raw) {
         out += part;
     }
     if (trailing && !out.endsWith("/")) out += "/";
-    return out === "" ? "/" : out;
+    if (out === "") out = "/";
+    while(out.includes("//"))out = out.replaceAll("//", "/");
+    return out;
 }
-function htmlKey(path) {
-    if (path === "/") return "/";
-    let key;
-    if (path.endsWith("/index.html")) key = path.slice(0, -"/index.html".length);
-    else if (path.endsWith("/index")) key = path.slice(0, -"/index".length);
-    else if (path.endsWith(".html")) key = path.slice(0, -".html".length);
-    else if (path.endsWith("/")) key = path.slice(0, -1);
-    else {
-        const last = path.slice(path.lastIndexOf("/") + 1);
-        if (last.includes(".")) return null;
-        key = path;
+function findAsset(has, path) {
+    return has(path) ? path : null;
+}
+function safeRedirect(has, mode, file, dest, skip) {
+    if (skip || dest === "" || has(dest)) return null;
+    const target = findAsset(has, file);
+    if (target === null) return null;
+    const intent = htmlIntent(has, mode, dest, true);
+    return intent !== null && "asset" in intent && intent.asset === target ? dest : null;
+}
+function htmlIntent(has, mode, path, skip) {
+    if (mode === "none") {
+        const asset = findAsset(has, path);
+        return asset === null ? null : {
+            asset
+        };
     }
-    return key === "" ? "/" : key;
+    if (mode === "force-trailing-slash") return htmlForce(has, path, skip);
+    if (mode === "drop-trailing-slash") return htmlDrop(has, path, skip);
+    return htmlAuto(has, path, skip);
+}
+function htmlAuto(has, path, skip) {
+    const exact = findAsset(has, path);
+    if (path.endsWith("/index")) {
+        if (exact !== null) return {
+            asset: exact
+        };
+        const dir = path.slice(0, -"index".length);
+        const first = safeRedirect(has, "auto-trailing-slash", `${path}.html`, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/index.html")) {
+        const dir = path.slice(0, -"index.html".length);
+        const first = safeRedirect(has, "auto-trailing-slash", path, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/")) {
+        const index = findAsset(has, `${path}index.html`);
+        if (index !== null) return {
+            asset: index
+        };
+        const stem = path.replace(/\/+$/, "");
+        const target = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+        if (target !== null) return {
+            redirect: target
+        };
+    } else if (path.endsWith(".html")) {
+        const stem = path.slice(0, -".html".length);
+        const first = safeRedirect(has, "auto-trailing-slash", path, stem, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const second = safeRedirect(has, "auto-trailing-slash", `${stem}/index.html`, `${stem}/`, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    }
+    if (exact !== null) return {
+        asset: exact
+    };
+    const html = findAsset(has, `${path}.html`);
+    if (html !== null) return {
+        asset: html
+    };
+    const tail = safeRedirect(has, "auto-trailing-slash", `${path}/index.html`, `${path}/`, skip);
+    return tail === null ? null : {
+        redirect: tail
+    };
+}
+function htmlForce(has, path, skip) {
+    const exact = findAsset(has, path);
+    if (path.endsWith("/index")) {
+        if (exact !== null) return {
+            asset: exact
+        };
+        const dir = path.slice(0, -"index".length);
+        const first = safeRedirect(has, "force-trailing-slash", `${path}.html`, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "force-trailing-slash", `${stem}.html`, dir, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/index.html")) {
+        const dir = path.slice(0, -"index.html".length);
+        const first = safeRedirect(has, "force-trailing-slash", path, dir, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const stem = dir.replace(/\/+$/, "");
+        const second = safeRedirect(has, "force-trailing-slash", `${stem}.html`, dir, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    } else if (path.endsWith("/")) {
+        const index = findAsset(has, `${path}index.html`);
+        if (index !== null) return {
+            asset: index
+        };
+        const stem = path.replace(/\/+$/, "");
+        const html = findAsset(has, `${stem}.html`);
+        if (html !== null) return {
+            asset: html
+        };
+    } else if (path.endsWith(".html")) {
+        const slashed = `${path.slice(0, -".html".length)}/`;
+        const first = safeRedirect(has, "force-trailing-slash", path, slashed, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        if (exact !== null) return {
+            asset: exact
+        };
+        const second = safeRedirect(has, "force-trailing-slash", `${slashed}index.html`, slashed, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    }
+    if (exact !== null) return {
+        asset: exact
+    };
+    const slashed = `${path}/`;
+    const first = safeRedirect(has, "force-trailing-slash", `${path}.html`, slashed, skip);
+    if (first !== null) return {
+        redirect: first
+    };
+    const second = safeRedirect(has, "force-trailing-slash", `${path}/index.html`, slashed, skip);
+    return second === null ? null : {
+        redirect: second
+    };
+}
+function htmlDrop(has, path, skip) {
+    const exact = findAsset(has, path);
+    if (path.endsWith("/index")) {
+        if (exact !== null) return {
+            asset: exact
+        };
+        const stem = path.slice(0, -"/index".length);
+        if (stem === "") {
+            const root = safeRedirect(has, "drop-trailing-slash", "/index.html", "/", skip);
+            if (root !== null) return {
+                redirect: root
+            };
+        } else {
+            const first = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+            if (first !== null) return {
+                redirect: first
+            };
+            const second = safeRedirect(has, "drop-trailing-slash", `${path}.html`, stem, skip);
+            if (second !== null) return {
+                redirect: second
+            };
+        }
+    } else if (path.endsWith("/index.html")) {
+        if (path === "/index.html") {
+            const root = safeRedirect(has, "drop-trailing-slash", "/index.html", "/", skip);
+            if (root !== null) return {
+                redirect: root
+            };
+        } else {
+            const stem = path.slice(0, -"/index.html".length);
+            const first = safeRedirect(has, "drop-trailing-slash", path, stem, skip);
+            if (first !== null) return {
+                redirect: first
+            };
+            if (exact !== null) return {
+                asset: exact
+            };
+            const second = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+            if (second !== null) return {
+                redirect: second
+            };
+        }
+    } else if (path.endsWith("/")) {
+        if (path === "/") {
+            const index = findAsset(has, "/index.html");
+            if (index !== null) return {
+                asset: index
+            };
+        } else {
+            const stem = path.replace(/\/+$/, "");
+            const first = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+            if (first !== null) return {
+                redirect: first
+            };
+            const second = safeRedirect(has, "drop-trailing-slash", `${stem}/index.html`, stem, skip);
+            if (second !== null) return {
+                redirect: second
+            };
+        }
+    } else if (path.endsWith(".html")) {
+        const stem = path.slice(0, -".html".length);
+        const first = safeRedirect(has, "drop-trailing-slash", path, stem, skip);
+        if (first !== null) return {
+            redirect: first
+        };
+        const second = safeRedirect(has, "drop-trailing-slash", `${stem}/index.html`, stem, skip);
+        if (second !== null) return {
+            redirect: second
+        };
+    }
+    if (exact !== null) return {
+        asset: exact
+    };
+    const html = findAsset(has, `${path}.html`);
+    if (html !== null) return {
+        asset: html
+    };
+    const index = findAsset(has, `${path}/index.html`);
+    return index === null ? null : {
+        asset: index
+    };
 }
 export function intentFetchable(index, path, navigate, hasStaticRouting) {
     const has = (p)=>index.paths.has(p);
     if (has(path)) return true;
     const nfh = hasStaticRouting || navigate ? index.notFoundHandling : "none";
-    if (index.htmlHandling !== "none") {
-        const key = htmlKey(path);
-        if (key !== null) {
-            if (key === "/" ? has("/index.html") : has(`${key}.html`) || has(`${key}/index.html`)) return true;
-        }
-    }
+    if (htmlIntent(has, index.htmlHandling, path, false) !== null) return true;
     if (nfh === "single-page-application") return has("/index.html");
     if (nfh === "404-page") {
         let dir = path;

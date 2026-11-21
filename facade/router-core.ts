@@ -249,28 +249,218 @@ export function normalizePath(raw: string): string | null {
     out += part;
   }
   if (trailing && !out.endsWith("/")) out += "/";
-  return out === "" ? "/" : out;
+  if (out === "") out = "/";
+  // Cloudflare `decodePath` collapses repeated slashes after decoding.
+  while (out.includes("//")) out = out.replaceAll("//", "/");
+  return out;
 }
 
-// Mirror of vrt-provider resolve/resolve_with_nfh — existence only.
-// `fetchable` means resolve() would produce Serve | Redirect |
-// SpaFallback (anything except NotFound).
-/// Mirror of vrt-provider `html_key`: strip the HTML-route suffix.
-/// `null` = a concrete asset path (last segment has a dot), never
-/// rewritten by html handling.
-function htmlKey(path: string): string | null {
-  if (path === "/") return "/";
-  let key: string;
-  if (path.endsWith("/index.html")) key = path.slice(0, -"/index.html".length);
-  else if (path.endsWith("/index")) key = path.slice(0, -"/index".length);
-  else if (path.endsWith(".html")) key = path.slice(0, -".html".length);
-  else if (path.endsWith("/")) key = path.slice(0, -1);
-  else {
-    const last = path.slice(path.lastIndexOf("/") + 1);
-    if (last.includes(".")) return null;
-    key = path;
+// Mirror of vrt-provider `html_intent`: the per-mode candidate order
+// plus `safeRedirect` validation, so the router's existence decision
+// matches what the provider actually serves. Asset identity is the
+// request path (the route index carries no digests): a canonical
+// rewrite only counts when it would round-trip to the same file.
+// Returns the asset path that would be served, the redirect target, or
+// null for a miss; `not_found_handling` is applied by the caller.
+type HtmlIntent = { asset: string } | { redirect: string } | null;
+type Has = (p: string) => boolean;
+
+function findAsset(has: Has, path: string): string | null {
+  return has(path) ? path : null;
+}
+
+function safeRedirect(
+  has: Has,
+  mode: string,
+  file: string,
+  dest: string,
+  skip: boolean,
+): string | null {
+  if (skip || dest === "" || has(dest)) return null;
+  const target = findAsset(has, file);
+  if (target === null) return null;
+  const intent = htmlIntent(has, mode, dest, true);
+  return intent !== null && "asset" in intent && intent.asset === target
+    ? dest
+    : null;
+}
+
+function htmlIntent(has: Has, mode: string, path: string, skip: boolean): HtmlIntent {
+  if (mode === "none") {
+    const asset = findAsset(has, path);
+    return asset === null ? null : { asset };
   }
-  return key === "" ? "/" : key;
+  if (mode === "force-trailing-slash") return htmlForce(has, path, skip);
+  if (mode === "drop-trailing-slash") return htmlDrop(has, path, skip);
+  return htmlAuto(has, path, skip);
+}
+
+/// `auto-trailing-slash` — mirror of `auto_trailing_slash`.
+function htmlAuto(has: Has, path: string, skip: boolean): HtmlIntent {
+  const exact = findAsset(has, path);
+  if (path.endsWith("/index")) {
+    if (exact !== null) return { asset: exact };
+    const dir = path.slice(0, -"index".length); // `/foo/` or `/`
+    const first = safeRedirect(has, "auto-trailing-slash", `${path}.html`, dir, skip);
+    if (first !== null) return { redirect: first };
+    const stem = dir.replace(/\/+$/, "");
+    const second = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+    if (second !== null) return { redirect: second };
+  } else if (path.endsWith("/index.html")) {
+    const dir = path.slice(0, -"index.html".length); // `/foo/` or `/`
+    const first = safeRedirect(has, "auto-trailing-slash", path, dir, skip);
+    if (first !== null) return { redirect: first };
+    const stem = dir.replace(/\/+$/, "");
+    const second = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+    if (second !== null) return { redirect: second };
+  } else if (path.endsWith("/")) {
+    const index = findAsset(has, `${path}index.html`);
+    if (index !== null) return { asset: index };
+    const stem = path.replace(/\/+$/, "");
+    const target = safeRedirect(has, "auto-trailing-slash", `${stem}.html`, stem, skip);
+    if (target !== null) return { redirect: target };
+  } else if (path.endsWith(".html")) {
+    const stem = path.slice(0, -".html".length);
+    const first = safeRedirect(has, "auto-trailing-slash", path, stem, skip);
+    if (first !== null) return { redirect: first };
+    const second = safeRedirect(
+      has,
+      "auto-trailing-slash",
+      `${stem}/index.html`,
+      `${stem}/`,
+      skip,
+    );
+    if (second !== null) return { redirect: second };
+  }
+  if (exact !== null) return { asset: exact };
+  const html = findAsset(has, `${path}.html`);
+  if (html !== null) return { asset: html };
+  const tail = safeRedirect(
+    has,
+    "auto-trailing-slash",
+    `${path}/index.html`,
+    `${path}/`,
+    skip,
+  );
+  return tail === null ? null : { redirect: tail };
+}
+
+/// `force-trailing-slash` — mirror of `force_trailing_slash`.
+function htmlForce(has: Has, path: string, skip: boolean): HtmlIntent {
+  const exact = findAsset(has, path);
+  if (path.endsWith("/index")) {
+    if (exact !== null) return { asset: exact };
+    const dir = path.slice(0, -"index".length); // `/foo/` or `/`
+    const first = safeRedirect(has, "force-trailing-slash", `${path}.html`, dir, skip);
+    if (first !== null) return { redirect: first };
+    const stem = dir.replace(/\/+$/, "");
+    const second = safeRedirect(has, "force-trailing-slash", `${stem}.html`, dir, skip);
+    if (second !== null) return { redirect: second };
+  } else if (path.endsWith("/index.html")) {
+    const dir = path.slice(0, -"index.html".length);
+    const first = safeRedirect(has, "force-trailing-slash", path, dir, skip);
+    if (first !== null) return { redirect: first };
+    const stem = dir.replace(/\/+$/, "");
+    const second = safeRedirect(has, "force-trailing-slash", `${stem}.html`, dir, skip);
+    if (second !== null) return { redirect: second };
+  } else if (path.endsWith("/")) {
+    const index = findAsset(has, `${path}index.html`);
+    if (index !== null) return { asset: index };
+    const stem = path.replace(/\/+$/, "");
+    const html = findAsset(has, `${stem}.html`);
+    if (html !== null) return { asset: html };
+  } else if (path.endsWith(".html")) {
+    const slashed = `${path.slice(0, -".html".length)}/`;
+    const first = safeRedirect(has, "force-trailing-slash", path, slashed, skip);
+    if (first !== null) return { redirect: first };
+    // Both `/foo.html` and `/foo/index.html` exist: the rewrite would
+    // land on the index, so the exact file is served at its own URL.
+    if (exact !== null) return { asset: exact };
+    const second = safeRedirect(
+      has,
+      "force-trailing-slash",
+      `${slashed}index.html`,
+      slashed,
+      skip,
+    );
+    if (second !== null) return { redirect: second };
+  }
+  if (exact !== null) return { asset: exact };
+  const slashed = `${path}/`;
+  const first = safeRedirect(has, "force-trailing-slash", `${path}.html`, slashed, skip);
+  if (first !== null) return { redirect: first };
+  const second = safeRedirect(
+    has,
+    "force-trailing-slash",
+    `${path}/index.html`,
+    slashed,
+    skip,
+  );
+  return second === null ? null : { redirect: second };
+}
+
+/// `drop-trailing-slash` — mirror of `drop_trailing_slash`.
+function htmlDrop(has: Has, path: string, skip: boolean): HtmlIntent {
+  const exact = findAsset(has, path);
+  if (path.endsWith("/index")) {
+    if (exact !== null) return { asset: exact };
+    const stem = path.slice(0, -"/index".length); // `/foo` or ``
+    if (stem === "") {
+      const root = safeRedirect(has, "drop-trailing-slash", "/index.html", "/", skip);
+      if (root !== null) return { redirect: root };
+    } else {
+      const first = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+      if (first !== null) return { redirect: first };
+      const second = safeRedirect(has, "drop-trailing-slash", `${path}.html`, stem, skip);
+      if (second !== null) return { redirect: second };
+    }
+  } else if (path.endsWith("/index.html")) {
+    if (path === "/index.html") {
+      const root = safeRedirect(has, "drop-trailing-slash", "/index.html", "/", skip);
+      if (root !== null) return { redirect: root };
+    } else {
+      const stem = path.slice(0, -"/index.html".length);
+      const first = safeRedirect(has, "drop-trailing-slash", path, stem, skip);
+      if (first !== null) return { redirect: first };
+      if (exact !== null) return { asset: exact };
+      const second = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+      if (second !== null) return { redirect: second };
+    }
+  } else if (path.endsWith("/")) {
+    if (path === "/") {
+      const index = findAsset(has, "/index.html");
+      if (index !== null) return { asset: index };
+    } else {
+      const stem = path.replace(/\/+$/, "");
+      const first = safeRedirect(has, "drop-trailing-slash", `${stem}.html`, stem, skip);
+      if (first !== null) return { redirect: first };
+      const second = safeRedirect(
+        has,
+        "drop-trailing-slash",
+        `${stem}/index.html`,
+        stem,
+        skip,
+      );
+      if (second !== null) return { redirect: second };
+    }
+  } else if (path.endsWith(".html")) {
+    const stem = path.slice(0, -".html".length);
+    const first = safeRedirect(has, "drop-trailing-slash", path, stem, skip);
+    if (first !== null) return { redirect: first };
+    const second = safeRedirect(
+      has,
+      "drop-trailing-slash",
+      `${stem}/index.html`,
+      stem,
+      skip,
+    );
+    if (second !== null) return { redirect: second };
+  }
+  if (exact !== null) return { asset: exact };
+  const html = findAsset(has, `${path}.html`);
+  if (html !== null) return { asset: html };
+  const index = findAsset(has, `${path}/index.html`);
+  return index === null ? null : { asset: index };
 }
 
 export function intentFetchable(
@@ -283,15 +473,11 @@ export function intentFetchable(
   if (has(path)) return true;
   const nfh =
     hasStaticRouting || navigate ? index.notFoundHandling : "none";
-  if (index.htmlHandling !== "none") {
-    // Every HTML route resolves to `<key>.html` or `<key>/index.html`;
-    // non-canonical forms are 307 redirects, which are still fetchable.
-    const key = htmlKey(path);
-    if (key !== null) {
-      if (key === "/" ? has("/index.html") : has(`${key}.html`) || has(`${key}/index.html`))
-        return true;
-    }
-  }
+  // Existence exactly as the provider resolves it: a request the
+  // provider would 404 (e.g. `/file-bin/` when `/file-bin` shadows the
+  // `/file-bin.html` rewrite) must fall through to the user worker
+  // instead of being claimed by assets.
+  if (htmlIntent(has, index.htmlHandling, path, false) !== null) return true;
   if (nfh === "single-page-application") return has("/index.html");
   if (nfh === "404-page") {
     // assets.worker.js:1011–1037 — the nearest ANCESTOR 404.html
