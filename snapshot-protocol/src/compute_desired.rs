@@ -21,7 +21,7 @@ use crate::error::SnapshotError;
 use crate::strict::MAX_SAFE_INTEGER;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// Snapshot kind this payload is carried under.
 pub const KIND: &str = "compute.desired";
@@ -108,12 +108,6 @@ pub const DEFAULT_MEMORY_MB: u32 = 128;
 pub const DEFAULT_SUBREQUESTS: u32 = 50;
 /// Platform default simultaneous outbound connections.
 pub const DEFAULT_OUTBOUND_CONNECTIONS: u32 = 16;
-
-/// Per-worker bound on one tail-consumer list (`tail_consumers` and
-/// `streaming_tail_consumers` each) — keeps a declared fan-out from
-/// inflating both the signed desired document and the rendered
-/// workerd config.
-pub const MAX_TAIL_CONSUMERS_PER_WORKER: usize = 16;
 
 /// The `compute.desired` payload: complete desired state for one cell.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -526,7 +520,9 @@ pub const RESERVED_ENTRYPOINT_PREFIXES: [&str; 2] = ["Vrt", "vrt"];
 pub fn valid_service_entrypoint(ep: &str) -> bool {
     valid_binding_name(ep)
         && ep != "default"
-        && !RESERVED_ENTRYPOINT_PREFIXES.iter().any(|p| ep.starts_with(p))
+        && !RESERVED_ENTRYPOINT_PREFIXES
+            .iter()
+            .any(|p| ep.starts_with(p))
 }
 
 /// `{"type":"d1"}` — server-assigned database identity + writer epoch.
@@ -1205,8 +1201,9 @@ impl ComputeDesired {
                 // Tail consumers: a same-tenant, DIFFERENT worker; unique
                 // per producer. Workerd refuses a `tails` designator with
                 // no service, so a dangling declaration must never ship.
-                // Both lists share one target set, so the same worker
-                // cannot be delivered on two channels either.
+                // Both lists share one target set: no self-reference, no
+                // duplicate, and the same worker cannot be delivered on
+                // two channels (tail() + tailStream() would both fire).
                 if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
                     || worker.streaming_tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
                 {
@@ -1364,11 +1361,7 @@ impl ComputeDesired {
             if d.revision == 0 || d.revision > MAX_SAFE_INTEGER {
                 return Err(DesiredError::InvalidRevision);
             }
-            if !seen_deletions.insert((
-                &d.tenant_id,
-                &d.worker_id,
-                &d.class_key,
-            )) {
+            if !seen_deletions.insert((&d.tenant_id, &d.worker_id, &d.class_key)) {
                 return Err(DesiredError::Duplicate("deletions"));
             }
         }
@@ -1465,8 +1458,9 @@ impl WorkerDesired {
                     let h = &hd.synthetic_host;
                     if !(h.len() <= 253
                         && h.ends_with(".hyperdrive.vrt.internal")
-                        && h.chars().all(|c| c.is_ascii_lowercase()
-                            || c.is_ascii_digit() || c == '-' || c == '.'))
+                        && h.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'
+                        }))
                     {
                         return Err(DesiredError::Identifier("bindings.syntheticHost"));
                     }
@@ -2379,7 +2373,9 @@ mod tests {
             ),
             (
                 "service-entrypoint-empty",
-                Box::new(|v| v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("")),
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("")
+                }),
                 "DESIRED_INVALID_IDENTIFIER",
             ),
             (
@@ -2467,7 +2463,7 @@ mod tests {
                     v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
                         json!([{"workerId": "w-nope"}])
                 }),
-                "DESIRED_TAIL_TARGET_SCOPE",
+                "DESIRED_TAIL_CONSUMER_SCOPE",
             ),
             (
                 "streaming-tail-self-reference",
@@ -2475,7 +2471,7 @@ mod tests {
                     v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
                         json!([{"workerId": "w-alpha-1"}])
                 }),
-                "DESIRED_TAIL_TARGET_SCOPE",
+                "DESIRED_TAIL_CONSUMER_SCOPE",
             ),
             (
                 "tail-same-consumer-on-both-channels",
@@ -2721,7 +2717,8 @@ mod tests {
 
     #[test]
     fn ratelimit_binding_validation_fails_closed() {
-        let ok = json!({"type":"ratelimit","name":"RL","namespaceId":"1001","limit":40,"period":60});
+        let ok =
+            json!({"type":"ratelimit","name":"RL","namespaceId":"1001","limit":40,"period":60});
         let mut v = valid_payload();
         bind_rl(&mut v, ok.clone());
         assert_eq!(desired(&v).unwrap().validate(), Ok(()));
@@ -2762,7 +2759,9 @@ mod tests {
         // Per-worker count cap.
         let mut v = valid_payload();
         for i in 0..=MAX_RATELIMIT_BINDINGS_PER_WORKER {
-            bind_rl(&mut v, json!({"type":"ratelimit","name":format!("RL{i}"),"namespaceId":"1","limit":1,"period":10}),
+            bind_rl(
+                &mut v,
+                json!({"type":"ratelimit","name":format!("RL{i}"),"namespaceId":"1","limit":1,"period":10}),
             );
         }
         assert_eq!(
@@ -3061,7 +3060,9 @@ mod tests {
     fn service_entrypoint_wire_shape() {
         let legacy = serde_json::json!({"type": "service", "name": "AUTH", "workerId": "w-2"});
         let b: BindingDesired = serde_json::from_value(legacy.clone()).unwrap();
-        let BindingDesired::Service(s) = &b else { panic!() };
+        let BindingDesired::Service(s) = &b else {
+            panic!()
+        };
         assert_eq!(s.entrypoint, None);
         // Absent stays absent: legacy snapshots keep their canonical bytes.
         assert_eq!(serde_json::to_value(&b).unwrap(), legacy);
@@ -3070,7 +3071,9 @@ mod tests {
             {"type": "service", "name": "AUTH", "workerId": "w-2", "entrypoint": "Greeter"}
         );
         let b: BindingDesired = serde_json::from_value(named.clone()).unwrap();
-        let BindingDesired::Service(s) = &b else { panic!() };
+        let BindingDesired::Service(s) = &b else {
+            panic!()
+        };
         assert_eq!(s.entrypoint.as_deref(), Some("Greeter"));
         assert_eq!(serde_json::to_value(&b).unwrap(), named);
 
@@ -3085,10 +3088,21 @@ mod tests {
         for ok in ["Greeter", "_x", "$y", "Admin2", "VRT"] {
             assert!(valid_service_entrypoint(ok), "{ok}");
         }
-        for bad in ["", "default", "1A", "a-b", "a.b", "VrtWaituntilProbe", "vrtX", "Vrt"] {
+        for bad in [
+            "",
+            "default",
+            "1A",
+            "a-b",
+            "a.b",
+            "VrtWaituntilProbe",
+            "vrtX",
+            "Vrt",
+        ] {
             assert!(!valid_service_entrypoint(bad), "{bad}");
         }
-        assert!(!valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN + 1)));
+        assert!(!valid_service_entrypoint(
+            &"E".repeat(MAX_BINDING_NAME_LEN + 1)
+        ));
         assert!(valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN)));
     }
 

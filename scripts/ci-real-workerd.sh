@@ -35,7 +35,8 @@
 #                m14_tcp_connect_workerd m16_ratelimit
 #                m17_hyperdrive_workerd m18_hyperdrive_node_pg
 #                runaway_workerd s2z_hibernate_workerd
-#                waituntil_workerd workerd_entry_smoke
+#                streaming_tail_workerd waituntil_workerd
+#                workerd_entry_smoke
 #     m13r5 + m16 additionally need real unix-socket binds (fine on a
 #     normal CI host; restricted sandboxes may deny bind(2) — those
 #     tests fail there rather than skip). m17/m18 need a PostgreSQL 16
@@ -118,6 +119,7 @@ TIER2=(
   m18_hyperdrive_node_pg
   runaway_workerd
   s2z_hibernate_workerd
+  streaming_tail_workerd
   waituntil_workerd
   workerd_entry_smoke
 )

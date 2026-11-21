@@ -194,9 +194,11 @@ honours `[observability]`: when the worker's `enabled` or
 collected); otherwise an `OBS` text binding carries
 `{"headSamplingRate":<float>, "invocationLogs":<bool>}` and the embedded
 collector samples per invocation — a dropped invocation keeps none of its
-log/exception/outcome records (deterministic FNV-1a over `traceId`/`spanId`
-when present, `Math.random()` otherwise), and `invocation_logs=false` drops
-only the outcome record. The wire carries the rate as integer ppm
+log/exception/outcome records (deterministic FNV-1a over the TraceItem's
+`scriptName` + `eventTimestamp` + `durableObjectId`; the pinned workerd
+exposes no `traceId`/`spanId` on `tail()` events, so the verdict is stable
+for a re-delivered event), and `invocation_logs=false` drops only the
+outcome record. The wire carries the rate as integer ppm
 (`headSamplingRatePpm`, 0..1_000_000) because the signed snapshot's
 canonical JSON accepts safe integers only.
 
@@ -208,9 +210,20 @@ canonical JSON accepts safe integers only.
 - Delivery is best-effort like Cloudflare: workerd may drop events under
   backpressure and consumer failures are isolated from the producer —
   both semantics come from the same upstream code path.
-- A self-referencing consumer is allowed even on first deploy, because the
-  deploy itself produces the version that satisfies the reference
-  (matches `wrangler deploy` behavior).
+- A self-referencing consumer is **rejected** at pack time and in the
+  signed-desired validator: a worker whose `tails`/`streamingTails`
+  designator points at itself would re-enter its own handler for every
+  event with no documented recursion bound. Point the consumer at a
+  sibling worker instead.
+- The same consumer worker may not appear on **both** channels
+  (`tail_consumers` and `streaming_tail_consumers`): workerd would
+  invoke its `tail()` and `tailStream()` for one event, double-delivering
+  with no way to tell the copies apart. Pick one channel per consumer;
+  the pack and the desired validator both fail closed.
+- Duplicate entries inside one list are collapsed by name at
+  normalization (`vrt-local` pack); a hand-crafted signed snapshot that
+  still carries duplicates is rejected by the desired validator. Both
+  lists are capped at 16 resolved consumers per worker.
 
 ## Unsupported keys and error shape
 
@@ -262,6 +275,22 @@ it as provisional:
   `streaming_tail_consumers` parse vectors (unknown-key fail-closed,
   non-string `service`).
 - `snapshot-protocol/src/compute_desired.rs` — same-tenant existence,
-  duplicate-consumer and empty-list vectors.
+  self-reference, duplicate (within one list and across both), cap and
+  empty-list vectors.
+- `vrt-local/src/worker_pkg.rs` — shared `resolve_tail_consumers`
+  invariants (self-target, dedupe, 16 cap, dual-channel refusal).
+- `vrt-local/src/state.rs` — version identity covers both lists.
+- `vrt-host/tests/streaming_tail_workerd.rs` — real-workerd
+  `tailStream()` delivery (gated on `VRT_WORKERD_BIN`).
 - `shared/vrt-project-config-vectors.json` — cross-repo golden vectors
   (parsed identically by the Rust and TypeScript project configs).
+
+## Changelog
+
+- 2026-11-21: version identity is derived from the canonical serialized
+  `VersionRecord`, so both tail lists (and any future version-scoped
+  field) automatically mint a new version on change; both lists share
+  one validator (self-reference refused, dedupe, 16 cap); a consumer on
+  both channels is refused instead of double-delivered; sampling docs
+  corrected to the real TraceItem fields; real-workerd `tailStream`
+  smoke added.

@@ -76,8 +76,7 @@ pub struct WorkerRecord {
 /// that added version-scoped fields. Dropping an unknown field is safe
 /// here (the state is re-projected through `to_desired`, and the host
 /// re-validates), whereas failing the decode bricks the tenant on a
-/// rollback — the exact downgrade hazard the envelope fence exists to
-/// avoid elsewhere.
+/// rollback. Same downgrade rule #48 established for `observability`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VersionRecord {
@@ -161,9 +160,10 @@ impl LocalState {
     /// join identity automatically: a field added to `VersionRecord`
     /// — and therefore replayed by `to_desired`/rollback — cannot be
     /// silently deduped away by `apply_deploy` because someone forgot
-    /// to copy it here. This was the root cause of two fail-open bugs
-    /// (`queueConsumers`, then `observability`): a pure config change
-    /// "deployed" successfully but never reached desired.
+    /// to copy it here. This was the root cause of repeated fail-open
+    /// bugs (`queueConsumers`, `tailConsumers`, `observability`,
+    /// `streamingTailConsumers`): a pure config change "deployed"
+    /// successfully but never reached desired.
     ///
     /// Absent/skipped fields keep their old canonical bytes, so
     /// workers that never declared the newer fields retain their
@@ -444,6 +444,12 @@ mod tests {
         }
     }
 
+    fn tail(id: &str) -> TailConsumerDesired {
+        TailConsumerDesired {
+            worker_id: id.into(),
+        }
+    }
+
     /// Minimal pack input — every version-scoped field at its empty
     /// default so a test can change exactly one dimension.
     fn pkg() -> crate::worker_pkg::PackedWorker {
@@ -459,6 +465,7 @@ mod tests {
             queue_consumers: vec![],
             tail_consumers: vec![],
             observability: None,
+            streaming_tail_consumers: vec![],
             durable_object_classes: vec![],
             workflows: vec![],
             hostnames: vec![],
@@ -489,10 +496,21 @@ mod tests {
         assert_ne!(base_id, LocalState::version_id(&gates), "enabled gate");
 
         let mut tails = pkg();
-        tails.tail_consumers = vec![TailConsumerDesired {
-            worker_id: "w-consumer".into(),
-        }];
+        tails.tail_consumers = vec![tail("w-consumer")];
         assert_ne!(base_id, LocalState::version_id(&tails), "tail consumers");
+
+        let mut streaming = pkg();
+        streaming.streaming_tail_consumers = vec![tail("w-live")];
+        assert_ne!(
+            base_id,
+            LocalState::version_id(&streaming),
+            "streaming tail consumers"
+        );
+        assert_ne!(
+            LocalState::version_id(&tails),
+            LocalState::version_id(&streaming),
+            "the two channels must not alias"
+        );
 
         let mut queues = pkg();
         queues.queue_consumers = vec![snapshot_protocol::compute_desired::QueueConsumerDesired {
