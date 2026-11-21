@@ -1,6 +1,6 @@
 {
  "version": 1,
- "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here \u2014 that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
+ "description": "Cross-language golden vectors for T31 project-config normalization (wrangler.toml / wrangler.json / wrangler.jsonc -> normalized WorkerProjectConfig). Every entry materializes `files` into a project dir, applies `configFile`/`envName`, then expects either the normalized config or a typed error. cloudflare.config.ts vectors are NOT here — that mapping is CLI-local (see doc/platform/workers-runtime-project-config.md).",
  "vectors": [
   {
    "name": "toml full mapping",

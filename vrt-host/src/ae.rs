@@ -135,8 +135,11 @@ impl AeService {
         if let Some(r) = &sock_root {
             crate::cache::ensure_traverse_dir(r, "ae socket root")?;
         }
-        std::fs::create_dir_all(data_root.join("spool"))?;
-        std::fs::create_dir_all(data_root.join("out"))?;
+        // Tenant datapoints — 0700 like every other tenant-data dir in
+        // the crate (the AeService doc's "host-only 0700" claim was
+        // previously only true under a strict umask).
+        vrt_securefs::ensure_secure_dir(&data_root.join("spool"))?;
+        vrt_securefs::ensure_secure_dir(&data_root.join("out"))?;
         Ok(Self {
             sock_root,
             inner: Arc::new(AeInner {
@@ -276,13 +279,18 @@ impl AeService {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Claim-read + decode + 45-column Arrow/Parquet build run on
+            // the blocking pool — on the async worker a 256 MiB spool
+            // would stall ingress for every tenant on the runtime.
+            let flush =
+                |inner: Arc<AeInner>| tokio::task::spawn_blocking(move || flush_all(&inner));
             loop {
                 tokio::select! {
                     _ = tick.tick() => {
-                        flush_all(&inner);
+                        let _ = flush(inner.clone()).await;
                     }
                     _ = shutdown.changed() => {
-                        flush_all(&inner);
+                        let _ = flush(inner.clone()).await;
                         return;
                     }
                 }
@@ -501,7 +509,7 @@ enum AppendError {
 fn append(inner: &AeInner, tenant: &str, dataset: &str, body: &[u8]) -> Result<(), AppendError> {
     let seg = vrt_securefs::segment_encode(tenant);
     let dir = inner.data_root.join("spool").join(&seg);
-    std::fs::create_dir_all(&dir).map_err(AppendError::Io)?;
+    vrt_securefs::ensure_secure_dir(&dir).map_err(AppendError::Io)?;
     let path = dir.join(format!("{dataset}.jsonl"));
 
     let mut guard = inner.write.lock().unwrap_or_else(|p| p.into_inner());
@@ -518,9 +526,14 @@ fn append(inner: &AeInner, tenant: &str, dataset: &str, body: &[u8]) -> Result<(
         .append(true)
         .open(&path)
         .map_err(AppendError::Io)?;
-    // One `write_all` under the shared lock — lines never interleave.
-    f.write_all(body.as_ref()).map_err(AppendError::Io)?;
-    f.write_all(b"\n").map_err(AppendError::Io)?;
+    // One `write_all` under the shared lock — lines never interleave
+    // AND a crash can never strand a body without its newline (two
+    // separate writes concatenated the next event onto the partial
+    // line, corrupting both).
+    let mut line = Vec::with_capacity(body.len() + 1);
+    line.extend_from_slice(body.as_ref());
+    line.push(b'\n');
+    f.write_all(&line).map_err(AppendError::Io)?;
     *tracked += body.len() as u64 + 1;
     crate::metrics::registry().set(
         "vrt_host_ae_spool_bytes",
@@ -613,21 +626,64 @@ fn flush_all(inner: &AeInner) {
     }
 }
 
+/// CF retention is ~3 months; the event timestamp is tenant-controlled
+/// and only checked for `> 0` at ingest, so an unbounded `dt=` key would
+/// let one 21 MiB spool mint ~100k dirs (inode DoS) and break the
+/// `dt=*` glob contract. Events outside `now-MAX_AGE .. now+FUTURE_SKEW`
+/// fold into a single `dt=_invalid` partition — partitions are bounded
+/// and the data is preserved rather than dropped.
+const AE_MAX_AGE_DAYS: i64 = 92;
+const AE_FUTURE_SKEW_DAYS: i64 = 2;
+/// Defense-in-depth: even inside the window, distinct partitions per
+/// claim stay bounded; overflow days merge into `dt=_invalid`.
+const MAX_PARTITIONS_PER_CLAIM: usize = 128;
+/// Bound on rows per part file — a multi-MB day writes several
+/// bounded parts instead of one giant batch.
+const MAX_ROWS_PER_PART: usize = 1_000_000;
+
+fn partition_day(now: chrono::DateTime<chrono::Utc>, ts_ns: i64) -> String {
+    let ts = chrono::DateTime::from_timestamp_nanos(ts_ns);
+    let min = now - chrono::Duration::days(AE_MAX_AGE_DAYS);
+    let max = now + chrono::Duration::days(AE_FUTURE_SKEW_DAYS);
+    if ts < min || ts > max {
+        "_invalid".into()
+    } else {
+        ts.format("%Y-%m-%d").to_string()
+    }
+}
+
 /// Convert one claimed spool file into per-day Parquet part files.
-/// Returns the number of converted events.
+/// Returns the number of converted events. Runs on the blocking pool
+/// (`spawn_flush` wraps it) — decoding + Arrow/Parquet must not stall
+/// the async worker that also serves ingress.
 fn flush_one(inner: &AeInner, tenant: &str, dataset: &str, claim: &Path) -> std::io::Result<usize> {
-    let raw = std::fs::read(claim)?;
+    // Stream line-by-line: the whole claim is hashed for idempotent
+    // part names without holding it plus the decoded events in memory.
+    let file = std::fs::File::open(claim)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = sha2::Sha256::new();
+    let mut line = Vec::new();
+    let now = chrono::Utc::now();
     let mut by_day: BTreeMap<String, Vec<AeEvent>> = BTreeMap::new();
     let mut bad = 0usize;
-    for line in raw.split(|b| *b == b'\n') {
-        if line.is_empty() {
+    loop {
+        line.clear();
+        let n = std::io::BufRead::read_until(&mut reader, b'\n', &mut line)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&line);
+        let trimmed = if line.last() == Some(&b'\n') {
+            &line[..line.len() - 1]
+        } else {
+            &line[..]
+        };
+        if trimmed.is_empty() {
             continue;
         }
-        match AeEvent::from_json(line) {
+        match AeEvent::from_json(trimmed) {
             Some(ev) => {
-                let day = chrono::DateTime::from_timestamp_nanos(ev.timestamp_ns)
-                    .format("%Y-%m-%d")
-                    .to_string();
+                let day = partition_day(now, ev.timestamp_ns);
                 by_day.entry(day).or_default().push(ev);
             }
             None => bad += 1,
@@ -636,26 +692,43 @@ fn flush_one(inner: &AeInner, tenant: &str, dataset: &str, claim: &Path) -> std:
     if bad > 0 {
         metric_err(tenant, "spoolLine");
     }
+    // Partition-count bound: an adversarial claim inside the window
+    // still cannot exceed MAX partitions — overflow days fold into
+    // `_invalid` (a deterministic merge: sorted days, keep first N-1).
+    if by_day.len() > MAX_PARTITIONS_PER_CLAIM {
+        let overflow: Vec<String> = by_day
+            .keys()
+            .filter(|d| d.as_str() != "_invalid")
+            .skip(MAX_PARTITIONS_PER_CLAIM - 1)
+            .cloned()
+            .collect();
+        for day in overflow {
+            let mut ev = by_day.remove(&day).unwrap_or_default();
+            by_day.entry("_invalid".into()).or_default().append(&mut ev);
+        }
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
     let mut written = 0usize;
     for (day, events) in by_day {
-        written += events.len();
         let out_dir = inner
             .data_root
             .join("out")
             .join(vrt_securefs::segment_encode(tenant))
             .join(dataset)
             .join(format!("dt={day}"));
-        std::fs::create_dir_all(&out_dir)?;
+        vrt_securefs::ensure_secure_dir(&out_dir)?;
         // Content-derived name → a crashed/repeated flush of the SAME
-        // bytes lands on the same part file (idempotent rewrite).
-        let digest: [u8; 32] = sha2::Sha256::digest(&raw).into();
-        let part = out_dir.join(format!("part-{}.parquet", hex::encode(&digest[..8])));
-        write_parquet(&part, tenant, dataset, &events)?;
-        crate::metrics::registry().inc(
-            "vrt_host_ae_parquet_files_total",
-            &[("tenant", tenant), ("dataset", dataset)],
-            1.0,
-        );
+        // bytes lands on the same part files (idempotent rewrite).
+        for (i, chunk) in events.chunks(MAX_ROWS_PER_PART).enumerate() {
+            written += chunk.len();
+            let part = out_dir.join(format!("part-{}-{i}.parquet", hex::encode(&digest[..8])));
+            write_parquet(&part, tenant, dataset, chunk)?;
+            crate::metrics::registry().inc(
+                "vrt_host_ae_parquet_files_total",
+                &[("tenant", tenant), ("dataset", dataset)],
+                1.0,
+            );
+        }
     }
     Ok(written)
 }
@@ -923,11 +996,14 @@ mod tests {
         assert!(spool.exists());
         flush_all(&svc.inner);
         assert!(!spool.exists());
+        // Nov 2023 is outside the 92-day window — tenant-controlled
+        // timestamps cannot mint unbounded partitions; it folds into
+        // the single `dt=_invalid` overflow bucket (data preserved).
         let out_dir = dir
             .path()
             .join("ae/out")
             .join(vrt_securefs::segment_encode("t1"))
-            .join("weather/dt=2023-11-14");
+            .join("weather/dt=_invalid");
         let parts: Vec<_> = std::fs::read_dir(&out_dir)
             .unwrap()
             .flatten()
@@ -965,5 +1041,62 @@ mod tests {
             append(&svc.inner, "t1", "weather", &body),
             Err(AppendError::Overflow)
         ));
+    }
+
+    #[test]
+    fn partition_day_window_bounds() {
+        let now = chrono::Utc::now();
+        // Inside the window → the real day.
+        let inside = now - chrono::Duration::days(10);
+        assert_eq!(
+            partition_day(now, inside.timestamp_nanos_opt().unwrap()),
+            inside.format("%Y-%m-%d").to_string()
+        );
+        // Boundary: exactly MAX_AGE days old / FUTURE_SKEW ahead pass.
+        for d in [-AE_MAX_AGE_DAYS, AE_FUTURE_SKEW_DAYS] {
+            let t = now + chrono::Duration::days(d);
+            assert_ne!(
+                partition_day(now, t.timestamp_nanos_opt().unwrap()),
+                "_invalid"
+            );
+        }
+        // Outside → the single overflow bucket, never a new dir.
+        for d in [-(AE_MAX_AGE_DAYS + 1), AE_FUTURE_SKEW_DAYS + 1, 80_000] {
+            let t = now + chrono::Duration::days(d);
+            assert_eq!(
+                partition_day(now, t.timestamp_nanos_opt().unwrap()),
+                "_invalid"
+            );
+        }
+        // Garbage timestamps (0 / pre-epoch-negative) also fold — never
+        // a panic or a dir like `dt=1969-12-31`.
+        assert_eq!(partition_day(now, 0), "_invalid");
+        assert_eq!(partition_day(now, -1), "_invalid");
+    }
+
+    #[test]
+    fn data_dirs_are_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let svc = AeService::new(
+            None,
+            dir.path().join("ae"),
+            AeLimits {
+                max_body_bytes: 1 << 20,
+                max_spool_bytes: 1 << 20,
+                flush_interval: std::time::Duration::from_secs(60),
+            },
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&event_json()).unwrap();
+        append(&svc.inner, "t1", "weather", &body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for sub in ["spool", "out", "spool/t1"] {
+            let mode = std::fs::metadata(dir.path().join("ae").join(sub))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "{sub} must be owner-only");
+        }
     }
 }

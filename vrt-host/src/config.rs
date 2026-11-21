@@ -119,14 +119,13 @@ pub struct HostConfig {
     #[serde(default)]
     pub scale_to_zero: ScaleToZeroConfig,
     /// `[analyticsEngine]` — per-tenant Analytics Engine ingest
-    /// (`env.<binding>.writeDataPoint()`). Default-enabled: the
-    /// cell-controller advertises the `analyticsEngine` capability
-    /// unconditionally, so a default-off host would admit dataset
-    /// bindings then fail their render — enabled keeps the capability
-    /// bit honest. Sockets live under `<workDir>/ae/sock/`, spool +
-    /// Parquet under `<workDir>/ae/`; a startup build failure
-    /// degrades observably (`record_ae_init`) and AE renders then
-    /// fail closed (`aeAddr`).
+    /// (`env.<binding>.writeDataPoint()`). Always-on when the service
+    /// builds: the cell-controller advertises `analyticsEngine`
+    /// unconditionally, so the only degrade path is an init failure
+    /// — observable via `record_ae_init`/`vrt_host_ae_degraded`, with
+    /// AE renders failing closed (`aeAddr`) rather than a fake ingest.
+    /// Sockets live under `<workDir>/ae/sock/`, spool + Parquet under
+    /// `<workDir>/ae/`.
     #[serde(default = "AnalyticsEngineConfig::enabled_default")]
     pub analytics_engine: AnalyticsEngineConfig,
 }
@@ -203,7 +202,9 @@ impl ScaleToZeroConfig {
             return Err(ConfigError::Invalid("scaleToZero.idleMs must be 1s..7d"));
         }
         if self.min_residency_ms > 24 * 3_600_000 {
-            return Err(ConfigError::Invalid("scaleToZero.minResidencyMs must be <= 24h"));
+            return Err(ConfigError::Invalid(
+                "scaleToZero.minResidencyMs must be <= 24h",
+            ));
         }
         if self.max_concurrent_wakes == 0 || self.max_concurrent_wakes > 256 {
             return Err(ConfigError::Invalid(
@@ -211,7 +212,9 @@ impl ScaleToZeroConfig {
             ));
         }
         if self.max_wake_queue > 100_000 {
-            return Err(ConfigError::Invalid("scaleToZero.maxWakeQueue must be <= 100000"));
+            return Err(ConfigError::Invalid(
+                "scaleToZero.maxWakeQueue must be <= 100000",
+            ));
         }
         if self.drain_timeout_ms < 100 || self.drain_timeout_ms > 600_000 {
             return Err(ConfigError::Invalid(
@@ -322,11 +325,6 @@ fn default_cache_tenant_inflight() -> usize {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AnalyticsEngineConfig {
-    /// Serve per-tenant ingest sockets + flush spool to Parquet.
-    /// Default true (the cell claims the capability unconditionally —
-    /// default-off would admit bindings then fail their render).
-    #[serde(default = "ae_enabled")]
-    pub enabled: bool,
     /// POST body cap — workerd's `AnalyticsEngineEvent` is
     /// schema-bounded (~64 KiB worst); the default leaves headroom.
     #[serde(default = "default_ae_max_body")]
@@ -341,28 +339,20 @@ pub struct AnalyticsEngineConfig {
     pub flush_interval_secs: u64,
 }
 
-fn ae_enabled() -> bool {
-    true
-}
-
 impl AnalyticsEngineConfig {
     /// Default when `[analyticsEngine]` is absent entirely.
     pub fn enabled_default() -> Self {
         Self {
-            enabled: true,
             max_body_bytes: default_ae_max_body(),
             max_spool_bytes: default_ae_max_spool(),
             flush_interval_secs: default_ae_flush_secs(),
         }
     }
 
-    /// Startup validation — bounds must be >0 when enabled (a zero
-    /// cap would fake the feature while dropping every event; the
-    /// flush cadence itself is clamped, not rejected).
+    /// Startup validation — bounds must be >0 (a zero cap would fake
+    /// the feature while dropping every event; the flush cadence
+    /// itself is clamped, not rejected).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if !self.enabled {
-            return Ok(());
-        }
         if self.max_body_bytes == 0 || self.max_spool_bytes == 0 {
             return Err(ConfigError::Invalid("analyticsEngine bounds must be > 0"));
         }
@@ -634,9 +624,7 @@ impl DoWalConfig {
             }
             Some(v) => v,
         };
-        let headroom = cfg
-            .replay_max_bytes
-            .saturating_sub(cfg.max_pending_bytes);
+        let headroom = cfg.replay_max_bytes.saturating_sub(cfg.max_pending_bytes);
         // r2 floor: a degenerate headroom (≈0) must not clamp the
         // threshold to ~1B — that would fire a full snapshot every
         // 30s forever. Prefer a sane floor and accept that
@@ -1099,8 +1087,7 @@ impl SupervisorConfig {
         // clamped to 1 anyway, but a zero config is a mistake, fail
         // closed) and >64 would pin the shared store runtime on
         // oversized tenants.
-        if !(1..=crate::do_switch_pipeline::MAX_CONCURRENCY)
-            .contains(&self.do_pipeline_concurrency)
+        if !(1..=crate::do_switch_pipeline::MAX_CONCURRENCY).contains(&self.do_pipeline_concurrency)
         {
             return Err(ConfigError::Invalid(
                 "supervisor.doPipelineConcurrency must be in 1..=64",
@@ -1146,9 +1133,7 @@ impl SupervisorConfig {
             circuit_cooldown: Duration::from_millis(self.circuit_cooldown_ms),
             drain_timeout: Duration::from_millis(self.drain_timeout_ms),
             wait_until_grace: Duration::from_millis(self.wait_until_grace_ms),
-            do_switch_wait_until_grace: Duration::from_millis(
-                self.do_switch_wait_until_grace_ms,
-            ),
+            do_switch_wait_until_grace: Duration::from_millis(self.do_switch_wait_until_grace_ms),
             monitor_interval: Duration::from_millis(self.monitor_interval_ms),
             max_switch_failures: self.max_switch_failures,
             preflight_timeout: Duration::from_millis(self.preflight_timeout_ms),
@@ -2002,9 +1987,7 @@ impl HostConfig {
                         }
                         (None, Some(d)) => {
                             if !d.is_absolute() {
-                                return Err(ConfigError::InsecureDir(
-                                    "bindingBackendDir",
-                                ));
+                                return Err(ConfigError::InsecureDir("bindingBackendDir"));
                             }
                         }
                     }
@@ -2229,9 +2212,7 @@ impl HostConfig {
                                     self.render
                                         .binding_backend_dir
                                         .as_ref()
-                                        .and_then(|d| {
-                                            d.to_str().map(str::to_string)
-                                        })
+                                        .and_then(|d| d.to_str().map(str::to_string))
                                 })
                                 .unwrap_or_default();
                             let value = params_json_from_manifest(
@@ -2626,9 +2607,17 @@ mod tests {
         d.validate().unwrap();
         assert!(d.build().is_none(), "off must build no runtime object");
         // Off ignores out-of-range numbers (byte-identical behaviour).
-        ScaleToZeroConfig { idle_ms: 1, ..Default::default() }.validate().unwrap();
+        ScaleToZeroConfig {
+            idle_ms: 1,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
 
-        let on = ScaleToZeroConfig { enabled: true, ..Default::default() };
+        let on = ScaleToZeroConfig {
+            enabled: true,
+            ..Default::default()
+        };
         on.validate().unwrap();
         let s = on.build().expect("enabled builds");
         assert_eq!(s.drain_timeout, Duration::from_secs(30));
@@ -2638,11 +2627,31 @@ mod tests {
         assert_eq!(on.max_concurrent_wakes, 4);
 
         let bad = [
-            ScaleToZeroConfig { enabled: true, idle_ms: 999, ..Default::default() },
-            ScaleToZeroConfig { enabled: true, max_concurrent_wakes: 0, ..Default::default() },
-            ScaleToZeroConfig { enabled: true, drain_timeout_ms: 99, ..Default::default() },
-            ScaleToZeroConfig { enabled: true, wake_deadline_ms: 999, ..Default::default() },
-            ScaleToZeroConfig { enabled: true, max_wake_queue: 100_001, ..Default::default() },
+            ScaleToZeroConfig {
+                enabled: true,
+                idle_ms: 999,
+                ..Default::default()
+            },
+            ScaleToZeroConfig {
+                enabled: true,
+                max_concurrent_wakes: 0,
+                ..Default::default()
+            },
+            ScaleToZeroConfig {
+                enabled: true,
+                drain_timeout_ms: 99,
+                ..Default::default()
+            },
+            ScaleToZeroConfig {
+                enabled: true,
+                wake_deadline_ms: 999,
+                ..Default::default()
+            },
+            ScaleToZeroConfig {
+                enabled: true,
+                max_wake_queue: 100_001,
+                ..Default::default()
+            },
         ];
         for c in bad {
             assert!(c.validate().is_err(), "{c:?} must be rejected");
@@ -2662,22 +2671,11 @@ mod tests {
         // Absent section ⇒ enabled with defaults (the cell advertises
         // the capability unconditionally — see HostConfig field doc).
         let d = AnalyticsEngineConfig::enabled_default();
-        assert!(d.enabled);
         d.validate().unwrap();
         let l = d.limits();
         assert_eq!(l.flush_interval, Duration::from_secs(60));
 
-        // Disabled ignores nonsense bounds (byte-identical absence).
-        AnalyticsEngineConfig {
-            enabled: false,
-            max_body_bytes: 0,
-            max_spool_bytes: 0,
-            flush_interval_secs: 0,
-        }
-        .validate()
-        .unwrap();
-
-        // Enabled + zero bound ⇒ a fake feature that drops every
+        // Zero bound ⇒ a fake feature that drops every
         // event — rejected at startup.
         for c in [
             AnalyticsEngineConfig {
@@ -2713,9 +2711,27 @@ mod tests {
     fn ingress_ranges_rv_r72() {
         IngressConfig::default().validate().unwrap();
         let bad: Vec<(&str, IngressConfig)> = vec![
-            ("requestTimeoutMs", IngressConfig { request_timeout_ms: 0, ..Default::default() }),
-            ("requestTimeoutMs", IngressConfig { request_timeout_ms: 300_001, ..Default::default() }),
-            ("connectTimeoutMs", IngressConfig { connect_timeout_ms: 99, ..Default::default() }),
+            (
+                "requestTimeoutMs",
+                IngressConfig {
+                    request_timeout_ms: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "requestTimeoutMs",
+                IngressConfig {
+                    request_timeout_ms: 300_001,
+                    ..Default::default()
+                },
+            ),
+            (
+                "connectTimeoutMs",
+                IngressConfig {
+                    connect_timeout_ms: 99,
+                    ..Default::default()
+                },
+            ),
             (
                 "connectTimeoutMs",
                 IngressConfig {
@@ -2724,16 +2740,39 @@ mod tests {
                     ..Default::default()
                 },
             ),
-            ("maxBodyBytes", IngressConfig { max_body_bytes: 0, ..Default::default() }),
-            ("switchHoldMs", IngressConfig { switch_hold_ms: 300_001, ..Default::default() }),
-            ("switchHoldMaxReqs", IngressConfig { switch_hold_max_reqs: 0, ..Default::default() }),
+            (
+                "maxBodyBytes",
+                IngressConfig {
+                    max_body_bytes: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "switchHoldMs",
+                IngressConfig {
+                    switch_hold_ms: 300_001,
+                    ..Default::default()
+                },
+            ),
+            (
+                "switchHoldMaxReqs",
+                IngressConfig {
+                    switch_hold_max_reqs: 0,
+                    ..Default::default()
+                },
+            ),
         ];
         for (field, cfg) in bad {
             let e = cfg.validate().unwrap_err().to_string();
             assert!(e.contains(field), "{field}: {e}");
         }
         // switchHoldMs = 0 is the documented "disable holding" value.
-        IngressConfig { switch_hold_ms: 0, ..Default::default() }.validate().unwrap();
+        IngressConfig {
+            switch_hold_ms: 0,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
     }
 
     /// `[ingress.websocket]`: optional section, range checks fail
@@ -2818,7 +2857,10 @@ mod tests {
         .to_string();
         assert!(e.contains("forwardedProtoTrusted"), "{e}");
         // fixed-* with a stray range → reject (fail closed, not ignored).
-        for mode in [ForwardedProtoMode::FixedHttp, ForwardedProtoMode::FixedHttps] {
+        for mode in [
+            ForwardedProtoMode::FixedHttp,
+            ForwardedProtoMode::FixedHttps,
+        ] {
             let e = IngressConfig {
                 forwarded_proto: mode,
                 forwarded_proto_trusted: vec![cidr],
@@ -3112,12 +3154,10 @@ mod tests {
         assert!(toml::from_str::<SupervisorConfig>("waitUntilGraceSec = 30\n").is_err());
 
         // 300 s is the ceiling; anything above fails validation.
-        let parsed: SupervisorConfig =
-            toml::from_str("waitUntilGraceMs = 300001\n").unwrap();
+        let parsed: SupervisorConfig = toml::from_str("waitUntilGraceMs = 300001\n").unwrap();
         let e = parsed.validate().unwrap_err().to_string();
         assert!(e.contains("waitUntilGraceMs"), "{e}");
-        let parsed: SupervisorConfig =
-            toml::from_str("waitUntilGraceMs = 300000\n").unwrap();
+        let parsed: SupervisorConfig = toml::from_str("waitUntilGraceMs = 300000\n").unwrap();
         parsed.validate().unwrap();
     }
 
@@ -3134,10 +3174,7 @@ mod tests {
         let d = SupervisorConfig::default();
         // Defaults: 30s drain + 2s wu grace + 5s kill grace + 5s
         // margin = 42s floor (above the 20s base).
-        assert_eq!(
-            d.params().prewarm_ttl,
-            Duration::from_secs(30 + 2 + 5 + 5)
-        );
+        assert_eq!(d.params().prewarm_ttl, Duration::from_secs(30 + 2 + 5 + 5));
         // A long drain raises the floor — never clamped below it.
         let parsed: SupervisorConfig =
             toml::from_str("drainTimeoutMs = 120000\nkillGraceMs = 9000\n").unwrap();
@@ -3161,28 +3198,20 @@ mod tests {
         );
         d.validate().unwrap();
 
-        let parsed: SupervisorConfig =
-            toml::from_str("doSwitchWaitUntilGraceMs = 1500\n").unwrap();
+        let parsed: SupervisorConfig = toml::from_str("doSwitchWaitUntilGraceMs = 1500\n").unwrap();
         assert_eq!(
             parsed.params().do_switch_wait_until_grace,
             Duration::from_millis(1500)
         );
 
         // 0 disables the do_switch wait — an explicit, valid value.
-        let parsed: SupervisorConfig =
-            toml::from_str("doSwitchWaitUntilGraceMs = 0\n").unwrap();
+        let parsed: SupervisorConfig = toml::from_str("doSwitchWaitUntilGraceMs = 0\n").unwrap();
         assert!(parsed.params().do_switch_wait_until_grace.is_zero());
         parsed.validate().unwrap();
 
         // snake_case and unknown keys are rejected, not ignored.
-        assert!(toml::from_str::<SupervisorConfig>(
-            "do_switch_wait_until_grace_ms = 1\n"
-        )
-        .is_err());
-        assert!(toml::from_str::<SupervisorConfig>(
-            "doSwitchWaitUntilGraceSec = 2\n"
-        )
-        .is_err());
+        assert!(toml::from_str::<SupervisorConfig>("do_switch_wait_until_grace_ms = 1\n").is_err());
+        assert!(toml::from_str::<SupervisorConfig>("doSwitchWaitUntilGraceSec = 2\n").is_err());
 
         // 30 s is the ceiling; anything above fails validation.
         let parsed: SupervisorConfig =
@@ -3218,10 +3247,8 @@ mod tests {
     fn egress_policy_rejects_internal_tcp_allow() {
         // TCP fields ARE operator-tunable; prove they deserialize so
         // the deny below is specifically about internalTcpAllow.
-        let ok: EgressPolicyToml = toml::from_str(
-            "tcpAllowedPorts = [43]\ntcpConnectTimeoutMs = 5000\n",
-        )
-        .unwrap();
+        let ok: EgressPolicyToml =
+            toml::from_str("tcpAllowedPorts = [43]\ntcpConnectTimeoutMs = 5000\n").unwrap();
         assert_eq!(ok.tcp_allowed_ports, vec![43]);
         assert_eq!(ok.tcp_connect_timeout_ms, 5_000);
 
@@ -3280,31 +3307,24 @@ mod tests {
 
         // budget < op_timeout rejects (a single op could never fit);
         // >600s rejects; op_timeout..=600s accepts.
-        let parsed: SupervisorConfig = toml::from_str(
-            "doPipelineOpTimeoutMs = 30000\ndoPipelineBudgetMs = 29999\n",
-        )
-        .unwrap();
-        assert!(parsed.validate().is_err(), "budget < op_timeout");
-        let parsed: SupervisorConfig = toml::from_str(
-            "doPipelineOpTimeoutMs = 30000\ndoPipelineBudgetMs = 30000\n",
-        )
-        .unwrap();
-        parsed.validate().unwrap();
         let parsed: SupervisorConfig =
-            toml::from_str("doPipelineBudgetMs = 600001\n").unwrap();
+            toml::from_str("doPipelineOpTimeoutMs = 30000\ndoPipelineBudgetMs = 29999\n").unwrap();
+        assert!(parsed.validate().is_err(), "budget < op_timeout");
+        let parsed: SupervisorConfig =
+            toml::from_str("doPipelineOpTimeoutMs = 30000\ndoPipelineBudgetMs = 30000\n").unwrap();
+        parsed.validate().unwrap();
+        let parsed: SupervisorConfig = toml::from_str("doPipelineBudgetMs = 600001\n").unwrap();
         assert!(parsed.validate().is_err(), "budget > 600s");
 
         // restore timeout (B1): must cover the per-op bound — a
         // narrower value re-opens the mid-unit-timeout window.
-        let parsed: SupervisorConfig = toml::from_str(
-            "doPipelineOpTimeoutMs = 20000\ndoPipelineRestoreTimeoutMs = 19999\n",
-        )
-        .unwrap();
+        let parsed: SupervisorConfig =
+            toml::from_str("doPipelineOpTimeoutMs = 20000\ndoPipelineRestoreTimeoutMs = 19999\n")
+                .unwrap();
         assert!(parsed.validate().is_err(), "restore < op_timeout");
-        let parsed: SupervisorConfig = toml::from_str(
-            "doPipelineOpTimeoutMs = 20000\ndoPipelineRestoreTimeoutMs = 20000\n",
-        )
-        .unwrap();
+        let parsed: SupervisorConfig =
+            toml::from_str("doPipelineOpTimeoutMs = 20000\ndoPipelineRestoreTimeoutMs = 20000\n")
+                .unwrap();
         parsed.validate().unwrap();
         let parsed: SupervisorConfig =
             toml::from_str("doPipelineRestoreTimeoutMs = 600001\n").unwrap();
@@ -3312,14 +3332,10 @@ mod tests {
 
         // camelCase contract — snake_case spellings are rejected, not
         // silently defaulted.
-        assert!(toml::from_str::<SupervisorConfig>(
-            "do_pipeline_concurrency = 4\n"
-        )
-        .is_err());
-        assert!(toml::from_str::<SupervisorConfig>(
-            "do_pipeline_restore_timeout_ms = 60000\n"
-        )
-        .is_err());
+        assert!(toml::from_str::<SupervisorConfig>("do_pipeline_concurrency = 4\n").is_err());
+        assert!(
+            toml::from_str::<SupervisorConfig>("do_pipeline_restore_timeout_ms = 60000\n").is_err()
+        );
     }
 
     /// MIG-17d: `[doWal] rebaselineChainBytes` — absent →
@@ -3328,9 +3344,8 @@ mod tests {
     /// violations clamp.
     #[test]
     fn do_wal_rebaseline_chain_bytes_boundaries() {
-        let parse = |body: &str| DoWalConfig::resolve(
-            &toml::from_str::<DoWalConfig>(body).unwrap(),
-        );
+        let parse =
+            |body: &str| DoWalConfig::resolve(&toml::from_str::<DoWalConfig>(body).unwrap());
         // Absent → derived default.
         let (cfg, warns) = parse("");
         assert_eq!(cfg.rebaseline_chain_bytes, (1 << 30) / 2);
@@ -3356,19 +3371,14 @@ mod tests {
         assert!(warns.iter().any(|w| w.contains("headroom")));
         // Headroom with the default: same numbers, derived replay/2
         // = 64MiB also violates → clamped identically.
-        let (cfg, warns) = parse(
-            "replayMaxBytes = 134217728\nmaxPendingBytes = 100663296\n",
-        );
+        let (cfg, warns) = parse("replayMaxBytes = 134217728\nmaxPendingBytes = 100663296\n");
         assert_eq!(cfg.rebaseline_chain_bytes, 32 << 20);
         assert!(warns.iter().any(|w| w.contains("headroom")));
         // Degenerate headroom == 0 (maxPending ≥ replay): r2 clamps
         // to the replay/8 FLOOR, not ~1B — occasional cap_exceeded
         // alerts beat a forced snapshot every 30s.
-        let (cfg, warns) = parse(
-            "replayMaxBytes = 134217728\nmaxPendingBytes = 134217728\n",
-        );
+        let (cfg, warns) = parse("replayMaxBytes = 134217728\nmaxPendingBytes = 134217728\n");
         assert_eq!(cfg.rebaseline_chain_bytes, 134217728 / 8);
         assert!(warns.iter().any(|w| w.contains("headroom")));
     }
 }
-
