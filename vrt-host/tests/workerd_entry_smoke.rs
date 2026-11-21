@@ -321,6 +321,169 @@ fn write_deny_stub(dir: &Path) {
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic Workers (workerLoader) smoke — the pinned fork binary must
+// accept the `workerLoader` group `vrt-config` emits under
+// `--experimental` (including the fork's `maxWorkers` field, which a
+// stock upstream binary would fail to parse), and the runtime must
+// actually load, name-cache and quota-bound dynamic workers.
+// ---------------------------------------------------------------------------
+
+/// The outer worker module: exercises `env.LOADER.get()` (named cache +
+/// entrypoint fetch), `env.LOADER.load()` (anonymous), the named-cache
+/// callback-run-once contract, and the fork's live-worker quota on a
+/// dedicated `LOADER_A` namespace so earlier `LOADER` traffic cannot
+/// pollute the count.
+const LOADER_MAIN_JS: &str = r#"
+const DYN = {
+  compatibilityDate: '2025-01-01',
+  mainModule: 'w.js',
+  modules: {
+    'w.js': "export default { async fetch(req) { return new Response('dyn:' + new URL(req.url).pathname); } }",
+  },
+};
+
+export default {
+  async fetch(req, env) {
+    const path = new URL(req.url).pathname;
+    if (path === '/get') {
+      const res = await env.LOADER.get('a', () => DYN).getEntrypoint().fetch('http://dyn/a');
+      return new Response('get:' + (await res.text()));
+    }
+    if (path === '/load') {
+      const res = await env.LOADER.load(DYN).getEntrypoint().fetch('http://dyn/load');
+      return new Response('load:' + (await res.text()));
+    }
+    if (path === '/cache') {
+      // get() is lazy: the code callback fires on first stub use, and a
+      // second get() for the same name reuses the cached worker without
+      // re-running the callback.
+      let ran = 0;
+      const a = env.LOADER.get('c', () => { ran++; return DYN; });
+      const b = env.LOADER.get('c', () => { ran++; return DYN; });
+      const ta = await (await a.getEntrypoint().fetch('http://dyn/x')).text();
+      const tb = await (await b.getEntrypoint().fetch('http://dyn/x')).text();
+      return new Response(`cache:ran=${ran}:${ta}:${tb}`);
+    }
+    if (path === '/quota') {
+      // maxWorkers = 2 on LOADER_A: held stubs keep workers live, so the
+      // third anonymous load must throw the fork's quota error.
+      const held = [];
+      let err = '';
+      for (let i = 0; i < 4 && !err; i++) {
+        try { held.push(env.LOADER_A.load(DYN)); }
+        catch (e) { err = String(e); }
+      }
+      return new Response(`quota:held=${held.length}:err=${err}`);
+    }
+    return new Response('ok');
+  },
+};
+"#;
+
+/// Minimal capnp with two `workerLoader` bindings — the same group
+/// shape `vrt-config` emits (`(name = X, workerLoader = (maxWorkers =
+/// N))`); `LOADER_A` gets a small quota so the test can fill it.
+fn write_loader_capnp(dir: &Path, port: u16) -> PathBuf {
+    std::fs::write(dir.join("main.js"), LOADER_MAIN_JS).unwrap();
+    let cfg = format!(
+        r#"using Workerd = import "/workerd/workerd.capnp";
+const cfg :Workerd.Config = (
+  services = [
+    (name = "main", worker = (
+      modules = [(name = "main.js", esModule = embed "main.js")],
+      compatibilityDate = "2025-01-01",
+      bindings = [
+        (name = "LOADER", workerLoader = (maxWorkers = 32)),
+        (name = "LOADER_A", workerLoader = (maxWorkers = 2)),
+      ],
+      globalOutbound = (name = "deny", entrypoint = "DenyAll"),
+    )),
+    (name = "deny", worker = (
+      modules = [(name = "deny.js", esModule = embed "deny.js")],
+      compatibilityDate = "2025-01-01",
+    )),
+  ],
+  sockets = [(name = "http", address = "127.0.0.1:{port}",
+              http = (), service = (name = "main"))],
+);
+"#,
+        port = port,
+    );
+    let path = dir.join("cfg.capnp");
+    std::fs::write(&path, cfg).unwrap();
+    path
+}
+
+#[test]
+#[ignore = "requires VRT_WORKERD_BIN"]
+fn real_workerd_worker_loader() {
+    let bin = workerd_bin().expect("VRT_WORKERD_BIN unset");
+    assert!(bin.exists(), "VRT_WORKERD_BIN does not exist: {bin:?}");
+
+    let Some(dir) = smoke_root() else {
+        return;
+    };
+    write_deny_stub(&dir);
+    let port = free_port();
+    let cfg = write_loader_capnp(&dir, port);
+    // `workerLoader` bindings are experimental-gated upstream;
+    // vrt-host's assemble adds `--experimental` to argv for tenants
+    // that declare `[[worker_loaders]]` — same flag here.
+    let proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port) {
+        panic!(
+            "worker_loader: never listened\n-- workerd.log --\n{}",
+            log_text(&proc)
+        );
+    }
+
+    // A named `get()` loads and serves the dynamic worker through its
+    // default entrypoint.
+    let (status, body) = http_get(port, "/get");
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "get:dyn:/a"),
+        "LOADER.get entrypoint must serve: {body}"
+    );
+
+    // An anonymous `load()` serves too.
+    let (status, body) = http_get(port, "/load");
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "load:dyn:/load"),
+        "LOADER.load entrypoint must serve: {body}"
+    );
+
+    // The named cache runs the code callback once per name: both stubs
+    // from `get('c', ...)` serve the same loaded worker.
+    let (status, body) = http_get(port, "/cache");
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "cache:ran=1:dyn:/x:dyn:/x"),
+        "named loader cache must reuse the worker: {body}"
+    );
+
+    // The fork's quota: held stubs keep loaded workers live, so the
+    // third load on a maxWorkers=2 namespace must throw. The bound is
+    // enforced in the loader's kj layer, so the JS caller currently
+    // sees workerd's generic `internal error; reference = <id>` rather
+    // than a descriptive message — assert the count held at 2 and that
+    // the load was rejected, not the wording (a later pin may add one).
+    let (status, body) = http_get(port, "/quota");
+    assert_eq!(status, 200, "quota probe must answer: {body}");
+    let (held, err) = body
+        .strip_prefix("quota:held=")
+        .and_then(|rest| rest.split_once(":err="))
+        .unwrap_or_else(|| panic!("quota probe shape: {body}"));
+    assert_eq!(held, "2", "two live workers then quota: {body}");
+    assert!(
+        !err.is_empty(),
+        "the third load on maxWorkers=2 must be rejected: {body}"
+    );
+    drop(proc);
+}
+
+// ---------------------------------------------------------------------------
 // T31f: real-render router smoke (F0.3 real facade-assets + F1.2 custom name)
 // ---------------------------------------------------------------------------
 

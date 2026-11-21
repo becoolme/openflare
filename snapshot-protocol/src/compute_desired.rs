@@ -275,6 +275,11 @@ pub enum BindingDesired {
     /// stub factory (`idFromName`/`get`); the namespace's SQLite
     /// storage lives under the declaring worker's `localDisk` dir.
     DurableObject(DoBindingDesired),
+    /// `{"type":"workerLoader"}` — Dynamic Workers loader (`env.<name>`
+    /// is a `WorkerLoader`: `.get(name, () => code)` / `.load(code)`).
+    /// Points at no provider resource; the tenant supplies code at
+    /// runtime. Rendered as workerd `workerLoader` (experimental).
+    WorkerLoader(WorkerLoaderBinding),
 }
 
 /// `{"type":"var"}` — see [`BindingDesired::Var`].
@@ -487,6 +492,18 @@ pub struct DoBindingDesired {
     /// (never a client-supplied storage id). `None` = own worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_worker_id: Option<String>,
+}
+
+/// `{"type":"workerLoader"}` — a Dynamic Workers `WorkerLoader`
+/// binding. The worker supplies dynamic code at runtime through the
+/// binding's `get()`/`load()` callbacks; the binding itself carries no
+/// resource reference — the loader's live-worker bound is a platform
+/// constant emitted at capnp render time.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerLoaderBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
 }
 
 /// P3c-1 `durableObjectClasses[]`: one DO class declared by this worker.
@@ -1276,6 +1293,10 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.queueName"));
                     }
                 }
+                // WorkerLoader carries no resource reference — `name`
+                // (validated as a binding name at the match head) is
+                // the only field.
+                BindingDesired::WorkerLoader(_) => {}
             }
         }
         Ok(())
@@ -1445,6 +1466,7 @@ impl BindingDesired {
             Self::D1(b) => &b.name,
             Self::Queue(b) => &b.name,
             Self::DurableObject(b) => &b.name,
+            Self::WorkerLoader(b) => &b.name,
         }
     }
 
@@ -1464,7 +1486,8 @@ impl BindingDesired {
             | Self::Secret(_)
             | Self::Service(_)
             | Self::DurableObject(_)
-            | Self::Ratelimit(_) => None,
+            | Self::Ratelimit(_)
+            | Self::WorkerLoader(_) => None,
         }
     }
 }
@@ -2658,5 +2681,48 @@ mod tests {
         assert!(!valid_run_worker_first_rules(&["x".repeat(101)]));
         let many: Vec<String> = (0..101).map(|i| format!("/{i}")).collect();
         assert!(!valid_run_worker_first_rules(&many));
+    }
+
+    #[test]
+    fn worker_loader_wire_shape_and_validation() {
+        // `{"type":"workerLoader","name":...}` is the signed desired
+        // snapshot shape emitted by the control plane.
+        let doc = serde_json::json!({"type": "workerLoader", "name": "LOADER"});
+        let b: BindingDesired = serde_json::from_value(doc.clone()).unwrap();
+        let BindingDesired::WorkerLoader(l) = &b else {
+            panic!()
+        };
+        assert_eq!(l.name, "LOADER");
+        assert_eq!(serde_json::to_value(&b).unwrap(), doc);
+
+        // deny_unknown_fields: a resource ref is not part of the
+        // contract and must not be silently accepted.
+        let with_id = serde_json::json!({"type": "workerLoader", "name": "L", "id": "x"});
+        assert!(serde_json::from_value::<BindingDesired>(with_id).is_err());
+
+        // The loader name flows through the shared binding-name
+        // checks: JS identifier required, duplicates rejected.
+        for (name, err) in [
+            ("1bad", DesiredError::BindingName),
+            ("has-dash", DesiredError::BindingName),
+        ] {
+            let p = payload_with_binding(serde_json::json!({"type": "workerLoader", "name": name}));
+            assert_eq!(desired(&p).unwrap().validate(), Err(err));
+        }
+        let dup = {
+            let mut p = valid_payload();
+            let workers = p["tenants"][0]["workers"].as_array_mut().unwrap();
+            workers[0]["bindings"] = serde_json::json!([
+                {"type": "workerLoader", "name": "L"},
+                {"type": "workerLoader", "name": "L"},
+            ]);
+            p
+        };
+        assert_eq!(
+            desired(&dup).unwrap().validate(),
+            Err(DesiredError::Duplicate("bindingName"))
+        );
+        let ok = payload_with_binding(serde_json::json!({"type": "workerLoader", "name": "LOADER"}));
+        assert!(desired(&ok).unwrap().validate().is_ok());
     }
 }

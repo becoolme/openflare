@@ -8022,6 +8022,15 @@ fn do_tainted_workers(
                         .or_default()
                         .push(w.worker_id.as_str());
                 }
+                // A workerLoader holder can pull a Durable Object class
+                // out of dynamically-loaded code (`getDurableObjectClass`)
+                // — an in-process path to an actor namespace that the
+                // static binding graph cannot see. Taint it like a DO
+                // declarer; service-binding callers taint transitively
+                // below (a WorkerStub can cross RPC).
+                BindingDesired::WorkerLoader(_) => {
+                    tainted.insert(w.worker_id.clone());
+                }
                 _ => {}
             }
         }
@@ -12461,6 +12470,25 @@ sleep 10
             taint_worker("w1", vec![], false),
         ]);
         assert!(tainted.is_empty());
+    }
+
+    #[test]
+    fn taint_marks_worker_loader_holders() {
+        use snapshot_protocol::compute_desired::{BindingDesired, WorkerLoaderBinding};
+        // A loader holder can fetch DO classes out of dynamic code —
+        // an actor-namespace path the static graph cannot see.
+        let tainted = taint_tenant(vec![
+            taint_worker(
+                "w0",
+                vec![BindingDesired::WorkerLoader(WorkerLoaderBinding {
+                    name: "LOADER".into(),
+                })],
+                false,
+            ),
+            taint_worker("w1", vec![], false),
+        ]);
+        assert!(tainted.contains("w0"), "loader holder tainted");
+        assert!(!tainted.contains("w1"), "unrelated worker untainted");
     }
 
 

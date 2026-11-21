@@ -8,6 +8,7 @@
     "queue": true,
     "serviceEntrypoint": true,
     "storagePurge": true,
+    "workerLoader": true,
     "workflows": true,
     "workflowsCrossWorker": true,
     "workflowsOps": true

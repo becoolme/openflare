@@ -111,6 +111,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Named service entrypoints render with this generation --
         // unconditionally on (same reasoning as `workflows_cross_worker`).
         service_entrypoint: true,
+        // `workerLoader` bindings render with this generation (the
+        // workerd pin carries the fork's `maxWorkers` field) --
+        // unconditionally on.
+        worker_loader: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

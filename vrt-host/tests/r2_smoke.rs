@@ -437,6 +437,7 @@ fn render_cfg(dir: &Path, port: u16, bundle: &VersionBundle) -> (PathBuf, Vec<St
             false,
             false,
             false,
+            false,
         ),
     )
 }
