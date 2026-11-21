@@ -191,6 +191,11 @@ pub(crate) struct BindingsToml {
     /// each renders as workerd's native `unsafeEval` capability.
     #[serde(default)]
     pub(crate) unsafe_evals: Vec<String>,
+    /// CF `[[flagship]]` — `binding name -> app_id` (the app record
+    /// lives tenant-side: standalone resolves it in `flagship.json`,
+    /// the platform in the Flagship app store).
+    #[serde(default)]
+    pub(crate) flagship: BTreeMap<String, String>,
 }
 
 /// `[bindings].ratelimit.<name>` normalized shape.
@@ -512,6 +517,11 @@ pub struct PackedWorker {
     /// T21: assets to materialize into the local asset store before
     /// the publish commits (`None` when no `[assets]` dir declared).
     pub pending_assets: Option<PendingAssets>,
+    /// Flagship app definitions the deploy carries — merged into the
+    /// tenant's `state.flagship_apps` at commit (file-provided apps
+    /// overwrite same-id entries; apps bound but undefined get an
+    /// empty `{"flags":{}}` config so every binding resolves).
+    pub flagship_apps: Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>,
 }
 
 /// T21: assets scanned at pack time — the deploy writes objects +
@@ -785,6 +795,10 @@ pub struct Gathered {
     pub skipped: Vec<String>,
     /// `[assets] dir` packed content (None when undeclared).
     pub pending_assets: Option<PendingAssets>,
+    /// `flagship.json` — the standalone flag store (CF's local flag
+    /// store analog): validated `FlagshipAppDesired`s, `None` when the
+    /// project ships no file.
+    pub flagship_apps: Option<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>>,
 }
 
 /// Collect `worker_dir` into a [`Gathered`]: meta normalization,
@@ -859,7 +873,62 @@ pub fn gather_dir_for_env(
         files,
         skipped,
         pending_assets,
+        flagship_apps: gather_flagship_apps(worker_dir)?,
     })
+}
+
+/// `flagship.json` cap — a standalone flag store stays small;
+/// oversized input fails before parse.
+const MAX_FLAGSHIP_FILE_BYTES: u64 = 256 * 1024;
+
+/// Read + validate `<worker_dir>/flagship.json` — the standalone flag
+/// store, the analog of CF's local flag store for `wrangler dev` (an
+/// app entry supplies the config the `cloudflare-internal:flagship`
+/// module receives; absent file → no store, `None`).
+fn gather_flagship_apps(
+    worker_dir: &Path,
+) -> Result<
+    Option<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>>,
+    LocalError,
+> {
+    let raw = match std::fs::read(worker_dir.join("flagship.json")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(LocalError::Worker("flagship.json")),
+    };
+    if raw.len() as u64 > MAX_FLAGSHIP_FILE_BYTES {
+        return Err(LocalError::Worker("flagship.json size"));
+    }
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&raw).map_err(|_| LocalError::Worker("flagship.json"))?;
+    build_flagship_apps(&map).map(Some)
+}
+
+/// `{<appId>: {accountTag?, flags}}` → validated
+/// `FlagshipAppDesired`s — shared by the local `flagship.json` gather
+/// and the remote upload body. The appId lands inside the serialized
+/// config so the module sees a self-describing document.
+pub fn build_flagship_apps(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>, LocalError> {
+    let mut apps = Vec::with_capacity(map.len());
+    for (app_id, body) in map {
+        let mut config = body
+            .as_object()
+            .cloned()
+            .ok_or(LocalError::Worker("flagship.json app"))?;
+        config.insert("appId".into(), serde_json::Value::from(app_id.clone()));
+        let config = serde_json::to_string(&serde_json::Value::Object(config))
+            .map_err(|_| LocalError::Worker("flagship.json"))?;
+        snapshot_protocol::compute_desired::validate_flagship_config(&config)
+            .map_err(|_| LocalError::Worker("flagship.json flag model"))?;
+        apps.push(snapshot_protocol::compute_desired::FlagshipAppDesired {
+            app_id: app_id.clone(),
+            config,
+        });
+    }
+    apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+    Ok(apps)
 }
 
 /// Validate a [`Gathered`] into a [`PackedWorker`]. Everything the
@@ -877,6 +946,7 @@ pub fn assemble(
         mut meta,
         files,
         pending_assets: gathered_assets,
+        flagship_apps: gathered_flagship_apps,
         ..
     } = g;
     // Caller-side non-secret var overrides (`--var`, `.dev.vars`).
@@ -1025,6 +1095,14 @@ pub fn assemble(
                 limit: config.limit,
                 period: config.period,
             }));
+        }
+        for (binding, app_id) in &b.flagship {
+            bindings.push(BindingDesired::Flagship(
+                snapshot_protocol::compute_desired::FlagshipBinding {
+                    name: binding.clone(),
+                    app_id: app_id.clone(),
+                },
+            ));
         }
         for (binding, target) in &b.service {
             let worker_id =
@@ -1365,6 +1443,31 @@ pub fn assemble(
     let mut hostnames = meta.hostnames.clone();
     hostnames.extend(overrides.hostnames.iter().cloned());
 
+    // Flagship: every bound `app_id` must resolve to an app — CF's
+    // local flag store starts empty and evaluations return defaults,
+    // so a bound app with no definitions synthesizes an empty
+    // `{"flags":{}}` config rather than failing the deploy.
+    let mut flagship_apps = gathered_flagship_apps.unwrap_or_default();
+    {
+        let mut have: std::collections::HashSet<String> =
+            flagship_apps.iter().map(|a| a.app_id.clone()).collect();
+        for b in &bindings {
+            if let BindingDesired::Flagship(f) = b {
+                if have.insert(f.app_id.clone()) {
+                    flagship_apps.push(snapshot_protocol::compute_desired::FlagshipAppDesired {
+                        app_id: f.app_id.clone(),
+                        config: format!(
+                            "{{\"appId\":{},\"flags\":{{}}}}",
+                            serde_json::to_string(&f.app_id)
+                                .map_err(|_| LocalError::Worker("flagship appId"))?
+                        ),
+                    });
+                }
+            }
+        }
+        flagship_apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+    }
+
     Ok(PackedWorker {
         name,
         digest: bundle.digest().to_string(),
@@ -1385,6 +1488,7 @@ pub fn assemble(
         quotas: normalize_quotas(meta.quotas)?,
         first_deploy_id: id_material[..16].to_string(),
         pending_assets,
+        flagship_apps,
     })
 }
 
@@ -1704,6 +1808,9 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
         for name in b.ratelimit.keys() {
             bindings.push(format!("ratelimit:{name}"));
         }
+        for name in b.flagship.keys() {
+            bindings.push(format!("flagship:{name}"));
+        }
         for name in b.service.keys() {
             bindings.push(format!("service:{name}"));
         }
@@ -1764,6 +1871,11 @@ pub struct DeployUpload {
     /// Worker name override (`vrt.toml` name otherwise).
     #[serde(default)]
     pub name: Option<String>,
+    /// Flagship app definitions gathered client-side
+    /// (`flagship.json`) — re-validated server-side with the same
+    /// wire-boundary flag-model proof before state application.
+    #[serde(default)]
+    pub flagship_apps: Option<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>>,
 }
 
 /// Uploaded `[assets]` payload — canonical manifest + objects keyed
@@ -1813,6 +1925,16 @@ pub fn gathered_from_upload(body: &DeployUpload) -> Result<Gathered, LocalError>
         files,
         skipped: Vec::new(),
         pending_assets,
+        flagship_apps: match &body.flagship_apps {
+            Some(apps) => {
+                for app in apps {
+                    snapshot_protocol::compute_desired::validate_flagship_config(&app.config)
+                        .map_err(|_| LocalError::Worker("flagshipApps flag model"))?;
+                }
+                Some(apps.clone())
+            }
+            None => None,
+        },
     })
 }
 

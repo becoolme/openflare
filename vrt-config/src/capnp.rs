@@ -1699,6 +1699,26 @@ fn emit_binding(
                 capnp_text(&u.name),
             ));
         }
+        BindingDesired::Flagship(f) => {
+            // CF `[[flagship]]` — `env.<name>` is the async Flagship
+            // evaluation API. Rendered as a `wrapped` binding over the
+            // `cloudflare-internal:flagship` internal module; the
+            // app's serialized flag config rides the `config`
+            // innerBinding so evaluation stays inside the isolate
+            // (Flagship semantics: no central-service round trip).
+            let app = input
+                .tenant
+                .flagship_apps
+                .iter()
+                .find(|a| a.app_id == f.app_id)
+                .ok_or(ConfigError::UnresolvedReference("flagshipAppId"))?;
+            out.push_str(&format!(
+                "        (name = {}, wrapped = (\n          moduleName = {},\n          innerBindings = [(\n            name = \"config\",\n            json = {}\n          )],\n        )),\n",
+                capnp_text(&f.name),
+                capnp_text("cloudflare-internal:flagship"),
+                capnp_text(&app.config),
+            ));
+        }
     }
     Ok(())
 }

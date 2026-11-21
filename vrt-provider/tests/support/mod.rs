@@ -130,6 +130,7 @@ pub fn tenant(tenant_id: &str, workers: Vec<WorkerDesired>) -> TenantDesired {
     TenantDesired {
         tenant_id: tenant_id.to_string(),
         workers,
+        flagship_apps: Vec::new(),
     }
 }
 

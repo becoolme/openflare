@@ -73,6 +73,7 @@ environment blocks.
 | `streaming_tail_consumers` | supported — Streaming Tail Workers; per-entry key `service` only; resolves to a same-tenant worker at deploy, renders as capnp `streamingTails` designators; consumer runs the `tailStream(event)` entrypoint (upstream marks the channel for future rework; wired and serving today) | `project_cfg.rs` `streaming_tail_consumers` arm |
 | `version_metadata` | supported — CF `[version_metadata] binding = "X"`; `env.X` is `{id, tag, timestamp}` of the SERVING version (id = version id, tag = `""` — no standalone tag surface, timestamp = version creation epoch-ms string). Emitted as a `json` binding at desired time so rollback reports the reactivated version's own values | `project_cfg.rs:901` |
 | `observability` | partial — Worker Logs gates + head sampling applied by the platform `vrt-tail` collector: `enabled`/`logs.enabled` `false` renders NO collector (nothing collected); `logs.head_sampling_rate` (or the deprecated top-level `head_sampling_rate` alias — both set is refused as ambiguous) keeps that fraction of INVOCATIONS whole, decided per invocation (a dropped invocation keeps none of its records; deterministic over `traceId`/`spanId` when present); the rate crosses the signed wire as integer ppm `headSamplingRatePpm` (0..1_000_000 — canonical JSON is safe-integer-only), so effective granularity is 1e-6; `logs.invocation_logs` `false` drops only the outcome record. `traces`, `persist`, `destinations` and other keys fail closed | `project_cfg.rs:991` |
+| `flagship` | partial — Flagship feature flags; per-entry keys `binding`, `app_id`, `remote` (`remote` accepted and ignored — no remote/local split; evaluation always uses the propagated app config). App definitions are tenant-level `flagshipApps` on the signed snapshot — standalone supplies them via `flagship.json` (bound-but-undeclared apps get an empty store); see [Flagship](bindings/flagship.md) | `project_cfg.rs:923` |
 | `unsafe` | partial — `[[unsafe.bindings]]` with `type = "unsafe_eval"` only: `env.<name>` is workerd's native `unsafeEval` capability (`eval()`, `new Function()`, `WebAssembly`). Other `type` values fail closed (every other binding kind has a first-class key or no runtime support); other `[unsafe]` keys (`capnp`, `metadata`, …) inject raw workerd/upload structures and are refused | `project_cfg.rs:1081` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
@@ -164,3 +165,11 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
   entrypoint receives a live event stream. Version-scoped like
   `tail_consumers`; admission requires the `streamingTailConsumers` cell
   capability.
+- 2026-11-21: `flagship` is supported — `[[flagship]] {binding, app_id,
+  remote}` (remote accepted-and-ignored) declares a version-scoped
+  binding; the app record lives tenant-side in `flagshipApps` (flag
+  edits propagate on the signed snapshot without redeploy) and renders
+  as a `wrapped` binding over `cloudflare-internal:flagship` with the
+  app config in a `config` json innerBinding. Standalone flag store:
+  `flagship.json`; bound-but-undeclared apps synthesize an empty store.
+  Admission requires the `flagship` cell capability.

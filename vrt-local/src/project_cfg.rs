@@ -59,6 +59,7 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
 /// these keys wholesale instead of merging the top-level value.
 const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "analytics_engine_datasets",
+    "flagship",
     "define",
     "vars",
     "d1_databases",
@@ -216,6 +217,7 @@ pub fn load_worker_meta_for_env(
 /// Config-file basenames that are never worker modules (module scan).
 pub fn is_config_basename(name: &str) -> bool {
     name == "vrt.toml"
+        || name == "flagship.json"
         || CANDIDATES.contains(&name)
         || matches!(
             name,
@@ -915,6 +917,50 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     b.insert("type".into(), Value::from("analyticsEngine"));
                     b.insert("name".into(), Value::from(binding));
                     b.insert("dataset".into(), Value::from(dataset));
+                    bindings.push(Value::Object(b));
+                }
+            }
+            "flagship" => {
+                // CF `[[flagship]] {binding, app_id}` — the Flagship
+                // feature-flag app binding; `env.<binding>` is the
+                // async evaluation API. `remote` is a CF local-dev
+                // knob (evaluate against the remote app instead of the
+                // local flag store): VRT has no remote/local split —
+                // evaluation always uses the propagated config — so it
+                // is accepted and ignored, same as AE's `remote`.
+                for (i, e) in table_list(value, "flagship")?.iter().enumerate() {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "binding" | "app_id" | "remote" => {}
+                            _ => return Err(unsupported(&format!("flagship[{i}].{k}"), None)),
+                        }
+                    }
+                    let binding = req_str(
+                        e.get("binding").unwrap_or(&Value::Null),
+                        &format!("flagship[{i}].binding"),
+                    )?;
+                    let app_id = req_str(
+                        e.get("app_id").unwrap_or(&Value::Null),
+                        &format!("flagship[{i}].app_id"),
+                    )?;
+                    if app_id.len() > 128 {
+                        return Err(invalid(
+                            &format!("flagship[{i}].app_id"),
+                            "must be at most 128 chars",
+                        ));
+                    }
+                    if let Some(v) = e.get("remote") {
+                        if !v.is_boolean() {
+                            return Err(invalid(
+                                &format!("flagship[{i}].remote"),
+                                "must be a boolean",
+                            ));
+                        }
+                    }
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("flagship"));
+                    b.insert("name".into(), Value::from(binding));
+                    b.insert("appId".into(), Value::from(app_id));
                     bindings.push(Value::Object(b));
                 }
             }
@@ -2108,6 +2154,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut ratelimit = Map::new();
         let mut worker_loaders = Vec::new();
         let mut unsafe_evals = Vec::new();
+        let mut flagship = Map::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -2209,6 +2256,10 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                 "unsafeEval" => {
                     unsafe_evals.push(Value::from(name));
                 }
+                "flagship" => {
+                    let app_id = b.get("appId").and_then(|i| i.as_str()).unwrap_or(name);
+                    flagship.insert(name.into(), Value::from(app_id));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -2256,6 +2307,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !unsafe_evals.is_empty() {
             bind.insert("unsafeEvals".into(), Value::Array(unsafe_evals));
+        }
+        if !flagship.is_empty() {
+            bind.insert("flagship".into(), Value::Object(flagship));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));
@@ -2731,6 +2785,42 @@ mod tests {
             let dir = wrangler_loader_body(toml);
             assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
         }
+    }
+
+    #[test]
+    fn flagship_bindings_into_pack_shape() {
+        // CF `[[flagship]] {binding, app_id}` → `{type:"flagship"}`
+        // binding records + the pack-shape `flagship` map (name →
+        // appId). Multiple apps bind to one worker (CF: one worker may
+        // consume several Flagship apps).
+        let dir = wrangler_loader_body(
+            "[[flagship]]\nbinding=\"FLAGS_A\"\napp_id=\"app-a\"\n[[flagship]]\nbinding=\"FLAGS_B\"\napp_id=\"app-b\"\nremote=true\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let b = meta.bindings.unwrap();
+        assert_eq!(b.flagship.get("FLAGS_A").map(String::as_str), Some("app-a"));
+        assert_eq!(b.flagship.get("FLAGS_B").map(String::as_str), Some("app-b"));
+
+        // Fail closed: missing binding/app_id, non-string values,
+        // oversized appId, non-boolean `remote`, unknown keys.
+        for toml in [
+            "[[flagship]]\napp_id=\"app-a\"\n",
+            "[[flagship]]\nbinding=\"F\"\n",
+            "[[flagship]]\nbinding=1\napp_id=\"a\"\n",
+            "[[flagship]]\nbinding=\"F\"\napp_id=7\n",
+            "[[flagship]]\nbinding=\"F\"\napp_id=\"a\"\nremote=\"yes\"\n",
+            "[[flagship]]\nbinding=\"F\"\napp_id=\"a\"\nextra=1\n",
+            "flagship={binding=\"F\",app_id=\"a\"}\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+        // appId cap.
+        let dir = wrangler_loader_body(&format!(
+            "[[flagship]]\nbinding=\"F\"\napp_id=\"{}\"\n",
+            "a".repeat(129)
+        ));
+        assert!(load_worker_meta(dir.path()).is_err());
     }
 
     /// wrangler `[limits]` → internal `quotas` — the CF surface maps onto
