@@ -1,6 +1,7 @@
 {
   "appliedAt": "2026-01-01T00:00:00Z",
   "capabilities": {
+    "analyticsEngine": true,
     "assets": true,
     "cron": true,
     "d1": true,
