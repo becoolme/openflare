@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "assets-routes-json",
+  "binding": "assets",
+  "title": "_routes.json include/exclude decide Worker invocation vs assets",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/pages/functions/routing/",
+    "docs/bindings/static-assets.md",
+    "vrt-provider/tests/assets_fetch.rs",
+    "facade/test/router.test.mjs"
+  ],
+  "steps": [
+    {
+      "name": "include route invokes the Worker without an asset",
+      "request": {
+        "path": "/api/hello"
+      },
+      "expect": {
+        "status": 200,
+        "body": "worker:/api/hello"
+      }
+    },
+    {
+      "name": "exclude wins over include and serves the static asset",
+      "request": {
+        "path": "/api/public/data.txt"
+      },
+      "expect": {
+        "status": 200,
+        "bodyContains": [
+          "excluded-asset-ok"
+        ]
+      }
+    },
+    {
+      "name": "unmatched paths use assets (Pages default)",
+      "request": {
+        "path": "/index.html"
+      },
+      "expect": {
+        "status": 200,
+        "bodyContains": [
+          "static-index-ok"
+        ]
+      }
+    },
+    {
+      "name": "_routes.json itself is configuration and is never served",
+      "request": {
+        "path": "/_routes.json"
+      },
+      "expect": {
+        "status": 404
+      }
+    }
+  ]
+}

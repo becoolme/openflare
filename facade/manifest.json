@@ -478,8 +478,8 @@
           "name": "facade/router-core.js",
           "dist": "facade/dist/facade/router-core.js",
           "source": "facade/router-core.ts",
-          "sourceSha256": "2fdd89e8cec389168da304701fc4413f5847736a23e06f18b249d5fa587fbd83",
-          "sha256": "ba0cc7863c0a8856b1400b6d73b572004a0e38370f031bde9df3715e35b8eed3"
+          "sourceSha256": "0e9bd1f60fc4301e4116f76027aeb086ec1fe5ea2f71ee08f9ce63b256063573",
+          "sha256": "09b4bb3a701c9a8d25bde3782b123291409c18dda395a17d33f232501dc144c8"
         },
         {
           "name": "facade/router-wire.js",

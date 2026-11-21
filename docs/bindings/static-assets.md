@@ -120,6 +120,29 @@ that does not match the bytes is never committed.
   substituted in one pass (longest-match, inserted values never
   rescanned). `facade-router` matches the same raw pathname so routing
   and serving agree.
+- `_routes.json` (Cloudflare Pages invocation routes) is honoured when
+  the deployment is routed through `facade-router`: `version` must be
+  `1`, `include` routes invoke the Worker and `exclude` routes are
+  served by assets, with `exclude` always winning. A path matching
+  neither list is served by assets (Pages default). `*` is a trailing
+  wildcard matching any number of segments (`/users/*`), everything
+  else is an exact path, and matching uses the raw request pathname.
+  Limits match Pages: at least one `include` rule, ≤ 100
+  `include`+`exclude` rules combined, ≤ 100 characters per rule,
+  `version` must be `1`, and unknown top-level fields are rejected. The
+  policy rides the `route-index` response (and `can-fetch` in the
+  `tooLarge` degradation path), so routing and serving agree. An invalid
+  or unreadable `_routes.json` fails closed
+  (`ASSET_STORAGE_UNAVAILABLE` / 503 from the router) instead of
+  guessing a side; the packer rejects it before publish.
+  `_routes.json` is configuration and is never served. An explicit
+  `run_worker_first` policy (`true` or a rule list) takes precedence and
+  ignores the file, mirroring Workers config authority;
+  `run_worker_first: false`/absent leaves `_routes.json` in control.
+  Non-GET/HEAD requests keep the existing worker-first rule (assets only
+  serve GET/HEAD), so an excluded POST still reaches the Worker.
+  Native `vrt.toml` deployments that never opt into `assetsFirst` have
+  no router, so the file only applies to assets-first deployments.
 - `run_worker_first`: `true`/`false` or a list of `/`-prefixed globs
   with `!` asset-first exclusions — at most 100 rules × 100 bytes, no
   duplicates, at least one non-`!` rule (validated identically in the
@@ -133,6 +156,10 @@ that does not match the bytes is never committed.
   skipped.
 - MIME types come from a fixed extension table; unknown extensions map
   to `application/octet-stream`.
+- `_headers`/`_redirects`/`_routes.json` are validated at pack time
+  (`vrt-local/src/worker_pkg.rs`, both the directory scan and the
+  upload path) so an unusable configuration fails the deploy instead of
+  503ing every asset/routed request afterwards.
 
 ## Unsupported keys and error shape
 
@@ -151,4 +178,7 @@ that does not match the bytes is never committed.
 - `facade/test/assets.test.mjs`, `facade/test/router.test.mjs`,
   `facade/test/router-contract.test.mjs` — facade asset/router contract
   tests.
-- `vrt-provider/tests/assets_fetch.rs` — provider assets route tests.
+- `vrt-provider/tests/assets_fetch.rs` — provider assets route tests,
+  including `_routes.json` policies and fail-closed invalid config.
+- `conformance/cases/assets/assets-routes-json` — end-to-end
+  include/exclude routing on the standalone stack.

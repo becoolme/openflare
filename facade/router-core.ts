@@ -17,10 +17,21 @@ export const MAX_INDEX_BYTES = 4 * 1024 * 1024;
 export const MAX_INDEX_PATHS = 4096;
 /// `_redirects` cap (2,000 static + 100 dynamic).
 export const MAX_REDIRECTS = 2100;
+/// `_routes.json` cap: 100 include+exclude rules, 100 characters each
+/// (Cloudflare Pages limits; mirrored by `vrt-provider/assets_routes.rs`).
+export const MAX_ROUTES_RULES = 100;
+export const MAX_ROUTE_RULE_CHARS = 100;
 
 export interface RedirectRuleWire {
   source: string;
   status: number;
+}
+
+/// Pages-style `_routes.json` invocation policy. `exclude` always wins;
+/// a path matching neither list stays on the assets side.
+export interface RoutesWire {
+  include: string[];
+  exclude: string[];
 }
 
 export interface RouteIndex {
@@ -31,6 +42,10 @@ export interface RouteIndex {
   /// fetchable: 3xx returns the redirect, 200 proxies a same-manifest
   /// path.
   redirects: RedirectRuleWire[];
+  /// `_routes.json` policy when the manifest ships one. It decides
+  /// invocation for every path, so it short-circuits the existence
+  /// probe below.
+  routes: RoutesWire | null;
   approxBytes: number;
   digest: string;
   /// E3: manifest digest the provider asserts this index describes —
@@ -507,6 +522,27 @@ function redirectMatches(rules: readonly RedirectRuleWire[], path: string): bool
   return false;
 }
 
+/// Mirror of the provider's `_routes.json` matcher. `*` is a trailing,
+/// segment-agnostic wildcard (prefix match); everything else is exact.
+/// Provider and router must agree on the raw request path.
+function routeMatches(rules: readonly string[], path: string): boolean {
+  for (const rule of rules) {
+    if (rule.endsWith("*")) {
+      if (path.startsWith(rule.slice(0, -1))) return true;
+    } else if (rule === path) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// `_routes.json` invocation decision: `true` runs the user Worker.
+/// `exclude` has priority over `include`; unmatched paths use assets.
+export function routesWorkerFirst(routes: RoutesWire, path: string): boolean {
+  if (routeMatches(routes.exclude, path)) return false;
+  return routeMatches(routes.include, path);
+}
+
 export function intentFetchable(
   index: RouteIndex,
   path: string,
@@ -514,6 +550,12 @@ export function intentFetchable(
   hasStaticRouting: boolean,
   rawPath: string = path,
 ): boolean {
+  // An explicit `run_worker_first` policy (rules or `true`) is the
+  // deployment's routing authority and takes precedence over
+  // `_routes.json`, mirroring Cloudflare Workers config precedence.
+  if (!hasStaticRouting && index.routes !== null) {
+    return !routesWorkerFirst(index.routes, rawPath);
+  }
   const has = (p: string) => index.paths.has(p);
   if (has(path)) return true;
   // `_redirects` runs before asset lookup, so a redirect-only path is
@@ -635,6 +677,28 @@ export type IndexParse =
   | { kind: "tooLarge" } // exceeds the cacheable bound → degrade, not 503
   | { kind: "invalid" }; // malformed payload → fail closed 503
 
+function parseRoutesWire(value: unknown): RoutesWire | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return undefined;
+  const { include, exclude } = value as { include?: unknown; exclude?: unknown };
+  if (!Array.isArray(include) || include.length === 0) return undefined;
+  if (exclude !== undefined && !Array.isArray(exclude)) return undefined;
+  const inc = include as unknown[];
+  const exc = (exclude ?? []) as unknown[];
+  if (inc.length + exc.length > MAX_ROUTES_RULES) return undefined;
+  const valid = (rule: unknown): rule is string => {
+    if (typeof rule !== "string" || rule.length === 0 || rule.length > MAX_ROUTE_RULE_CHARS) {
+      return false;
+    }
+    if (!rule.startsWith("/") || rule.includes("?") || rule.includes("#")) return false;
+    if (!/^[\x20-\x7e]+$/.test(rule)) return false;
+    const star = rule.indexOf("*");
+    return star === -1 || star === rule.length - 1;
+  };
+  if (!inc.every(valid) || !exc.every(valid)) return undefined;
+  return { include: inc as string[], exclude: exc as string[] };
+}
+
 export function parseIndex(raw: unknown): IndexParse {
   if (typeof raw !== "object" || raw === null) return { kind: "invalid" };
   const doc = raw as {
@@ -642,6 +706,7 @@ export function parseIndex(raw: unknown): IndexParse {
     notFoundHandling?: unknown;
     paths?: unknown;
     redirects?: unknown;
+    routes?: unknown;
     tooLarge?: unknown;
     manifestDigest?: unknown;
   };
@@ -659,6 +724,8 @@ export function parseIndex(raw: unknown): IndexParse {
     return { kind: "invalid" };
   }
   const md = doc.manifestDigest;
+  const routes = parseRoutesWire(doc.routes);
+  if (routes === undefined) return { kind: "invalid" };
   // Provider-side cap: same bound as MAX_INDEX_PATHS — an oversized
   // manifest gets `tooLarge` without streaming its path list.
   if (doc.tooLarge === true) return { kind: "tooLarge" };
@@ -696,6 +763,11 @@ export function parseIndex(raw: unknown): IndexParse {
       approxBytes += source.length + 16;
     }
   }
+  if (routes !== null) {
+    approxBytes +=
+      routes.include.reduce((n, r) => n + r.length + 4, 8) +
+      routes.exclude.reduce((n, r) => n + r.length + 4, 0);
+  }
   if (approxBytes > MAX_INDEX_BYTES) return { kind: "tooLarge" };
   return {
     kind: "index",
@@ -704,6 +776,7 @@ export function parseIndex(raw: unknown): IndexParse {
       notFoundHandling: doc.notFoundHandling,
       paths,
       redirects,
+      routes,
       approxBytes,
       digest: "", // set by the caller (cfg.manifestDigest)
       manifestDigest: md,
