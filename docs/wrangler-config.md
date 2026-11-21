@@ -78,6 +78,7 @@ environment blocks.
 | `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1269` |
 | `tail_consumers` | supported — see [Tail Workers](bindings/tail-workers.md); `service` table or legacy string entries; distinct same-tenant already-deployed consumers, deduped, max 16; empty list valid | `project_cfg.rs:1352` |
 | `limits` | supported — see [Per-worker quotas](quotas.md); `cpu_ms` (1..300000) and `subrequests` (0..10000); other keys rejected | `project_cfg.rs:1393` |
+| `dev` | supported (dev-only) — `ip` (loopback only; `localhost` normalizes to `127.0.0.1`, `::1` binds as `[::1]:port`), `port` (1..65535), `host` (extra route hostname registered for the session via `DeployOverrides.hostnames`; must satisfy the route hostname rule), `local_protocol = "http"` no-op. The deploy-facing projection accepts and drops the table, so dev-only keys never fail `vrt deploy`; `vrt dev` validates strictly at session start (`parse_dev_table`) where `inspector_*`, `upstream_protocol`, `remote`/`experimental_remote`, `enable_containers`, `container_engine`, `generate_types` are rejected | `project_cfg.rs` `parse_dev_table`, `dev.rs` `DevPorts::alloc` |
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
 
 ## Accepted and ignored
@@ -89,7 +90,7 @@ but change nothing (`IGNORED_TOP_LEVEL`, `project_cfg.rs:31–57`):
 `rules`, `alias`, `tsconfig`, `jsx_factory`, `jsx_fragment`,
 `no_bundle`, `minify`, `keep_names`, `find_additional_modules`,
 `preserve_file_names`, `base_dir`, `define`, `upload_source_maps`,
-`dev`, `cwd`, `config`, `placement`.
+`cwd`, `config`, `placement`.
 
 Also type-checked then dropped inside supported blocks:
 
@@ -141,5 +142,28 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 - 2026-11-21: `tail_consumers` is accepted (table or legacy string
   entries, deduped, max 16) and carried to the signed snapshot as
   resolved same-tenant worker ids; empty lists are ignored.
-
+- 2026-11-21 (r2): `[dev]` handling corrected against review — the
+  shared normalize path now accepts-and-drops the table (mirroring the
+  TS ignore list), so config `wrangler deploy` accepts (`ip =
+  "0.0.0.0"`, `inspector_port`, …) can no longer fail `vrt deploy`.
+  `vrt dev` re-validates it strictly at session start via
+  `parse_dev_table` on the env-resolved config: loopback-only `ip`
+  (IPv6 `::1` binds as a bracketed `SocketAddr`), `port`, and `host`
+  validated against the route hostname rule. `dev.host` now rides
+  `DeployOverrides.hostnames` into the deployed worker's routes
+  instead of mutating a meta the deploy reloads from disk.
 - 2026-11-20: `vrt deploy`, `vrt dev`, and `vrt doctor` accept `--env` to select Wrangler named environments.
+- 2026-11-21: `[dev]` is consumed instead of ignored — `vrt dev` reads
+  `ip`/`port` for the loopback ingress bind (`--listen` still wins, same
+  flag-over-config order as wrangler) and registers `host` as a
+  forwarded-`Host` hostname for the session. On the `vrt dev` entry
+  `dev.ip` must be loopback: wrangler permits `0.0.0.0` to share a
+  session on the LAN, but `vrt dev` never binds publicly, so a
+  non-loopback value is `VRT_CONFIG_INVALID` there (same gate as
+  `--listen`). Keys naming dev machinery vrt does not implement
+  (`inspector_*`, `upstream_protocol`, `remote`, `experimental_remote`,
+  `enable_containers`, `container_engine`, `generate_types`) fail closed
+  as `VRT_CONFIG_UNSUPPORTED_FIELD` on that entry; `local_protocol` is
+  accepted only as `"http"`, the sole mode served. `vrt deploy` accepts
+  and drops the table (see the r2 entry above), matching wrangler where
+  `[dev]` configures only `wrangler dev`.

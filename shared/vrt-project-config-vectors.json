@@ -201,7 +201,7 @@
    }
   },
   {
-   "name": "documented ignore-list entries are dropped",
+   "name": "documented ignore-list entries are dropped including dev",
    "files": {
     "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\naccount_id = \"cf-acct\"\nworkers_dev = true\nkeep_vars = true\nsend_metrics = false\n\n[build]\ncommand = \"npm run build\"\n\n[dev]\nport = 8787\n"
    },
@@ -1041,6 +1041,70 @@
     "ok": false,
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "unsafe.bindings[0].bogus"
+   }
+  },
+  {
+   "name": "dev table dropped on the deploy-facing projection",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nip = \"localhost\"\nport = 9000\nhost = \"dev.example.com\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   }
+  },
+  {
+   "name": "dev non-loopback ip dropped on the deploy-facing projection",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nip = \"0.0.0.0\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   }
+  },
+  {
+   "name": "dev unimplemented key dropped on the deploy-facing projection",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nupstream_protocol = \"https\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   }
+  },
+  {
+   "name": "dev inspector/remote keys dropped on the deploy-facing projection",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nip = \"0.0.0.0\"\ninspector_port = 9229\nremote = true\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
    }
   }
  ]

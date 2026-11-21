@@ -1762,7 +1762,7 @@ fn valid_bucket_name(value: &str) -> bool {
 }
 
 /// Lowercase FQDN hostname, no wildcards, at least two labels.
-fn valid_hostname(value: &str) -> bool {
+pub fn valid_hostname(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_HOSTNAME_LEN {
         return false;
     }
