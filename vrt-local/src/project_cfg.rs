@@ -49,7 +49,6 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
     "base_dir",
     "define",
     "upload_source_maps",
-    "dev",
     "cwd",
     "config",
     // MIG-14: wrangler `[placement]` (CF Smart Placement / region
@@ -585,6 +584,12 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
             }
             "limits" => {
                 out.insert("quotas".into(), normalize_limits(value)?);
+            }
+            // CF `[dev]` — wrangler dev-server settings. Not runtime
+            // config: `vrt dev` consumes `ip`/`port`/`host` for the
+            // loopback ingress; deploy ignores the normalized value.
+            "dev" => {
+                out.insert("dev".into(), normalize_dev(value)?);
             }
             "vars" => {
                 let vars = value
@@ -1722,6 +1727,74 @@ fn normalize_limits(value: &Value) -> Result<Value, ProjectConfigError> {
     }))
 }
 
+/// CF `[dev]` — wrangler dev-server settings, normalized for `vrt dev`.
+/// `ip`/`port` pick the loopback ingress listen (CLI `--listen` still
+/// wins); `host` registers an extra hostname for the session. Keys
+/// that declare dev behavior the standalone does not implement —
+/// `upstream_protocol`, `inspector_*`, `remote`/`experimental_remote`,
+/// `enable_containers`, `container_engine`, `generate_types` — fail
+/// closed (same rule as every other section); `local_protocol` is a
+/// no-op only when `http` (the sole mode vrt dev serves).
+fn normalize_dev(value: &Value) -> Result<Value, ProjectConfigError> {
+    let table = value
+        .as_object()
+        .ok_or_else(|| invalid("dev", "must be a table"))?;
+    let mut out = serde_json::Map::new();
+    for (k, v) in table {
+        match k.as_str() {
+            "ip" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid("dev.ip", "must be a string"))?;
+                // `localhost` — CF's default — resolves to IPv4
+                // loopback (DevPorts::alloc enforces loopback for
+                // `--listen` too; a public bind is refused either way).
+                let ip: std::net::IpAddr = if s == "localhost" {
+                    std::net::IpAddr::from([127, 0, 0, 1])
+                } else {
+                    s.parse()
+                        .map_err(|_| invalid("dev.ip", "must be an IP address or 'localhost'"))?
+                };
+                if !ip.is_loopback() {
+                    return Err(invalid("dev.ip", "vrt dev binds loopback only"));
+                }
+                out.insert("ip".into(), Value::from(ip.to_string()));
+            }
+            "port" => {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| invalid("dev.port", "must be an integer"))?;
+                if !(1..=65535).contains(&n) {
+                    return Err(invalid("dev.port", "must be within 1..=65535"));
+                }
+                out.insert("port".into(), Value::from(n));
+            }
+            "host" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid("dev.host", "must be a string"))?;
+                if s.is_empty() || s.len() > 253 {
+                    return Err(invalid("dev.host", "must be a non-empty hostname (<=253 chars)"));
+                }
+                out.insert("host".into(), Value::from(s));
+            }
+            "local_protocol" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid("dev.local_protocol", "must be a string"))?;
+                if s != "http" {
+                    return Err(unsupported(
+                        "dev.local_protocol",
+                        Some("vrt dev serves http only"),
+                    ));
+                }
+            }
+            other => return Err(unsupported(&format!("dev.{other}"), None)),
+        }
+    }
+    Ok(Value::Object(out))
+}
+
 /// T31c: normalize `run_worker_first` — Wrangler semantics:
 /// boolean, or a list of `/`-prefixed globs with `!`-prefixed
 /// asset-first exclusions. Bounds and rule syntax mirror
@@ -1842,6 +1915,11 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     // filled) — project it verbatim into the pack-time document.
     if let Some(v) = obj.get("quotas") {
         wire.insert("quotas".into(), v.clone());
+    }
+    // `[dev]` — dev-server settings, verbatim (consumed by `vrt dev`,
+    // never by the desired-state path).
+    if let Some(v) = obj.get("dev") {
+        wire.insert("dev".into(), v.clone());
     }
     if let Some(Value::Object(vars)) = obj.get("vars") {
         let mut out_vars = Map::new();
@@ -1966,6 +2044,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "durableObjectMigrations",
         "workflows",
         "quotas",
+        "dev",
         "bindings",
     ];
     // Normalized-internal keys that legitimately do not carry to the
@@ -2638,6 +2717,64 @@ mod tests {
             .expect_err("unknown key must fail");
         assert_eq!(err.code, "VRT_CONFIG_UNSUPPORTED_FIELD");
         assert_eq!(err.field.as_deref(), Some("limits.memory_mb"));
+    }
+
+    #[test]
+    fn normalize_dev_gates_and_fail_closed() {
+        // The wrangler `[dev]` surface vrt dev consumes: ip/port/host.
+        let full = normalize_dev(&serde_json::json!({
+            "ip": "localhost",
+            "port": 9_000,
+            "host": "dev.example.com",
+        }))
+        .expect("ip/port/host accepted");
+        assert_eq!(full["ip"], "127.0.0.1");
+        assert_eq!(full["port"], 9_000);
+        assert_eq!(full["host"], "dev.example.com");
+
+        // `local_protocol = "http"` is a no-op (the only mode).
+        normalize_dev(&serde_json::json!({"local_protocol": "http"})).unwrap();
+
+        // Malformed values.
+        for (input, path) in [
+            (serde_json::json!(1), "dev"),
+            (serde_json::json!({"ip": 1}), "dev.ip"),
+            (serde_json::json!({"ip": "0.0.0.0"}), "dev.ip"),
+            (serde_json::json!({"ip": "example.com"}), "dev.ip"),
+            (serde_json::json!({"port": 0}), "dev.port"),
+            (serde_json::json!({"port": 70000}), "dev.port"),
+            (serde_json::json!({"port": "9000"}), "dev.port"),
+            (serde_json::json!({"host": ""}), "dev.host"),
+        ] {
+            let err = normalize_dev(&input).expect_err("malformed must fail");
+            assert_eq!(err.code, "VRT_CONFIG_INVALID", "{input}: {err:?}");
+            assert_eq!(err.field.as_deref(), Some(path), "{input}: {err:?}");
+        }
+
+        // Unimplemented dev semantics fail closed.
+        for (input, path) in [
+            (
+                serde_json::json!({"local_protocol": "https"}),
+                "dev.local_protocol",
+            ),
+            (
+                serde_json::json!({"upstream_protocol": "https"}),
+                "dev.upstream_protocol",
+            ),
+            (
+                serde_json::json!({"inspector_port": 9229}),
+                "dev.inspector_port",
+            ),
+            (serde_json::json!({"remote": true}), "dev.remote"),
+            (
+                serde_json::json!({"generate_types": true}),
+                "dev.generate_types",
+            ),
+        ] {
+            let err = normalize_dev(&input).expect_err("unsupported key must fail");
+            assert_eq!(err.code, "VRT_CONFIG_UNSUPPORTED_FIELD", "{input}: {err:?}");
+            assert_eq!(err.field.as_deref(), Some(path), "{input}: {err:?}");
+        }
     }
 
     /// The normalized `limits` block must survive the anti-drop projection
