@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "id": "d1-dump-raw",
+  "binding": "d1",
+  "title": "D1 dump() SQL export (empty DB, exact quoting/escaping, restore round-trip) + raw({columnNames:true|false}) shapes + the documented 50 MB query-result limit",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/d1/worker-api/d1-database/#dump (dump() takes no parameters and returns the entire database as a SQLite-compatible file in an ArrayBuffer)",
+    "https://developers.cloudflare.com/d1/worker-api/prepared-statements/#raw (raw() returns an array of arrays without column names by default; raw({columnNames:true}) prepends one row of column names)",
+    "https://github.com/cloudflare/workerd/blob/7545be644952d71d76b904b37ae71b10c0ba8cad/src/workerd/server/tests/d1/d1-export-test.js (golden dump vectors: PRAGMA defer_foreign_keys=TRUE, CREATE TABLE IF NOT EXISTS for quoted names, INSERT INTO \"t\" (\"c\",...) VALUES(...), ''/\\n/\\r/X'..'/NULL/9e999 escaping, sqlite_sequence handling)",
+    "https://github.com/cloudflare/workerd/blob/7545be644952d71d76b904b37ae71b10c0ba8cad/src/workerd/server/d1/d1.js (dumpSql implementation: statement order, identifier/string escaping; skipped _cf_/sqlite_ tables)",
+    "https://github.com/cloudflare/workerd/blob/7545be644952d71d76b904b37ae71b10c0ba8cad/src/cloudflare/internal/d1-api.ts (dump() POSTs /dump and returns response.arrayBuffer(); raw() maps columns+rows; a non-200 /dump response throws D1_DUMP_ERROR)",
+    "https://developers.cloudflare.com/d1/platform/limits/ (maximum query result size: 50 MB)",
+    "https://developers.cloudflare.com/changelog/post/2026-10-30-query-result-size-limit/ (the 50 MB limit is enforced from 2026-11-04; exact error text: \"D1 query result exceeded the maximum response size limit of 50 MB\")",
+    "https://developers.cloudflare.com/d1/observability/debug-d1/#error-list (the oversized-result entry under D1_ERROR types; d1-api adds the D1_ERROR: prefix)",
+    "vrt-sql/tests/dump_tests.rs (byte-for-byte match against the workerd golden vectors, empty dump, restore round-trip, 50 MB rejection)"
+  ],
+  "steps": [
+    {
+      "name": "reset: no user tables",
+      "request": {
+        "method": "POST",
+        "path": "/reset"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "count": 1
+        }
+      }
+    },
+    {
+      "name": "dump() of an empty database is just the leading pragma",
+      "request": {
+        "path": "/dump-empty"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "isArrayBuffer": true,
+          "text": "PRAGMA defer_foreign_keys=TRUE;"
+        }
+      }
+    },
+    {
+      "name": "setup: quoted, newline/CR, blob, NULL and infinite values",
+      "request": {
+        "method": "POST",
+        "path": "/setup"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "count": 5
+        }
+      }
+    },
+    {
+      "name": "raw() default and columnNames:false agree; columnNames:true prepends names; duplicate columns and empty results",
+      "request": {
+        "path": "/raw"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "defaultRows": 3,
+          "defaultWidths": [
+            2,
+            2,
+            2
+          ],
+          "defaultFirst": [
+            1,
+            "it's"
+          ],
+          "falseMatchesDefault": true,
+          "namesHeader": [
+            "id",
+            "s"
+          ],
+          "namesLength": 4,
+          "namesFirstId": 1,
+          "duplicateHeader": [
+            "id",
+            "id"
+          ],
+          "duplicateRow": [
+            1,
+            1
+          ],
+          "emptyRows": [],
+          "emptyWithNames": [
+            [
+              "id",
+              "s"
+            ]
+          ]
+        }
+      }
+    },
+    {
+      "name": "dump() is restorable SQL with exact escaping",
+      "request": {
+        "path": "/dump"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "isArrayBuffer": true,
+          "firstLine": "PRAGMA defer_foreign_keys=TRUE;",
+          "createLine": "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT, r REAL, b BLOB, n);",
+          "insertCount": 3,
+          "row1": "INSERT INTO \"t\" (\"id\",\"s\",\"r\",\"b\",\"n\") VALUES(1,'it''s',1.5,X'00ff10',NULL);",
+          "quoteEscaped": true,
+          "newlineEscaped": true,
+          "inf": true,
+          "blobHex": true,
+          "roundTrip": true,
+          "restoredRows": 3
+        }
+      }
+    },
+    {
+      "name": "a result above 50 MB fails with the documented D1 error",
+      "request": {
+        "path": "/too-large"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true,
+          "message": "D1_ERROR: D1 query result exceeded the maximum response size limit of 50 MB"
+        }
+      }
+    }
+  ]
+}

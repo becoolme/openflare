@@ -207,6 +207,10 @@ fn pragma_restrictions() {
     }
     // foreign_keys read allowed
     assert!(batch(&e, &["PRAGMA foreign_keys"]).is_ok());
+    // dump() starts with this statement; restoring a dump must work.
+    assert!(batch(&e, &["PRAGMA defer_foreign_keys=TRUE"]).is_ok());
+    assert!(batch(&e, &["PRAGMA defer_foreign_keys"]).is_ok());
+    assert!(batch(&e, &["PRAGMA defer_foreign_keys=banana"]).is_err());
 }
 
 #[test]

@@ -265,7 +265,11 @@ fn permit_denied_response(path: &str) -> Response<Body> {
     } else if path.starts_with("/internal/bindings/v1/r2/") {
         error_response("R2_OVERLOADED", StatusCode::TOO_MANY_REQUESTS, true, false)
     } else if path.starts_with("/internal/bindings/v1/d1/") {
-        d1_wire_error("provider busy; retry")
+        if path.ends_with("/dump") {
+            d1_dump_error("provider busy; retry")
+        } else {
+            d1_wire_error("provider busy; retry")
+        }
     } else if path.starts_with("/internal/bindings/v1/queue/") {
         queue_wire_error(StatusCode::TOO_MANY_REQUESTS, "provider busy; retry")
     } else if path.starts_with("/internal/bindings/v1/pg/") {
@@ -455,10 +459,33 @@ impl http_body::Body for PermitGuardBody {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_permits, permit_denied_response, PermitGuardBody, BODY_IDLE_TIMEOUT,
+        acquire_permits, parse_d1_path, permit_denied_response, PermitGuardBody, BODY_IDLE_TIMEOUT,
         BODY_SEND_DEADLINE,
     };
     use http_body_util::BodyExt;
+
+    #[test]
+    fn d1_path_accepts_query_execute_dump_only() {
+        assert_eq!(
+            parse_d1_path("/internal/bindings/v1/d1/db1/query"),
+            Some(("db1".to_string(), "query"))
+        );
+        assert_eq!(
+            parse_d1_path("/internal/bindings/v1/d1/db1/execute"),
+            Some(("db1".to_string(), "execute"))
+        );
+        assert_eq!(
+            parse_d1_path("/internal/bindings/v1/d1/db1/dump"),
+            Some(("db1".to_string(), "dump"))
+        );
+        for bad in [
+            "/internal/bindings/v1/d1/db1/drop",
+            "/internal/bindings/v1/d1/db1/dump/extra",
+            "/internal/bindings/v1/d1/dump",
+        ] {
+            assert_eq!(parse_d1_path(bad), None, "{bad}");
+        }
+    }
 
     /// Test body: emits the queued frames, then pends forever — the
     /// stalled-reader shape the idle timer exists to cut (RV-R28 #2).
@@ -611,6 +638,11 @@ mod tests {
         let text = std::str::from_utf8(&bytes).unwrap();
         assert!(text.contains("\"success\":false") || text.contains("success"));
         assert!(text.contains("D1_ERROR"));
+        // D1 dump → non-200: d1-api treats any 200 body as dump bytes.
+        let r = permit_denied_response("/internal/bindings/v1/d1/db1/dump");
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let bytes = r.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&bytes).unwrap().contains("D1_ERROR"));
         // Queue → {error:…} at 429.
         let r = permit_denied_response("/internal/bindings/v1/queue/q1/send");
         assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -1524,7 +1556,7 @@ async fn assets_dispatch(svc: Arc<TenantService>, request: Request) -> Response<
 
 // ---------------- D1 (T34) ----------------
 
-/// `/internal/bindings/v1/d1/{bindingId}/{op}`, op in query|execute.
+/// `/internal/bindings/v1/d1/{bindingId}/{op}`, op in query|execute|dump.
 fn parse_d1_path(path: &str) -> Option<(String, &'static str)> {
     let rest = path.strip_prefix("/internal/bindings/v1/d1/")?;
     let (id, op) = rest.split_once('/')?;
@@ -1534,6 +1566,9 @@ fn parse_d1_path(path: &str) -> Option<(String, &'static str)> {
     let op = match op {
         "query" => "query",
         "execute" => "execute",
+        // `D1Database.dump()` posts to `/dump`; workerd's d1-api turns
+        // the 200 body into the tenant's ArrayBuffer.
+        "dump" => "dump",
         _ => return None,
     };
     Some((id.to_string(), op))
@@ -1541,13 +1576,39 @@ fn parse_d1_path(path: &str) -> Option<(String, &'static str)> {
 
 /// D1 error surface: HTTP 200 + `{success:false,error:"D1_ERROR: ..."}`.
 fn d1_wire_error(message: &str) -> Response<Body> {
+    d1_wire_error_status(message, StatusCode::OK)
+}
+
+/// `dump()` errors must not be 200: d1-api only parses an error body when
+/// the status is not 200, and would otherwise return the JSON text as the
+/// dump itself.
+fn d1_dump_error(message: &str) -> Response<Body> {
+    d1_wire_error_status(message, StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Op-aware local error: `dump` must be non-200, everything else keeps
+/// the D1 `{success:false}` 200 surface that d1-api throws on.
+fn d1_op_error(op: &str, message: &str) -> Response<Body> {
+    if op == "dump" {
+        d1_dump_error(message)
+    } else {
+        d1_wire_error(message)
+    }
+}
+
+fn d1_wire_error_status(message: &str, status: StatusCode) -> Response<Body> {
     // Error text is bounded: only a restricted message goes in (never a secret/path).
     let bounded: String = message.chars().take(200).collect();
-    json_response(
-        serde_json::json!({"success": false, "error": format!("D1_ERROR: {bounded}")})
-            .to_string()
-            .into_bytes(),
-    )
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(
+            serde_json::json!({"success": false, "error": format!("D1_ERROR: {bounded}")})
+                .to_string()
+                .into_bytes(),
+        ))
+        .unwrap()
 }
 
 /// T34d: one bounded warn per D1 rejection — reason token + bindingId
@@ -1584,7 +1645,7 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
     {
         tracing::warn!(binding_id, "d1 request denied: oversized body");
         crate::metrics::d1_outcome(&worker_id, "oversize");
-        return d1_wire_error("request too large");
+        return d1_op_error(op, "request too large");
     }
     let identity = match parse_request_identity(&binding_id, request.headers()) {
         Ok(identity) => identity,
@@ -1636,7 +1697,7 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
     let Some(client) = svc.d1.clone() else {
         tracing::warn!(binding = ctx.binding_name(), "d1 backend unconfigured");
         crate::metrics::d1_outcome(&worker_id, "backend_unconfigured");
-        return d1_wire_error("backend unavailable");
+        return d1_op_error(op, "backend unavailable");
     };
     let query_suffix = request
         .uri()
@@ -1664,13 +1725,16 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
         _ => {
             tracing::warn!(binding_id, "d1 request denied: body read failed");
             crate::metrics::d1_outcome(&worker_id, "body_error");
-            return d1_wire_error("failed to read request body");
+            return d1_op_error(op, "failed to read request body");
         }
     };
-    if let Err(why) = crate::d1::D1Client::precheck(&body) {
-        tracing::warn!(binding_id, reason = "precheck", "d1 request denied");
-        crate::metrics::d1_outcome(&worker_id, "precheck");
-        return d1_wire_error(why);
+    // `dump()` posts no body; every other op is a JSON statement batch.
+    if op != "dump" {
+        if let Err(why) = crate::d1::D1Client::precheck(&body) {
+            tracing::warn!(binding_id, reason = "precheck", "d1 request denied");
+            crate::metrics::d1_outcome(&worker_id, "precheck");
+            return d1_wire_error(why);
+        }
     }
     match client
         .forward(&ctx, op, &query_suffix, body, session_headers)
@@ -1680,18 +1744,22 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
             // T36: vrt-sql fenced/unavailable → D1 retryable error
             // surface. (No writerAddr cache exists — the client holds a
             // single static addr; recovery happens inside vrt-sql.)
-            if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                match v.get("code").and_then(|c| c.as_str()) {
-                    Some("VRT_FENCED") => {
-                        tracing::warn!(binding_id, "vrt-sql writer fenced");
-                        crate::metrics::d1_outcome(&worker_id, "fenced");
-                        return d1_wire_error("backend fenced; retry");
+            // `dump` errors must stay non-200 (d1-api decides success by
+            // status alone), so its JSON error bodies pass through as-is.
+            if op != "dump" {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    match v.get("code").and_then(|c| c.as_str()) {
+                        Some("VRT_FENCED") => {
+                            tracing::warn!(binding_id, "vrt-sql writer fenced");
+                            crate::metrics::d1_outcome(&worker_id, "fenced");
+                            return d1_wire_error("backend fenced; retry");
+                        }
+                        Some("VRT_UNAVAILABLE") => {
+                            crate::metrics::d1_outcome(&worker_id, "backend_unavailable");
+                            return d1_wire_error("backend unavailable; retry");
+                        }
+                        _ => {}
                     }
-                    Some("VRT_UNAVAILABLE") => {
-                        crate::metrics::d1_outcome(&worker_id, "backend_unavailable");
-                        return d1_wire_error("backend unavailable; retry");
-                    }
-                    _ => {}
                 }
             }
             let mut b = Response::builder().status(status);
@@ -1699,7 +1767,12 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
                 b = b.header(crate::d1::BOOKMARK_HEADER, bm);
             }
             crate::metrics::d1_outcome(&worker_id, "ok");
-            b.header(header::CONTENT_TYPE, "application/json")
+            let content_type = if op == "dump" && status == 200 {
+                "application/octet-stream"
+            } else {
+                "application/json"
+            };
+            b.header(header::CONTENT_TYPE, content_type)
                 .body(Body::from(bytes))
                 .unwrap()
         }
@@ -1707,7 +1780,7 @@ async fn d1_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body
             // vrt-sql unavailable: D1 error surface + structured log (forward already warned).
             crate::metrics::d1_backend_unavailable(ctx.worker_id());
             crate::metrics::d1_outcome(&worker_id, "backend_error");
-            d1_wire_error("backend unavailable")
+            d1_op_error(op, "backend unavailable")
         }
     }
 }

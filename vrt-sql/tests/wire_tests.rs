@@ -52,6 +52,53 @@ async fn malformed_request_separate_surface() {
 }
 
 #[tokio::test]
+async fn dump_endpoint_returns_sql_bytes_and_non_200_errors() {
+    use tower::ServiceExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let st = state(&tmp);
+    let app = wire::app(st.clone());
+    // Seed a table through the normal query path.
+    let r = call(&st, &json!({"sql": "CREATE TABLE t(a TEXT)"})).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let r = call(&st, &json!({"sql": "INSERT INTO t VALUES('x''y')"})).await;
+    assert_eq!(r.status, StatusCode::OK);
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/dbs/{DBID}/dump"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers().get(axum::http::header::CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        text.starts_with("PRAGMA defer_foreign_keys=TRUE;"),
+        "{text}"
+    );
+    assert!(text.contains("CREATE TABLE t(a TEXT);"), "{text}");
+    assert!(
+        text.contains("INSERT INTO \"t\" (\"a\") VALUES('x''y');"),
+        "{text}"
+    );
+
+    // Non-200: d1-api only parses an error body when the dump status is not 200.
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/dbs/UPPERCASE/dump")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_ne!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn success_carries_bookmark_header_value() {
     let tmp = tempfile::tempdir().unwrap();
     let st = state(&tmp);

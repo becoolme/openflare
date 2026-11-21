@@ -67,8 +67,8 @@ pub fn registry() -> &'static Registry {
     reg()
 }
 
-/// `endpoint` ∈ `query|execute`; `outcome` ∈
-/// `ok|sql_error|protocol_error|unauthorized|rate_limited|unavailable`.
+/// `endpoint` ∈ `query|execute|dump`; `outcome` ∈
+/// `ok|sql_error|protocol_error|unauthorized|rate_limited|unavailable|error`.
 pub fn query(endpoint: &'static str, outcome: &'static str, seconds: f64) {
     let r = reg();
     r.inc(

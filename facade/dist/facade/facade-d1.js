@@ -14,8 +14,21 @@ function d1Error(message, status = 200) {
         }
     });
 }
+function dumpError(status) {
+    return new Response(JSON.stringify({
+        success: false,
+        error: "D1_ERROR: dump failed"
+    }), {
+        status: status >= 400 ? status : 502,
+        headers: {
+            "content-type": "application/json",
+            "cache-control": "no-store"
+        }
+    });
+}
 export class D1Facade extends WorkerEntrypoint {
     async fetch(request) {
+        const isDump = new URL(request.url).pathname.split("/").filter(Boolean).pop() === "dump";
         try {
             const props = resourceProps(this.ctx.props);
             const backend = wrapBindingBackend(this.env.BINDING_BACKEND, this.ctx.props);
@@ -43,20 +56,20 @@ export class D1Facade extends WorkerEntrypoint {
                 redirect: "manual"
             }, D1_BACKEND_TIMEOUT_MS);
             if (resp === BACKEND_TIMEOUT) {
-                return d1Error("backend timeout (504) - retryable");
+                return isDump ? dumpError(504) : d1Error("backend timeout (504) - retryable");
             }
             if (resp instanceof Error) {
-                return d1Error("backend error (502) - retryable");
+                return isDump ? dumpError(502) : d1Error("backend error (502) - retryable");
             }
             if (!(resp instanceof Response)) {
-                return d1Error("backend protocol error");
+                return isDump ? dumpError(502) : d1Error("backend protocol error");
             }
             if (!resp.ok) {
-                return d1Error(`backend denied request (${resp.status})`);
+                return isDump ? dumpError(resp.status) : d1Error(`backend denied request (${resp.status})`);
             }
             return resp;
         } catch  {
-            return d1Error("facade error");
+            return isDump ? dumpError(500) : d1Error("facade error");
         }
     }
 }

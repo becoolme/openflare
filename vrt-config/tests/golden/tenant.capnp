@@ -73,8 +73,8 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-d1.js", esModule = embed "sys/da831d5a768a562aaf89cb6addb4357cd2f041e2b6f01ea97a4b15aa552e68d7"),
-        (name = "facade/d1-wire.js", esModule = embed "sys/c18db39b11ac63c64b562ad72d2516d5e668bda0a339f77aa83b7801593de637"),
+        (name = "facade/facade-d1.js", esModule = embed "sys/28bd5fe09b3ee764bd52342aa8d5ac6c16f616b88d63de113b66e01a32a37866"),
+        (name = "facade/d1-wire.js", esModule = embed "sys/6c946b92333e55e1acc70e860de50191471cf62e5cc926e6ba6ba45127164320"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),

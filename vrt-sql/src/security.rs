@@ -210,6 +210,20 @@ fn pragma_allowed(name: &str, value: Option<&str>) -> bool {
     if name.eq_ignore_ascii_case("foreign_keys") {
         return value.is_none(); // reads allowed, writes denied
     }
+    // D1 dump() emits `PRAGMA defer_foreign_keys=TRUE;` as its first
+    // statement, and executing a dump must restore it. The pragma only
+    // defers FK enforcement inside the current transaction; it widens no
+    // read/write authority, and its value is restricted to boolean
+    // spellings SQLite itself accepts.
+    if name.eq_ignore_ascii_case("defer_foreign_keys") {
+        return match value {
+            None => true,
+            Some(v) => matches!(
+                v.to_ascii_lowercase().as_str(),
+                "0" | "1" | "true" | "false" | "on" | "off"
+            ),
+        };
+    }
     if name.eq_ignore_ascii_case("miniflare_d1_export") {
         return false;
     }

@@ -1,6 +1,8 @@
 //! D1 wire layer (section 2 protocol spec): `POST /dbs/{id}/query` and `POST /dbs/{id}/execute`
-//! share one handler. Two error surfaces: SQL failure = HTTP 200 + `{success:false,error}`;
+//! share one handler; `POST /dbs/{id}/dump` returns the SQLite-compatible export as bytes.
+//! Two error surfaces: SQL failure = HTTP 200 + `{success:false,error}`;
 //! malformed request (schema mismatch) = HTTP 400 + a non-`{success:false}` shape.
+//! `dump` errors are non-200 because workerd's d1-api only parses an error body then.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -535,6 +537,169 @@ async fn query_handler(State(state): State<AppState>, request: axum::extract::Re
         .unwrap()
 }
 
+/// `POST /dbs/{id}/dump`: `D1Database.dump()`. Same trust chain as
+/// `query_handler` (permit -> Content-Length -> signature -> trusted ctx);
+/// the success body is the SQLite-compatible SQL script as
+/// `application/octet-stream` -- exactly what workerd's d1-api returns to
+/// the tenant as an ArrayBuffer. Errors are non-200 JSON: d1-api only
+/// parses an error body when the status is not 200, and would otherwise
+/// hand the tenant the JSON error text as if it were a dump.
+async fn dump_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    let started = Instant::now();
+    let fail = |outcome: &'static str, status: StatusCode, body: serde_json::Value| {
+        crate::metrics::query("dump", outcome, started.elapsed().as_secs_f64());
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let _permit = match state.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return fail(
+                "rate_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"success": false, "error": "vrt-sql overloaded"}),
+            )
+        }
+    };
+    let _inflight = match state.inflight.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return fail(
+                "unavailable",
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"success": false, "error": "vrt-sql draining"}),
+            )
+        }
+    };
+    if let Some(cl) = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if cl > state.body_max {
+            return fail(
+                "protocol_error",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error": "request body too large"}),
+            );
+        }
+    }
+    let db_id = request
+        .uri()
+        .path()
+        .strip_prefix("/dbs/")
+        .and_then(|rest| rest.rsplit_once('/'))
+        .map(|(id, _)| id.to_string())
+        .unwrap_or_default();
+    let method = request.method().clone();
+    let path_query = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let headers = request.headers().clone();
+    let body = match axum::body::to_bytes(request.into_body(), state.body_max).await {
+        Ok(b) => b,
+        Err(_) => {
+            return fail(
+                "protocol_error",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error": "request body too large"}),
+            )
+        }
+    };
+    if let Some(auth) = &state.auth {
+        if !auth.verify(&headers, &method, &path_query, &body) {
+            return fail(
+                "unauthorized",
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "unauthorized"}),
+            );
+        }
+    }
+    let budget = clamp_budget(
+        state.txn_budget,
+        headers
+            .get(DEADLINE_MS_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
+    let deadline = Instant::now() + budget;
+    let call = match trusted_ctx_from_headers(&headers, deadline) {
+        Ok(c) => c,
+        Err(()) => {
+            return fail(
+                "protocol_error",
+                StatusCode::BAD_REQUEST,
+                json!({ "error": "invalid request: x-vrt-epoch/x-vrt-seq must be u64 pair" }),
+            )
+        }
+    };
+    let task = {
+        let registry = state.registry.clone();
+        let db_id = db_id.clone();
+        tokio::task::spawn_blocking(move || {
+            let engine = registry
+                .get_until(crate::paths::ResourceKind::D1, &db_id, deadline)
+                .map_err(|e| (e, false))?;
+            let ctx = TxnCtx {
+                epoch: call.epoch,
+                deadline: call.deadline,
+                dedup: None,
+            };
+            match engine.dump_sync(&ctx) {
+                Ok(bytes) => {
+                    if engine.is_degraded() {
+                        crate::metrics::degraded_read();
+                    }
+                    Ok(bytes)
+                }
+                Err(e) => {
+                    if let EngineError::Fenced(ep) = e {
+                        registry.evict_fenced(crate::paths::ResourceKind::D1, &db_id, ep);
+                    }
+                    Err((e, true))
+                }
+            }
+        })
+    };
+    let cutoff = tokio::time::Instant::from_std(deadline) + D1_OUTER_GRACE;
+    let outcome: Result<Vec<u8>, EngineError> = match tokio::time::timeout_at(cutoff, task).await {
+        Ok(Ok(Ok(bytes))) => Ok(bytes),
+        Ok(Ok(Err((e, _ran)))) => Err(e),
+        Ok(Err(_join)) => Err(EngineError::Unavailable("dump task failed")),
+        // dump never writes: a cut can only mean "nothing committed".
+        Err(_) => Err(EngineError::DeadlineExceeded),
+    };
+    match outcome {
+        Ok(bytes) => {
+            crate::metrics::query("dump", "ok", started.elapsed().as_secs_f64());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        Err(e) => {
+            // A 200 here would make d1-api treat the JSON body as dump bytes.
+            let status = match error_status(&e) {
+                StatusCode::OK => StatusCode::INTERNAL_SERVER_ERROR,
+                s => s,
+            };
+            let outcome = match status {
+                StatusCode::SERVICE_UNAVAILABLE => "unavailable",
+                _ => "error",
+            };
+            fail(outcome, status, error_body(&e))
+        }
+    }
+}
+
 /// T36: read-only diagnostic `GET /internal/dbs` -- fenced/degraded databases and the last
 /// uploaded lsn. Verified with the same ServiceAuth as queries (GET + empty body,
 /// epoch=0 seq=none are covered by the signing string). Allowed through when auth is not configured (unit tests).
@@ -718,6 +883,7 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/dbs/{id}/query", post(query_handler))
         .route("/dbs/{id}/execute", post(query_handler))
+        .route("/dbs/{id}/dump", post(dump_handler))
         .route("/dbs/{id}/drop", post(drop_handler))
         .route("/queues/{id}/drop", post(queue_drop_handler))
         .route("/queues/{id}/send", post(queue_handler))
