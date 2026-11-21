@@ -416,6 +416,7 @@ pub fn worker(worker_id: &str, hostname: &str, digest: &str) -> WorkerDesired {
         durable_object_classes: vec![],
         workflows: vec![],
         tail_consumers: vec![],
+        streaming_tail_consumers: vec![],
         quotas: WorkerQuotas {
             cpu_ms: 50,
             memory_mb: 128,
