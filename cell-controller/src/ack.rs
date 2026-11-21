@@ -187,6 +187,14 @@ pub struct AckCapabilities {
     /// Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unsafe_eval: bool,
+    /// `observability` per-worker settings (CF `[observability]`) —
+    /// collection gates + head sampling applied by the rendered
+    /// `vrt-tail` collector. A pre-observability cell rejects the
+    /// unknown worker field via `deny_unknown_fields`, so the control
+    /// plane only admits observability-bearing workers onto cells
+    /// that claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observability: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

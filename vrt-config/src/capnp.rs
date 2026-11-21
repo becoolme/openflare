@@ -431,7 +431,7 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         if !service_names.insert(worker_service_name(&worker.worker_id)) {
             return Err(ConfigError::ServiceReference("services"));
         }
-        if input.params.log_tail.enabled()
+        if collects_logs(worker, input.params)
             && !service_names.insert(crate::logs::tail_service_name(&worker.worker_id))
         {
             return Err(ConfigError::ServiceReference("services"));
@@ -1332,7 +1332,7 @@ fn emit_tenant_worker(
     // the whole config load, so re-check the id resolves here too).
     {
         let mut tail_names: Vec<String> = Vec::new();
-        if input.params.log_tail.enabled() {
+        if collects_logs(worker, input.params) {
             tail_names.push(crate::logs::tail_service_name(&worker.worker_id));
         }
         for consumer in &worker.tail_consumers {
@@ -1363,6 +1363,18 @@ fn emit_tenant_worker(
     Ok(())
 }
 
+/// Whether this worker gets a `vrt-tail` collector: platform-wide log
+/// collection AND the worker's own `[observability]` gates
+/// (`enabled`/`logs.enabled` false => no collector, CF semantics).
+fn collects_logs(worker: &WorkerDesired, params: &RuntimeParams) -> bool {
+    params.log_tail.enabled()
+        && !worker
+            .observability
+            .as_ref()
+            .map(|o| !o.enabled || !o.logs_enabled)
+            .unwrap_or(false)
+}
+
 /// Emit the platform-owned `vrt-tail-<workerId>` collector for one
 /// tenant worker (see [`crate::logs`]). Identity (`WORKER_ID`,
 /// `TOKEN`) is rendered from trusted config; outbound is deny-all and
@@ -1373,18 +1385,51 @@ fn emit_tail_worker(
     worker: &WorkerDesired,
     input: &TenantRenderInput<'_>,
 ) -> Result<(), ConfigError> {
+    // `[observability]` gates — `enabled`/`logs.enabled` false means
+    // NO collector at all (CF: nothing is emitted or collected). Runs
+    // before the pepper check: a disabled worker must not fail a
+    // missing-pepper render.
+    if worker
+        .observability
+        .as_ref()
+        .map(|o| !o.enabled || !o.logs_enabled)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     if input.params.log_tail.pepper.is_empty() {
         return Err(ConfigError::Identifier("logTailPepper"));
     }
     let token = crate::logs::log_token(&input.params.log_tail.pepper, &worker.worker_id);
+    // OBS carries the sampling/gate settings the collector applies
+    // per-invocation; absent `observability` renders no binding and
+    // the JS defaults (rate 1, invocation logs on) keep legacy
+    // renders byte-identical.
+    let obs_binding = worker
+        .observability
+        .as_ref()
+        .map(|o| {
+            format!(
+                "        (name = \"OBS\", text = {}),\n",
+                capnp_text(
+                    &json!({
+                        "headSamplingRate": o.head_sampling_rate,
+                        "invocationLogs": o.invocation_logs,
+                    })
+                    .to_string()
+                )
+            )
+        })
+        .unwrap_or_default();
     out.push_str(&format!(
-        "    (name = {}, worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = \"vrt-tail.mjs\", esModule = {}),\n      ],\n      bindings = [\n        (name = \"SINK\", service = {}),\n        (name = \"WORKER_ID\", text = {}),\n        (name = \"TOKEN\", text = {}),\n      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
+        "    (name = {}, worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = \"vrt-tail.mjs\", esModule = {}),\n      ],\n      bindings = [\n        (name = \"SINK\", service = {}),\n        (name = \"WORKER_ID\", text = {}),\n        (name = \"TOKEN\", text = {}),\n{}      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
         capnp_text(&crate::logs::tail_service_name(&worker.worker_id)),
         capnp_text(&input.params.system_compat_date),
         capnp_text(crate::logs::TAIL_WORKER_JS),
         capnp_text(crate::logs::LOGSINK_SERVICE),
         capnp_text(&worker.worker_id),
         capnp_text(&token),
+        obs_binding,
         capnp_text(&input.params.deny_outbound.service),
         capnp_text(&input.params.deny_outbound.entrypoint),
     ));

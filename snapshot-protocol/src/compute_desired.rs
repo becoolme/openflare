@@ -244,7 +244,47 @@ pub struct WorkerDesired {
     /// `deny_unknown_fields` — fail closed).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail_consumers: Vec<TailConsumerDesired>,
+
+    /// Observability (`[observability]`) — Worker Logs gates +
+    /// head sampling applied by the platform `vrt-tail` collector.
+    /// Skipped when absent so snapshots without the table stay
+    /// byte-identical (old cells reject the field via
+    /// `deny_unknown_fields` — fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<ObservabilityDesired>,
 }
+
+/// `[observability]` — CF Worker Logs collection gates and head
+/// sampling. All fields are EFFECTIVE values (wrangler-side defaults
+/// and the deprecated top-level `head_sampling_rate` alias are folded
+/// at parse). `traces`/`persist`/`destinations` have no counterpart
+/// and are rejected upstream.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObservabilityDesired {
+    /// Master gate (`observability.enabled`, default true).
+    pub enabled: bool,
+    /// Logs sub-gate (`observability.logs.enabled`, default true).
+    /// `enabled && logsEnabled == false` => no collection at all —
+    /// the cell emits no `vrt-tail` collector for the worker.
+    pub logs_enabled: bool,
+    /// Head sampling rate in [0,1] (`logs.headSamplingRate`, with
+    /// the deprecated top-level alias folded in): fraction of
+    /// INVOCATIONS whose records are kept, decided per-invocation —
+    /// a dropped invocation keeps none of its log/exception/outcome
+    /// records.
+    pub head_sampling_rate: f64,
+    /// `observability.logs.invocation_logs` (default true) — false
+    /// drops only the `outcome` (invocation) record; console and
+    /// exception records still collect.
+    pub invocation_logs: bool,
+}
+
+// f64 has no derived Eq, but `WorkerDesired` is Eq — safe here: JSON
+// cannot carry NaN (serde_json serializes it as `null`, which the
+// parser rejects), and `validate` bounds the rate to [0,1], so every
+// reachable value is reflexive.
+impl Eq for ObservabilityDesired {}
 
 /// One `tail_consumers[]` entry — the CONSUMER of this worker's tail
 /// events. Points at a worker of the same tenant by `workerId`.
@@ -969,6 +1009,12 @@ pub enum DesiredError {
     #[error("tail consumer target is not in the same tenant")]
     TailTarget,
 
+    /// `observability.headSamplingRate` is outside [0,1] (NaN
+    /// included — a NaN rate can never sample correctly, so it fails
+    /// closed rather than degrading to an arbitrary gate).
+    #[error("observability headSamplingRate outside [0,1]")]
+    ObservabilityBounds,
+
     /// A cron expression is not a valid 5-field schedule.
     #[error("invalid cron expression")]
     CronExpression,
@@ -1014,6 +1060,7 @@ impl DesiredError {
             Self::DoClass => "DESIRED_DO_CLASS_UNDECLARED",
             Self::WorkflowTarget => "DESIRED_WORKFLOW_TARGET_SCOPE",
             Self::TailTarget => "DESIRED_TAIL_TARGET_SCOPE",
+            Self::ObservabilityBounds => "DESIRED_OBSERVABILITY_BOUNDS",
         }
     }
 }
@@ -1159,6 +1206,13 @@ impl ComputeDesired {
                         || !tenant_worker_ids.contains(&consumer.worker_id)
                     {
                         return Err(DesiredError::TailTarget);
+                    }
+                }
+                if let Some(obs) = &worker.observability {
+                    if !obs.head_sampling_rate.is_finite()
+                        || !(0.0..=1.0).contains(&obs.head_sampling_rate)
+                    {
+                        return Err(DesiredError::ObservabilityBounds);
                     }
                 }
                 for binding in &worker.bindings {
@@ -2357,6 +2411,44 @@ mod tests {
                     v["tenants"][0]["workers"][0]["tailConsumers"] = json!([{"workerId": "w-nope"}])
                 }),
                 "DESIRED_TAIL_TARGET_SCOPE",
+            ),
+            // `[observability]` — the rate is the only bound-checked
+            // field (booleans carry no range semantics).
+            (
+                "observability-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["observability"] = json!({
+                        "enabled": true,
+                        "logsEnabled": true,
+                        "invocationLogs": false,
+                        "headSamplingRate": 0.25
+                    })
+                }),
+                "",
+            ),
+            (
+                "observability-rate-high",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["observability"] = json!({
+                        "enabled": true,
+                        "logsEnabled": true,
+                        "invocationLogs": true,
+                        "headSamplingRate": 1.5
+                    })
+                }),
+                "DESIRED_OBSERVABILITY_BOUNDS",
+            ),
+            (
+                "observability-rate-negative",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["observability"] = json!({
+                        "enabled": true,
+                        "logsEnabled": true,
+                        "invocationLogs": true,
+                        "headSamplingRate": -0.1
+                    })
+                }),
+                "DESIRED_OBSERVABILITY_BOUNDS",
             ),
             // `{"type":"json"}` — version_metadata / typed vars carrier.
             (

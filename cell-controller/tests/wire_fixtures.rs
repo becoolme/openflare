@@ -186,6 +186,7 @@ fn desired_ack_fixture() {
             version_metadata: true,
             service_binding_props: true,
             unsafe_eval: true,
+            observability: true,
         }),
     };
     check(

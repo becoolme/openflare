@@ -84,11 +84,39 @@ function fmt(v) {
     return "[unserializable]";
   }
 }
+function fnv1a(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 0x01000193) >>> 0;
+  }
+  return h;
+}
+// Head sampling, per invocation (one `ev` = one invocation): CF keeps
+// or drops the WHOLE invocation — deterministic on traceId/spanId when
+// workerd provides one (consistent across collectors), else a
+// per-invocation Bernoulli roll.
+function keep(ev, rate) {
+  if (rate >= 1) return true;
+  if (rate <= 0) return false;
+  const id = ev.traceId || ev.spanId;
+  const u = id ? fnv1a(String(id)) / 0x100000000 : Math.random();
+  return u < rate;
+}
 export default {
   async tail(events, env) {
     try {
+      let obs = {};
+      try {
+        obs = JSON.parse(env.OBS || "{}");
+      } catch (_) {
+        obs = {};
+      }
+      const rate = typeof obs.headSamplingRate === "number" ? obs.headSamplingRate : 1;
+      const il = obs.invocationLogs !== false;
       const records = [];
       for (const ev of events || []) {
+        if (!keep(ev, rate)) continue;
         const base = ev.eventTimestamp || Date.now();
         for (const l of ev.logs || []) {
           if (records.length >= MAX_RECORDS) break;
@@ -100,7 +128,7 @@ export default {
           const stack = typeof x.stack === "string" ? "\n" + x.stack : "";
           records.push({ kind: "exception", level: "error", ts: x.timestamp || base, message: cut(String(x.name || "Error") + ": " + String(x.message || "") + stack) });
         }
-        if (records.length < MAX_RECORDS) {
+        if (il && records.length < MAX_RECORDS) {
           const req = ev.event && ev.event.request;
           const res = ev.event && ev.event.response;
           const m = req ? String(req.method || "") + " " + String(req.url || "") : "";
@@ -139,5 +167,17 @@ mod tail_js_tests {
             .contains("status: res && typeof res.status === \"number\" ? res.status : null"));
         // The raw workerd outcome is forwarded, not remapped.
         assert!(TAIL_WORKER_JS.contains("outcome: String(ev.outcome || \"\")"));
+    }
+
+    #[test]
+    fn tail_js_enforces_observability() {
+        // CF `[observability]` — head sampling is per-INVOCATION (`ev`
+        // granularity): a dropped `ev` loses all of its records. The
+        // `invocation_logs` gate only suppresses the outcome record.
+        assert!(TAIL_WORKER_JS.contains("function keep(ev, rate)"));
+        assert!(TAIL_WORKER_JS.contains("fnv1a"));
+        assert!(TAIL_WORKER_JS.contains("JSON.parse(env.OBS || \"{}\")"));
+        assert!(TAIL_WORKER_JS.contains("if (!keep(ev, rate)) continue;"));
+        assert!(TAIL_WORKER_JS.contains("if (il && records.length < MAX_RECORDS)"));
     }
 }
