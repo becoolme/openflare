@@ -12,10 +12,18 @@ use std::time::{Duration, Instant};
 use vrt_config::EgressPolicy;
 
 /// PoC 7 — `_documents_gap` form: `--include-ignored` must not fail,
-/// so this test ASSERTS the verified gap on stock workerd and prints
-/// the numbers. It FAILS (correctly — the gap is then closed) only if
-/// a future W2-patched build renders `limits` and enforces fairness.
-/// Measured 2026-11-12 on workerd 1.20260916.1.
+/// so this test ASSERTS the verified gap and prints the numbers.
+///
+/// W2 (per-worker `limits`) landed with the quotas work: a declared
+/// deviation now renders, but an UNDECLARED dimension stays stock.
+/// This fixture leaves `cpuMs` at the platform default (50), so no
+/// `cpuMs` limit is emitted and the fairness gap below is unchanged
+/// for default-quota workers. The test fails if a build starts
+/// rendering CPU limits for a default declaration, or stops rendering
+/// the declared `subRequests`.
+///
+/// Measured 2026-11-12 on workerd 1.20260916.1 (pre-W2); re-verified
+/// 2026-11-20 on the pinned VRT fork.
 #[test]
 #[ignore = "requires VRT_WORKERD_BIN"]
 fn g1_poc7_limits_gap_documented() {
@@ -56,11 +64,19 @@ export default {
         },
     );
 
-    // FACT 1 (verified): stock render emits NO limits stanza at all —
-    // quotas in the desired document never reach workerd.
+    // FACT 1 (W2): quotas reach workerd as a `limits` group, but only
+    // for dimensions that deviate from the platform default. This
+    // fixture declares `subrequests: 100` (default 50) and leaves
+    // `cpuMs`/`memoryMb` at their defaults, so the render carries the
+    // subrequest budget and NO CPU budget — the fairness gap asserted
+    // below is the default-quota shape.
     assert!(
-        !text.contains("limits") && !text.contains("cpuMs = "),
-        "unexpected limits stanza — W2 may have landed; re-verify PoC7"
+        text.contains("limits = (subRequests = 100)"),
+        "declared subRequests quota must render: {text}"
+    );
+    assert!(
+        !text.contains("cpuMs = ") && !text.contains("memoryMb = "),
+        "default dimensions must not render (stock behaviour): {text}"
     );
     assert!(
         !text.contains("isolatedVm") && !text.contains("actorMode"),
@@ -90,10 +106,11 @@ export default {
         "baseline {base:?} too high — http read must stop at body-complete"
     );
 
-    // FACT 2 (verified): a bounded CPU burn in A starves B — one
-    // process, single V8 isolate pool, no per-tenant fairness.
-    // Measured (G1-r4, body-complete timing): 2591ms starved vs
-    // 235µs baseline during a 3s burn — amplification >10⁴×.
+    // FACT 2 (verified, still true post-W2 because no cpuMs limit is
+    // declared): a bounded CPU burn in A starves B — one process,
+    // single V8 isolate pool, no per-tenant fairness unless a CPU
+    // budget is emitted. Measured (G1-r4, body-complete timing):
+    // 2591ms starved vs 235µs baseline during a 3s burn.
     let burn = std::thread::spawn({
         let pa = ports["wa"];
         move || {
@@ -112,14 +129,19 @@ export default {
     // burn stretches B's request by >10x AND >1s wall-clock (single
     // shared event loop — B cannot even start until A's spin ends;
     // measured ~2.4s vs ~10-40ms baseline).
+    // Assert the GAP, not the goal: without a rendered cpuMs limit a
+    // 3s neighbor burn stretches B's request by >10x AND >1s
+    // wall-clock (single shared event loop — B cannot even start
+    // until A's spin ends; measured ~2.4s vs ~10-40ms baseline).
     assert!(
         starved > base * 10 && starved > Duration::from_secs(1),
-        "unexpected fairness — starved {starved:?} vs baseline {base:?};          if W2 limits landed, flip this gate to assert the inverse"
+        "unexpected fairness — starved {starved:?} vs baseline {base:?};          if a default cpuMs limit started rendering, flip this gate"
     );
 
-    // FACT 3 (verified): nothing terminates the spin — the request
-    // completes only when the worker's OWN loop bound ends, and the
-    // process keeps running. An unbounded loop ran 32s+ in the G1
+    // FACT 3 (verified): nothing terminates the spin — the worker
+    // declared no cpuMs budget, so no CPU limit is emitted and the
+    // request completes only when the worker's OWN loop bound ends;
+    // the process keeps running. An unbounded loop ran 32s+ in the G1
     // probe with no limiter intervention.
     let t = Instant::now();
     let (st, body) = http(ports["wa"], "/?secs=2");
@@ -138,7 +160,7 @@ export default {
         None,
         "workerd died — unexpected"
     );
-    eprintln!("poc7 spin completed at {spin:?} by worker's own bound; process alive —                DOCUMENTED GAP: stock workerd enforces no cpuMs/memory/subrequest limits;                W2 (limits fork) required before shared cells open per workers-runtime.md §6");
+    eprintln!("poc7 spin completed at {spin:?} by worker's own bound; process alive —                DOCUMENTED: a default (undeclared) cpuMs renders no limit, so                           shared cells need an explicit CPU budget; declared quotas now                           render (W2 landed) per docs/quotas.md");
 }
 
 /// Percentile over a latency sample set (nearest-rank).
