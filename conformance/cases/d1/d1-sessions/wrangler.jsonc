@@ -1,0 +1,12 @@
+// Conformance case: D1 Sessions API (withSession/getBookmark) on the
+// local data plane — bookmarks are minted by vrt-sql, forwarded by the
+// provider, and consumed by workerd's d1-api client.
+{
+  "name": "conf-d1-sessions",
+  "main": "worker.js",
+  "compatibility_date": "2024-09-25",
+  "routes": ["conf-d1-sessions.vrt.local/*"],
+  "d1_databases": [
+    { "binding": "DB", "database_name": "conf-d1-sessions-db", "database_id": "conf-d1-sessions" },
+  ],
+}

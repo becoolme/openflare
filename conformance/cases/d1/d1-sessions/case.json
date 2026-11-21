@@ -1,0 +1,65 @@
+{
+  "schemaVersion": 1,
+  "id": "d1-sessions",
+  "binding": "d1",
+  "title": "D1 Sessions API: withSession()/getBookmark() round-trip through the local data plane (null before a query, monotonic bookmarks, resume from a bookmark, first-primary/first-unconstrained)",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/d1/worker-api/d1-database/#withsession (withSession(constraint|bookmark): first-primary / first-unconstrained / bookmark; D1DatabaseSession adds getBookmark(), prepare(), batch())",
+    "https://developers.cloudflare.com/d1/worker-api/d1-database/#getbookmark (getBookmark(): String | null \u2014 \"returns null if no query is executed within a Session\", else the latest bookmark seen by the last query)",
+    "https://developers.cloudflare.com/d1/reference/time-travel/#bookmarks (bookmarks are lexicographically sortable oldest\u2192newest)",
+    "https://github.com/cloudflare/workerd/blob/7545be644952d71d76b904b37ae71b10c0ba8cad/src/cloudflare/internal/d1-api.ts (session sends x-cf-d1-session-commit-token, keeps the max response token by localeCompare, and returns null while only a constraint is held)",
+    "vrt-sql/src/bookmark.rs (fixed-width {epoch:016x}-{lsn:016x}-{hmac}; lexical order == commit order)",
+    "vrt-provider/src/d1.rs + vrt-provider/src/server.rs (x-cf-d1-* request headers forwarded to vrt-sql; its x-cf-d1-session-commit-token response header passed back)",
+    "vrt-sql/src/wire.rs (every successful /query|/execute signs a bookmark from the engine's commit_lsn)"
+  ],
+  "steps": [
+    {
+      "name": "reset table (session fixture)",
+      "request": {
+        "method": "POST",
+        "path": "/reset"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true
+        }
+      }
+    },
+    {
+      "name": "bookmark lifecycle: null before a query, resume, monotonic advance, constraints, session batch()",
+      "request": {
+        "path": "/sessions"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "insertOk": true,
+          "defaultNullBefore": true,
+          "defaultBookmarkAfter": true,
+          "sameSessionReads": [
+            "one"
+          ],
+          "resumeReturnsGivenBookmark": true,
+          "resumedReadSeesCommittedRows": [
+            "one"
+          ],
+          "advancedAfterWrite": true,
+          "staleSessionSeesLatest": true,
+          "batchOk": true,
+          "batchBookmarkIsString": true,
+          "firstPrimary": {
+            "nullBefore": true,
+            "stringAfter": true,
+            "rowIsObject": true
+          },
+          "firstUnconstrained": {
+            "nullBefore": true,
+            "stringAfter": true
+          }
+        }
+      }
+    }
+  ]
+}

@@ -2,12 +2,16 @@
   "schemaVersion": 1,
   "id": "queues-basic",
   "binding": "queues",
-  "title": "Queue send/sendBatch producer + consumer batch shape (queue name, message fields, attempts)",
+  "title": "Queue send/sendBatch producer + consumer batch shape (queue name, message fields, attempts) and the documented delaySeconds bounds",
   "requiresWorkerd": true,
   "evidence": [
     "https://developers.cloudflare.com/queues/configuration/javascript-apis/ (send/sendBatch, Message{id,timestamp,attempts,body}, MessageBatch{queue,messages,ackAll,retryAll})",
+    "https://developers.cloudflare.com/queues/configuration/javascript-apis/#queuesendoptions (delaySeconds: \"Must be an integer between 0 and 86400 (24 hours)\"; 0 explicitly prevents a delay)",
+    "https://developers.cloudflare.com/queues/configuration/javascript-apis/#message (Message.timestamp is \"a timestamp when the message was sent\", so the delivery lag measures the applied delay)",
+    "https://developers.cloudflare.com/queues/configuration/javascript-apis/#queuesendresult (send() resolves to {metadata:{metrics:{backlogCount,backlogBytes,oldestMessageTimestamp}}})",
     "facade/facade-qconsumer.ts (wire: {id,timestamp:Date,attempts>=1,body} \u2192 Fetcher.queue)",
-    "vrt-provider/src/queue.rs (128_000B per-message cap, 100-msg batch cap, delay \u226486_400s)"
+    "vrt-provider/src/queue.rs (128_000B per-message cap, 100-msg batch cap, X-Msg-Delay-Secs parsed as u32 and capped at 86_400s, so -1 and 86_401 are refused)",
+    "vrt-sql/src/queue.rs (visible_at = now + delaySecs*1000; the delivered timestamp is COALESCE(client_ts, created_at), i.e. the send time)"
   ],
   "steps": [
     {
@@ -117,19 +121,6 @@
       }
     },
     {
-      "name": "send with delaySeconds accepted",
-      "request": {
-        "method": "POST",
-        "path": "/send-delay"
-      },
-      "expect": {
-        "status": 200,
-        "json": {
-          "ok": true
-        }
-      }
-    },
-    {
       "name": "oversize message rejected",
       "request": {
         "method": "POST",
@@ -140,6 +131,80 @@
         "json": {
           "threw": true
         }
+      }
+    },
+    {
+      "name": "delaySeconds below the floor (-1) is rejected",
+      "request": {
+        "method": "POST",
+        "path": "/send-delay-neg"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true
+        }
+      }
+    },
+    {
+      "name": "delaySeconds above the ceiling (86401) is rejected",
+      "request": {
+        "method": "POST",
+        "path": "/send-delay-over"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": true
+        }
+      }
+    },
+    {
+      "name": "delaySeconds 0 (the floor) is accepted and send() resolves with QueueSendResult",
+      "request": {
+        "method": "POST",
+        "path": "/send-zero"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "threw": false,
+          "hasMetadata": true,
+          "backlogIsNumber": true,
+          "backlogBytesIsNumber": true
+        }
+      }
+    },
+    {
+      "name": "delaySeconds 5 is accepted",
+      "request": {
+        "method": "POST",
+        "path": "/send-delay"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ok": true,
+          "threw": false
+        }
+      }
+    },
+    {
+      "name": "delayed message is delivered only after the requested delay",
+      "request": {
+        "path": "/delays"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "delayedFound": true,
+          "immediateFound": true,
+          "delayedHonored": true
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 2000
       }
     }
   ]
