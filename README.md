@@ -66,8 +66,9 @@ differences in [`docs/compatibility.md`](docs/compatibility.md).
 
 Legend: **Drop-in** — same API and configuration, differences limited to where
 the data lives. **Partial** — runs with the differences listed below.
-**Unsupported** — the configuration key fails the deploy with
-`VRT_CONFIG_UNSUPPORTED_FIELD`.
+Anything not listed here is rejected at deploy with
+`VRT_CONFIG_UNSUPPORTED_FIELD`; the complete matrix (including unsupported
+bindings) is in [`docs/bindings/README.md`](docs/bindings/README.md).
 
 | Service / binding | Status | Notes |
 | --- | --- | --- |
@@ -87,24 +88,6 @@ the data lives. **Partial** — runs with the differences listed below.
 | [Vars and secrets](docs/bindings/vars-and-secrets.md) | 🟡 Partial | Vars are `text` bindings (non-strings arrive JSON-encoded); secrets are `vrt secret put` name→ref maps. |
 | [Tail Workers](docs/bindings/tail-workers.md) | 🟡 Partial | `tail_consumers` render as native workerd `tails`; same-tenant, best effort, no streaming tails. |
 | [Worker loaders](docs/bindings/worker-loaders.md) | 🟡 Partial | Native `WorkerLoader` (`get`/`load`, named caches, dynamic entrypoints, DO facets); quota-bounded per loader. |
-| Workers AI (`ai`) | ⛔ Unsupported | Deploy-time rejection. |
-| Vectorize (`vectorize`) | ⛔ Unsupported | Deploy-time rejection. |
-| AI Search (`ai_search`) | ⛔ Unsupported | Deploy-time rejection. |
-| Analytics Engine (`analytics_engine_datasets`) | ⛔ Unsupported | Deploy-time rejection. |
-| Analytics SQL (`analytics`) | ⛔ Unsupported | No `env.ANALYTICS_SQL.query()`. |
-| Browser Rendering (`browser`) | ⛔ Unsupported | Deploy-time rejection. |
-| Containers (`containers`) | ⛔ Unsupported | Deploy-time rejection. |
-| Send Email (`send_email`) | ⛔ Unsupported | Deploy-time rejection. |
-| mTLS (`mtls_certificates`) | ⛔ Unsupported | Deploy-time rejection. |
-| Pipelines (`pipelines`) | ⛔ Unsupported | Deploy-time rejection. |
-| Dispatch namespaces (`dispatch_namespaces`) | ⛔ Unsupported | Workers for Platforms dispatch is not emulated. |
-| Secrets Store (`secrets_store_secrets`) | ⛔ Unsupported | Use `secrets` per worker. |
-| Version metadata (`version_metadata`) | ⛔ Unsupported | No `env.CF_VERSION_METADATA`. |
-| Images / Stream / Media Transformations | ⛔ Unsupported | Product bindings are not recognized and are rejected. |
-| Workers VPC (`vpc_networks`) | ⛔ Unsupported | No private-network egress. |
-| Flagship (`flagship`) | ⛔ Unsupported | Deploy-time rejection. |
-| `wasm_modules` / `text_blobs` / `data_blobs` | ⛔ Unsupported | Import modules instead. |
-| Python Workers | ⛔ Unsupported | The runtime hosts JavaScript/TypeScript and Wasm (bundled through wrangler), not Pyodide. |
 
 Platform-wide differences (no edge network, server-minted resource ids,
 structural scale-to-zero, a whitelisted `request.cf`, WebSocket session
