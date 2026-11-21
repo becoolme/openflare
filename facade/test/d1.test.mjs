@@ -134,6 +134,37 @@ test("binding name independence: facade uses props.bindingId only", async () => 
   assert.equal(seen, "/internal/bindings/v1/d1/w-9~TOTALLY_OTHER_NAME/execute");
 });
 
+test("dump(): forwards /dump and keeps failures non-200", async () => {
+  // Success: the provider's bytes pass through untouched (d1-api wraps
+  // them in an ArrayBuffer; content-type is irrelevant to it).
+  let seen;
+  const sql = "PRAGMA defer_foreign_keys=TRUE;";
+  const { facade } = makeFacade({}, async (record) => {
+    seen = new URL(record.url);
+    return new Response(sql, {
+      headers: { "content-type": "application/octet-stream" },
+    });
+  });
+  const ok = await facade.fetch(new Request("http://d1/dump", { method: "POST" }));
+  assert.equal(ok.status, 200);
+  assert.equal(await ok.text(), sql);
+  assert.equal(seen.pathname, "/internal/bindings/v1/d1/w-alpha-1~KV/dump");
+  // Failure: d1-api treats any 200 body as dump bytes, so every error
+  // path must be non-200.
+  const { facade: f2 } = makeFacade({}, async () => new Response("nope", { status: 503 }));
+  const r2 = await f2.fetch(new Request("http://d1/dump", { method: "POST" }));
+  assert.equal(r2.status, 503);
+  const { facade: f3 } = makeFacade({}, async () => {
+    throw new Error("boom");
+  });
+  const r3 = await f3.fetch(new Request("http://d1/dump", { method: "POST" }));
+  assert.equal(r3.status, 502);
+  // Forged props also fail closed with a non-200.
+  const bad = new D1Facade({ props: { bindingId: "x" } }, { BINDING_BACKEND: { fetch: () => new Response("x") } });
+  const r4 = await bad.fetch(new Request("http://d1/dump", { method: "POST" }));
+  assert.equal(r4.status, 500);
+});
+
 test("rejects non-POST and unknown leaves", async () => {
   const { facade } = makeFacade();
   const r1 = await facade.fetch(new Request("http://d1/query"));

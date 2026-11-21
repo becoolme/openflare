@@ -100,6 +100,27 @@ impl ResultsFormat {
     }
 }
 
+/// Cloudflare's documented maximum query result size is 50 MB
+/// (https://developers.cloudflare.com/d1/platform/limits/), enforced
+/// since 2026-11-04. D1 counts MB as 10^6 bytes on the same page
+/// (100 KB = 100,000 bytes, 2 MB = 2,000,000 bytes), so the cap is
+/// expressed the same way here.
+pub const D1_RESULT_MAX_BYTES: usize = 50_000_000;
+
+/// Documented error text for an oversized query result
+/// (https://developers.cloudflare.com/d1/observability/debug-d1/#error-list).
+/// workerd's `d1-api` adds the `D1_ERROR: ` prefix when it throws.
+pub const D1_RESULT_TOO_LARGE: &str =
+    "D1 query result exceeded the maximum response size limit of 50 MB";
+
+/// In-process ceiling for `dump()`: unlike query results, D1 export is
+/// documented as *not* subject to the 50 MB query-result limit, but the
+/// provider's transport cap is 64 MiB and the whole export is buffered
+/// in memory. Exceeding this fails closed with a bounded error instead
+/// of an unbounded allocation.
+pub const D1_DUMP_MAX_BYTES: usize = 64 * 1024 * 1024;
+const D1_DUMP_TOO_LARGE: &str = "D1 dump exceeded the local 64 MiB export limit";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Meta {
     pub served_by: String,
@@ -1018,16 +1039,42 @@ impl RusqliteEngine {
                 let mut rows_cur = st
                     .query(params_from_iter(params.iter()))
                     .map_err(EngineError::Sqlite)?;
-                let mut rows: Vec<Vec<serde_json::Value>> = Vec::new();
+                // D1's documented 50 MB cap is per statement result. Count
+                // the serialized shape while rows are produced so a huge
+                // result fails closed before the whole set is materialized.
+                let mut result_bytes: usize = match format {
+                    ResultsFormat::RowsAndColumns => serde_json::to_vec(&cols)
+                        .map_err(|e| EngineError::Message(e.to_string()))?
+                        .len()
+                        .saturating_add(32),
+                    _ => 2,
+                };
+                let mut rows: Vec<serde_json::Value> = Vec::new();
                 while let Some(row) = rows_cur.next().map_err(EngineError::Sqlite)? {
                     let mut r = Vec::with_capacity(cols.len());
                     for i in 0..cols.len() {
                         r.push(value_to_json(row.get_ref(i)?)?);
                     }
-                    rows.push(r);
+                    let row_value = format_row(format, &cols, r);
+                    result_bytes = result_bytes.saturating_add(
+                        serde_json::to_vec(&row_value)
+                            .map_err(|e| EngineError::Message(e.to_string()))?
+                            .len()
+                            .saturating_add(1),
+                    );
+                    if result_bytes > D1_RESULT_MAX_BYTES {
+                        return Err(EngineError::Message(D1_RESULT_TOO_LARGE.into()));
+                    }
+                    rows.push(row_value);
                 }
                 let nrows = rows.len() as i64;
-                Ok((format_rows(format, &cols, rows), nrows))
+                let results = match format {
+                    ResultsFormat::RowsAndColumns => {
+                        serde_json::json!({ "columns": cols, "rows": rows })
+                    }
+                    _ => serde_json::Value::Array(rows),
+                };
+                Ok((results, nrows))
             })();
 
             match run {
@@ -1121,6 +1168,35 @@ impl RusqliteEngine {
             }
         };
         security::disarm_deadline(&mut inner.conn);
+        result
+    }
+
+    /// `dump()`: export the user database as a SQLite-compatible SQL
+    /// script. Read-only: it takes the same dropped/fenced/lease gates as
+    /// a query but opens a deferred (snapshot) transaction and never
+    /// commits, so no lsn advances and no dedup row is written.
+    pub fn dump_sync(&self, ctx: &TxnCtx) -> Result<Vec<u8>, EngineError> {
+        if self.dropped.load(Ordering::SeqCst) {
+            return Err(EngineError::Dropped);
+        }
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(EngineError::Fenced(self.lease_epoch.load(Ordering::SeqCst)));
+        }
+        let mut inner = self.lock_inner(ctx.deadline)?;
+        self.ensure_lease(&mut inner, ctx.deadline)?;
+        let tx = inner
+            .conn
+            .unchecked_transaction()
+            .map_err(EngineError::Sqlite)?;
+        security::arm_deadline(&tx, ctx.deadline);
+        let result = dump_sql(&tx, ctx.deadline);
+        drop(tx); // read-only: always rolled back
+        security::disarm_deadline(&mut inner.conn);
+        // T35c: a concurrent DROP while the export ran must not return a
+        // dump of a database the control plane already removed.
+        if self.dropped.load(Ordering::SeqCst) {
+            return Err(EngineError::Dropped);
+        }
         result
     }
 
@@ -1270,26 +1346,221 @@ impl SqlEngine for RusqliteEngine {
     }
 }
 
-fn format_rows(
+/// Build one result row in the wire's result shape. Counting the
+/// serialized row is what enforces [`D1_RESULT_MAX_BYTES`].
+fn format_row(
     format: ResultsFormat,
     cols: &[String],
-    rows: Vec<Vec<serde_json::Value>>,
+    values: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     match format {
-        // miniflare: ROWS_AND_COLUMNS -> {columns, rows}; the rest (including NONE) -> array of objects
-        ResultsFormat::RowsAndColumns => serde_json::json!({ "columns": cols, "rows": rows }),
-        _ => serde_json::Value::Array(
-            rows.iter()
-                .map(|r| {
-                    cols.iter()
-                        .cloned()
-                        .zip(r.iter().cloned())
-                        .collect::<serde_json::Map<String, serde_json::Value>>()
-                })
-                .map(serde_json::Value::Object)
-                .collect(),
-        ),
+        ResultsFormat::RowsAndColumns => serde_json::Value::Array(values),
+        _ => {
+            let mut obj = serde_json::Map::with_capacity(cols.len());
+            for (name, value) in cols.iter().zip(values) {
+                obj.insert(name.clone(), value);
+            }
+            serde_json::Value::Object(obj)
+        }
     }
+}
+
+/// `dump()`: a SQLite-compatible SQL script for the whole database.
+///
+/// The statement order, quoting and escaping follow workerd's own D1
+/// export (`src/workerd/server/d1/d1.js`, ported from workers-sdk's
+/// `dumpSql`), whose golden vectors live in
+/// `src/workerd/server/tests/d1/d1-export-test.js`. Engine-internal
+/// tables (`_vrt_*`) are skipped: they are not part of the user
+/// database and must never leak through an export.
+fn dump_sql(conn: &Connection, deadline: Instant) -> Result<Vec<u8>, EngineError> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(b"PRAGMA defer_foreign_keys=TRUE;\n");
+    let tables: Vec<(String, String)> = {
+        let mut st = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_schema AS o \
+                 WHERE (true) AND type=='table' AND sql NOT NULL \
+                 ORDER BY tbl_name='sqlite_sequence', rowid",
+            )
+            .map_err(EngineError::Sqlite)?;
+        let rows = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(EngineError::Sqlite)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(EngineError::Sqlite)?
+    };
+    for (table, sql) in tables {
+        check_dump_deadline(deadline)?;
+        if table == "sqlite_sequence" {
+            out.extend_from_slice(b"DELETE FROM sqlite_sequence;\n");
+        } else if table.starts_with("sqlite_stat") {
+            // As SQLite's shell dump: before the table's contents.
+            out.extend_from_slice(b"ANALYZE sqlite_schema;\n");
+        } else if sql.starts_with("CREATE VIRTUAL TABLE") {
+            return Err(EngineError::Message(
+                "D1 Export error: cannot export databases with Virtual Tables (fts5)".into(),
+            ));
+        } else if table.starts_with("_cf_")
+            || table.starts_with("sqlite_")
+            || table.starts_with("_vrt_")
+        {
+            continue;
+        } else if sql.starts_with("CREATE TABLE \"") || sql.starts_with("CREATE TABLE '") {
+            // As SQLite's dump: a quoted table name gets IF NOT EXISTS.
+            out.extend_from_slice(b"CREATE TABLE IF NOT EXISTS ");
+            out.extend_from_slice(sql[13..].as_bytes());
+            out.push(b';');
+            out.push(b'\n');
+        } else {
+            out.extend_from_slice(sql.as_bytes());
+            out.push(b';');
+            out.push(b'\n');
+        }
+        if out.len() > D1_DUMP_MAX_BYTES {
+            return Err(EngineError::Message(D1_DUMP_TOO_LARGE.into()));
+        }
+
+        let cols: Vec<String> = {
+            let mut st = conn
+                .prepare(&format!("PRAGMA table_info={}", dump_escape_id(&table)))
+                .map_err(EngineError::Sqlite)?;
+            let names = st
+                .query_map([], |r| r.get::<_, String>(1))
+                .map_err(EngineError::Sqlite)?;
+            names
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(EngineError::Sqlite)?
+        };
+        let names = cols
+            .iter()
+            .map(|c| dump_escape_id(c))
+            .collect::<Vec<_>>()
+            .join(",");
+        let select = format!("SELECT {names} FROM {};", dump_escape_id(&table));
+        let mut st = conn.prepare(&select).map_err(EngineError::Sqlite)?;
+        let mut it = st.query([]).map_err(EngineError::Sqlite)?;
+        while let Some(row) = it.next().map_err(EngineError::Sqlite)? {
+            check_dump_deadline(deadline)?;
+            let mut cells: Vec<String> = Vec::with_capacity(cols.len());
+            for i in 0..cols.len() {
+                cells.push(dump_cell(row.get_ref(i).map_err(EngineError::Sqlite)?));
+            }
+            out.extend_from_slice(
+                format!(
+                    "INSERT INTO {} ({names}) VALUES({});\n",
+                    dump_escape_id(&table),
+                    cells.join(",")
+                )
+                .as_bytes(),
+            );
+            if out.len() > D1_DUMP_MAX_BYTES {
+                return Err(EngineError::Message(D1_DUMP_TOO_LARGE.into()));
+            }
+        }
+    }
+
+    let rest: Vec<String> = {
+        let mut st = conn
+            .prepare(
+                "SELECT sql FROM sqlite_schema AS o WHERE (true) AND sql NOT NULL \
+                 AND type IN ('index', 'trigger', 'view') ORDER BY type COLLATE NOCASE",
+            )
+            .map_err(EngineError::Sqlite)?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(EngineError::Sqlite)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(EngineError::Sqlite)?
+    };
+    for sql in rest {
+        check_dump_deadline(deadline)?;
+        out.extend_from_slice(sql.as_bytes());
+        out.push(b';');
+        out.push(b'\n');
+        if out.len() > D1_DUMP_MAX_BYTES {
+            return Err(EngineError::Message(D1_DUMP_TOO_LARGE.into()));
+        }
+    }
+    // Statements are newline-separated; drop the trailing separator so an
+    // empty database dumps exactly the leading pragma statement.
+    if out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    Ok(out)
+}
+
+fn check_dump_deadline(deadline: Instant) -> Result<(), EngineError> {
+    if Instant::now() >= deadline {
+        Err(EngineError::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
+fn dump_escape_id(id: &str) -> String {
+    format!("\"{}\"", id.replace('"', "\"\""))
+}
+
+fn dump_cell(v: rusqlite::types::ValueRef<'_>) -> String {
+    use rusqlite::types::ValueRef;
+    match v {
+        ValueRef::Null => "NULL".into(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Real(f) => dump_real(f),
+        // shell.c.in output_quoted_escaped_string: a literal newline/CR
+        // cannot be embedded in a dump line, so they are written as
+        // `\n`/`\r` and restored with replace(...,char(10|13)).
+        ValueRef::Text(t) => dump_quote(&String::from_utf8_lossy(t)),
+        ValueRef::Blob(b) => {
+            let mut s = String::with_capacity(3 + b.len() * 2);
+            s.push_str("X'");
+            for byte in b {
+                s.push_str(&format!("{byte:02x}"));
+            }
+            s.push('\'');
+            s
+        }
+    }
+}
+
+fn dump_real(f: f64) -> String {
+    if f.is_finite() {
+        f.to_string()
+    } else if f > 0.0 {
+        "9e999".into()
+    } else {
+        "-9e999".into()
+    }
+}
+
+fn dump_quote(text: &str) -> String {
+    let mut lf = false;
+    let mut cr = false;
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for ch in text.chars() {
+        match ch {
+            '\'' => quoted.push_str("''"),
+            '\n' => {
+                lf = true;
+                quoted.push_str("\\n");
+            }
+            '\r' => {
+                cr = true;
+                quoted.push_str("\\r");
+            }
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('\'');
+    if cr {
+        quoted = format!("replace({quoted},'\\r',char(13))");
+    }
+    if lf {
+        quoted = format!("replace({quoted},'\\n',char(10))");
+    }
+    quoted
 }
 
 fn value_to_json(v: rusqlite::types::ValueRef) -> Result<serde_json::Value, EngineError> {

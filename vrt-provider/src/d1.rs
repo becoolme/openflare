@@ -29,8 +29,11 @@ pub const D1_MAX_SQL_BYTES: usize = 100 * 1024;
 pub const D1_MAX_PARAMS: usize = 100;
 /// Per-request body cap (checked before reading the body).
 pub const D1_MAX_BODY_BYTES: usize = 1024 * 1024;
-/// Upstream response cap (RV-R8 #8): consistent with vrt-sql's own `body_max_bytes` upper bound
-/// (64MiB) -- vrt-sql cannot produce a larger legal response.
+/// Upstream response cap (RV-R8 #8): a single statement result is
+/// capped at 50 MB by vrt-sql's documented D1 limit, but a
+/// multi-statement batch can legally serialize larger. This remains the
+/// transport backstop: over it the provider fails closed (never
+/// truncates) instead of growing the buffer without bound.
 pub const D1_MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;

@@ -7,7 +7,9 @@
 export const D1_PROVIDER_PREFIX = "/internal/bindings/v1/d1/";
 
 /// Ops accepted on the last path segment (d1-api emits these).
-export const D1_OPS = ["query", "execute"] as const;
+/// `query`/`execute` are the prepared-statement calls; `dump` is
+/// `D1Database.dump()` (POST /dump).
+export const D1_OPS = ["query", "execute", "dump"] as const;
 export type D1Op = (typeof D1_OPS)[number];
 
 /// Headers forwarded from the d1-api request to the provider — D1

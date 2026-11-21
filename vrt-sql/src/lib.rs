@@ -1,6 +1,6 @@
 //! vrt-sql: D1/Queues data-plane SQL service (Phase 3 / P3a).
 //!
-//! Scope of this round (T33): single-process local rusqlite engine + D1 `/query`/`/execute`
+//! Scope of this round (T33): single-process local rusqlite engine + D1 `/query`/`/execute`/`/dump`
 //! wire layer + single writer (in-process map + file lock) + `_vrt_dedup` same-transaction dedup ledger.
 //! Durability level: **local fsync only, no replication**; object-store LTX replication, lease and
 //! epoch fencing are left to later phases (TxnCtx already reserves the epoch field).

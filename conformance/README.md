@@ -4,6 +4,8 @@
 
 Executable cases cover KV, R2, D1, Queues, Cache, Cron, Durable Objects,
 static Assets, plain Vars, and the basic Rate Limiting binding result.
+D1 coverage includes prepared-statement calls, Sessions, `dump()`,
+`raw({columnNames})`, and the documented 50 MB query-result limit.
 The areas that need infrastructure or protocols the runner cannot yet
 exercise are listed in [`UNVERIFIED.md`](UNVERIFIED.md), including service
 bindings, Hyperdrive, Secrets, WebSockets, and Workflows. A listed case
@@ -129,6 +131,11 @@ stack), not that it passed.
 
 ## Changelog
 
+- 2026-11-20: Added the `d1-dump-raw` fixture: `dump()` SQL export
+  (empty database, exact quoting/escaping, restore round-trip),
+  `raw({columnNames:true|false})`, duplicate/empty result shapes, and the
+  documented 50 MB query-result error. Removed the D1 `dump()` entry from
+  `UNVERIFIED.md`.
 - 2026-11-20: Added basic Assets, Vars, and Rate Limiting fixtures; listed
   unsupported multi-worker, database, secret, WebSocket, workflow, and
   advanced asset behaviors as unverified.

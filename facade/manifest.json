@@ -268,8 +268,8 @@
           "name": "facade/d1-wire.js",
           "dist": "facade/dist/facade/d1-wire.js",
           "source": "facade/d1-wire.ts",
-          "sourceSha256": "d7e3c394dbc4eb448deb1075e855463556f45f1d197f32a186e9073aa465feba",
-          "sha256": "c18db39b11ac63c64b562ad72d2516d5e668bda0a339f77aa83b7801593de637"
+          "sourceSha256": "5127b07d50475674b4528dbbe53676174c5c4cb25f64695cf1030de79a46cb4b",
+          "sha256": "6c946b92333e55e1acc70e860de50191471cf62e5cc926e6ba6ba45127164320"
         },
         {
           "name": "facade/deadline.js",
@@ -282,8 +282,8 @@
           "name": "facade/facade-d1.js",
           "dist": "facade/dist/facade/facade-d1.js",
           "source": "facade/facade-d1.ts",
-          "sourceSha256": "c9e44bba353429b291a138bdc19d774b01fe2e6025ff78b9e7fdce1f3be86243",
-          "sha256": "da831d5a768a562aaf89cb6addb4357cd2f041e2b6f01ea97a4b15aa552e68d7"
+          "sourceSha256": "eb79f216b33f4d9105f670fee8d8cd4858d5caf805e9d9e0676c706efd8d903b",
+          "sha256": "28bd5fe09b3ee764bd52342aa8d5ac6c16f616b88d63de113b66e01a32a37866"
         },
         {
           "name": "facade/props.js",
