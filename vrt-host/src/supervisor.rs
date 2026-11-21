@@ -7842,12 +7842,13 @@ async fn swap_finalize(
         }
         match gen.child.inner.try_wait() {
             // MIG-13-r5: a dead warm child can never emit the marker.
-            // workerd 1.20260916.1 fataled fast on any bind/load error
-            // after the execve; 1.20261120 tolerates a failed `--watch`
-            // reload instead (it reports the errors and keeps serving
-            // what it can), so an EADDRINUSE now surfaces through this
-            // loop's deadline rather than as a child exit — still fail
-            // closed, just bounded by `ready_timeout`.
+            // workerd VRT #4 (`e699fea`) made environmental bind
+            // failures fatal again even under `--watch`, so a stale
+            // unix socket shows up here as a fast child exit
+            // (`swap-child-exit`) exactly like the pre-1.20261120
+            // binaries. The poll still covers every other reload crash
+            // and any build that only reports the error: either way
+            // the swap fails closed.
             Ok(Some(_)) | Err(_) => {
                 child_died = true;
                 break false;
