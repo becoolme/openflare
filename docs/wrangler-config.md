@@ -67,7 +67,7 @@ environment blocks.
 | `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint, validated at pack) | `project_cfg.rs:788` |
 | `worker_loaders` | supported — see [Worker loaders](bindings/worker-loaders.md); per-entry key `binding` only | `project_cfg.rs:820` |
 | `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:846` |
-| `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
+| `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`, `delivery_delay`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:875` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
 | `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1179` |
@@ -123,7 +123,7 @@ objects (`zone_name`, `zone_id`, `custom_domain` on `routes[]` entries
 are not carried — only `pattern` is read).
 
 Inside supported blocks the rule is the same — an unrecognized nested
-key names the path, e.g. `queues.producers[0].delivery_delay`,
+key names the path, e.g. `queues.consumers[0].max_ack`,
 `ratelimits[0].simple.burst`, `migrations[0].transferred_classes`.
 
 Normalized keys with no projection into the `vrt.toml` wire document
@@ -137,5 +137,8 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 - 2026-11-21: `tail_consumers` is accepted (table or legacy string
   entries, deduped, max 16) and carried to the signed snapshot as
   resolved same-tenant worker ids; empty lists are ignored.
-
+- 2026-11-21: `queues.producers[].delivery_delay` is accepted
+  (0–86,400 seconds) as a queue-level default send delay, carried into
+  the signed queue binding and applied by `facade-queue` when a send
+  omits `delaySeconds`.
 - 2026-11-20: `vrt deploy`, `vrt dev`, and `vrt doctor` accept `--env` to select Wrangler named environments.

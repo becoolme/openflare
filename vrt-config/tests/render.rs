@@ -46,6 +46,50 @@ fn assets_binding_props_carry_tenant_namespaced_key() {
     );
 }
 
+/// Queue-level `delivery_delay` is rendered into facade props ONLY when
+/// declared — a queue without it keeps the exact props bytes it had
+/// before the field existed.
+#[test]
+fn queue_delivery_delay_props_only_when_declared() {
+    let base = || {
+        let tenant = tenant();
+        let bs = bundles();
+        let params = runtime_params();
+        render_tenant_config(&input(&tenant, &bs, &params))
+            .unwrap()
+            .text
+    };
+    let out = base();
+    assert!(
+        out.contains("\\\"queueName\\\":\\\"jobs\\\""),
+        "queue props emitted"
+    );
+    assert!(
+        !out.contains("deliveryDelaySeconds"),
+        "absent queue delay must not add a props field"
+    );
+
+    let mut tenant = tenant();
+    let queue = tenant.workers[0]
+        .bindings
+        .iter_mut()
+        .find_map(|b| match b {
+            snapshot_protocol::compute_desired::BindingDesired::Queue(q) => Some(q),
+            _ => None,
+        })
+        .expect("fixture has a queue binding");
+    queue.delivery_delay_seconds = Some(45);
+    let bs = bundles();
+    let params = runtime_params();
+    let out = render_tenant_config(&input(&tenant, &bs, &params))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains("\\\"deliveryDelaySeconds\\\":45"),
+        "declared queue delay must ride in props"
+    );
+}
+
 fn with_auth_entrypoint(ep: &str) -> snapshot_protocol::compute_desired::TenantDesired {
     let mut tenant = tenant();
     let auth = tenant.workers[0]

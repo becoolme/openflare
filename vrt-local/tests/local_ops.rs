@@ -805,6 +805,79 @@ fn pack_wrangler_hyperdrive_and_ratelimits_into_bindings() {
     assert_eq!(limiter.period, 60);
 }
 
+/// Queue-level `delivery_delay` reaches the signed `QueueBinding` from
+/// both config sources; an out-of-range value fails closed at pack.
+#[test]
+fn pack_queue_delivery_delay_from_wrangler_and_vrt_toml() {
+    use snapshot_protocol::compute_desired::BindingDesired;
+
+    let queue_delay = |dir: &Path| {
+        let pkg = vrt_local::pack_with_resolver(dir, &DeployOverrides::default(), "local", &|_| {
+            None
+        })
+        .unwrap();
+        pkg.bindings
+            .iter()
+            .find_map(|binding| match binding {
+                BindingDesired::Queue(q) => Some(q.delivery_delay_seconds),
+                _ => None,
+            })
+            .expect("queue binding")
+    };
+
+    let root = root();
+    // wrangler source: `queues.producers[].delivery_delay`.
+    let wr_dir = root.join("worker-queue-delay-wrangler");
+    std::fs::create_dir_all(&wr_dir).unwrap();
+    std::fs::write(
+        wr_dir.join("wrangler.toml"),
+        "name = \"q-worker\"\nmain = \"main.js\"\ncompatibility_date = \"2025-01-01\"\n\
+         [[queues.producers]]\nbinding = \"Q\"\nqueue = \"jobs\"\ndelivery_delay = 60\n",
+    )
+    .unwrap();
+    std::fs::write(wr_dir.join("main.js"), "export default {}\n").unwrap();
+    assert_eq!(queue_delay(&wr_dir), Some(60));
+
+    // Native vrt.toml source: `[bindings.queue]` table form.
+    let toml_dir = root.join("worker-queue-delay-toml");
+    std::fs::create_dir_all(&toml_dir).unwrap();
+    std::fs::write(
+        toml_dir.join("vrt.toml"),
+        "name = \"q-worker\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2025-01-01\"\n\
+         [bindings.queue]\nQ = { queue = \"jobs\", deliveryDelaySeconds = 90 }\n",
+    )
+    .unwrap();
+    std::fs::write(toml_dir.join("main.js"), "export default {}\n").unwrap();
+    assert_eq!(queue_delay(&toml_dir), Some(90));
+
+    // Legacy string form: no queue-level default.
+    let legacy_dir = root.join("worker-queue-delay-legacy");
+    std::fs::create_dir_all(&legacy_dir).unwrap();
+    std::fs::write(
+        legacy_dir.join("vrt.toml"),
+        "name = \"q-worker\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2025-01-01\"\n\
+         [bindings.queue]\nQ = \"jobs\"\n",
+    )
+    .unwrap();
+    std::fs::write(legacy_dir.join("main.js"), "export default {}\n").unwrap();
+    assert_eq!(queue_delay(&legacy_dir), None);
+
+    // Native config > 86400 fails at pack (the signed protocol bound).
+    let bad_dir = root.join("worker-queue-delay-bad");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    std::fs::write(
+        bad_dir.join("vrt.toml"),
+        "name = \"q-worker\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2025-01-01\"\n\
+         [bindings.queue]\nQ = { queue = \"jobs\", deliveryDelaySeconds = 86401 }\n",
+    )
+    .unwrap();
+    std::fs::write(bad_dir.join("main.js"), "export default {}\n").unwrap();
+    assert!(
+        vrt_local::pack_with_resolver(&bad_dir, &DeployOverrides::default(), "local", &|_| None)
+            .is_err()
+    );
+}
+
 #[test]
 fn pack_selects_wrangler_environment_from_deploy_overrides() {
     let root = root();
