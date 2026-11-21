@@ -102,10 +102,29 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.3
       - uses: actions/setup-node@v5
         with:
           node-version: '24.22.1'
-      - name: Read pinned version and digest from workerd.lock
+      # m18 bundles the real `pg` driver with the repo's pinned esbuild;
+      # the exact versions the test resolves live in devDependencies.
+      - name: Install workspace dependencies (esbuild/pg for m18)
+        run: pnpm install --frozen-lockfile
+      # m17/m18 start a throwaway PostgreSQL 16 with initdb/pg_ctl. The
+      # runner images usually ship it; install it when the bin dir is
+      # absent so the two Hyperdrive proofs cannot silently skip.
+      - name: Resolve PostgreSQL 16 bin dir
+        run: |
+          set -euo pipefail
+          bin=/usr/lib/postgresql/16/bin
+          if [ ! -x "$bin/initdb" ]; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-16
+          fi
+          echo "VRT_TEST_PG_BIN=$bin" >> "$GITHUB_ENV"
+      - name: Read pinned version and digests from workerd.lock
         id: lock
         run: |
           set -euo pipefail
