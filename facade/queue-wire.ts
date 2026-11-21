@@ -17,6 +17,13 @@ export type QueueOp = (typeof QUEUE_OPS)[number];
 /// inbound requests before forwarding (S4 + T34 adversarial case).
 export const QUEUE_STRIP_HEADER_PREFIX = "x-vrt-";
 
+/// Broker message-delay header (workerd `X-Msg-Delay-Secs`), mirrored by
+/// `vrt-provider::queue::HDR_MSG_DELAY`. For `/message` it is the send
+/// delay; for `/batch` it is the batch-wide default, overridden by each
+/// item's `delaySecs`. The facade fills it from the queue-level props
+/// default only when workerd omitted it (the tenant specified no delay).
+export const QUEUE_HDR_MSG_DELAY = "x-msg-delay-secs";
+
 /// The provider identity channel (`x-open-compute-binding-id` etc.) —
 /// same rule: host-injected only, inbound copies are stripped (T34d).
 export const OPEN_COMPUTE_PREFIX = "x-open-compute-";
