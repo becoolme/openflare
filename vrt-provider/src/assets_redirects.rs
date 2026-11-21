@@ -26,6 +26,17 @@ pub const MAX_LINE_BYTES: usize = 1_000;
 /// Bound on the parsed rule file we are willing to read from the store.
 pub const MAX_FILE_BYTES: usize = 512 * 1024;
 
+/// Deployment-time validation for `/_redirects`: at request time an
+/// oversized or non-UTF-8 file fails closed (503 for every asset
+/// request), so reject it before the deployment is published.
+pub fn validate_file(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err("_redirects exceeds the 512 KiB cap".into());
+    }
+    std::str::from_utf8(bytes).map_err(|_| "_redirects is not valid UTF-8")?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleKind {
     Static,
@@ -148,7 +159,7 @@ pub fn match_redirect(
         let Some(captures) = match_rule(rule, path) else {
             continue;
         };
-        let mut location = substitute(&rule.destination, &captures);
+        let mut location = crate::assets::substitute_placeholders(&rule.destination, &captures);
         if rule.status == 200 {
             let target = location.split(['?', '#']).next().unwrap_or("").to_string();
             if target.starts_with('/') {
@@ -182,40 +193,6 @@ pub fn match_redirect(
         });
     }
     None
-}
-
-/// Substitute `:name` / `:splat` placeholders in one pass.
-///
-/// Only complete, longest-match tokens are recognized, and inserted
-/// capture values are never rescanned — so `:id` cannot eat the prefix
-/// of `:id2`, and a captured literal `:other` stays literal.
-fn substitute(template: &str, captures: &[(String, String)]) -> String {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(idx) = rest.find(':') {
-        out.push_str(&rest[..idx]);
-        let after = &rest[idx + 1..];
-        let name_len = after
-            .bytes()
-            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
-            .count();
-        if name_len == 0 {
-            out.push(':');
-            rest = after;
-            continue;
-        }
-        let name = &after[..name_len];
-        match captures.iter().find(|(n, _)| n == name) {
-            Some((_, value)) => out.push_str(value),
-            None => {
-                out.push(':');
-                out.push_str(name);
-            }
-        }
-        rest = &after[name_len..];
-    }
-    out.push_str(rest);
-    out
 }
 
 /// Percent-encode bytes that are not safe inside a URL (`new URL(...)`

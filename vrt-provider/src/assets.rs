@@ -28,6 +28,7 @@
 
 use axum::body::Body;
 use axum::http::{header, HeaderValue, Request, Response, StatusCode};
+use crate::assets_headers::{self, HeaderRule};
 use crate::assets_redirects::{self, RedirectAction, RedirectRule};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -183,6 +184,41 @@ fn encode_segment(seg: &str) -> String {
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
+    out
+}
+
+/// Substitute `:name` / `:splat` placeholders in one pass.
+///
+/// Shared by `_redirects` destinations and `_headers` values. Only
+/// complete, longest-match tokens are recognized, and inserted capture
+/// values are never rescanned — so `:id` cannot eat the prefix of
+/// `:id2`, and a captured literal `:other` stays literal.
+pub(crate) fn substitute_placeholders(template: &str, captures: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(idx) = rest.find(':') {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 1..];
+        let name_len = after
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if name_len == 0 {
+            out.push(':');
+            rest = after;
+            continue;
+        }
+        let name = &after[..name_len];
+        match captures.iter().find(|(n, _)| n == name) {
+            Some((_, value)) => out.push_str(value),
+            None => {
+                out.push(':');
+                out.push_str(name);
+            }
+        }
+        rest = &after[name_len..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -612,6 +648,10 @@ pub struct AssetStore {
     redirect_cache: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<RedirectRule>>>>,
     >,
+    /// Parsed `_headers` per (tenant, file digest), same policy.
+    header_cache: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<Vec<HeaderRule>>>>,
+    >,
 }
 
 fn is_lower_hex(value: &str, bytes: usize) -> bool {
@@ -633,6 +673,9 @@ impl AssetStore {
         Ok(Self {
             root: root.to_path_buf(),
             redirect_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            header_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         })
@@ -760,6 +803,49 @@ impl AssetStore {
             .redirect_cache
             .lock()
             .map_err(|_| "redirect cache poisoned".to_string())?;
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, rules.clone());
+        Ok(Some(rules))
+    }
+
+    /// Load + parse the manifest's `/_headers` file. `None` when absent;
+    /// unreadable/oversized is an error (fail closed).
+    pub fn header_rules(
+        &self,
+        tenant: &str,
+        manifest: &AssetManifest,
+    ) -> Result<Option<std::sync::Arc<Vec<HeaderRule>>>, String> {
+        let Some(file) = manifest.files.iter().find(|f| f.path == "/_headers") else {
+            return Ok(None);
+        };
+        if file.size as usize > assets_headers::MAX_FILE_BYTES {
+            return Err("_headers exceeds the parse cap".into());
+        }
+        let key = format!("{tenant}:{}", file.sha256);
+        {
+            let cache = self
+                .header_cache
+                .lock()
+                .map_err(|_| "header cache poisoned".to_string())?;
+            if let Some(hit) = cache.get(&key) {
+                return Ok(Some(hit.clone()));
+            }
+        }
+        let Some(bytes) = self.object(tenant, file)? else {
+            return Err("_headers object missing from the store".into());
+        };
+        if bytes.len() > assets_headers::MAX_FILE_BYTES {
+            return Err("_headers exceeds the parse cap".into());
+        }
+        let text =
+            String::from_utf8(bytes).map_err(|_| "_headers is not valid UTF-8".to_string())?;
+        let rules = std::sync::Arc::new(assets_headers::parse_headers(&text));
+        let mut cache = self
+            .header_cache
+            .lock()
+            .map_err(|_| "header cache poisoned".to_string())?;
         if cache.len() >= 64 {
             cache.clear();
         }
@@ -951,6 +1037,37 @@ fn typed(code: &'static str, status: StatusCode) -> Response<Body> {
     crate::error::error_response(code, status, true, false)
 }
 
+/// Internal response header that lists the header names `_headers`
+/// touched (set or detached). The assets facade forwards exactly these
+/// names — never arbitrary backend headers — after stripping the
+/// internal prefix. Bounded to keep the value small.
+pub const CUSTOM_HEADER_NAMES: &str = "x-open-compute-asset-header-names";
+/// Same bounds the deployment validator enforces
+/// (`assets_headers::validate_file`), so an accepted `_headers` can
+/// never make the forwarding list overflow here.
+const MAX_CUSTOM_HEADER_NAMES: usize = assets_headers::MAX_FORWARDED_NAMES;
+const MAX_CUSTOM_HEADER_NAME_BYTES: usize = assets_headers::MAX_FORWARDED_NAME_BYTES;
+
+fn attach_custom_header_names(response: &mut Response<Body>, names: Vec<String>) {
+    if names.is_empty() {
+        return;
+    }
+    let joined = names.join(",");
+    if names.len() > MAX_CUSTOM_HEADER_NAMES || joined.len() > MAX_CUSTOM_HEADER_NAME_BYTES {
+        // Deployment validation rejects such a file, so this only fires
+        // for a manifest published before validation existed.
+        tracing::warn!(
+            names = names.len(),
+            bytes = joined.len(),
+            "assets: _headers names list over the forwarding bound; dropping it"
+        );
+        return;
+    }
+    if let Ok(value) = HeaderValue::from_str(&joined) {
+        response.headers_mut().insert(CUSTOM_HEADER_NAMES, value);
+    }
+}
+
 /// `POST /internal/assets/v1/fetch` — identity is already authorized
 /// by the caller (`BindingContext`); this resolves + serves the bytes.
 pub fn fetch(
@@ -1030,6 +1147,18 @@ pub fn fetch(
                 manifest_digest = %manifest_digest,
                 error = %e,
                 "assets fetch: _redirects unreadable"
+            );
+            crate::metrics::assets_outcome(&worker_id, "error");
+            return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
+        }
+    };
+    let header_rules = match store.header_rules(tenant, &manifest) {
+        Ok(rules) => rules,
+        Err(e) => {
+            tracing::warn!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "assets fetch: _headers unreadable"
             );
             crate::metrics::assets_outcome(&worker_id, "error");
             return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
@@ -1120,7 +1249,11 @@ pub fn fetch(
         }
     };
     let is_404_page = matches!(resolved, Resolved::NotFoundPage(_));
-    let response = match resolved {
+    let header_applicable = matches!(
+        resolved,
+        Resolved::Serve(_) | Resolved::SpaFallback(_) | Resolved::NotFoundPage(_)
+    );
+    let mut response = match resolved {
         Resolved::Redirect(to) => redirect_location(&encode_path(&to)),
         Resolved::NotFound => typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND),
         Resolved::Serve(_) | Resolved::SpaFallback(_) | Resolved::NotFoundPage(_)
@@ -1162,6 +1295,10 @@ pub fn fetch(
                 if let Ok(v) = HeaderValue::from_str(&etag) {
                     r.headers_mut().insert(header::ETAG, v);
                 }
+                if let Some(rules) = header_rules.as_deref() {
+                    let names = assets_headers::apply_headers(rules, &path, r.headers_mut());
+                    attach_custom_header_names(&mut r, names);
+                }
                 crate::metrics::assets_outcome(&worker_id, "not_modified");
                 return r;
             }
@@ -1183,6 +1320,12 @@ pub fn fetch(
             r
         }
     };
+    if header_applicable {
+        if let Some(rules) = header_rules.as_deref() {
+            let names = assets_headers::apply_headers(rules, &path, response.headers_mut());
+            attach_custom_header_names(&mut response, names);
+        }
+    }
     if matches!(response.status(), StatusCode::NOT_FOUND) && outcome == "not_found" {
         crate::metrics::assets_outcome(&worker_id, "not_found");
     } else if !response.status().is_success() && !response.status().is_redirection() {

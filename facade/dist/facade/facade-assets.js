@@ -34,6 +34,24 @@ const PASSTHROUGH_RESPONSE_HEADERS = new Set([
     "vary",
     "location"
 ]);
+const CUSTOM_HEADER_NAMES = "x-open-compute-asset-header-names";
+const MAX_CUSTOM_HEADER_NAMES = 256;
+const CUSTOM_HEADER_DENY = new Set([
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "host"
+]);
+const CUSTOM_HEADER_NAME_RE = new RegExp("^[a-z0-9!#$%&'*+.^_\\x60|~-]+$");
+function isForwardableCustomHeader(name) {
+    return CUSTOM_HEADER_NAME_RE.test(name) && !name.startsWith("x-open-compute-") && !name.startsWith("x-vrt-") && !CUSTOM_HEADER_DENY.has(name);
+}
 function sanitizeErrorCode(value) {
     return value && ALLOWED_ERROR_CODES.has(value) ? value : "ASSET_STORAGE_UNAVAILABLE";
 }
@@ -180,6 +198,23 @@ export class AssetTransport extends WorkerEntrypoint {
         for (const name of PASSTHROUGH_RESPONSE_HEADERS){
             const value = response.headers.get(name);
             if (value !== null) responseHeaders.set(name, value);
+        }
+        const customNames = response.headers.get(CUSTOM_HEADER_NAMES);
+        if (customNames !== null) {
+            for (const raw of customNames.split(",").slice(0, MAX_CUSTOM_HEADER_NAMES)){
+                const name = raw.trim().toLowerCase();
+                if (!isForwardableCustomHeader(name)) continue;
+                if (name === "set-cookie") {
+                    const getSetCookie = response.headers.getSetCookie;
+                    const cookies = typeof getSetCookie === "function" ? getSetCookie.call(response.headers) : [];
+                    if (cookies.length > 0) {
+                        for (const cookie of cookies)responseHeaders.append("set-cookie", cookie);
+                        continue;
+                    }
+                }
+                const value = response.headers.get(name);
+                if (value !== null) responseHeaders.set(name, value);
+            }
         }
         const representationLength = response.headers.get("x-open-compute-asset-representation-length") ?? responseHeaders.get("content-length");
         if (representationLength) {

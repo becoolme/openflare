@@ -863,3 +863,39 @@ async fn redirects_encode_captures_and_never_proxy_configuration() {
     let res = fetch(&e.app, &e.digest, "GET", "https://x/raw/_headers", &[]).await;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }
+
+/// `_headers` rules apply to asset responses in file order, including
+/// detach/replace, and the provider enumerates the touched names for the
+/// facade (the facade forwards only those).
+#[tokio::test]
+async fn headers_apply_to_assets_and_detach_replace() {
+    let e = env(
+        &[
+            ("/index.html", b"i"),
+            ("/assets/a.js", b"a"),
+            (
+                "/_headers",
+                b"/*\n  X-Frame-Options: DENY\n  Content-Security-Policy: default-src 'self'\n\n/assets/*\n  ! Content-Security-Policy\n  Cache-Control: public, max-age=60\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/assets/a.js", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers().get("x-frame-options").unwrap(), "DENY");
+    assert!(res.headers().get("content-security-policy").is_none());
+    assert_eq!(
+        res.headers().get("cache-control").unwrap(),
+        "public, max-age=60"
+    );
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-frame-options"), "{names}");
+    assert!(names.contains("content-security-policy"), "{names}");
+    assert!(names.contains("cache-control"), "{names}");
+}
