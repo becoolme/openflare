@@ -525,6 +525,13 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
             .max(Duration::from_millis(config.ingress.switch_hold_ms) * 2);
     }
     let mut host = SupervisorHost::new(registry.clone(), deps, sup_params);
+    // [geoip] (default on): open the MMDB if one is already on disk;
+    // the sync task below fills/refreshes it. A missing or unreadable
+    // database simply yields no geo fields — never a startup error.
+    let geoip = config
+        .geoip
+        .enabled
+        .then(|| vrt_host::geoip::GeoIp::open(config.geoip.mmdb_path_or(&config.work_dir)));
     let ingress_state = IngressState::new(
         registry.clone(),
         Duration::from_millis(config.ingress.request_timeout_ms),
@@ -538,7 +545,10 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     )
     .with_forwarded_proto(config.ingress.forwarded_policy())
     // MIG-9: typed upstream client-IP trust — same rebuild chain.
-    .with_client_ip(config.ingress.client_ip_policy());
+    .with_client_ip(config.ingress.client_ip_policy())
+    // [geoip]: local MMDB fills `request.cf` geo/ASN fields the
+    // verified upstream chain did not provide.
+    .with_geoip(geoip.clone());
     // WebSocket tunnel bounds (`[ingress.websocket]`, validated at load).
     let ws = config.ingress.websocket_limits();
     let ingress_state = ingress_state.with_ws_limits(
@@ -691,6 +701,15 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         1.0,
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // [geoip]: background refresh of the MMDB — bounded retries,
+    // atomic install, exits on the shutdown watch like ingress.
+    if let Some(geo) = geoip.clone() {
+        let sync_cfg = config.geoip.sync_config(&config.work_dir);
+        let geoip_shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            vrt_host::geoip::sync::run(sync_cfg, geo, geoip_shutdown).await;
+        });
+    }
     // [analyticsEngine]: spool→Parquet flush — exits on the shutdown
     // watch (one final flush before exit).
     if let Some(svc) = ae_service.clone() {

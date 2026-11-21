@@ -62,6 +62,7 @@ pub mod do_transfer;
 pub mod do_wal;
 pub mod endpoint;
 pub mod exclusion;
+pub mod geoip;
 pub mod hibernate;
 pub mod ingress;
 pub mod initial_snapshot;

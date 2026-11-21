@@ -54,6 +54,19 @@ fn declare_all(r: &Registry) {
         "vrt_host_logs_buffer_bytes",
         "Bytes currently buffered in the host log ring buffers.",
     );
+    // ---- geoip ----
+    r.declare_gauge(
+        "vrt_host_geoip_loaded",
+        "1 when a GeoIP database is loaded and serving lookups.",
+    );
+    r.declare_counter(
+        "vrt_host_geoip_sync_errors_total",
+        "GeoIP sync attempts that failed (previous database keeps serving).",
+    );
+    r.declare_gauge(
+        "vrt_host_geoip_last_sync_unix",
+        "Unix time of the last successful GeoIP database update.",
+    );
     // ---- per-worker ----
     r.declare_counter(
         "vrt_worker_requests_total",
@@ -911,4 +924,22 @@ pub fn router(reg: Arc<TenantRegistry>) -> axum::Router {
     axum::Router::new()
         .route("/metrics", axum::routing::get(metrics_handler))
         .with_state(reg)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn geoip_series_are_exported() {
+        // The sync/reload path records these names — undeclared they
+        // silently drop from /metrics (render only iterates decls),
+        // hiding the degraded/stale/error story.
+        let text = super::registry().render();
+        for name in [
+            "vrt_host_geoip_loaded",
+            "vrt_host_geoip_sync_errors_total",
+            "vrt_host_geoip_last_sync_unix",
+        ] {
+            assert!(text.contains(name), "{name} missing from /metrics");
+        }
+    }
 }

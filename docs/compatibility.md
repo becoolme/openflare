@@ -55,16 +55,23 @@ These are not tied to one binding.
 - **No edge network.** One `vrt-host` is one ingress — no Cloudflare
   global anycast, no edge cache tier for `cacheTtl`, no Smart Placement
   (`placement` is ignored).
-- **`request.cf` is a whitelist, synthesized from the verified Cloudflare
-  chain.** Inbound `cf-*` headers are stripped and re-injected only when
-  the request arrived through the trusted proxy → Cloudflare edge. Today:
-  `country`, `colo`, `httpProtocol`, plus the visitor-location set
-  `city`, `continent`, `region`, `regionCode`, `metroCode`,
-  `postalCode`, `timezone`, `latitude`, `longitude`, `isEUCountry`
-  (the location fields require the zone's **Add visitor location
-  headers** managed transform). `asn`, `asOrganization`, `botManagement`
-  and the `tls*` fields have no header source on this ingress and stay
-  absent rather than being guessed.
+- **`request.cf` is a whitelist, synthesized from two sources.**
+  Inbound `cf-*` headers are stripped and re-injected only when the
+  request arrived through the trusted proxy → Cloudflare edge;
+  verified upstream values always win. On top of that, the `[geoip]`
+  module (default on) resolves the client IP the typed `clientIp`
+  policy derived — or the TCP peer itself when no trusted proxy is
+  configured — against a local MMDB and fills any field upstream did
+  not provide. Emitted today: `country`, `colo`, `httpProtocol`,
+  `asn` (JSON number), `asOrganization`, plus the visitor-location
+  set `city`, `continent`, `region`, `regionCode`, `metroCode`,
+  `postalCode`, `timezone`, `latitude`, `longitude`, `isEUCountry`.
+  `colo` has no local source (it names the edge in front, not the
+  client) and stays upstream-only; `botManagement` and the `tls*`
+  fields stay absent rather than being guessed. The MMDB is the
+  merged `NetworkCats/Merged-IP-Data` release — see `[geoip]` in
+  `examples/*-vrt-host.toml` for mirror/disable options and the
+  attribution note.
 
 ## Known limitations
 

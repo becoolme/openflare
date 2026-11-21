@@ -118,6 +118,12 @@ pub struct HostConfig {
     /// leaves every tenant's lifecycle byte-identical to before.
     #[serde(default)]
     pub scale_to_zero: ScaleToZeroConfig,
+    /// `[geoip]` — local MMDB resolution for `request.cf` geo/ASN
+    /// fields. Default ON with the upstream Merged-IP-Data source;
+    /// every failure mode degrades to "no geo data", never to a
+    /// startup or request failure.
+    #[serde(default = "GeoIpConfig::enabled_default")]
+    pub geoip: GeoIpConfig,
     /// `[analyticsEngine]` — per-tenant Analytics Engine ingest
     /// (`env.<binding>.writeDataPoint()`). Always-on when the service
     /// builds: the cell-controller advertises `analyticsEngine`
@@ -1451,6 +1457,132 @@ impl WebsocketConfig {
     }
 }
 
+/// `[geoip]` — local GeoIP database for `request.cf` (see
+/// [`crate::geoip`]). Enabled by default with the public
+/// Merged-IP-Data source; set `enabled = false` for airgap pods or
+/// when geo fields are unwanted.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GeoIpConfig {
+    /// Resolve `request.cf` geo/ASN fields from a local MMDB.
+    /// Default true — a missing/unreadable database degrades to
+    /// upstream-only fields, so default-on costs nothing.
+    #[serde(default = "geoip_enabled")]
+    pub enabled: bool,
+    /// MMDB file path. Default `<workDir>/geoip/Merged-IP.mmdb`
+    /// (resolved against `workDir` at startup, which also puts the
+    /// `*.part` download and `*.state.json` next to it).
+    #[serde(default)]
+    pub mmdb_path: Option<PathBuf>,
+    /// Releases-API URL polled for the current tag — the tag check
+    /// decides whether the ~100 MB download runs at all. Default the
+    /// upstream GitHub API. Set to `""` for mirror mode: skip the tag
+    /// check and re-download when the file is older than
+    /// `refreshIntervalSecs` (for mirrors serving only the binary).
+    #[serde(default)]
+    pub releases_api_url: Option<String>,
+    /// Direct database download URL — used as-is in mirror mode, and
+    /// as the fallback when the API names no `.mmdb` asset. Must be
+    /// `https://` when set.
+    #[serde(default)]
+    pub download_url: Option<String>,
+    /// Poll cadence in seconds. Range 300..=604800, default 43200
+    /// (12h — upstream ships daily, and anonymous GitHub API callers
+    /// get 60 req/h/IP so cells behind one NAT stay far below it).
+    #[serde(default)]
+    pub refresh_interval_secs: Option<u64>,
+}
+
+fn geoip_enabled() -> bool {
+    true
+}
+
+impl GeoIpConfig {
+    /// Default when `[geoip]` is absent entirely — enabled with
+    /// upstream defaults (see `HostConfig::geoip` field doc).
+    pub fn enabled_default() -> Self {
+        Self {
+            enabled: true,
+            mmdb_path: None,
+            releases_api_url: None,
+            download_url: None,
+            refresh_interval_secs: None,
+        }
+    }
+
+    /// Startup validation — the only hard failures are malformed
+    /// operator input (non-HTTPS URL, out-of-range interval), never
+    /// runtime conditions like a missing file.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        for url in [
+            self.releases_api_url.as_deref(),
+            self.download_url.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !url.is_empty() && !url.starts_with("https://") {
+                return Err(ConfigError::Invalid(
+                    "geoip URLs must be https:// (or empty)",
+                ));
+            }
+        }
+        // Mirror mode (`releasesApiUrl = ""`) has no API to supply a
+        // download URL — `downloadUrl` is then the ONLY source and an
+        // explicit empty string would leave the task error-looping.
+        if self.releases_api_url.as_deref() == Some("") && self.download_url.as_deref() == Some("") {
+            return Err(ConfigError::Invalid(
+                "geoip mirror mode (releasesApiUrl=\"\") needs a downloadUrl",
+            ));
+        }
+        if let Some(secs) = self.refresh_interval_secs {
+            if !(300..=604800).contains(&secs) {
+                return Err(ConfigError::Invalid(
+                    "geoip.refreshIntervalSecs must be 300..=604800",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolved database path (explicit `mmdbPath`, else
+    /// `<workDir>/geoip/Merged-IP.mmdb`).
+    pub fn mmdb_path_or(&self, work_dir: &std::path::Path) -> PathBuf {
+        self.mmdb_path
+            .clone()
+            .unwrap_or_else(|| work_dir.join("geoip").join("Merged-IP.mmdb"))
+    }
+
+    /// The sync task config (only called when `enabled`).
+    pub fn sync_config(&self, work_dir: &std::path::Path) -> crate::geoip::sync::GeoIpSyncConfig {
+        crate::geoip::sync::GeoIpSyncConfig {
+            mmdb_path: self.mmdb_path_or(work_dir),
+            releases_api_url: self
+                .releases_api_url
+                .clone()
+                .unwrap_or_else(|| crate::geoip::sync::DEFAULT_RELEASES_API.to_string()),
+            download_url: self
+                .download_url
+                .clone()
+                .unwrap_or_else(|| crate::geoip::sync::DEFAULT_DOWNLOAD_URL.to_string()),
+            refresh_interval: Duration::from_secs(self.refresh_interval_secs.unwrap_or(43200)),
+        }
+    }
+}
+
+impl Default for GeoIpConfig {
+    /// `serde(default)` on the FIELD means "absent → enabled" only via
+    /// [`HostConfig::geoip`]'s explicit default fn; a bare
+    /// `GeoIpConfig::default()` (tests, other callers) matches that
+    /// same enabled-with-upstream-defaults shape.
+    fn default() -> Self {
+        Self::enabled_default()
+    }
+}
+
 /// MIG-9: typed upstream client-IP trust layer — see
 /// [`crate::ingress::ClientIpPolicy`]. Nested under `[ingress]` as
 /// `[ingress.clientIp]` so the mode, the trusted-proxy set, and the
@@ -2099,6 +2231,7 @@ impl HostConfig {
         // — readyTimeoutMs + backoffMaxMs each — must fit the window.
         self.supervisor.validate()?;
         self.scale_to_zero.validate()?;
+        self.geoip.validate()?;
         self.analytics_engine.validate()?;
         {
             let t = self.supervisor.fail_threshold.max(1) as u64;
@@ -3380,5 +3513,54 @@ mod tests {
         let (cfg, warns) = parse("replayMaxBytes = 134217728\nmaxPendingBytes = 134217728\n");
         assert_eq!(cfg.rebaseline_chain_bytes, 134217728 / 8);
         assert!(warns.iter().any(|w| w.contains("headroom")));
+    }
+
+    /// `[geoip]` — default-on with upstream defaults; hard failures
+    /// only on malformed operator input, and the sync config resolves
+    /// workDir-relative defaults.
+    #[test]
+    fn geoip_defaults_and_validation() {
+        // Absent section → enabled with upstream defaults.
+        let d = GeoIpConfig::default();
+        assert!(d.enabled);
+        d.validate().unwrap();
+        let sync = d.sync_config(std::path::Path::new("/w"));
+        assert_eq!(sync.mmdb_path.to_str().unwrap(), "/w/geoip/Merged-IP.mmdb");
+        assert!(sync.releases_api_url.contains("api.github.com"));
+        assert!(sync.download_url.contains("/releases/latest/download/"));
+        assert_eq!(sync.refresh_interval, Duration::from_secs(43200));
+
+        // enabled=false → validation is a no-op even with junk fields.
+        let off: GeoIpConfig =
+            toml::from_str("enabled = false\ndownloadUrl = \"http://insecure\"\n").unwrap();
+        off.validate().unwrap();
+
+        // Non-https URL with enabled → reject.
+        let bad: GeoIpConfig =
+            toml::from_str("downloadUrl = \"http://example.com/x.mmdb\"\n").unwrap();
+        assert!(bad.validate().is_err());
+        // Empty releasesApiUrl = mirror mode → allowed.
+        let mirror: GeoIpConfig = toml::from_str(
+            "releasesApiUrl = \"\"\ndownloadUrl = \"https://mirror.local/x.mmdb\"\n",
+        )
+        .unwrap();
+        mirror.validate().unwrap();
+        assert!(mirror
+            .sync_config(std::path::Path::new("/w"))
+            .releases_api_url
+            .is_empty());
+        // Mirror mode with an explicit empty downloadUrl has no
+        // source at all — fail fast instead of error-looping.
+        let broken: GeoIpConfig =
+            toml::from_str("releasesApiUrl = \"\"\ndownloadUrl = \"\"\n").unwrap();
+        assert!(broken.validate().is_err());
+        // Interval bounds.
+        for secs in [299u64, 604801] {
+            let c: GeoIpConfig =
+                toml::from_str(&format!("refreshIntervalSecs = {secs}\n")).unwrap();
+            assert!(c.validate().is_err(), "{secs} must reject");
+        }
+        // Unknown key → deny_unknown_fields.
+        assert!(toml::from_str::<GeoIpConfig>("bogus = 1\n").is_err());
     }
 }

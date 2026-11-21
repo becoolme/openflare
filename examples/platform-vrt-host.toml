@@ -74,6 +74,20 @@ maxBodyBytes = 1048576
 forwardedProto = "trusted-proxy-header"
 forwardedProtoTrusted = ["10.42.0.0/16"]
 
+# GeoIP: fills request.cf geo/ASN fields from a local MMDB when the
+# verified upstream chain did not provide them (see
+# standalone-vrt-host.toml for the full option list and the
+# attribution note). On a platform cell, prefer a mirror — many pods
+# behind one NAT share the GitHub API rate limit, and a mirror keeps
+# the ~100 MB asset off the public path.
+[geoip]
+# enabled = true                                     # default
+# releasesApiUrl = ""                                # mirror mode: no GitHub API, refresh on file age
+# downloadUrl = "https://mirror.example.com/Merged-IP.mmdb"
+# refreshIntervalSecs = 86400
+# Alternatively leave the defaults and set VRT_GEOIP_GITHUB_TOKEN in
+# the pod env to lift the anonymous API rate limit.
+
 # Analytics Engine: per-tenant ingest sockets + Parquet output under
 # `<workDir>/ae/`; enabled by default (the cell claims the
 # capability unconditionally). See standalone-vrt-host.toml for the
