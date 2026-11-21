@@ -20,14 +20,14 @@ USAGE:
            [--facade-dist <dir>] [--workerd <path>] [--ingress-listen <addr>]
   vrt serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
            [--vrt-sql-bin <p>] [--mgmt-tcp-listen <addr> --mgmt-tcp-token-file <p>]
-  vrt dev [<worker_dir>] [--listen <addr>] [--no-watch] [--no-color] [--no-logs]
+  vrt dev [<worker_dir>] [--env <name>] [--listen <addr>] [--no-watch] [--no-color] [--no-logs]
            [--workerd <p>] [--stub] [--allow-unpinned-workerd]
            [--vrt-host-bin <p>] [--vrt-provider-bin <p>] [--vrt-sql-bin <p>]
            [--facade-dist <dir>]
-  vrt deploy --root <dir> [--secrets-file <f|->] [--var K:V]… [--name <n>] [--dry-run] <worker_dir>
+  vrt deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--dry-run] <worker_dir>
   vrt deploy --url <http://host:port> --token-file <p> [same options] <worker_dir>
   vrt logs --root <dir> <worker> [--follow] [--since <dur>] [--level <lvl>] [--json]
-  vrt doctor [--root <dir>] [--json] [--strict]
+  vrt doctor [--root <dir>] [--env <name>] [--json] [--strict]
   vrt rollback --root <dir> <worker> <version_id>
   vrt hostnames add --root <dir> <worker> <hostname>
   vrt hostnames rm  --root <dir> <worker> <hostname>
@@ -976,7 +976,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
     let root_s = arg(args, "--root").unwrap_or(".vrt");
     let root = std::path::Path::new(root_s);
     let project_dir = std::env::current_dir().map_err(|e| e.to_string())?;
-    let report = vrt_local::doctor::run(root, &project_dir);
+    let report = vrt_local::doctor::run_with_env(root, &project_dir, arg(args, "--env"));
     let strict = args.iter().any(|a| a == "--strict");
     let ok = report.passing(strict);
     if args.iter().any(|a| a == "--json") {
@@ -1056,6 +1056,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
     let dir = pos.first().ok_or("worker_dir required")?.clone();
     let overrides = DeployOverrides {
         name: arg(args, "--name").map(String::from),
+        env_name: arg(args, "--env").map(String::from),
         vars: collect_vars(args)?,
         ..Default::default()
     };
@@ -1071,7 +1072,11 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             arg(args, "--token-file").ok_or("--url requires --token-file <path> (0600, 64-hex)")?;
         let token = vrt_local::keys::load_token_file(Path::new(token_path))
             .map_err(|e| format!("token file: {e}"))?;
-        let g = vrt_local::worker_pkg::gather_dir(Path::new(&dir)).map_err(|e| e.to_string())?;
+        let g = vrt_local::worker_pkg::gather_dir_for_env(
+            Path::new(&dir),
+            overrides.env_name.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         if dry_run {
             let s = vrt_local::worker_pkg::summarize(&g, &overrides).map_err(|e| e.to_string())?;
             println!("{}", serde_json::to_string_pretty(&s).unwrap_or_default());
@@ -1122,7 +1127,13 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
     // ---- local mode (unchanged semantics + the new options)
     let root = root_of(args)?;
     let g = if dry_run {
-        Some(vrt_local::worker_pkg::gather_dir(Path::new(&dir)).map_err(|e| e.to_string())?)
+        Some(
+            vrt_local::worker_pkg::gather_dir_for_env(
+                Path::new(&dir),
+                overrides.env_name.as_deref(),
+            )
+            .map_err(|e| e.to_string())?,
+        )
     } else {
         None
     };
@@ -1268,6 +1279,7 @@ async fn cmd_dev(args: &[String]) -> Result<(), String> {
         .unwrap_or_else(|| PathBuf::from("."));
     let opts = vrt_local::dev::DevOptions {
         worker_dir,
+        env_name: arg(args, "--env").map(String::from),
         listen: arg(args, "--listen").map(String::from),
         no_watch: args.iter().any(|a| a == "--no-watch"),
         workerd: arg(args, "--workerd").map(PathBuf::from),
@@ -1286,6 +1298,9 @@ async fn cmd_dev(args: &[String]) -> Result<(), String> {
     println!("dev server ready in {:?}", s.ready_after);
     println!("  url:    {}", s.url);
     println!("  worker: {}", s.worker_name);
+    if let Some(env) = &s.environment {
+        println!("  env:    {env}");
+    }
     println!("  runtime: {}", s.runtime);
     if !s.bindings.is_empty() {
         println!("bindings:");

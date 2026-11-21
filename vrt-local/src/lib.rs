@@ -48,7 +48,9 @@ pub mod mgmt;
 mod oplog;
 mod preflight;
 mod project_cfg;
-pub use project_cfg::{load_worker_meta, MetaSource, WRANGLER_CANDIDATES};
+pub use project_cfg::{
+    load_worker_meta, load_worker_meta_for_env, MetaSource, WRANGLER_CANDIDATES,
+};
 pub use worker_pkg::WorkerToml;
 pub mod serve;
 mod state;
@@ -310,7 +312,10 @@ impl VrtLocal {
         // is first resolved through the same meta load path (consistent with the decision inside pack).
         let do_ctx = {
             let pepper = keys::load_signing_seed(&self.root)?;
-            let (meta, _src) = crate::project_cfg::load_worker_meta(worker_dir)?;
+            let (meta, _src) = crate::project_cfg::load_worker_meta_for_env(
+                worker_dir,
+                overrides.env_name.as_deref(),
+            )?;
             let name = overrides.name.clone().unwrap_or(meta.name);
             let prior = st_probe
                 .workers

@@ -803,6 +803,37 @@ fn pack_wrangler_hyperdrive_and_ratelimits_into_bindings() {
     assert_eq!(limiter.period, 60);
 }
 
+#[test]
+fn pack_selects_wrangler_environment_from_deploy_overrides() {
+    let root = root();
+    let dir = root.join("worker-env");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("wrangler.json"),
+        r#"{"name":"env-worker","main":"main.js","compatibility_date":"2025-01-01",
+           "vars":{"MODE":"base"},
+           "env":{"staging":{"vars":{"MODE":"staging","ONLY_STAGING":"yes"}}}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("main.js"), "export default {}\n").unwrap();
+
+    let overrides = DeployOverrides {
+        env_name: Some("staging".into()),
+        ..Default::default()
+    };
+    let pkg = vrt_local::pack_with_resolver(&dir, &overrides, "local", &|_| None).unwrap();
+    let values: Vec<&str> = pkg.var_values.values().map(String::as_str).collect();
+    assert_eq!(values, ["staging", "yes"]);
+
+    let err = match vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &|_| {
+        None
+    }) {
+        Ok(_) => panic!("named env must not silently use the base config"),
+        Err(err) => err,
+    };
+    assert!(format!("{err:?}").contains("named environments found"));
+}
+
 // ---------- P3c-1: Durable Objects ----------
 
 fn mk_do_worker(root: &Path, extra_toml: &str) -> PathBuf {

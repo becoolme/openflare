@@ -27,6 +27,20 @@ fail closed. The file is capped at 256 KiB (`MAX_CONFIG_BYTES`).
 value wholesale; `name`, `keep_vars` and `send_metrics` may only appear
 at top level (`TOP_LEVEL_ONLY_ENV_KEYS`, `project_cfg.rs:81`).
 
+Select a named environment with `--env` when deploying or running locally:
+
+```sh
+vrt deploy --root .vrt --env staging ./worker
+vrt dev --env staging ./worker
+vrt doctor --env staging
+```
+
+The same option applies to remote `vrt deploy --url` and `vrt deploy --dry-run`.
+If named environments exist and `--env` is omitted, the command fails with
+the available environment names instead of using the base config. `--env`
+with a higher-precedence `vrt.toml` is rejected because that format has no
+environment blocks.
+
 ## Behaviors
 
 - **supported** — parsed, validated, carried to the signed snapshot.
@@ -40,26 +54,26 @@ at top level (`TOP_LEVEL_ONLY_ENV_KEYS`, `project_cfg.rs:81`).
 
 | Key | Behavior | Code location |
 | --- | --- | --- |
-| `name` | supported — worker name, required for standalone naming | `project_cfg.rs:524` |
-| `main` | supported — entrypoint module path | `project_cfg.rs:527` |
-| `compatibility_date` | supported — passed through to workerd | `project_cfg.rs:530` |
-| `compatibility_flags` | supported — array of strings | `project_cfg.rs:536` |
-| `vars` | supported — string table; non-strings JSON-encoded as text bindings | `project_cfg.rs:549` |
-| `kv_namespaces` | supported — see [KV](bindings/kv.md); per-entry keys `binding`, `id`, `preview_id`, `remote` | `project_cfg.rs:562` |
-| `d1_databases` | supported — see [D1](bindings/d1.md); per-entry keys `binding`, `database_name`, `database_id`, `preview_database_id`, `remote` | `project_cfg.rs:585` |
-| `hyperdrive` | supported — see [Hyperdrive](bindings/hyperdrive.md); per-entry keys `binding`, `id`, `database_tenant`, `localConnectionString`, `remote` | `project_cfg.rs:623` |
-| `ratelimits` | supported — see [Rate limiting](bindings/rate-limiting.md); `name` + `namespace_id` + `simple.{limit,period}` | `project_cfg.rs:677` |
-| `r2_buckets` | supported — see [R2](bindings/r2.md); per-entry keys `binding`, `bucket_name` | `project_cfg.rs:745` |
-| `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint, validated at pack) | `project_cfg.rs:772` |
-| `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:804` |
-| `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:833` |
-| `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:961` |
-| `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1020` |
-| `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1137` |
-| `route` / `routes` | supported — pattern strings or `{ pattern }`; only plain hostnames or `<fqdn>/*`; `route` and `routes` are mutually exclusive (`VRT_CONFIG_INVALID`) | `project_cfg.rs:1160`, `route_to_hostname` `:494` |
-| `assets` | supported — see [Static assets](bindings/static-assets.md); `directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first` | `project_cfg.rs:1193` |
-| `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1227` |
-| `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1307`, env resolution earlier in the file |
+| `name` | supported — worker name, required for standalone naming | `project_cfg.rs:539` |
+| `main` | supported — entrypoint module path | `project_cfg.rs:542` |
+| `compatibility_date` | supported — passed through to workerd | `project_cfg.rs:545` |
+| `compatibility_flags` | supported — array of strings | `project_cfg.rs:551` |
+| `vars` | supported — string table; non-strings JSON-encoded as text bindings | `project_cfg.rs:564` |
+| `kv_namespaces` | supported — see [KV](bindings/kv.md); per-entry keys `binding`, `id`, `preview_id`, `remote` | `project_cfg.rs:577` |
+| `d1_databases` | supported — see [D1](bindings/d1.md); per-entry keys `binding`, `database_name`, `database_id`, `preview_database_id`, `remote` | `project_cfg.rs:600` |
+| `hyperdrive` | supported — see [Hyperdrive](bindings/hyperdrive.md); per-entry keys `binding`, `id`, `database_tenant`, `localConnectionString`, `remote` | `project_cfg.rs:638` |
+| `ratelimits` | supported — see [Rate limiting](bindings/rate-limiting.md); `name` + `namespace_id` + `simple.{limit,period}` | `project_cfg.rs:692` |
+| `r2_buckets` | supported — see [R2](bindings/r2.md); per-entry keys `binding`, `bucket_name` | `project_cfg.rs:760` |
+| `services` | supported — see [Service bindings](bindings/service-bindings.md); `binding`, `service`, `entrypoint` (named entrypoint, validated at pack) | `project_cfg.rs:787` |
+| `pg` | supported — vrt-native Postgres binding (`binding`, `id`, `endpoint`, `tenant_slug`, `read_only`); credentials never in toml | `project_cfg.rs:819` |
+| `queues` | supported — see [Queues](bindings/queues.md); `producers` (`binding`, `queue`) and `consumers` (`queue`, `max_batch_size`, `max_batch_timeout`, `max_retries`, `dead_letter_queue`, `retry_delay`, `max_concurrency`) | `project_cfg.rs:848` |
+| `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:976` |
+| `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1035` |
+| `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1152` |
+| `route` / `routes` | supported — pattern strings or `{ pattern }`; only plain hostnames or `<fqdn>/*`; `route` and `routes` are mutually exclusive (`VRT_CONFIG_INVALID`) | `project_cfg.rs:1175`, `route_to_hostname` `:509` |
+| `assets` | supported — see [Static assets](bindings/static-assets.md); `directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first` | `project_cfg.rs:1208` |
+| `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1242` |
+| `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1322`, env resolution earlier in the file |
 
 ## Accepted and ignored
 
@@ -75,7 +89,7 @@ but change nothing (`IGNORED_TOP_LEVEL`, `project_cfg.rs:31–57`):
 Also type-checked then dropped inside supported blocks:
 
 - `hyperdrive[].id` — accepted, never used as an identity
-  (`project_cfg.rs:625`).
+  (`project_cfg.rs:640`).
 - `hyperdrive[].localConnectionString`, `hyperdrive[].remote` —
   dev-only keys, dropped by normalization.
 - `kv_namespaces[].id`, `.preview_id`, `.remote` — `id` becomes the
@@ -88,7 +102,7 @@ Also type-checked then dropped inside supported blocks:
 ## Rejected
 
 Any other top-level key → `VRT_CONFIG_UNSUPPORTED_FIELD`
-(`project_cfg.rs:1313`):
+(`project_cfg.rs:1328`):
 
 ```
 [VRT_CONFIG_UNSUPPORTED_FIELD] <key> is not supported by the VRT runtime
@@ -112,5 +126,9 @@ key names the path, e.g. `queues.producers[0].delivery_delay`,
 Normalized keys with no projection into the `vrt.toml` wire document
 are also rejected rather than silently dropped — the projection
 whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
-(`project_cfg.rs:1543`), the fail-closed check that produced the
+(`project_cfg.rs:1558`), the fail-closed check that produced the
 "update wrangler_config_to_worker_toml" error shape.
+
+## Changelog
+
+- 2026-11-20: `vrt deploy`, `vrt dev`, and `vrt doctor` accept `--env` to select Wrangler named environments.

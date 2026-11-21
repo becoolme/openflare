@@ -335,6 +335,8 @@ pub struct DoPackCtx<'a> {
 pub struct DeployOverrides {
     /// Override `vrt.toml` `name` (rare — for programmatic deploys).
     pub name: Option<String>,
+    /// Select a named Wrangler environment (`vrt.toml` has no env blocks).
+    pub env_name: Option<String>,
     /// Extra desired bindings appended after vrt.toml's.
     pub bindings: Vec<BindingDesired>,
     /// Extra hostnames.
@@ -604,7 +606,7 @@ fn pack_inner(
     do_ctx: Option<&DoPackCtx<'_>>,
 ) -> Result<PackedWorker, LocalError> {
     assemble(
-        gather_dir(worker_dir)?,
+        gather_dir_for_env(worker_dir, overrides.env_name.as_deref())?,
         overrides,
         tenant_id,
         resolve_worker,
@@ -638,9 +640,18 @@ pub struct Gathered {
 /// everything downstream live in [`assemble`] — the single
 /// validation path shared by `vrt deploy --root` and remote uploads.
 pub fn gather_dir(worker_dir: &Path) -> Result<Gathered, LocalError> {
+    gather_dir_for_env(worker_dir, None)
+}
+
+/// [`gather_dir`] with a named Wrangler environment selected before
+/// module and asset discovery.
+pub fn gather_dir_for_env(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+) -> Result<Gathered, LocalError> {
     // T31/C4: `vrt.toml` keeps precedence; otherwise the wrangler family
     // (json > jsonc > toml) normalizes into the same meta shape.
-    let (meta, _meta_source) = crate::project_cfg::load_worker_meta(worker_dir)?;
+    let (meta, _meta_source) = crate::project_cfg::load_worker_meta_for_env(worker_dir, env_name)?;
     let mut files = BTreeMap::new();
     let mut skipped = Vec::new();
     let mut total: u64 = 0;

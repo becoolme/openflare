@@ -102,6 +102,12 @@ impl Report {
 /// the checks report that); `project_dir` is the directory whose
 /// wrangler/vrt config gets the unsupported-keys check.
 pub fn run(root: &Path, project_dir: &Path) -> Report {
+    run_with_env(root, project_dir, None)
+}
+
+/// [`run`] with a Wrangler named environment selected for the project
+/// configuration check.
+pub fn run_with_env(root: &Path, project_dir: &Path, env_name: Option<&str>) -> Report {
     let checks = vec![
         check_workerd(),
         check_root(root),
@@ -114,7 +120,7 @@ pub fn run(root: &Path, project_dir: &Path) -> Report {
         check_service_host(root),
         check_service_provider(root),
         check_service_sql(root),
-        check_project(project_dir),
+        check_project_for_env(project_dir, env_name),
     ];
     Report {
         root: root.display().to_string(),
@@ -606,7 +612,7 @@ fn check_service_sql(root: &Path) -> Check {
 }
 
 /// --- project: wrangler/vrt config loads; unsupported keys surface ---
-fn check_project(dir: &Path) -> Check {
+fn check_project_for_env(dir: &Path, env_name: Option<&str>) -> Check {
     let id = "project";
     let has_cfg = dir.join("vrt.toml").exists()
         || [
@@ -623,7 +629,7 @@ fn check_project(dir: &Path) -> Check {
     if !has_cfg {
         return Check::ok(id, format!("no project config in {}", dir.display()));
     }
-    match crate::project_cfg::load_worker_meta(dir) {
+    match crate::project_cfg::load_worker_meta_for_env(dir, env_name) {
         Ok((meta, src)) => Check::ok(
             id,
             format!("{} loads — worker '{}' ({src:?})", dir.display(), meta.name),
@@ -723,7 +729,21 @@ mod tests {
     #[test]
     fn project_check_no_config_is_ok() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(check_project(dir.path()).status, "ok");
+        assert_eq!(check_project_for_env(dir.path(), None).status, "ok");
+    }
+
+    #[test]
+    fn project_check_selects_named_wrangler_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"x","main":"index.js","compatibility_date":"2025-01-01",
+               "env":{"staging":{"vars":{"MODE":"staging"}}}}"#,
+        )
+        .unwrap();
+        let check = check_project_for_env(dir.path(), Some("staging"));
+        assert_eq!(check.status, "ok", "{check:?}");
+        assert!(check.detail.contains("worker 'x'"));
     }
 
     #[test]
@@ -735,10 +755,10 @@ mod tests {
         )
         .unwrap();
         std::fs::write(dir.path().join("index.js"), "export default {}\n").unwrap();
-        let c = check_project(dir.path());
+        let c = check_project_for_env(dir.path(), None);
         assert_eq!(c.status, "action", "unsupported key → action, got {c:?}");
         std::fs::write(dir.path().join("wrangler.toml"), "not = [valid\n").unwrap();
-        let c = check_project(dir.path());
+        let c = check_project_for_env(dir.path(), None);
         assert_eq!(c.status, "fail", "broken toml → fail, got {c:?}");
     }
 
