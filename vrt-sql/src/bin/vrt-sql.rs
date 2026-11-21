@@ -310,6 +310,95 @@ async fn run_follower(config_path: PathBuf) -> ExitCode {
         "vrt-sql follower starting"
     );
 
+    // Optional read-only D1 wire listener. Reads are served from the current immutable
+    // generation; the provider routes eligible queries here when `vrtSql.replicas` is set.
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let mut server: Option<tokio::task::JoinHandle<()>> = None;
+    if config.unix_dir.is_some() || config.listen_tcp.is_some() {
+        let auth_path = config
+            .auth_secret_file
+            .as_ref()
+            .expect("validated: authSecretFile required when serving");
+        let auth_secret = match load_secret_0600(auth_path, SecretPurpose::ServiceHmac) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, path = %auth_path.display(),
+                    "follower auth secret file unusable");
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut state = vrt_sql::replica::ReplicaState::new(follower.clone())
+            .with_auth(vrt_sql::service::ServiceAuth::new(auth_secret));
+        if let Some(path) = &config.bookmark_secret_file {
+            let raw = match load_secret_0600(path, SecretPurpose::ServiceHmac) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(error = %e, path = %path.display(),
+                        "follower bookmark secret file unusable");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if raw.len() < 32 {
+                tracing::error!(path = %path.display(), "bookmark secret shorter than 32 bytes");
+                return ExitCode::FAILURE;
+            }
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&raw[..32]);
+            state = state.with_signer(vrt_sql::bookmark::BookmarkSigner::new(key));
+        }
+        let app = vrt_sql::replica::app(state);
+        let stop = shutdown.clone();
+        if let Some(dir) = &config.unix_dir {
+            if let Err(e) = vrt_securefs::ensure_secure_dir(dir) {
+                tracing::error!(error = %e, "follower unixDir unusable");
+                return ExitCode::FAILURE;
+            }
+            let path = dir.join("vrt-sql-replica.sock");
+            let _ = std::fs::remove_file(&path);
+            let std_listener = match vrt_securefs::bind_unix_private(&path, 0o600) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, "follower unix bind failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            std_listener.set_nonblocking(true).ok();
+            let listener = match tokio::net::UnixListener::from_std(std_listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, "follower unix listener conversion failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            tracing::info!(path = %path.display(), "follower replica listening (unix)");
+            server = Some(tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { stop.notified().await })
+                    .await;
+            }));
+        } else {
+            let addr: std::net::SocketAddr = config
+                .listen_tcp
+                .as_ref()
+                .expect("validated")
+                .parse()
+                .expect("validated");
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, %addr, "follower replica bind failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            tracing::info!(%addr, "follower replica listening (tcp)");
+            server = Some(tokio::spawn(async move {
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { stop.notified().await })
+                    .await;
+            }));
+        }
+    }
+
     let mut sigterm = match signal(SignalKind::terminate()) {
         Ok(s) => s,
         Err(_) => {
@@ -364,6 +453,15 @@ async fn run_follower(config_path: PathBuf) -> ExitCode {
                 break;
             }
             _ = tick.tick() => {}
+        }
+    }
+    shutdown.notify_waiters();
+    if let Some(task) = server {
+        if tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("follower replica shutdown timed out");
         }
     }
     ExitCode::SUCCESS

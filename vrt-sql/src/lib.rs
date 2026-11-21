@@ -14,6 +14,7 @@ pub mod metrics;
 pub mod paths;
 pub mod persist;
 pub mod queue;
+pub mod replica;
 pub mod security;
 pub mod seg;
 pub mod service;

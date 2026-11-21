@@ -4,9 +4,9 @@
 object-store chain that the writer already publishes. It does not take the
 writer lease, does not write to the object store, and never accepts SQL writes.
 
-This is the P0 replication core. Provider-side bookmark routing is a follow-up;
-today the follower publishes an immutable local generation plus a watermark that
-a co-located read path can open.
+The follower optionally serves a read-only D1 wire (`/dbs/{id}/query`) and the
+provider routes eligible reads to it using the tenant's session bookmark. `execute`
+and `dump` always stay on the writer; the follower never executes a write.
 
 ## What it reuses
 
@@ -31,6 +31,11 @@ dbRoot = "/var/lib/vrt-sql/replica"
 databaseId = "01j2m8x4q9z7v3k6w5n1p0r8ta"
 pollIntervalMs = 500      # default 1000; range [50, 3600000]
 retainGenerations = 2     # default 2; range [1, 16]
+
+# Optional read-only D1 wire. Exactly one of unixDir / listenTcp.
+listenTcp = "0.0.0.0:8091"
+authSecretFile = "/etc/openflare/secrets/vrt-sql-auth"
+bookmarkSecretFile = "/etc/openflare/secrets/bookmark"
 
 [persistence]
 backend = "s3"            # follower requires fs or s3, never none
@@ -57,6 +62,53 @@ vrt-sql follower --config /etc/openflare/d1-follower.toml
 
 One process replicates one `databaseId`. Start several processes for several
 databases.
+
+## Serving reads and routing
+
+A follower with a listener exposes:
+
+| Endpoint | Behaviour |
+| --- | --- |
+| `POST /dbs/{id}/query` | Runs the batch on the current immutable generation (read-only connection). |
+| `POST /dbs/{id}/execute` | Always HTTP 409 `VRT_REPLICA_READ_ONLY`. |
+| `POST /dbs/{id}/dump` | Always HTTP 409 `VRT_REPLICA_PRIMARY_ONLY`. |
+| `GET /internal/replica/status` | Authenticated watermark/status JSON. |
+| `GET /healthz`, `/readyz` | Liveness; readiness requires a non-empty generation. |
+
+The provider opts in per cell:
+
+```toml
+[vrtSql]
+addr = "http://vrt-sql:8082"
+authSecretFile = "/etc/openflare/secrets/vrt-sql-auth"
+timeoutMs = 30000
+replicas = [
+  "http://vrt-sql-replica-0:8091",
+  "http://vrt-sql-replica-1:8091",
+]
+```
+
+Routing rules (round-robin over `replicas`):
+
+1. `execute` and `dump` always go to `addr` (the writer).
+2. `query` goes to a replica only when the session is not `first-primary`.
+3. The replica checks the inbound `x-cf-d1-session-commit-token`:
+   - `first-primary` -> `VRT_REPLICA_PRIMARY_REQUIRED`;
+   - a signed bookmark -> served only if `(appliedEpoch, appliedLsn) >= bookmark`;
+   - otherwise `VRT_REPLICA_STALE`;
+   - `first-unconstrained`, empty, or absent -> no constraint.
+4. A statement that would write is detected by SQLite's readonly error and
+   answered with `VRT_REPLICA_READ_ONLY`; it is never executed on the replica.
+5. The provider retries the read **once on the writer** for any of these 409
+   signals, a 429/5xx, or a transport error. A replica SQL error (HTTP 200
+   `{success:false}`) is returned as-is and is not retried.
+6. A replica response carries its own signed bookmark at
+   `(appliedEpoch, appliedLsn)`; workerd keeps the greatest token it has seen,
+   so a lagging replica can never move a session backwards.
+
+Because the replica decides with its exact watermark, the provider needs no
+status poller and no eventually-consistent health cache. A stale replica costs
+one extra request; a wrong answer is never served.
 
 ## On-disk layout
 
@@ -144,25 +196,32 @@ The follower is fail-closed:
 The follower never deletes or mutates writer objects, so a broken follower
 cannot damage the primary.
 
-## Limits (P0)
+## Limits
 
 - **Full-file copy per applied batch.** Safe and simple; reflink/incremental
   page application is a later optimization. A follower polling once per second
   copies once per poll (batches coalesce to the manifest head), not once per
   commit.
-- **One database per process config.** Run multiple processes or extend the
-  config to a list later.
-- **No provider routing yet.** D1 reads still go to the writer. Bookmark-based
-  selection (`servable(bookmark) = appliedEpoch > bm.epoch || (== && appliedLsn
-  >= bm.lsn)`) and a read-only query surface are the next step.
+- **One database per process config.** Run multiple processes for several
+  databases.
+- **Read-only routing only.** `execute`, `batch()` writes, migrations and
+  `dump()` stay on the writer. A write sent through `/query` is rejected by the
+  replica and retried on the writer (no double execution: the replica is
+  read-only).
 - **No failover.** Promotion of a follower to writer still requires the
   existing lease/epoch takeover; the follower is not a consensus member.
-- **GC watermark**: if the writer checkpoints and GCs faster than the follower
-  polls, the follower re-bootstraps from the snapshot. Keep
+- **No GC watermark yet.** If the writer checkpoints and GCs faster than the
+  follower polls, the follower re-bootstraps from the snapshot. Keep
   `pollIntervalMs` well below the writer's effective snapshot interval, or
-  increase snapshot retention when that changes.
+  increase snapshot retention when that changes. Reporting follower watermarks
+  to the writer (to retain segments a live replica still needs) is next.
 - **Full snapshot download on re-bootstrap.** A large database re-downloads the
   snapshot when it cannot tail from its watermark.
+- **Per-request engine open.** Each replica query opens the immutable generation
+  and configures the SQLite authorizer; there is no connection pool yet.
+- **No automatic replica discovery.** Replicas are static provider config.
+- **Metrics** are per process; there is no cross-process lag dashboard yet.
+  Use `/internal/replica/status` and logs.
 
 ## Tests
 
@@ -175,6 +234,20 @@ cannot damage the primary.
 - corrupt segment fail-closed with the previous generation still readable;
 - writer takeover across epochs;
 - empty source, generation pruning, and status lag reporting.
+
+`vrt-sql/tests/replica_tests.rs`:
+
+- authenticated query serving and bookmark watermark;
+- newer commits visible after the next sync;
+- stale / invalid / `first-primary` session constraints return the routing code;
+- writes on `/query` and all of `/execute` / `/dump` are rejected;
+- unknown database, auth-required status endpoint.
+
+`vrt-provider/src/d1.rs` unit tests cover routing: query to a replica, execute
+and `first-primary` to the writer, stale/read-only/transport fallback, and
+no-retry for a replica SQL error. One end-to-end test runs the real writer and
+replica wire handlers over TCP and asserts read-your-writes: the new bookmark is
+served by the writer before the next sync and by the replica after it.
 
 Unit tests in `vrt-sql/src/follower.rs` cover config parsing/validation, URI
 escaping, and generation naming.

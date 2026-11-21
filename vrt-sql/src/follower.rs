@@ -94,6 +94,18 @@ pub struct FollowerServiceConfig {
     pub persistence: PersistenceConfig,
     /// Follower settings.
     pub follower: FollowerConfig,
+    /// Optional read-only D1 wire listener (exactly one of `unixDir` / `listenTcp`).
+    #[serde(default)]
+    pub unix_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub listen_tcp: Option<String>,
+    /// Service-to-service auth secret (0600). Required when a listener is configured.
+    #[serde(default)]
+    pub auth_secret_file: Option<PathBuf>,
+    /// Bookmark signing key (0600, the writer's key). Optional: without it the replica serves
+    /// reads but returns no bookmark and rejects bookmark constraints.
+    #[serde(default)]
+    pub bookmark_secret_file: Option<PathBuf>,
 }
 
 impl FollowerServiceConfig {
@@ -103,7 +115,21 @@ impl FollowerServiceConfig {
         if self.persistence.backend == "none" {
             return Err("follower requires persistence.backend fs|s3");
         }
-        self.follower.validate()
+        self.follower.validate()?;
+        match (self.unix_dir.is_some(), self.listen_tcp.is_some()) {
+            (true, true) => return Err("follower unixDir|listenTcp: at most one"),
+            (false, false) => return Ok(()),
+            _ => {}
+        }
+        if self.auth_secret_file.is_none() {
+            return Err("follower authSecretFile required when serving");
+        }
+        if let Some(addr) = &self.listen_tcp {
+            if addr.parse::<std::net::SocketAddr>().is_err() {
+                return Err("follower.listenTcp invalid");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -140,6 +166,16 @@ pub struct FollowerState {
     pub head_lsn: u64,
     /// Wall clock (unix ms) of the last successful sync.
     pub updated_at_ms: u64,
+}
+
+impl FollowerState {
+    /// Whether this applied point satisfies a `(epoch, lsn)` bookmark.
+    ///
+    /// Bookmarks are `(epoch, lsn)` ordered lexicographically (the epoch precedes every lsn of
+    /// the next epoch), so a replica at `(self.epoch, self.lsn)` can serve every earlier point.
+    pub fn servable(&self, epoch: u64, lsn: u64) -> bool {
+        (self.epoch, self.lsn) >= (epoch, lsn)
+    }
 }
 
 /// Live status (state + current manifest head).
@@ -860,7 +896,7 @@ fn unique_suffix() -> String {
     )
 }
 
-fn sqlite_uri_path(path: &Path) -> String {
+pub(crate) fn sqlite_uri_path(path: &Path) -> String {
     let s = path.to_string_lossy();
     let mut out = String::with_capacity(s.len() + 16);
     for ch in s.chars() {
@@ -951,6 +987,20 @@ databaseId = "abcdefghijklmnopqrstuvwxyz"
         assert_eq!(parsed.follower.poll_interval_ms, 250);
         assert!(parsed.validate().is_ok());
 
+        // A listener requires the service auth secret; both listener kinds at once are rejected.
+        let json_serving = r#"{
+            "dbRoot": "/tmp/replica",
+            "persistence": {"backend": "fs", "fs": {"root": "/tmp/persistence"}},
+            "follower": {"databaseId": "abcdefghijklmnopqrstuvwxyz"},
+            "listenTcp": "127.0.0.1:8091"
+        }"#;
+        let mut serving: FollowerServiceConfig = serde_json::from_str(json_serving).unwrap();
+        assert!(serving.validate().is_err());
+        serving.auth_secret_file = Some("/tmp/auth".into());
+        assert!(serving.validate().is_ok());
+        serving.unix_dir = Some("/tmp/replica.sock".into());
+        assert!(serving.validate().is_err());
+
         // `none` has no source to tail.
         let none_cfg = FollowerServiceConfig {
             db_root: "/tmp/replica".into(),
@@ -971,6 +1021,10 @@ databaseId = "abcdefghijklmnopqrstuvwxyz"
                 allow_same_device_durability: false,
             },
             follower: cfg().clone(),
+            unix_dir: None,
+            listen_tcp: None,
+            auth_secret_file: None,
+            bookmark_secret_file: None,
         };
         assert!(none_cfg.validate().is_err());
     }
