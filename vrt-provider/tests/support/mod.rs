@@ -110,6 +110,7 @@ pub fn worker(
         durable_object_classes: vec![],
         workflows: vec![],
         tail_consumers: vec![],
+        streaming_tail_consumers: vec![],
         quotas: quotas(),
     }
 }

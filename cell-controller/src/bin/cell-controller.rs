@@ -129,6 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `{"type":"unsafeEval"}` bindings (unsafe_eval) render ships
         // with this generation -- unconditionally on.
         unsafe_eval: true,
+        // `streamingTailConsumers` renders with this generation --
+        // unconditionally on (same reasoning).
+        streaming_tail_consumers: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

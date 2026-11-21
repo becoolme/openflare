@@ -1106,6 +1106,52 @@
      "compatibilityDate": "2025-01-01"
     }
    }
+  },
+  {
+   "name": "streaming_tail_consumers normalized",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\nstreaming_tail_consumers = [{service = \"tail-a\"}, {service = \"tail-b\"}]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "streamingTailConsumers": [
+      {
+       "service": "tail-a"
+      },
+      {
+       "service": "tail-b"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "streaming_tail_consumers unknown key fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\nstreaming_tail_consumers = [{service = \"t\", environment = \"prod\"}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "streaming_tail_consumers[0].environment"
+   }
+  },
+  {
+   "name": "streaming_tail_consumers missing service fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\nstreaming_tail_consumers = [{namespace = \"ns\"}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "streaming_tail_consumers[0].namespace"
+   }
   }
  ]
 }
