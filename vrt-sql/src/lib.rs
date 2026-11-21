@@ -9,6 +9,7 @@ pub mod bookmark;
 pub mod clock;
 pub mod do_snap;
 pub mod engine;
+pub mod follower;
 pub mod metrics;
 pub mod paths;
 pub mod persist;

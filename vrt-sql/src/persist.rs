@@ -279,7 +279,8 @@ fn manifest_key(kind: crate::paths::ResourceKind, id: &str) -> String {
 }
 
 /// lsn -> epoch key-space resolution (chain ascending).
-fn epoch_for_lsn(chain: &[EpochSpan], lsn: u64) -> Option<u64> {
+/// Epoch that owns `lsn` according to the manifest chain (None when no span covers it).
+pub fn epoch_for_lsn(chain: &[EpochSpan], lsn: u64) -> Option<u64> {
     let mut hit = None;
     for span in chain {
         if span.first_lsn <= lsn {
