@@ -601,7 +601,7 @@ impl Drop for GroupChild {
 /// group leader). Errors are swallowed by callers that proceed to the
 /// next escalation step anyway.
 pub fn signal_process_group(pid: u32, sig: libc::c_int) {
-// SAFETY: kill(2) with a negative pid signals the process group led by that pid; callers only pass groups they spawned and the result is handled.
+// SAFETY: kill(2) with a negative pid signals the process group led by that pid; callers only pass groups they spawned. The return value is deliberately ignored: escalation continues (or the group is already gone, ESRCH) regardless.
     unsafe {
         libc::kill(-(pid as i32), sig);
     }

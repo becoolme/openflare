@@ -465,7 +465,7 @@ pub fn bind_unix_private(path: &Path, mode: u32) -> io::Result<std::os::unix::ne
     // dir briefly exists world-writable before a chmod lands.
     let cstage = std::ffi::CString::new(stage.as_os_str().as_encoded_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path nul"))?;
-// SAFETY: the path is a valid NUL-terminated CString and mode 0o711 is a valid mode_t.
+// SAFETY: the path is a valid NUL-terminated CString and mode 0o700 is a valid mode_t.
     if unsafe { libc::mkdir(cstage.as_ptr(), 0o700) } != 0 {
         return Err(io::Error::last_os_error());
     }

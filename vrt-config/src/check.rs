@@ -157,7 +157,7 @@ fn admit_check(deadline: Instant) -> Result<CheckPermit, CheckFailure> {
 /// off unix.
 fn kill_check_child(child: &mut std::process::Child) {
     #[cfg(unix)]
-// SAFETY: kill(2) with a negative pid signals the process group led by that pid; callers only pass groups they spawned and the result is handled.
+// SAFETY: kill(2) with a negative pid signals the process group led by that pid; the child was spawned as a group leader. The return value is deliberately ignored (the group may already be gone); the direct `child.kill()` below is the fallback.
     unsafe {
         libc::kill(-(child.id() as i32), libc::SIGKILL);
     }
