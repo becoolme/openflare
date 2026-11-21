@@ -96,6 +96,11 @@ pub struct VersionRecord {
     /// and a rollback restores the earlier consumer set.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
+    /// Streaming tail consumers — version-scoped like `tail_consumers`
+    /// (CF treats `streaming_tail_consumers` as a deploy-time setting;
+    /// rollback restores the earlier set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// `[observability]` — version-scoped collection gates; a
     /// rollback restores the earlier gates with the version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -230,6 +235,7 @@ impl LocalState {
                 crons: pkg.crons.clone(),
                 queue_consumers: pkg.queue_consumers.clone(),
                 tail_consumers: pkg.tail_consumers.clone(),
+                streaming_tail_consumers: pkg.streaming_tail_consumers.clone(),
                 observability: pkg.observability.clone(),
                 version_metadata_binding: pkg.version_metadata_binding.clone(),
                 created_at_unix_ms: std::time::SystemTime::now()
@@ -366,6 +372,7 @@ impl LocalState {
                 crons: active.crons.clone(),
                 queue_consumers: active.queue_consumers.clone(),
                 tail_consumers: active.tail_consumers.clone(),
+                streaming_tail_consumers: active.streaming_tail_consumers.clone(),
                 observability: active.observability.clone(),
                 durable_object_classes: active.durable_object_classes.clone(),
                 workflows: active.workflows.clone(),

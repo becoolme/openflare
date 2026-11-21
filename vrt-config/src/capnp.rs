@@ -1355,6 +1355,30 @@ fn emit_tenant_worker(
             out.push_str(&format!("      tails = [{designators}],\n"));
         }
     }
+    // `streamingTails` designators: the worker's declared
+    // `streamingTailConsumers` — same same-tenant resolution rule as
+    // `tails`, but consumers get TailStream events via `tailStream()`
+    // instead of batched `tail()` calls.
+    if !worker.streaming_tail_consumers.is_empty() {
+        let mut names: Vec<String> = Vec::new();
+        for consumer in &worker.streaming_tail_consumers {
+            if !input
+                .tenant
+                .workers
+                .iter()
+                .any(|w| w.worker_id == consumer.worker_id)
+            {
+                return Err(ConfigError::Identifier("streamingTailConsumers.workerId"));
+            }
+            names.push(worker_service_name(&consumer.worker_id));
+        }
+        let designators = names
+            .iter()
+            .map(|n| format!("(name = {})", capnp_text(n)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("      streamingTails = [{designators}],\n"));
+    }
     out.push_str(&format!(
         "      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
         capnp_text(&input.params.egress.service),

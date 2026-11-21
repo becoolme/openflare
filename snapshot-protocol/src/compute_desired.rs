@@ -245,6 +245,16 @@ pub struct WorkerDesired {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail_consumers: Vec<TailConsumerDesired>,
 
+    /// Streaming Tail Workers (`streaming_tail_consumers`) — same
+    /// same-tenant resolution rule as `tail_consumers` but rendered to
+    /// workerd `streamingTails` designators: the consumer receives
+    /// TailStream events via `tailStream()` rather than batched
+    /// `tail()` calls. Skipped when empty so snapshots stay
+    /// byte-identical (old cells reject the field via
+    /// `deny_unknown_fields` — fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_tail_consumers: Vec<TailConsumerDesired>,
+
     /// Observability (`[observability]`) — Worker Logs gates +
     /// head sampling applied by the platform `vrt-tail` collector.
     /// Skipped when absent so snapshots without the table stay
@@ -1196,7 +1206,11 @@ impl ComputeDesired {
                 // never reach a foreign tenant's worker. Tail edges are
                 // observability-only: they do NOT join the service-call
                 // cycle check below (a consumer never invokes back).
-                for consumer in &worker.tail_consumers {
+                for consumer in worker
+                    .tail_consumers
+                    .iter()
+                    .chain(&worker.streaming_tail_consumers)
+                {
                     if !valid_identifier(&consumer.worker_id, MAX_IDENTIFIER_LEN)
                         || !tenant_worker_ids.contains(&consumer.worker_id)
                     {
@@ -2402,6 +2416,24 @@ mod tests {
                 "tail-missing-target",
                 Box::new(|v| {
                     v["tenants"][0]["workers"][0]["tailConsumers"] = json!([{"workerId": "w-nope"}])
+                }),
+                "DESIRED_TAIL_TARGET_SCOPE",
+            ),
+            // `streamingTailConsumers` — identical same-tenant rule
+            // (`streamingTails` is the same trust boundary as `tails`).
+            (
+                "streaming-tail-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}])
+                }),
+                "",
+            ),
+            (
+                "streaming-tail-missing-target",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-nope"}])
                 }),
                 "DESIRED_TAIL_TARGET_SCOPE",
             ),

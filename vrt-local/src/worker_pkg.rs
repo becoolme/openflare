@@ -100,6 +100,12 @@ pub struct WorkerToml {
     /// (same rule as `[bindings.service]`).
     #[serde(default)]
     pub(crate) tail_consumers: Vec<TailConsumerToml>,
+    /// `streamingTailConsumers` — same `{service}`-by-name shape as
+    /// `tailConsumers`, but the consumer receives TailStream events
+    /// via `tailStream()` instead of batched `tail()` calls (CF
+    /// `streaming_tail_consumers`; workerd `streamingTails`).
+    #[serde(default)]
+    pub(crate) streaming_tail_consumers: Vec<TailConsumerToml>,
     /// `versionMetadata` — CF `[version_metadata]`: `{binding}` names
     /// the env binding that exposes `{id, tag, timestamp}` of the
     /// serving version. Rendered as a `json` binding at to_desired
@@ -482,6 +488,9 @@ pub struct PackedWorker {
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
     /// Desired tail consumers (consumer workerIds already resolved).
     pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
+    /// Desired streaming tail consumers — same resolution rule as
+    /// `tail_consumers`, rendered to `streamingTails` instead of `tails`.
+    pub streaming_tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// `version_metadata` binding name — `to_desired` synthesizes the
     /// `json` binding with THIS version's id/timestamp.
     pub version_metadata_binding: Option<String>,
@@ -1122,6 +1131,15 @@ pub fn assemble(
                 .ok_or(LocalError::Worker("tail consumer target"))?,
         });
     }
+    // `streamingTailConsumers` — same name→id rule as `tailConsumers`;
+    // an unresolvable name fails closed.
+    let mut streaming_tail_consumers = Vec::with_capacity(meta.streaming_tail_consumers.len());
+    for c in &meta.streaming_tail_consumers {
+        streaming_tail_consumers.push(snapshot_protocol::compute_desired::TailConsumerDesired {
+            worker_id: resolve_worker(&c.service)
+                .ok_or(LocalError::Worker("streaming tail consumer target"))?,
+        });
+    }
 
     // Deterministic worker-id material: hash the worker name so a
     // re-deployed directory keeps its identity without stored state.
@@ -1358,6 +1376,7 @@ pub fn assemble(
         crons: meta.crons,
         queue_consumers,
         tail_consumers,
+        streaming_tail_consumers,
         version_metadata_binding: meta.version_metadata.map(|v| v.binding),
         observability: meta.observability,
         durable_object_classes,

@@ -3,11 +3,13 @@
 `tail_consumers` attaches a worker's trace events to sibling workers in the
 same tenant — after the producer's invocation finishes, workerd replays a
 summary of what happened (outcome, exceptions, logs, event metadata) to each
-consumer's `tail` handler. Consumers observe; they never affect the producer's
-response.
+consumer's `tail` handler. `streaming_tail_consumers` does the same for
+consumers exporting a `tailStream` handler, which receives a live event
+stream instead of post-invocation batches. Consumers observe; they never
+affect the producer's response.
 
-**Status: Partial** — same-tenant consumer resolution, `tail` entrypoint
-delivery and rollback-safe versioning work; `tailStream` and cross-account
+**Status: Partial** — same-tenant consumer resolution, `tail`/`tailStream`
+entrypoint delivery and rollback-safe versioning work; cross-account
 consumers are not supported.
 
 ## Wrangler configuration
@@ -17,6 +19,10 @@ tail_consumers = [
   { service = "log-sink" },
   { service = "log-sink-2" },
 ]
+
+streaming_tail_consumers = [
+  { service = "live-sink" },
+]
 ```
 
 `service` is the **name of another worker in the same tenant** (or the
@@ -24,7 +30,8 @@ producer itself). It is resolved to a concrete worker at pack/deploy time —
 the wire carries a worker id, never a raw name, so a renamed or deleted
 target can never silently receive events.
 
-The consumer worker exports a `tail` handler:
+The `tail_consumers` consumer exports a `tail` handler; a
+`streaming_tail_consumers` consumer exports `tailStream`:
 
 ```js
 export default {
@@ -32,6 +39,17 @@ export default {
     for (const ev of events) {
       console.log(ev.outcome, ev.exceptions?.length ?? 0);
     }
+  },
+};
+```
+
+```js
+export default {
+  tailStream(event, env, ctx) {
+    // `event` is the onset event for this invocation; return a handler
+    // (function or object) that receives the session's remaining
+    // TailStream events as they happen.
+    return {};
   },
 };
 ```
@@ -44,15 +62,20 @@ export default {
   set is versioned state, so rollback restores the consumers that version
   had, matching Cloudflare's "consumer list is a property of the version"
   semantics.
-- `vrt-config` emits every consumer as a `tails = [(name = "<service>")]`
-  designator on the producer's workerd service — merged into the same list
-  as the platform's internal log tail, so user consumers and log collection
-  coexist.
-- workerd then delivers `TailEvent` batches to the consumer's `tail`
-  entrypoint itself; the platform only routes and stores.
-- Deployments carrying consumers require the `tailConsumers` cell
-  capability; a cell that does not claim it rejects the assignment at
-  admission rather than half-rendering.
+- `vrt-config` emits every `tail_consumers` entry as a
+  `tails = [(name = "<service>")]` designator on the producer's workerd
+  service — merged into the same list as the platform's internal log
+  tail, so user consumers and log collection coexist — and every
+  `streaming_tail_consumers` entry as a `streamingTails` designator
+  (a separate list; upstream marks the channel for future rework but it
+  is wired and serving TailStream events today).
+- workerd then delivers `TailEvent` batches to `tail` consumers and
+  TailStream events to `tailStream` consumers itself; the platform only
+  routes and stores.
+- Deployments carrying consumers require the `tailConsumers` /
+  `streamingTailConsumers` cell capability respectively; a cell that
+  does not claim it rejects the assignment at admission rather than
+  half-rendering.
 
 ## Backends
 
@@ -76,8 +99,6 @@ canonical JSON accepts safe integers only.
 - Consumers must live in the **same tenant**; Cloudflare's cross-account
   tails (shared `tail_consumers` across accounts) are rejected as
   unresolvable names.
-- `tailStream` (`streaming_tail_consumers`) is not implemented — upstream
-  workerd marks the channel for deprecation, so only `tail` is exposed.
 - Delivery is best-effort like Cloudflare: workerd may drop events under
   backpressure and consumer failures are isolated from the producer —
   both semantics come from the same upstream code path.
@@ -87,25 +108,30 @@ canonical JSON accepts safe integers only.
 
 ## Unsupported keys and error shape
 
-- Each `tail_consumers[]` entry accepts only `service` — anything else →
-  `VRT_CONFIG_UNSUPPORTED_FIELD` (`tail_consumers[0].<key>`).
+- Each `tail_consumers[]` / `streaming_tail_consumers[]` entry accepts
+  only `service` — anything else → `VRT_CONFIG_UNSUPPORTED_FIELD`
+  (`tail_consumers[0].<key>` / `streaming_tail_consumers[0].<key>`).
 - A missing/non-string `service` → `VRT_CONFIG_INVALID`
   (`tail_consumers[0].service`); a `service` name that resolves to no
-  worker in the tenant fails the pack (`tail consumer target`), and at
-  desired-state validation a consumer id that is unknown or belongs to a
-  different tenant → `DESIRED_TAIL_TARGET_SCOPE`.
-- A cell not claiming the `tailConsumers` capability is never assigned a
-  worker that needs it — the deploy is rejected at admission, and a
-  rollback whose target version still needs it re-validates the same bit.
+  worker in the tenant fails the pack (`tail consumer target` /
+  `streaming tail consumer target`), and at desired-state validation a
+  consumer id that is unknown or belongs to a different tenant →
+  `DESIRED_TAIL_TARGET_SCOPE`.
+- A cell not claiming the `tailConsumers` / `streamingTailConsumers`
+  capability is never assigned a worker that needs it — the deploy is
+  rejected at admission, and a rollback whose target version still needs
+  it re-validates the same bit.
 - In dry-run rendering a worker with an unresolvable consumer is skipped
   individually (poisoned-worker isolation) while siblings still render.
 
 ## Examples and tests
 
-- `vrt-config/tests/tail_emit.rs` — `tails` designator emit, merge with
-  the platform log tail, unresolvable-consumer worker isolation.
-- `vrt-local/src/project_cfg.rs` — `tail_consumers` parse vectors
-  (unknown-key fail-closed, non-string `service`).
+- `vrt-config/tests/tail_emit.rs` — `tails`/`streamingTails` designator
+  emit, merge with the platform log tail, unresolvable-consumer worker
+  isolation.
+- `vrt-local/src/project_cfg.rs` — `tail_consumers` /
+  `streaming_tail_consumers` parse vectors (unknown-key fail-closed,
+  non-string `service`).
 - `snapshot-protocol/src/compute_desired.rs` — same-tenant existence,
   duplicate-consumer and empty-list vectors.
 - `shared/vrt-project-config-vectors.json` — cross-repo golden vectors
