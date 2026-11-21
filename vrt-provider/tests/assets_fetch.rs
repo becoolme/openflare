@@ -899,3 +899,115 @@ async fn headers_apply_to_assets_and_detach_replace() {
     assert!(names.contains("content-security-policy"), "{names}");
     assert!(names.contains("cache-control"), "{names}");
 }
+
+/// Cloudflare `asset-worker/tests/handler.test.ts` — "Custom headers are
+/// applied even to redirect responses": the html-handling 307 carries the
+/// `Location` and the matching `_headers` value together.
+#[tokio::test]
+async fn headers_apply_to_html_handling_redirects() {
+    let e = env(
+        &[
+            ("/foo.html", b"foo"),
+            (
+                "/_headers",
+                b"/*\n  X-Custom-Foo-HTML-Header: Custom-Foo-HTML-Value\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(res.headers().get("location").unwrap(), "/foo");
+    assert_eq!(
+        res.headers().get("x-custom-foo-html-header").unwrap(),
+        "Custom-Foo-HTML-Value"
+    );
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-custom-foo-html-header"), "{names}");
+}
+
+/// Cloudflare `asset-worker/tests/handler.test.ts` — "Custom headers are
+/// applied even to custom redirect responses": an authored `_redirects`
+/// 301 keeps its `Location` and still gets the `_headers` set/detach
+/// pass. The forbidden-name allowlist keeps applying.
+#[tokio::test]
+async fn headers_apply_to_custom_redirects() {
+    let e = env(
+        &[
+            (
+                "/_headers",
+                b"/*\n  X-Custom-Foo-Header: Custom-Foo-Value\n  X-Stale: set\n  X-Open-Compute-Worker-Id: forged\n/foo\n  ! X-Stale\n",
+            ),
+            ("/_redirects", b"/foo /bar 301\n"),
+        ],
+        "none",
+        TENANT,
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/foo", &[]).await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(res.headers().get("location").unwrap(), "/bar");
+    assert_eq!(
+        res.headers().get("x-custom-foo-header").unwrap(),
+        "Custom-Foo-Value"
+    );
+    // The later rule detaches the value the first rule set.
+    assert!(res.headers().get("x-stale").is_none());
+    // The forbidden `x-open-compute-*` surface is still unreachable.
+    assert!(res.headers().get("x-open-compute-worker-id").is_none());
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-custom-foo-header"), "{names}");
+    // Detached names are advertised too, so the facade drops the value it
+    // would otherwise have copied from the representation whitelist.
+    assert!(names.contains("x-stale"), "{names}");
+}
+
+/// Cloudflare `asset-worker/tests/handler.test.ts` — "Custom headers are
+/// applied even to not modified responses": a 304 keeps the `ETag` and
+/// the matching `_headers` value.
+#[tokio::test]
+async fn headers_apply_to_not_modified() {
+    let e = env(
+        &[
+            ("/a.txt", b"abc"),
+            (
+                "/_headers",
+                b"/*\n  X-Custom-Foo-Header: Custom-Foo-Value\n",
+            ),
+        ],
+        "none",
+        TENANT,
+    );
+    let etag = format!("\"{}\"", hex64(b"abc"));
+    let res = fetch(
+        &e.app,
+        &e.digest,
+        "GET",
+        "https://x/a.txt",
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(res.headers().get("etag").unwrap(), etag.as_str());
+    assert_eq!(
+        res.headers().get("x-custom-foo-header").unwrap(),
+        "Custom-Foo-Value"
+    );
+    let names = res
+        .headers()
+        .get("x-open-compute-asset-header-names")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(names.contains("x-custom-foo-header"), "{names}");
+}

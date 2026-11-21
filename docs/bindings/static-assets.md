@@ -91,7 +91,10 @@ that does not match the bytes is never committed.
   `200` proxying to a relative path. Query-parameter/country/cookie
   conditions, domain-level rules and rewrites other than 200 are not
   supported. `_headers` is supported: rules apply in file order to
-  asset responses (not Worker responses), multiple matches accumulate,
+  asset responses (not Worker responses) — including `304`
+  revalidations and html-handling / `_redirects` `3xx` redirects, which
+  keep their `Location` and still get the configured headers, matching
+  Cloudflare's `attachCustomHeaders` tail. Multiple matches accumulate,
   `! Name` detaches earlier values, `:splat`/`:name` substitute in
   values (in one pass, `:name` may be combined with a trailing `*`),
   and duplicates are comma-joined. `_headers`/`_redirects` are

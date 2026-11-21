@@ -1,7 +1,10 @@
 //! Cloudflare `_headers` for static assets (documented subset).
 //!
 //! The file lives at the assets root, is never served, and its rules are
-//! applied to **static asset responses** in file order:
+//! applied to the response of every static-asset request in file order —
+//! served bytes, `304` revalidations, and html-handling / `_redirects`
+//! `3xx` redirects alike (Cloudflare `attachCustomHeaders` is the single
+//! return of the asset handler):
 //!
 //! - a rule matches a request path (`*` splat, `:name` placeholders,
 //!   absolute `https://` URLs are reduced to their path);
