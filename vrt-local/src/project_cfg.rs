@@ -78,7 +78,6 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "secrets",
     "secrets_store_secrets",
     "worker_loaders",
-    "unsafe",
 ];
 /// Mirrors @wdl-dev/cli TOP_LEVEL_ONLY_ENV_KEYS.
 const TOP_LEVEL_ONLY_ENV_KEYS: &[&str] = &["name", "keep_vars", "send_metrics"];
@@ -455,6 +454,37 @@ pub fn resolve_env(
         if k == "__proto__" {
             continue;
         }
+        // `observability` is an inherited table, not a replace-only
+        // list: an env block that only tunes e.g.
+        // `logs.head_sampling_rate` must not silently reset the
+        // top-level `enabled = false` back to the default `true`
+        // (fail-open on a privacy/collection gate). Deep-merge the
+        // table (and its `logs` sub-table) so the env value overrides
+        // exactly the keys it declares.
+        if k == "observability" {
+            if let (Some(base), Some(over)) =
+                (resolved.get(k).and_then(Value::as_object), v.as_object())
+            {
+                let mut merged = base.clone();
+                for (ok, ov) in over {
+                    if ok == "logs" {
+                        if let (Some(b), Some(o)) =
+                            (merged.get(ok).and_then(Value::as_object), ov.as_object())
+                        {
+                            let mut logs = b.clone();
+                            for (lk, lv) in o {
+                                logs.insert(lk.clone(), lv.clone());
+                            }
+                            merged.insert(ok.clone(), Value::Object(logs));
+                            continue;
+                        }
+                    }
+                    merged.insert(ok.clone(), ov.clone());
+                }
+                resolved.insert(k.clone(), Value::Object(merged));
+                continue;
+            }
+        }
         resolved.insert(k.clone(), v.clone());
     }
     Ok(Value::Object(resolved))
@@ -480,6 +510,24 @@ fn opt_u64(v: Option<&Value>, field: &str) -> Result<Option<u64>, ProjectConfigE
         Some(v) => match v.as_u64() {
             Some(n) => Ok(Some(n)),
             None => Err(invalid(field, "must be a non-negative integer")),
+        },
+    }
+}
+fn opt_bool(v: Option<&Value>, field: &str) -> Result<Option<bool>, ProjectConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| invalid(field, "must be a boolean")),
+    }
+}
+fn opt_rate(v: Option<&Value>, field: &str) -> Result<Option<f64>, ProjectConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_f64().filter(|f| f.is_finite()) {
+            Some(f) => Ok(Some(f)),
+            None => Err(invalid(field, "must be a finite number")),
         },
     }
 }
@@ -653,9 +701,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         match k.as_str() {
                             "binding" | "id" | "database_tenant" => {}
                             "localConnectionString" | "remote" => {}
-                            _ => {
-                                return Err(unsupported(&format!("hyperdrive[{i}].{k}"), None))
-                            }
+                            _ => return Err(unsupported(&format!("hyperdrive[{i}].{k}"), None)),
                         }
                     }
                     // Type-check only — the value is never used.
@@ -673,7 +719,10 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                                 .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
                                 .unwrap_or(false)
                             && tenant.bytes().all(|c| {
-                                c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                                c.is_ascii_lowercase()
+                                    || c.is_ascii_digit()
+                                    || c == b'-'
+                                    || c == b'_'
                             });
                         if !ok {
                             return Err(invalid(
@@ -716,7 +765,13 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         &format!("ratelimits[{i}].name"),
                     )?;
                     let ns = match e.get("namespace_id").and_then(|v| v.as_str()) {
-                        Some(s) if !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_digit()) => s,
+                        Some(s)
+                            if !s.is_empty()
+                                && s.len() <= 32
+                                && s.bytes().all(|c| c.is_ascii_digit()) =>
+                        {
+                            s
+                        }
                         _ => {
                             return Err(invalid(
                                 &format!("ratelimits[{i}].namespace_id"),
@@ -724,15 +779,17 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                             ))
                         }
                     };
-                    let simple = e
-                        .get("simple")
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| invalid(&format!("ratelimits[{i}].simple"), "must be a table"))?;
+                    let simple = e.get("simple").and_then(|v| v.as_object()).ok_or_else(|| {
+                        invalid(&format!("ratelimits[{i}].simple"), "must be a table")
+                    })?;
                     for k in simple.keys() {
                         match k.as_str() {
                             "limit" | "period" => {}
                             _ => {
-                                return Err(unsupported(&format!("ratelimits[{i}].simple.{k}"), None))
+                                return Err(unsupported(
+                                    &format!("ratelimits[{i}].simple.{k}"),
+                                    None,
+                                ))
                             }
                         }
                     }
@@ -878,10 +935,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 for (i, e) in table_list(value, "worker_loaders")?.iter().enumerate() {
                     for k in e.keys() {
                         if k != "binding" {
-                            return Err(unsupported(
-                                &format!("worker_loaders[{i}].{k}"),
-                                None,
-                            ));
+                            return Err(unsupported(&format!("worker_loaders[{i}].{k}"), None));
                         }
                     }
                     let mut b = Map::new();
@@ -895,6 +949,94 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     );
                     bindings.push(Value::Object(b));
                 }
+            }
+            "observability" => {
+                // CF `[observability]` — Worker Logs gates + head
+                // sampling, enforced by the platform `vrt-tail`
+                // collector per worker. `enabled`/`logs.enabled`
+                // false => the cell renders NO collector (nothing is
+                // collected); `logs.head_sampling_rate` (or the
+                // deprecated top-level alias) keeps that fraction of
+                // INVOCATIONS whole — a dropped invocation keeps none
+                // of its records; `logs.invocation_logs` gates just
+                // the outcome record. `traces`/`persist`/`destinations`
+                // have no counterpart here and fail closed.
+                let t = value
+                    .as_object()
+                    .ok_or_else(|| invalid("observability", "must be a table"))?;
+                let mut enabled = None;
+                let mut rate_top = None;
+                let mut rate_logs = None;
+                let mut logs_enabled = None;
+                let mut invocation_logs = None;
+                for (k, v) in t {
+                    match k.as_str() {
+                        "enabled" => enabled = opt_bool(Some(v), "observability.enabled")?,
+                        "head_sampling_rate" => {
+                            rate_top = opt_rate(Some(v), "observability.head_sampling_rate")?
+                        }
+                        "logs" => {
+                            let lt = v
+                                .as_object()
+                                .ok_or_else(|| invalid("observability.logs", "must be a table"))?;
+                            for (lk, lv) in lt {
+                                match lk.as_str() {
+                                    "enabled" => {
+                                        logs_enabled =
+                                            opt_bool(Some(lv), "observability.logs.enabled")?
+                                    }
+                                    "head_sampling_rate" => {
+                                        rate_logs = opt_rate(
+                                            Some(lv),
+                                            "observability.logs.head_sampling_rate",
+                                        )?
+                                    }
+                                    "invocation_logs" => {
+                                        invocation_logs = opt_bool(
+                                            Some(lv),
+                                            "observability.logs.invocation_logs",
+                                        )?
+                                    }
+                                    _ => {
+                                        return Err(unsupported(
+                                            &format!("observability.logs.{lk}"),
+                                            None,
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                        _ => return Err(unsupported(&format!("observability.{k}"), None)),
+                    }
+                }
+                // When both the modern `logs.head_sampling_rate` and the
+                // deprecated top-level alias are present, `logs.*` wins
+                // (CF treats it as authoritative) — refusing the pair
+                // would reject a valid, unambiguous CF config. The
+                // alias is only a fallback for configs that predate the
+                // nested table.
+                let rate = rate_logs.or(rate_top).unwrap_or(1.0);
+                if !(0.0..=1.0).contains(&rate) {
+                    return Err(invalid(
+                        "observability.head_sampling_rate",
+                        "must be in [0,1]",
+                    ));
+                }
+                // PPM integer — the signed wire's canonical JSON is
+                // safe-integer-only (deterministic across Rust/TS).
+                let ppm = (rate * 1_000_000.0).round() as u64;
+                let mut o = Map::new();
+                o.insert("enabled".into(), Value::from(enabled.unwrap_or(true)));
+                o.insert(
+                    "logsEnabled".into(),
+                    Value::from(logs_enabled.unwrap_or(true)),
+                );
+                o.insert(
+                    "invocationLogs".into(),
+                    Value::from(invocation_logs.unwrap_or(true)),
+                );
+                o.insert("headSamplingRatePpm".into(), Value::from(ppm));
+                out.insert("observability".into(), Value::Object(o));
             }
             "unsafe" => {
                 // CF `[unsafe]` — raw-binding escape hatch
@@ -919,9 +1061,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                             Some("only [[unsafe.bindings]] is supported"),
                         ));
                     }
-                    for (i, et) in
-                        table_list(v, "unsafe.bindings")?.iter().enumerate()
-                    {
+                    for (i, et) in table_list(v, "unsafe.bindings")?.iter().enumerate() {
                         for k in et.keys() {
                             match k.as_str() {
                                 "name" | "type" => {}
@@ -1812,6 +1952,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("tailConsumers") {
         wire.insert("tailConsumers".into(), v.clone());
     }
+    if let Some(v) = obj.get("observability") {
+        wire.insert("observability".into(), v.clone());
+    }
 
     // W1-r1: STRUCTURAL anti-drop — every normalized top-level key
     // must reach the wire (or be an explicitly documented
@@ -1829,6 +1972,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "routeHostnames",
         "crons",
         "queueConsumers",
+        "observability",
         "durableObjectBindings",
         "durableObjectMigrations",
         "workflows",
@@ -2041,8 +2185,7 @@ mod tests {
 
     fn vectors_path() -> PathBuf {
         // vrt-local → workers-runtime → server → repo root
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../shared/vrt-project-config-vectors.json")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shared/vrt-project-config-vectors.json")
     }
 
     #[test]
@@ -2300,7 +2443,10 @@ mod tests {
             "[service]\nA = \"t\"\nB = { service = \"t\", entrypoint = \"Greeter\" }\n",
         )
         .unwrap();
-        assert_eq!(b.service.get("A"), Some(&ServiceTargetToml::Worker("t".into())));
+        assert_eq!(
+            b.service.get("A"),
+            Some(&ServiceTargetToml::Worker("t".into()))
+        );
         assert_eq!(b.service.get("B").unwrap().entrypoint(), Some("Greeter"));
         // Unknown keys inside the table fail closed.
         assert!(toml::from_str::<BindingsToml>(
@@ -2316,9 +2462,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("wrangler.toml"),
-            format!(
-                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{extra}"
-            ),
+            format!("name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{extra}"),
         )
         .unwrap();
         dir
@@ -2339,7 +2483,10 @@ mod tests {
         // Unknown field under the array table.
         let dir = wrangler_loader_body("[[worker_loaders]]\nbinding=\"L\"\nid=\"x\"\n");
         let err = load_worker_meta(dir.path()).expect_err("unknown key must fail");
-        assert!(format!("{err:?}").contains("worker_loaders[0].id"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("worker_loaders[0].id"),
+            "{err:?}"
+        );
         // Missing binding.
         let dir = wrangler_loader_body("[[worker_loaders]]\n");
         assert!(load_worker_meta(dir.path()).is_err());
@@ -2385,9 +2532,8 @@ mod tests {
         let dir = wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\nname=\"E\"\n");
         assert!(load_worker_meta(dir.path()).is_err());
         // Non-string name.
-        let dir = wrangler_loader_body(
-            "[unsafe]\n[[unsafe.bindings]]\nname=1\ntype=\"unsafe_eval\"\n",
-        );
+        let dir =
+            wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\nname=1\ntype=\"unsafe_eval\"\n");
         assert!(load_worker_meta(dir.path()).is_err());
         // `unsafe` not a table.
         let dir = wrangler_loader_body("unsafe=\"x\"\n");
@@ -2395,6 +2541,82 @@ mod tests {
         // `unsafe.bindings` not an array of tables.
         let dir = wrangler_loader_body("[unsafe]\nbindings=\"x\"\n");
         assert!(load_worker_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn observability_into_pack_shape() {
+        let dir = wrangler_loader_body(
+            "[observability]\nenabled=true\nhead_sampling_rate=0.3\n[observability.logs]\ninvocation_logs=false\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.expect("observability parsed");
+        assert!(obs.enabled);
+        assert!(obs.logs_enabled);
+        assert!(!obs.invocation_logs);
+        assert_eq!(obs.head_sampling_rate_ppm, 300_000);
+        // `logs.head_sampling_rate` is the modern slot; folded the same.
+        let dir =
+            wrangler_loader_body("[observability.logs]\nhead_sampling_rate=0.5\nenabled=false\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.unwrap();
+        assert_eq!(obs.head_sampling_rate_ppm, 500_000);
+        assert!(!obs.logs_enabled);
+    }
+
+    #[test]
+    fn observability_defaults_and_fail_closed() {
+        // An empty table folds to CF defaults: all gates on, rate 1.
+        let dir = wrangler_loader_body("[observability]\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.unwrap();
+        assert_eq!(obs.head_sampling_rate_ppm, 1_000_000);
+        assert!(obs.enabled && obs.logs_enabled && obs.invocation_logs);
+        // Deprecated alias AND `logs.head_sampling_rate` together:
+        // CF treats `logs.*` as authoritative, so the nested value wins
+        // instead of rejecting an otherwise valid config.
+        let dir = wrangler_loader_body(
+            "[observability]\nhead_sampling_rate=0.5\n[observability.logs]\nhead_sampling_rate=0.25\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.observability.unwrap().head_sampling_rate_ppm, 250_000);
+        // A named env that only tunes sampling must not reset inherited
+        // gates to their defaults (top-level `enabled = false` is a
+        // privacy gate; losing it here is fail-open).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"w","main":"m.js","compatibility_date":"2025-01-01",
+               "observability":{"enabled":false,"logs":{"invocation_logs":false}},
+               "env":{"production":{"observability":{"head_sampling_rate":0.25}}}}"#,
+        )
+        .unwrap();
+        let (meta, _) = load_worker_meta_for_env(dir.path(), Some("production")).unwrap();
+        let obs = meta.observability.expect("env observability parsed");
+        assert!(!obs.enabled, "inherited enabled=false must survive");
+        assert!(!obs.invocation_logs, "inherited logs gate must survive");
+        assert_eq!(obs.head_sampling_rate_ppm, 250_000);
+        // Rate bounds.
+        for toml in [
+            "[observability.logs]\nhead_sampling_rate=1.5\n",
+            "[observability]\nhead_sampling_rate=-0.1\n",
+            "[observability]\nhead_sampling_rate=\"half\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+        // No counterpart in this pipeline — every one fails closed.
+        for toml in [
+            "[observability.traces]\nenabled=true\n",
+            "[observability.logs]\npersist=true\n",
+            "[observability.logs]\ndestinations=[\"x\"]\n",
+            "[observability]\ninvocation_logs=false\n",
+            "[observability]\nenabled=\"yes\"\n",
+            "observability=\"x\"\n",
+            "[observability]\nlogs=\"x\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
     }
 
     /// wrangler `[limits]` → internal `quotas` — the CF surface maps onto
