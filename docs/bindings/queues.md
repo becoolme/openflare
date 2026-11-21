@@ -33,8 +33,11 @@ From `examples/standalone-queue/wrangler.jsonc`:
   the worker's `queue(batch)` handler via `Fetcher.queue()`.
 - Settlement mirrors Cloudflare's per-message precedence: an explicit
   `ack()` remains acknowledged when a later message fails or the handler
-  returns an error. Otherwise non-`ok` outcomes or `retryBatch` retry the
-  whole batch; `explicitRetries` and
+  returns an error. `ackAll()` has the same precedence at batch scope --
+  the implicit retry of a failed outcome does not resurrect an
+  acknowledged batch, while `retry()`/`retryMessages` marks recorded
+  before it still retry. Otherwise non-`ok` outcomes or `retryBatch`
+  retry the whole batch; `explicitRetries` and
   `retryMessages` retry individual messages (message delay > batch delay
   > consumer `retry_delay`); messages that exhaust `max_retries + 1`
   deliveries move to the dead-letter queue or drop with an audit record.
