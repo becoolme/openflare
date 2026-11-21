@@ -115,7 +115,7 @@ These are not tied to one binding.
   canonical Parquet under `<work>/ae/out/`. Full-fidelity storage (no
   sampling/`_sample_interval`); query via DuckDB or ClickHouse
   `s3(...,'Parquet')` — see [Analytics Engine](bindings/analytics-engine.md).
-- **No D1 migrations runner** — `migrations_dir` is an unsupported key.
+- **No standalone D1 migrations runner** — `migrations_dir`/`migrations_table` are accepted-and-ignored (CF tooling pointers; `wrangler deploy`/`dev` never applies migrations). The platform control plane applies `*.sql` sets via the MIGRATIONS_APPLY cell op (cf `wrangler d1 migrations apply`); `migrations_pattern` (custom glob discovery) is unsupported.
 - **Routes**: only plain hostnames and `<fqdn>/*` patterns; no zone
   management, no `custom_domain`.
 

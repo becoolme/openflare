@@ -608,11 +608,20 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         match k.as_str() {
                             // database_id is a USER-side identifier only;
                             // the server mints the real databaseId.
+                            // migrations_dir / migrations_table are CF
+                            // tooling pointers consumed by `wrangler d1
+                            // migrations` — wrangler deploy/dev never
+                            // applies migrations, so they have no runtime
+                            // effect and are accepted-and-ignored (the
+                            // platform control plane applies them via the
+                            // MIGRATIONS_APPLY op path).
                             "binding"
                             | "database_name"
                             | "database_id"
                             | "preview_database_id"
-                            | "remote" => {}
+                            | "remote"
+                            | "migrations_dir"
+                            | "migrations_table" => {}
                             _ => return Err(unsupported(&format!("d1_databases[{i}].{k}"), None)),
                         }
                     }

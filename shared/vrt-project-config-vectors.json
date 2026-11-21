@@ -167,6 +167,46 @@
    }
   },
   {
+   "name": "d1 migrations_dir is a tooling pointer (carried by CP, ignored standalone)",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[d1_databases]]\nbinding = \"DB\"\ndatabase_name = \"main-db\"\nmigrations_dir = \"migrations\"\nmigrations_table = \"custom_migs\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "databaseName": "main-db",
+       "migrationsDir": "migrations",
+       "name": "DB",
+       "type": "d1"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   },
+   "rustExpect": {
+    "ok": true,
+    "config": {
+     "bindings": [
+      {
+       "databaseName": "main-db",
+       "name": "DB",
+       "type": "d1"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
    "name": "queues producers map to queue bindings",
    "files": {
     "wrangler.json": "{ \"name\": \"svc\", \"main\": \"src/index.ts\", \"compatibility_date\": \"2025-01-01\", \"queues\": { \"producers\": [{ \"binding\": \"Q\", \"queue\": \"q1\" }] } }\n"

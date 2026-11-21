@@ -60,7 +60,7 @@ environment blocks.
 | `compatibility_flags` | supported — array of strings | `project_cfg.rs:552` |
 | `vars` | supported — strings → `text` bindings; non-strings (number/bool/object/array) → `json` bindings with the real JS value (CF semantics) | `project_cfg.rs:569` |
 | `kv_namespaces` | supported — see [KV](bindings/kv.md); per-entry keys `binding`, `id`, `preview_id`, `remote` | `project_cfg.rs:578` |
-| `d1_databases` | supported — see [D1](bindings/d1.md); per-entry keys `binding`, `database_name`, `database_id`, `preview_database_id`, `remote` | `project_cfg.rs:601` |
+| `d1_databases` | supported — see [D1](bindings/d1.md); per-entry keys `binding`, `database_name`, `database_id`, `preview_database_id`, `remote`; **`migrations_dir` / `migrations_table` accepted-and-ignored** (CF tooling pointers consumed by `wrangler d1 migrations` — wrangler deploy/dev never applies migrations; the platform control plane applies them via the MIGRATIONS_APPLY op path); `migrations_pattern` rejected | `project_cfg.rs:601` |
 | `hyperdrive` | supported — see [Hyperdrive](bindings/hyperdrive.md); per-entry keys `binding`, `id`, `database_tenant`, `localConnectionString`, `remote` | `project_cfg.rs:639` |
 | `ratelimits` | supported — see [Rate limiting](bindings/rate-limiting.md); `name` + `namespace_id` + `simple.{limit,period}` | `project_cfg.rs:693` |
 | `r2_buckets` | supported — see [R2](bindings/r2.md); per-entry keys `binding`, `bucket_name` | `project_cfg.rs:761` |
@@ -120,7 +120,7 @@ That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
 `secrets_store_secrets`,
-`unsafe`, `migrations_dir`, `observability`, `streaming_tail_consumers`,
+`unsafe`, `migrations_pattern`, `observability`, `streaming_tail_consumers`,
 `logpush`, `site`, `preview_id` (top level),
 `node_compat`, `route`-shaped `custom_domain` fields inside routes
 objects (`zone_name`, `zone_id`, `custom_domain` on `routes[]` entries
