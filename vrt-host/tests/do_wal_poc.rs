@@ -278,16 +278,7 @@ fn render_do(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf) {
     );
     let cfg = dir.join("cfg.capnp");
     std::fs::write(&cfg, text).unwrap();
-    let mut argv = vrt_host::assemble::experimental_extra_args(
-        &params.system_compat_flags,
-        tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-        tenant
-            .workers
-            .iter()
-            .any(|w| !w.durable_object_classes.is_empty()),
-        false,
-        false,
-    );
+    let mut argv = vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant);
     argv.extend(vrt_host::launch::external_addr_args(&out.external_addrs));
     (cfg, argv, do_root)
 }

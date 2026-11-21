@@ -1079,7 +1079,13 @@ fn binding_backend_dir_rekeys_fingerprint() {
 #[test]
 fn worker_loaders_enable_experimental_extra_arg() {
     let args = |loaders: bool| {
-        vrt_host::assemble::experimental_extra_args(&[], false, false, false, loaders)
+        vrt_host::assemble::experimental_extra_args(
+            &[],
+            vrt_host::assemble::ExperimentalNeeds {
+                worker_loaders: loaders,
+                ..Default::default()
+            },
+        )
     };
     assert!(args(true).iter().any(|a| a == "--experimental"));
     assert!(args(false).is_empty());

@@ -466,16 +466,7 @@ fn render_cfg(dir: &Path, port: u16, sql_port: u16, db_id: &str) -> (PathBuf, Ve
     std::fs::write(&cfg, text).unwrap();
     (
         cfg,
-        vrt_host::assemble::experimental_extra_args(
-            &params.system_compat_flags,
-            tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-            tenant
-                .workers
-                .iter()
-                .any(|w| !w.durable_object_classes.is_empty()),
-            false,
-            false,
-        ),
+        vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant),
     )
 }
 
@@ -1383,16 +1374,7 @@ fn render_queue_cfg_full(
     std::fs::write(&cfg, text).unwrap();
     (
         cfg,
-        vrt_host::assemble::experimental_extra_args(
-            &params.system_compat_flags,
-            tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-            tenant
-                .workers
-                .iter()
-                .any(|w| !w.durable_object_classes.is_empty()),
-            false,
-            false,
-        ),
+        vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant),
     )
 }
 
@@ -2087,16 +2069,7 @@ fn render_do_cfg(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf, Strin
     std::fs::write(&cfg, text).unwrap();
     // argv from the PRODUCTION derivation (T31g/H4): durableObjectClasses
     // present ⇒ --experimental must be on the command line.
-    let mut argv = vrt_host::assemble::experimental_extra_args(
-        &params.system_compat_flags,
-        tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-        tenant
-            .workers
-            .iter()
-            .any(|w| !w.durable_object_classes.is_empty()),
-        false,
-        false,
-    );
+    let mut argv = vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant);
     assert!(argv.iter().any(|a| a == "--experimental"), "{argv:?}");
     // P3c-1-r2: `--external-addr` comes from the SAME production
     // derivation the supervisor uses — `assemble` copies

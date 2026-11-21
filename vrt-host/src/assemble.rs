@@ -743,23 +743,7 @@ impl Assembler {
         // generations need `--experimental` for the emitted qconsumer
         // flag (the stub launcher has no system_compat_flags channel).
         let mut extra_args = self.extra_args.clone();
-        for a in experimental_extra_args(
-            &[],
-            tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-            tenant
-                .workers
-                .iter()
-                .any(|w| !w.durable_object_classes.is_empty() || !w.workflows.is_empty()),
-            tenant.workers.iter().any(|w| !w.crons.is_empty()),
-            tenant.workers.iter().any(|w| {
-                w.bindings.iter().any(|b| {
-                    matches!(
-                        b,
-                        snapshot_protocol::compute_desired::BindingDesired::WorkerLoader(_)
-                    )
-                })
-            }),
-        ) {
+        for a in vrt_config::tenant_experimental_extra_args(&[], tenant) {
             if !extra_args.iter().any(|e| e == &a) {
                 extra_args.push(a);
             }
@@ -969,25 +953,11 @@ impl Assembler {
         // emitted qconsumer worker (compat-date.capnp:296 `$experimental`)
         // and workerd refuses to start without `--experimental` on argv.
         // The literal `experimental` catch-all is NOT derived (the T31g
-        // gate above keeps it a deliberate opt-in).
+        // gate above keeps it a deliberate opt-in). The predicate is
+        // shared with vrt-local's deploy preflight
+        // (`vrt_config::launch_args`) so both paths agree.
         let mut extra_args = self.extra_args.clone();
-        for a in experimental_extra_args(
-            &params.system_compat_flags,
-            tenant.workers.iter().any(|w| !w.queue_consumers.is_empty()),
-            tenant
-                .workers
-                .iter()
-                .any(|w| !w.durable_object_classes.is_empty() || !w.workflows.is_empty()),
-            tenant.workers.iter().any(|w| !w.crons.is_empty()),
-            tenant.workers.iter().any(|w| {
-                w.bindings.iter().any(|b| {
-                    matches!(
-                        b,
-                        snapshot_protocol::compute_desired::BindingDesired::WorkerLoader(_)
-                    )
-                })
-            }),
-        ) {
+        for a in vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, tenant) {
             if !extra_args.iter().any(|e| e == &a) {
                 extra_args.push(a);
             }
@@ -1282,23 +1252,10 @@ fn stub_do_storage(tenant: &TenantDesired) -> Option<crate::spec::DoStorageSpec>
 /// CR1: cron-carrying workers derive `--experimental` the same way —
 /// their `facade-cron-<id>` service emits the `$experimental`
 /// `service_binding_extra_handlers` flag (Fetcher.scheduled()).
-pub fn experimental_extra_args(
-    system_compat_flags: &[String],
-    tenant_has_queue_consumers: bool,
-    tenant_has_durable_objects: bool,
-    tenant_has_crons: bool,
-    tenant_has_worker_loaders: bool,
-) -> Vec<String> {
-    let needs = tenant_has_queue_consumers
-        || tenant_has_durable_objects
-        || tenant_has_crons
-        || tenant_has_worker_loaders
-        || system_compat_flags
-            .iter()
-            .any(|f| f != "experimental" && vrt_config::is_experimental_compat_flag(f));
-    if needs {
-        vec!["--experimental".to_string()]
-    } else {
-        Vec::new()
-    }
-}
+///
+/// The predicate itself lives in `vrt_config::launch_args` — one
+/// implementation shared with `vrt-local`'s deploy preflight; launch
+/// paths call [`vrt_config::tenant_experimental_extra_args`], which
+/// derives the needs from the tenant so no caller can drift.
+pub use vrt_config::{experimental_extra_args, ExperimentalNeeds};
+

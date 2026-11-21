@@ -388,10 +388,10 @@ pub fn render(
     std::fs::write(&cfg, &text).unwrap();
     let args = vrt_host::assemble::experimental_extra_args(
         &params.system_compat_flags,
-        false,
-        has_do,
-        false,
-        false,
+        vrt_host::assemble::ExperimentalNeeds {
+            durable_objects_or_workflows: has_do,
+            ..Default::default()
+        },
     );
     (cfg, ingress_ports, args, text)
 }
