@@ -30,6 +30,8 @@ struct HostCfg {
     binding_backend_socket: String,
     system_compat_date: String,
     system_compat_flags: Vec<String>,
+    /// `render.quotas` — the host's workerd enforces per-worker limits.
+    quotas: bool,
 }
 
 /// Run the deploy-time check against the post-deploy state (`st`
@@ -130,6 +132,11 @@ pub(crate) fn deploy_preflight(
             })?,
         );
     }
+    // Per-worker quotas: the deploy must fail HERE when the host's
+    // workerd cannot enforce a declared limit — otherwise the published
+    // snapshot would render as a skipped worker (or run unlimited).
+    vrt_config::ensure_quotas_enforceable(tenant, cfg.quotas)
+        .map_err(|e| LocalError::Op("deploy check", format!("quotas: {e}")))?;
     let rendered = vrt_config::render_tenant_config(&vrt_config::TenantRenderInput {
         tenant,
         revision: st.revision,
@@ -308,6 +315,22 @@ fn seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// `render.quotas` — does this root's host enforce per-worker limits?
+/// Diagnostic only: an unreadable/malformed host config reads `false`
+/// (fail closed: never claim enforcement we cannot see). A valid
+/// `[render]` without the key reads `true` — that is the host's own
+/// default (the pinned workerd carries the limits patch).
+pub(crate) fn host_quotas_enforced(root: &Path) -> bool {
+    std::fs::read_to_string(root.join("config/vrt-host.toml"))
+        .ok()
+        .and_then(|raw| raw.parse::<toml::Value>().ok())
+        .and_then(|doc| {
+            doc.get("render")
+                .map(|r| r.get("quotas").and_then(|v| v.as_bool()).unwrap_or(true))
+        })
+        .unwrap_or(false)
+}
+
 /// Read `config/vrt-host.toml`; `None` when absent or stub mode.
 fn read_host_config(root: &Path) -> Result<Option<HostCfg>, LocalError> {
     let path = root.join("config/vrt-host.toml");
@@ -372,5 +395,9 @@ fn read_host_config(root: &Path) -> Result<Option<HostCfg>, LocalError> {
         binding_backend_socket: render_str("bindingBackendSocket")?,
         system_compat_date: render_str("systemCompatDate")?,
         system_compat_flags: flags,
+        quotas: render
+            .get("quotas")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
     }))
 }

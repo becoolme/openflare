@@ -6,6 +6,7 @@ const config :Workerd.Config = (
   services = [
     (name = "worker-w-alpha-1", worker = (
       compatibilityDate = "2026-11-01",
+      limits = (subRequests = 100),
       modules = [
         (name = "index.js", esModule = embed "bundles/daa8eaa80a45398cae9a6f07666c0bda8c4e2a8c4288e732e0a36e083aa9f6a4/index.js"),
         (name = "blob.bin", data = embed "bundles/daa8eaa80a45398cae9a6f07666c0bda8c4e2a8c4288e732e0a36e083aa9f6a4/blob.bin"),
@@ -32,6 +33,7 @@ const config :Workerd.Config = (
     )),
     (name = "worker-w-alpha-2", worker = (
       compatibilityDate = "2026-10-15",
+      limits = (cpuMs = 10, memoryMb = 64),
       modules = [
         (name = "auth.js", esModule = embed "bundles/a240937c4aee30091d616ab4d6ee9014417f8f9fc6a1d53c92926f3bfa02fe41/auth.js"),
       ],

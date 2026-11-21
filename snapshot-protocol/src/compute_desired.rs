@@ -92,6 +92,19 @@ pub const MAX_SUBREQUESTS: u32 = 10_000;
 /// `quotas.outboundConnections` bounds (simultaneous outbound connections).
 pub const MAX_OUTBOUND_CONNECTIONS: u32 = 1024;
 
+/// Platform default CPU budget (ms) — the value a worker that never
+/// declared `limits` carries. One source of truth for the control
+/// plane, `vrt-local` and `vrt-config` (a default that disagreed
+/// between them would silently turn into an enforced limit).
+pub const DEFAULT_CPU_MS: u32 = 50;
+/// Platform default isolate memory (MiB); matches Cloudflare's 128 MB
+/// isolate.
+pub const DEFAULT_MEMORY_MB: u32 = 128;
+/// Platform default outbound subrequests per request.
+pub const DEFAULT_SUBREQUESTS: u32 = 50;
+/// Platform default simultaneous outbound connections.
+pub const DEFAULT_OUTBOUND_CONNECTIONS: u32 = 16;
+
 /// The `compute.desired` payload: complete desired state for one cell.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -720,10 +733,75 @@ pub struct WorkerQuotas {
     pub cpu_ms: u32,
     /// Isolate memory in MiB.
     pub memory_mb: u32,
-    /// Outbound subrequests per request (0 = no subrequests).
+    /// Outbound subrequests per request.
     pub subrequests: u32,
-    /// Simultaneous outbound connections (0 = none).
+    /// Simultaneous outbound connections.
     pub outbound_connections: u32,
+}
+
+impl WorkerQuotas {
+    /// The platform default set — what a worker that never declared
+    /// `limits` carries. Rendering treats these values as "not
+    /// declared": no `limits` dimension is emitted for them, so an
+    /// undeclared worker keeps stock workerd behaviour.
+    pub const fn platform_default() -> Self {
+        Self {
+            cpu_ms: DEFAULT_CPU_MS,
+            memory_mb: DEFAULT_MEMORY_MB,
+            subrequests: DEFAULT_SUBREQUESTS,
+            outbound_connections: DEFAULT_OUTBOUND_CONNECTIONS,
+        }
+    }
+
+    /// True when every dimension equals [`Self::platform_default`].
+    pub fn is_platform_default(&self) -> bool {
+        self.cpu_ms == DEFAULT_CPU_MS
+            && self.memory_mb == DEFAULT_MEMORY_MB
+            && self.subrequests == DEFAULT_SUBREQUESTS
+            && self.outbound_connections == DEFAULT_OUTBOUND_CONNECTIONS
+    }
+
+    /// First dimension that differs from [`Self::platform_default`], in
+    /// render order. `None` = nothing was explicitly declared.
+    pub fn declared_deviation(&self) -> Option<&'static str> {
+        if self.cpu_ms != DEFAULT_CPU_MS {
+            return Some("cpuMs");
+        }
+        if self.memory_mb != DEFAULT_MEMORY_MB {
+            return Some("memoryMb");
+        }
+        if self.subrequests != DEFAULT_SUBREQUESTS {
+            return Some("subrequests");
+        }
+        if self.outbound_connections != DEFAULT_OUTBOUND_CONNECTIONS {
+            return Some("outboundConnections");
+        }
+        None
+    }
+
+    /// True when at least one dimension this runtime generation can
+    /// render (`cpuMs`, `memoryMb`, `subRequests`) was declared, i.e.
+    /// the cell must emit a `limits` block for this worker.
+    ///
+    /// `subrequests = 0` means "no subrequest budget" in the protocol
+    /// but "unlimited" on the workerd side; it therefore needs no
+    /// `limits` entry (omitted dimension = stock behaviour) and does not
+    /// count as rendered.
+    pub fn declares_enforceable_limit(&self) -> bool {
+        (self.cpu_ms != DEFAULT_CPU_MS && self.cpu_ms > 0)
+            || (self.memory_mb != DEFAULT_MEMORY_MB && self.memory_mb > 0)
+            || (self.subrequests != DEFAULT_SUBREQUESTS && self.subrequests > 0)
+    }
+
+    /// True when a positive `outboundConnections` budget was declared.
+    /// This dimension has no `limits` field in the pinned workerd fork
+    /// yet (the connection-counter patch is deferred), so it can never
+    /// be enforced — a declared value is refused instead of being
+    /// silently dropped. `0` means "no declared budget" (stock
+    /// behaviour) and is accepted.
+    pub fn declares_unenforceable_limit(&self) -> bool {
+        self.outbound_connections > 0 && self.outbound_connections != DEFAULT_OUTBOUND_CONNECTIONS
+    }
 }
 
 /// Typed `compute.desired` validation error with stable `DESIRED_*` codes.

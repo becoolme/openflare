@@ -91,6 +91,17 @@ pub struct ProdConfig {
     /// false (the control plane never dispatches the kind here).
     #[serde(default)]
     pub storage_purge: Option<crate::storagepurge::StoragePurgeConfig>,
+    /// Per-worker quotas capability (ACK bit `quotas`): the cell's
+    /// vrt-host renders the workerd `limits` block. Default `false`:
+    /// the bit is OMITTED from the ACK while false, so a control plane
+    /// whose strict schema does not know `quotas` yet keeps accepting
+    /// acks. Enable it only after the control plane ships the key (the
+    /// pinned workerd and vrt-host already support it; leave
+    /// `[render] quotas` at its default on the hosts). With the bit
+    /// absent, the control plane rejects deploys that declare a
+    /// non-default quota (409, fail closed).
+    #[serde(default)]
+    pub quotas: bool,
 }
 
 /// T37b: `[queue_dispatch]` — optional tuning over

@@ -1186,3 +1186,150 @@ fn worker_loader_binding_renders_native_loader() {
     // wires no service, socket, or facade reference.
     assert_eq!(out.matches("\"LOADER\"").count(), 1, "{out}");
 }
+
+// ---- per-worker quotas (`limits`) ----
+
+/// The `limits` block renders only declared dimensions, in a fixed
+/// order, and never for a dimension left at the platform default or 0 —
+/// an undeclared worker keeps stock workerd behaviour byte-for-byte.
+#[test]
+fn worker_limits_render_declared_dimensions_only() {
+    use snapshot_protocol::compute_desired::WorkerQuotas;
+    let mut tenant = tenant();
+    tenant.workers[0].quotas = WorkerQuotas {
+        cpu_ms: 120,
+        memory_mb: 192,
+        subrequests: 100,
+        outbound_connections: 16,
+    };
+    let out = render_tenant_config(&input(&tenant, &bundles(), &runtime_params()))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains("limits = (cpuMs = 120, memoryMb = 192, subRequests = 100),"),
+        "declared dimensions render in order:\n{out}"
+    );
+
+    // A zero / default dimension is omitted: stock behaviour, not an
+    // explicit `0` limit (workerd's 0 means "unlimited" and would make
+    // the emitted config lie about intent).
+    for worker in &mut tenant.workers {
+        worker.quotas = WorkerQuotas {
+            cpu_ms: 50,
+            memory_mb: 128,
+            subrequests: 0,
+            outbound_connections: 16,
+        };
+    }
+    let out = render_tenant_config(&input(&tenant, &bundles(), &runtime_params()))
+        .unwrap()
+        .text;
+    assert!(
+        !out.contains("limits = ("),
+        "platform defaults / 0 must not render a limits block:\n{out}"
+    );
+}
+
+/// `outboundConnections` has no workerd enforcement hook yet: a
+/// non-default declaration is refused instead of silently ignored.
+#[test]
+fn worker_limits_reject_unenforceable_outbound_connections() {
+    use snapshot_protocol::compute_desired::WorkerQuotas;
+    let mut tenant = tenant();
+    tenant.workers[0].quotas = WorkerQuotas {
+        cpu_ms: 50,
+        memory_mb: 128,
+        subrequests: 50,
+        outbound_connections: 6,
+    };
+    assert_eq!(
+        render_tenant_config(&input(&tenant, &bundles(), &runtime_params())),
+        Err(ConfigError::Quotas("outboundConnections"))
+    );
+    // 0 means "no declared budget" (stock behaviour) and stays accepted.
+    tenant.workers[0].quotas.outbound_connections = 0;
+    assert!(render_tenant_config(&input(&tenant, &bundles(), &runtime_params())).is_ok());
+}
+
+/// Out-of-bounds quota values are rejected at emit depth (defense in
+/// depth behind compute.desired validation).
+#[test]
+fn worker_limits_reject_out_of_bounds() {
+    use snapshot_protocol::compute_desired::WorkerQuotas;
+    let mut tenant = tenant();
+    for (quotas, field) in [
+        (
+            WorkerQuotas {
+                cpu_ms: 0,
+                ..WorkerQuotas::platform_default()
+            },
+            "cpuMs",
+        ),
+        (
+            WorkerQuotas {
+                cpu_ms: 300_001,
+                ..WorkerQuotas::platform_default()
+            },
+            "cpuMs",
+        ),
+        (
+            WorkerQuotas {
+                memory_mb: 4_097,
+                ..WorkerQuotas::platform_default()
+            },
+            "memoryMb",
+        ),
+        (
+            WorkerQuotas {
+                subrequests: 10_001,
+                ..WorkerQuotas::platform_default()
+            },
+            "subrequests",
+        ),
+        (
+            WorkerQuotas {
+                outbound_connections: 1_025,
+                ..WorkerQuotas::platform_default()
+            },
+            "outboundConnections",
+        ),
+    ] {
+        tenant.workers[0].quotas = quotas;
+        assert_eq!(
+            render_tenant_config(&input(&tenant, &bundles(), &runtime_params())),
+            Err(ConfigError::Quotas(field)),
+            "field {field}"
+        );
+    }
+}
+
+/// Capability gate: a cell that cannot render `limits` must refuse a
+/// tenant that declared one (fail closed — never silently unlimited).
+#[test]
+fn quotas_capability_gate_fails_closed() {
+    use snapshot_protocol::compute_desired::WorkerQuotas;
+    let mut tenant = tenant();
+    // All-default tenant: nothing to enforce, accepted on any cell.
+    for worker in &mut tenant.workers {
+        worker.quotas = WorkerQuotas::platform_default();
+    }
+    assert!(ensure_quotas_enforceable(&tenant, false).is_ok());
+    assert!(ensure_quotas_enforceable(&tenant, true).is_ok());
+
+    tenant.workers[1].quotas.cpu_ms = 400;
+    assert_eq!(
+        ensure_quotas_enforceable(&tenant, false),
+        Err(ConfigError::Quotas("cpuMs"))
+    );
+    assert_eq!(
+        ConfigError::Quotas("cpuMs").code(),
+        "CONFIG_QUOTA_UNSUPPORTED"
+    );
+    assert!(ensure_quotas_enforceable(&tenant, true).is_ok());
+
+    // `subrequests = 0` declares "no budget": omitted, not enforced, so
+    // it never trips the capability gate.
+    tenant.workers[1].quotas.cpu_ms = 50;
+    tenant.workers[1].quotas.subrequests = 0;
+    assert!(ensure_quotas_enforceable(&tenant, false).is_ok());
+}

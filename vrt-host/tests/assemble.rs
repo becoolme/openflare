@@ -229,24 +229,10 @@ fn stub_do_storage_classes_cover_workflows_and_dos() {
     );
 }
 
-#[test]
-fn capnp_assembly_renders_and_materializes_embeds() {
-    let fx = Fixture::new();
-    let source = Arc::new(MemoryBundleSource::default());
-    let cache = Arc::new(BundleCache::new(fx.dir.path().join("cache")));
-
-    // One bundle for the tenant worker + one system module artifact.
-    let bundle = vrt_config::VersionBundle::from_pack(&serde_json::json!({
-        "mainModule": "main.js",
-        "modules": { "main.js": "export default { fetch() { return new Response('ok') } }" },
-        "compatibilityDate": "2024-01-01",
-    }))
-    .unwrap();
-    source.insert_aliased(bundle.digest(), bundle.stored_document());
-    let sys_bytes = b"export default class { fetch() { return new Response('sys') } }";
-    let sys_digest = source.insert(sys_bytes);
-
-    let params = vrt_config::RuntimeParams {
+/// Minimal capnp `RuntimeParams` for assembly tests: one system service
+/// (`sys`) that every facade/egress hook points at.
+fn assemble_test_params(sys_digest: String) -> vrt_config::RuntimeParams {
+    vrt_config::RuntimeParams {
         socket_dir: String::new(),
         binding_backend_socket: "/tmp/binding.sock".to_string(),
         egress: vrt_config::ServiceEndpoint {
@@ -308,7 +294,27 @@ fn capnp_assembly_renders_and_materializes_embeds() {
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
-    };
+    }
+}
+
+#[test]
+fn capnp_assembly_renders_and_materializes_embeds() {
+    let fx = Fixture::new();
+    let source = Arc::new(MemoryBundleSource::default());
+    let cache = Arc::new(BundleCache::new(fx.dir.path().join("cache")));
+
+    // One bundle for the tenant worker + one system module artifact.
+    let bundle = vrt_config::VersionBundle::from_pack(&serde_json::json!({
+        "mainModule": "main.js",
+        "modules": { "main.js": "export default { fetch() { return new Response('ok') } }" },
+        "compatibilityDate": "2024-01-01",
+    }))
+    .unwrap();
+    source.insert_aliased(bundle.digest(), bundle.stored_document());
+    let sys_bytes = b"export default class { fetch() { return new Response('sys') } }";
+    let sys_digest = source.insert(sys_bytes);
+
+    let params = assemble_test_params(sys_digest.clone());
 
     let assembler = Assembler::new(
         PathBuf::from("/bin/true"), // not launched — materialization only
@@ -1078,3 +1084,65 @@ fn worker_loaders_enable_experimental_extra_arg() {
     assert!(args(true).iter().any(|a| a == "--experimental"));
     assert!(args(false).is_empty());
 }
+
+/// Per-worker quotas: the host renders `limits` for a declared quota,
+/// and a host whose workerd cannot enforce it refuses the generation
+/// instead of running the worker unlimited (`render.quotas = false`).
+#[test]
+fn quotas_capability_off_fails_closed() {
+    let fx = Fixture::new();
+    let source = Arc::new(MemoryBundleSource::default());
+    let cache = Arc::new(BundleCache::new(fx.dir.path().join("cache")));
+    let bundle = vrt_config::VersionBundle::from_pack(&serde_json::json!({
+        "mainModule": "main.js",
+        "modules": { "main.js": "export default { fetch() { return new Response('ok') } }" },
+        "compatibilityDate": "2024-01-01",
+    }))
+    .unwrap();
+    source.insert_aliased(bundle.digest(), bundle.stored_document());
+    let sys_digest = source.insert(b"export default class {}");
+    let params = assemble_test_params(sys_digest);
+    let build = |quotas: bool| {
+        Assembler::new(
+            PathBuf::from("/bin/true"), // not launched — materialization only
+            fx.work_root(),
+            cache.clone(),
+            source.clone(),
+            EmitMode::Capnp {
+                params: params.clone(),
+            },
+            Default::default(),
+            Default::default(),
+            vec![],
+            std::sync::Arc::new(vrt_host::render_inputs::StaticRenderInputs(
+                Default::default(),
+            )),
+        )
+        .with_quotas(quotas)
+    };
+    let mut desired = tenant("t1", vec![worker("w1", "a.test", bundle.digest())]);
+    desired.workers[0].quotas.cpu_ms = 900;
+
+    let spec = build(true).assemble(&desired, 7, 1).unwrap();
+    let capnp = std::fs::read_to_string(&spec.config_path).unwrap();
+    assert!(
+        capnp.contains("limits = (cpuMs = 900)"),
+        "declared quota must render: {capnp}"
+    );
+
+    // Capability off: same tenant is refused before anything is written.
+    let err = build(false).assemble(&desired, 7, 2).unwrap_err();
+    assert!(
+        err.to_string().contains("CONFIG_QUOTA_UNSUPPORTED")
+            || matches!(
+                err,
+                vrt_host::assemble::AssembleError::Render(vrt_config::ConfigError::Quotas("cpuMs"))
+            ),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !fx.work_root().join("t1").join("gen-2").exists(),
+        "a refused generation must not be materialized"
+    );
+}
+

@@ -448,10 +448,19 @@ pub struct HostStatusFile {
     pub tenants: std::collections::BTreeMap<String, TenantStatusFile>,
     /// MIG-10: CA trust-store probe result (egress TLS capability).
     pub egress_trust_store_ok: bool,
+    /// Per-worker quotas: this host renders the workerd `limits` block
+    /// (`render.quotas`). `vrt status` merges this so an operator can
+    /// tell "declared but unenforced" from "enforced" without reading
+    /// the host config.
+    pub quotas_enforced: bool,
 }
 
 /// Snapshot the registry + adopted revision into a serializable file.
-pub fn status_file_view(status: &HostStatus, registry: &Arc<TenantRegistry>) -> HostStatusFile {
+pub fn status_file_view(
+    status: &HostStatus,
+    registry: &Arc<TenantRegistry>,
+    quotas_enforced: bool,
+) -> HostStatusFile {
     let inner = status.read().unwrap_or_else(|e| e.into_inner());
     let mut tenants = std::collections::BTreeMap::new();
     for id in registry.tenant_ids() {
@@ -474,6 +483,7 @@ pub fn status_file_view(status: &HostStatus, registry: &Arc<TenantRegistry>) -> 
         revision: inner.revision,
         tenants,
         egress_trust_store_ok: inner.egress_trust_store_ok,
+        quotas_enforced,
     }
 }
 
@@ -485,8 +495,9 @@ pub fn write_status_file(
     work_dir: &std::path::Path,
     status: &HostStatus,
     registry: &Arc<TenantRegistry>,
+    quotas_enforced: bool,
 ) {
-    let view = status_file_view(status, registry);
+    let view = status_file_view(status, registry, quotas_enforced);
     let body = match serde_json::to_vec_pretty(&view) {
         Ok(b) => b,
         Err(_) => return,

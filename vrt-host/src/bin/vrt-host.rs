@@ -299,6 +299,10 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     if let Some(root) = &config.do_storage_dir {
         assembler = assembler.with_do_storage(root.clone());
     }
+    // Per-worker quotas: `render.quotas` states that this host's
+    // workerd enforces the VRT `limits` block. Off ⇒ a tenant declaring
+    // a limit fails at assemble (never silently unlimited).
+    assembler = assembler.with_quotas(config.render.quotas);
     // H5-r1: platform mode derives every tenant's binding-backend
     // socket under the provider listenerDir (config validate already
     // rejected verbatim-socket+assignmentFile and socket+dir combos).
@@ -569,7 +573,12 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         &ingress_state,
         &ctx,
     );
-    vrt_host::status::write_status_file(&config.work_dir, &ctx.status, &registry);
+    vrt_host::status::write_status_file(
+        &config.work_dir,
+        &ctx.status,
+        &registry,
+        config.render.quotas,
+    );
 
     let listener = TcpListener::bind(&config.listen_addr).await.map_err(|e| {
         tracing::error!(error = %e, "ingress listen failed");
@@ -689,7 +698,11 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
                 // supervisor state, last failure reasons and circuit
                 // state without reaching the control listener.
                 vrt_host::status::write_status_file(
-                    &config.work_dir, &ctx.status, &registry);
+                    &config.work_dir,
+                    &ctx.status,
+                    &registry,
+                    config.render.quotas,
+                );
             }
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
