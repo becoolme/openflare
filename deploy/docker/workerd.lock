@@ -1,15 +1,24 @@
 {
-  "source": "npm",
-  "version": "1.20260916.1",
+  "source": "github-release",
+  "version": "vrt-20261120-2d52b58",
+  "upstream": {
+    "version": "1.20261120.1",
+    "commit": "7545be644952d71d76b904b37ae71b10c0ba8cad"
+  },
   "artifacts": {
     "linux-x64": {
-      "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-1.20260916.1.tgz",
-      "integrity": "sha512-a4gRHOI2Iv9wRbFkSGqcDFyfgo4pthTKeBUkdKhL7fxyNUghPNs9rHw+d2Q9aZyeOW2TDa2FI7ELg09eDJOPxA==",
-      "binarySha256": "fcaac1783cbd1cafd6e400ba73250aca04464cf4222cd9288404358fec7d5c29"
+      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd-linux-x64.gz",
+      "archiveSha256": "8fe2120c38545cc2fd3541cf58e0feac989742391d79c0681314cf3a54d9ea30",
+      "binarySha256": "01b8597769f3450ff86d9192c5cfe3db4f6f182b63dd95a2686dc735e364a5ed",
+      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd.capnp",
+      "capnpSha256": "a306f21d42a8f3a6372bd8a442d9a93509537fcd83d70c4a7c711f28620b5ffa"
     },
     "linux-arm64": {
-      "url": "https://registry.npmjs.org/@cloudflare/workerd-linux-arm64/-/workerd-linux-arm64-1.20260916.1.tgz",
-      "integrity": "sha512-qWIZZtd1ATaRI53hKBTxpLKGQJcwOwpPsqfIUaRv8ouq2yJkzJxlG9hReacOjpSh1br3edPxysNa5KBOkqpn9Q=="
+      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd-linux-arm64.gz",
+      "archiveSha256": "887d58ea56347bce62bbb6bf350b128d9591a8618b58d60042c3bcdafcffc456",
+      "binarySha256": "2bdafaec686070a88403ba929fb8dfdbe4d038808ead7e888d1a02aaeb7c6eed",
+      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261120-2d52b58/workerd.capnp",
+      "capnpSha256": "a306f21d42a8f3a6372bd8a442d9a93509537fcd83d70c4a7c711f28620b5ffa"
     }
   }
 }

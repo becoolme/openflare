@@ -7841,12 +7841,13 @@ async fn swap_finalize(
             break false;
         }
         match gen.child.inner.try_wait() {
-            // MIG-13-r5: a dead warm child can never emit the marker
-            // — the execve'd image fatals fast on any bind/load error
-            // (e.g. an EADDRINUSE the pre-clear refused to fix), so
-            // stop NOW with a distinct reason instead of draining the
-            // whole ready_timeout on a corpse (e2e24 burned ~9.6 s
-            // and 20+ 503s per worker on exactly this).
+            // MIG-13-r5: a dead warm child can never emit the marker.
+            // workerd 1.20260916.1 fataled fast on any bind/load error
+            // after the execve; 1.20261120 tolerates a failed `--watch`
+            // reload instead (it reports the errors and keeps serving
+            // what it can), so an EADDRINUSE now surfaces through this
+            // loop's deadline rather than as a child exit — still fail
+            // closed, just bounded by `ready_timeout`.
             Ok(Some(_)) | Err(_) => {
                 child_died = true;
                 break false;

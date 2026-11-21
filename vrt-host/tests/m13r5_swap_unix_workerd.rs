@@ -17,9 +17,11 @@
 //! rewrite. This file proves both halves on real workerd + real
 //! unix binds:
 //!
-//! - `watch_reload_unix_rebind_crashes_without_preclear`: the r4
-//!   write form alone kills the exec'd image with EADDRINUSE —
-//!   the e2e24 shape, reproduced deterministically.
+//! - `watch_reload_unix_rebind_never_lands_without_preclear`: the r4
+//!   write form alone cannot land the reload — the exec'd image hits
+//!   EADDRINUSE on the stale paths and never serves the new config
+//!   (since 1.20261120 it survives the failed reload instead of
+//!   dying: e2e24's silent shape), reproduced deterministically.
 //! - `watch_reload_unix_succeeds_after_preclear`: with the
 //!   production pre-clear the reload lands the marker on the SAME
 //!   pid, an early-flipped non-DO worker serves on its unix socket,
@@ -408,11 +410,14 @@ async fn boot_twin(bin: &str, tag: &str) -> TwinBoot {
 
 /// NEGATIVE CONTROL — the r4 write form alone reproduces e2e24: the
 /// execve'd image re-binds every declared unix socket, hits the stale
-/// files the twin bound, and dies with `EADDRINUSE`. This is the
-/// crash the tcpify suite structurally could not see.
+/// files the twin bound, and cannot serve the new config. Since
+/// workerd 1.20261120 the failure is not fatal under `--watch` (the
+/// reload reports the bind errors and the image stays up), so the
+/// assertion is the hazard itself: not one of the twin's sockets comes
+/// back. This is what the tcpify suite structurally could not see.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires VRT_WORKERD_BIN + real unix binds"]
-async fn watch_reload_unix_rebind_crashes_without_preclear() {
+async fn watch_reload_unix_rebind_never_lands_without_preclear() {
     init_logs();
     let bin = std::env::var("VRT_WORKERD_BIN").expect("VRT_WORKERD_BIN unset");
     assert!(Path::new(&bin).exists(), "VRT_WORKERD_BIN missing: {bin}");
@@ -428,19 +433,21 @@ async fn watch_reload_unix_rebind_crashes_without_preclear() {
     // socket file still exists — the execve'd image rebinds them all.
     vrt_securefs::atomic_write(&boot.live_config, boot.final_text.as_bytes(), 0o600).unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(20);
-    // try_wait reaps the child: an unreaped zombie still answers
-    // kill(pid, 0), so pid_alive alone can never observe this death.
-    let mut exited = false;
-    while Instant::now() < deadline {
-        if matches!(boot.child.try_wait(), Ok(Some(_))) {
-            exited = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(exited, "execve'd image must die on the stale unix binds");
-    // Give the stderr drain a beat to flush the fatal line.
+    // The reload must NOT land. Every socket the twin bound keeps its
+    // stale pathname, so the exec'd image's bind(2) fails and no new
+    // listen event can arrive for it. (`vrt-switch` is not a witness
+    // here: the twin config carries no marker socket, so its path is
+    // free and it binds even in the broken reload.)
+    assert!(
+        !await_marker(
+            &mut boot.lines,
+            "\"socket\":\"sock-w-do\"",
+            Duration::from_secs(5)
+        )
+        .await,
+        "a reload without the pre-clear must never rebind the stale unix sockets"
+    );
+    // Give the stderr drain a beat to flush the failed binds.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let tail = boot
         .stderr_tail
@@ -451,9 +458,21 @@ async fn watch_reload_unix_rebind_crashes_without_preclear() {
         tail.contains("Address already in use") || tail.contains("EADDRINUSE"),
         "expected EADDRINUSE evidence in stderr tail: {tail}"
     );
+    // workerd >= 1.20261120 tolerates a failed `--watch` reload: the
+    // exec'd image reports the bind errors and keeps running with no
+    // working listener, instead of dying like 1.20260916.1 did. That
+    // is the e2e24 hazard in its current shape — a process that looks
+    // alive and serves nothing — and it is why the supervisor's swap
+    // marker wait must fail closed on its own deadline rather than on
+    // the child's exit.
+    assert!(
+        matches!(boot.child.try_wait(), Ok(None)),
+        "workerd --watch is expected to survive a failed reload; if this \
+         regressed to a fatal exit, revisit the supervisor's swap-child-exit path"
+    );
     let _ = vrt_host::launch::terminate_child(&mut boot.child, pid, Duration::from_secs(2)).await;
     let _ = std::fs::remove_dir_all(&boot.root);
-    eprintln!("M13R5-UNIX-REPRO reload rebind crashed on stale unix sockets (e2e24 shape)");
+    eprintln!("M13R5-UNIX-REPRO reload never lands on stale unix sockets (e2e24 shape)");
 }
 
 /// THE FIX — the exact production call (`swap_finalize`'s

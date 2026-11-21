@@ -392,16 +392,25 @@ async fn get(port: u16, path: &str) -> Option<(u16, String)> {
 
 async fn get_dbg(port: u16, path: &str, dbg: bool) -> Option<(u16, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut s = match tokio::net::TcpStream::connect(std::net::SocketAddr::from((
-        [127, 0, 0, 1],
-        port,
-    )))
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
+    // The connect must be bounded too: a generation whose listener is
+    // still bound but whose event loop is wedged would otherwise park
+    // the test (and the whole 15-min target) on an unanswered SYN.
+    let connected = tokio::time::timeout(
+        Duration::from_secs(3),
+        tokio::net::TcpStream::connect(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+    )
+    .await;
+    let mut s = match connected {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             if dbg {
                 eprintln!("get {port}{path}: connect {e}");
+            }
+            return None;
+        }
+        Err(_) => {
+            if dbg {
+                eprintln!("get {port}{path}: connect timed out");
             }
             return None;
         }
@@ -509,6 +518,12 @@ async fn waituntil_side_effect_survives_generation_switch() {
     const ARM_MS: u64 = 15_000;
     let mut params = wu_params();
     params.wait_until_grace = Duration::from_secs(40);
+    // `wait_until_grace` is capped by `drain_timeout` (15 s in `wu_params`).
+    // At that cap the SIGKILL lands within ~100 ms of the 15 s waitUntil
+    // settling: the gate below then passes or fails on runner scheduling
+    // alone, which is how 1.20261120 lost it. Give the drain the same runway
+    // as the grace so the deferral — not the deadline — is what ends gen1.
+    params.drain_timeout = Duration::from_secs(40);
     let h = spawn_supervisor(rt.clone(), r1.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 

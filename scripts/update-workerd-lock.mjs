@@ -14,6 +14,13 @@
 //   node scripts/update-workerd-lock.mjs --manifest manifest.json
 //   node scripts/update-workerd-lock.mjs --manifest manifest.json --check   # CI/PR check
 //
+// `upstream.version` must be the workerd release the fork is based on (`1.YYYYMMDD.N`), because
+// consumers parse it as a workerd version (see `vrt-config/compat/gen_compat_flags.py`). When a
+// release was cut from an upstream commit that carries no release tag yet, the manifest's
+// `upstream.tag` is empty and the version has to be named explicitly:
+//
+//   node scripts/update-workerd-lock.mjs --manifest manifest.json --upstream-version 1.20261120.1
+//
 // Anything missing or inconsistent fails: a lock that cannot be verified is not a pin.
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -22,9 +29,33 @@ import { pathToFileURL } from "node:url";
 const DEFAULT_REPO = "becoolme/workerd";
 const DEFAULT_OUT = "deploy/docker/workerd.lock";
 const PLATFORMS = ["linux-x64", "linux-arm64"];
+const WORKERD_VERSION_RE = /^1\.\d{8}\.\d+$/;
 
 function fail(message) {
   throw new Error(message);
+}
+
+/**
+ * The workerd release the fork is based on. The manifest's tag wins; a release cut from an
+ * untagged upstream commit must name it with `--upstream-version`.
+ */
+function upstreamVersionOf(manifest, options) {
+  const tagged = (manifest?.upstream?.tag ?? "").replace(/^v/, "");
+  const explicit = (options.upstreamVersion ?? "").replace(/^v/, "");
+  if (tagged && explicit && tagged !== explicit) {
+    fail(`--upstream-version ${explicit} contradicts the manifest's upstream.tag ${tagged}`);
+  }
+  const version = tagged || explicit;
+  if (!version) {
+    fail(
+      "manifest.upstream.tag is empty; pass --upstream-version 1.YYYYMMDD.N " +
+        "(the lock records the workerd release consumers parse)",
+    );
+  }
+  if (!WORKERD_VERSION_RE.test(version)) {
+    fail(`upstream workerd version is not 1.YYYYMMDD.N: ${JSON.stringify(version)}`);
+  }
+  return version;
 }
 
 /**
@@ -41,6 +72,7 @@ export function buildLock(manifest, options = {}) {
   if (typeof upstreamCommit !== "string" || upstreamCommit.length < 7) {
     fail("manifest.upstream.commit is missing; releases must record the synced workerd commit");
   }
+  const upstreamVersion = upstreamVersionOf(manifest, options);
   const binaries = manifest?.binaries ?? {};
   const assets = manifest?.assets ?? {};
   const capnpSha = assets["workerd.capnp"];
@@ -73,7 +105,8 @@ export function buildLock(manifest, options = {}) {
     source: "github-release",
     version: tag,
     upstream: {
-      version: manifest.upstream.tag || upstreamCommit.slice(0, 12),
+      // Consumers (vrt-config compat checks) parse this as a workerd semver.
+      version: upstreamVersion,
       commit: upstreamCommit,
     },
     artifacts,
@@ -95,7 +128,10 @@ function parseArgs(argv) {
     else if (arg.startsWith("--out=")) args.out = arg.slice("--out=".length);
     else if (arg === "--repo") args.repo = argv[++i];
     else if (arg.startsWith("--repo=")) args.repo = arg.slice("--repo=".length);
-    else fail(`unknown argument: ${arg}`);
+    else if (arg === "--upstream-version") args.upstreamVersion = argv[++i];
+    else if (arg.startsWith("--upstream-version=")) {
+      args.upstreamVersion = arg.slice("--upstream-version=".length);
+    } else fail(`unknown argument: ${arg}`);
   }
   if (!args.manifest) fail("--manifest <path> is required");
   return args;
@@ -104,7 +140,9 @@ function parseArgs(argv) {
 function main(argv) {
   const args = parseArgs(argv);
   const manifest = JSON.parse(readFileSync(args.manifest, "utf8"));
-  const rendered = serializeLock(buildLock(manifest, { repo: args.repo }));
+  const rendered = serializeLock(
+    buildLock(manifest, { repo: args.repo, upstreamVersion: args.upstreamVersion }),
+  );
 
   if (args.check) {
     let current;
