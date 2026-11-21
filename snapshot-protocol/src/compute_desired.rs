@@ -251,6 +251,15 @@ pub struct WorkerDesired {
     /// `deny_unknown_fields` — fail closed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability: Option<ObservabilityDesired>,
+    /// Streaming Tail Workers (`streaming_tail_consumers`) — same
+    /// same-tenant resolution rule as `tail_consumers` but rendered to
+    /// workerd `streamingTails` designators: the consumer receives
+    /// TailStream events via `tailStream()` rather than batched
+    /// `tail()` calls. Skipped when empty so snapshots stay
+    /// byte-identical (old cells reject the field via
+    /// `deny_unknown_fields` — fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_tail_consumers: Vec<TailConsumerDesired>,
 
     /// Per-isolate/per-request resource limits enforced by the runtime.
     pub quotas: WorkerQuotas,
@@ -1190,11 +1199,17 @@ impl ComputeDesired {
                 // Tail consumers: a same-tenant, DIFFERENT worker; unique
                 // per producer. Workerd refuses a `tails` designator with
                 // no service, so a dangling declaration must never ship.
-                if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+                if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
+                    || worker.streaming_tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
+                {
                     return Err(DesiredError::Capacity("tailConsumers"));
                 }
                 let mut tail_targets = HashSet::new();
-                for tail in &worker.tail_consumers {
+                for tail in worker
+                    .tail_consumers
+                    .iter()
+                    .chain(&worker.streaming_tail_consumers)
+                {
                     if !valid_identifier(&tail.worker_id, MAX_IDENTIFIER_LEN) {
                         return Err(DesiredError::Identifier("tailConsumers.workerId"));
                     }
@@ -2426,6 +2441,43 @@ mod tests {
                         json!("E".repeat(MAX_BINDING_NAME_LEN + 1))
                 }),
                 "DESIRED_INVALID_IDENTIFIER",
+            ),
+            // `streamingTailConsumers` — identical same-tenant and
+            // uniqueness rules as `tail_consumers` (one shared target
+            // set, so the same worker cannot appear on both channels).
+            (
+                "streaming-tail-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}])
+                }),
+                "",
+            ),
+            (
+                "streaming-tail-missing-target",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-nope"}])
+                }),
+                "DESIRED_TAIL_TARGET_SCOPE",
+            ),
+            (
+                "streaming-tail-self-reference",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-alpha-1"}])
+                }),
+                "DESIRED_TAIL_TARGET_SCOPE",
+            ),
+            (
+                "tail-same-consumer-on-both-channels",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}]);
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}]);
+                }),
+                "DESIRED_DUPLICATE",
             ),
             (
                 "bad-assets-digest",

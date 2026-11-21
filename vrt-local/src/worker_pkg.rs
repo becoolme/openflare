@@ -93,6 +93,12 @@ pub struct WorkerToml {
     #[serde(default)]
     pub(crate) observability:
         Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// `streamingTailConsumers` — same `{service}`-by-name shape as
+    /// `tailConsumers`, but the consumer receives TailStream events
+    /// via `tailStream()` instead of batched `tail()` calls (CF
+    /// `streaming_tail_consumers`; workerd `streamingTails`).
+    #[serde(default)]
+    pub(crate) streaming_tail_consumers: Vec<TailConsumerToml>,
     /// P3c-1: `durableObjectBindings` -- DO namespace bindings
     /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
@@ -486,6 +492,9 @@ pub struct PackedWorker {
     /// `[observability]` — version-scoped like `tail_consumers`:
     /// rollback restores the earlier collection gates.
     pub observability: Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// Desired streaming tail consumers — same resolution rule as
+    /// `tail_consumers`, rendered to `streamingTails` instead of `tails`.
+    pub streaming_tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
     /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
@@ -1370,6 +1379,33 @@ pub fn assemble(
         }
     }
 
+    // Streaming Tail Workers (`streaming_tail_consumers`): identical
+    // name→id, self-reference, dedupe and cap rules as `tail_consumers`.
+    let mut streaming_tail_consumers = Vec::new();
+    {
+        use snapshot_protocol::compute_desired::{
+            TailConsumerDesired, MAX_TAIL_CONSUMERS_PER_WORKER,
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for consumer in &meta.streaming_tail_consumers {
+            if consumer.service == name {
+                return Err(LocalError::Worker(
+                    "streaming_tail_consumers service must be another worker",
+                ));
+            }
+            let target = resolve_worker(&consumer.service)
+                .ok_or(LocalError::Worker("streaming tail consumer target"))?;
+            if seen.insert(target.clone()) {
+                streaming_tail_consumers.push(TailConsumerDesired { worker_id: target });
+            }
+        }
+        if streaming_tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+            return Err(LocalError::Worker(
+                "streaming_tail_consumers at most 16 consumers per worker",
+            ));
+        }
+    }
+
     // T21: `[assets] dir` — pack the directory into the local
     // content-addressed store (materialized by `Local::deploy`; the
     // binding references the manifest digest it produced).
@@ -1411,6 +1447,7 @@ pub fn assemble(
         crons: meta.crons,
         queue_consumers,
         observability: meta.observability,
+        streaming_tail_consumers,
         durable_object_classes,
         workflows,
         tail_consumers,

@@ -103,6 +103,11 @@ pub struct VersionRecord {
     /// rollback restores the earlier gates with the version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability: Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// Streaming tail consumers — version-scoped like `tail_consumers`
+    /// (CF treats `streaming_tail_consumers` as a deploy-time setting;
+    /// rollback restores the earlier set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// P3c-1: the DO class set declared by this version (migrations were already
     /// resolved to the final set at pack time, `uniqueKey` is fixed; rollback restores the original declaration --
     /// the storage identity of the `renamed_classes` lineage follows the version).
@@ -188,6 +193,7 @@ impl LocalState {
             var_values: pkg.var_values.clone(),
             crons: pkg.crons.clone(),
             queue_consumers: pkg.queue_consumers.clone(),
+            streaming_tail_consumers: pkg.streaming_tail_consumers.clone(),
             tail_consumers: pkg.tail_consumers.clone(),
             observability: pkg.observability.clone(),
             durable_object_classes: pkg.durable_object_classes.clone(),
@@ -230,6 +236,9 @@ impl LocalState {
                 record.versions.remove(pos);
             }
             record.versions.push(Self::version_record(pkg, version_id.clone()));
+            record
+                .versions
+                .push(Self::version_record(pkg, version_id.clone()));
         }
         record.active_version_id = Some(version_id.clone());
         Ok((version_id, pkg.digest.clone()))
@@ -337,6 +346,7 @@ impl LocalState {
                 crons: active.crons.clone(),
                 queue_consumers: active.queue_consumers.clone(),
                 observability: active.observability.clone(),
+                streaming_tail_consumers: active.streaming_tail_consumers.clone(),
                 durable_object_classes: active.durable_object_classes.clone(),
                 workflows: active.workflows.clone(),
                 tail_consumers: active.tail_consumers.clone(),
