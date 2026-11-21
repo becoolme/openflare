@@ -60,6 +60,7 @@ pub fn queue_binding_perms(name: &str, queue_id: &str, read: bool, write: bool) 
         queue_id: queue_id.to_string(),
         queue_name: name.to_string(),
         permissions: BindingPermissions { read, write },
+        delivery_delay_seconds: None,
     })
 }
 

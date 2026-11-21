@@ -5,6 +5,7 @@ export const QUEUE_OPS = [
     "metrics"
 ];
 export const QUEUE_STRIP_HEADER_PREFIX = "x-vrt-";
+export const QUEUE_HDR_MSG_DELAY = "x-msg-delay-secs";
 export const OPEN_COMPUTE_PREFIX = "x-open-compute-";
 export const QUEUE_BODY_MAX_BYTES = 601_856;
 export const QUEUE_DRAIN_MAX_BYTES = QUEUE_BODY_MAX_BYTES * 4;

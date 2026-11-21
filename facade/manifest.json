@@ -338,8 +338,8 @@
           "name": "facade/facade-queue.js",
           "dist": "facade/dist/facade/facade-queue.js",
           "source": "facade/facade-queue.ts",
-          "sourceSha256": "78808111a70d4bbb74adbd656866489d08fa563981d38a21f1a9ee3d3d26a749",
-          "sha256": "4aa49686b6ece747f1d25b2a29eeb6c6d9bd42eebaa8aaee328c112d8eccb643"
+          "sourceSha256": "dbbc3594163b6132420eda06dc3006fcf542db9a9234d3fbcbab5e5408de2246",
+          "sha256": "f1f5e707bb17e4a2fe208294a869735a08f36fc0539a827cfd3bf2e24393ac6d"
         },
         {
           "name": "facade/props.js",
@@ -352,8 +352,8 @@
           "name": "facade/queue-wire.js",
           "dist": "facade/dist/facade/queue-wire.js",
           "source": "facade/queue-wire.ts",
-          "sourceSha256": "99a06be592eca20597ac4fce0f2cf8507670cc91fce3bfddb1d6cf566ac8805b",
-          "sha256": "f22d35fa0051d3576af9f56efae17d2f79e66dca674ae018ea322acbfc0e2508"
+          "sourceSha256": "e1dc4563ebbaa5d7b0ecb3a3bf2025d257ba77f1e66c2ade7be6e41822c1c502",
+          "sha256": "03e39f43d67f734985a7ac5681d6c01f5790b568fddace60c9f0f4c6c0f72290"
         },
         {
           "name": "third_party/open-compute/facade/bindings/json-body.js",
@@ -457,8 +457,8 @@
           "name": "facade/queue-wire.js",
           "dist": "facade/dist/facade/queue-wire.js",
           "source": "facade/queue-wire.ts",
-          "sourceSha256": "99a06be592eca20597ac4fce0f2cf8507670cc91fce3bfddb1d6cf566ac8805b",
-          "sha256": "f22d35fa0051d3576af9f56efae17d2f79e66dca674ae018ea322acbfc0e2508"
+          "sourceSha256": "e1dc4563ebbaa5d7b0ecb3a3bf2025d257ba77f1e66c2ade7be6e41822c1c502",
+          "sha256": "03e39f43d67f734985a7ac5681d6c01f5790b568fddace60c9f0f4c6c0f72290"
         }
       ]
     },
