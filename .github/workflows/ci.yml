@@ -124,7 +124,7 @@ jobs:
             sudo apt-get install -y postgresql-16
           fi
           echo "VRT_TEST_PG_BIN=$bin" >> "$GITHUB_ENV"
-      - name: Read pinned version and digests from workerd.lock
+      - name: Read pinned version and digest from workerd.lock
         id: lock
         run: |
           set -euo pipefail
@@ -207,20 +207,21 @@ jobs:
           retention-days: 14
 
   persistence-fuzz:
-    name: Persistence fuzz (5x kill -9)
+    name: Persistence fuzz (repeated kill -9)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `kill9_fuzz_repeated` is `#[ignore]`d: five kill -9 rounds over one
-      # growing insert stream, each followed by a lease takeover that must
-      # prove every acked transaction survived. It stays a bounded gate
+      # `kill9_fuzz_repeated` is `#[ignore]`d: kill -9 rounds over a growing
+      # insert stream (5 slices, ~2 rounds each -- one killed at half its
+      # slice, one completing it), every round followed by a lease takeover
+      # that must prove the acked rows survived. It stays a bounded gate
       # (5k rows, a few minutes); the 100k-row soak is the separate
       # `kill9_fuzz_100k` test, far too slow for per-PR CI. Naming the test
       # keeps `--ignored` from also pulling in the unix-bind / workerd gates.
-      - name: Persistence fuzz (5x kill -9)
+      - name: Persistence fuzz (repeated kill -9)
         env:
           CARGO_INCREMENTAL: '0'
           CARGO_PROFILE_DEV_DEBUG: '0'
