@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "assets-basic",
+  "binding": "assets",
+  "title": "Worker fetches a packaged static asset through env.ASSETS",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/workers/static-assets/binding/",
+    "docs/bindings/static-assets.md",
+    "vrt-provider/tests/assets_fetch.rs"
+  ],
+  "steps": [
+    {
+      "name": "asset binding returns packaged bytes",
+      "request": {
+        "path": "/asset.txt"
+      },
+      "expect": {
+        "status": 200,
+        "bodyContains": [
+          "asset-conformance-ok"
+        ]
+      }
+    }
+  ]
+}

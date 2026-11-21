@@ -8,6 +8,7 @@ import {
   buildReport,
   renderMarkdown,
   runCase,
+  stageCaseDir,
   summarize,
   writeReport,
 } from "../run.mjs";
@@ -157,4 +158,28 @@ test("report builder + writer produce json and md", async () => {
   assert.match(md, /\| a \| kv \| passed \|/);
   assert.match(md, /boom/);
   assert.equal(summarize(report.cases).skipped, 1);
+});
+
+test("stageCaseDir copies asset subdirectories and drops case metadata", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-stage-"));
+  const dir = path.join(tmp, "assets-basic");
+  fs.mkdirSync(path.join(dir, "public", "nested"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "case.json"), "{}");
+  fs.writeFileSync(path.join(dir, "README.md"), "# docs");
+  fs.writeFileSync(path.join(dir, "wrangler.jsonc"), "{}");
+  fs.writeFileSync(path.join(dir, "worker.js"), "export default {};");
+  fs.writeFileSync(path.join(dir, "public", "asset.txt"), "asset-conformance-ok");
+  fs.writeFileSync(path.join(dir, "public", "nested", "deep.txt"), "deep");
+  // A markdown file inside the asset tree is deployable content, not case
+  // documentation.
+  fs.writeFileSync(path.join(dir, "public", "notes.md"), "# asset");
+
+  const staged = stageCaseDir({ id: "assets-basic", dir });
+  assert.deepEqual(fs.readdirSync(staged).sort(), ["public", "worker.js", "wrangler.jsonc"]);
+  assert.equal(
+    fs.readFileSync(path.join(staged, "public", "asset.txt"), "utf8"),
+    "asset-conformance-ok",
+  );
+  assert.equal(fs.readFileSync(path.join(staged, "public", "nested", "deep.txt"), "utf8"), "deep");
+  assert.equal(fs.readFileSync(path.join(staged, "public", "notes.md"), "utf8"), "# asset");
 });

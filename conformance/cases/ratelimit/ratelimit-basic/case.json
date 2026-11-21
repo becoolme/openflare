@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "ratelimit-basic",
+  "binding": "ratelimit",
+  "title": "Rate limit binding accepts a key and returns a success boolean",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/",
+    "docs/bindings/rate-limiting.md",
+    "facade/test/ratelimit.test.mjs"
+  ],
+  "steps": [
+    {
+      "name": "readiness endpoint does not consume a rate-limit key",
+      "request": {
+        "path": "/ready"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "ready": true
+        }
+      }
+    },
+    {
+      "name": "limit returns a boolean success field",
+      "request": {
+        "path": "/limit"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "success": true
+        }
+      }
+    }
+  ]
+}
