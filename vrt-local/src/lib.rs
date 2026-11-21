@@ -54,6 +54,7 @@ pub use project_cfg::{
 pub use worker_pkg::WorkerToml;
 pub mod serve;
 mod state;
+pub mod templates;
 mod wf_scan;
 pub mod worker_pkg;
 

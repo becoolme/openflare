@@ -240,6 +240,29 @@ fn t24_workerd_path_contract_is_unique() {
 }
 
 #[test]
+fn t25_standalone_compose_passes_the_dev_durability_opt_in() {
+    // Docker named volumes share one device, so the quick-start stack
+    // cannot boot with vrt-sql's fail-closed durability guard armed.
+    // The opt-in must be EXPLICIT in the compose init commands (base +
+    // stub overlay) so removing it is a visible diff, not a silent
+    // regression to `vrt-sql unhealthy`.
+    for f in [
+        "deploy/standalone/docker-compose.yml",
+        "deploy/standalone/docker-compose.stub.yml",
+    ] {
+        let y = read(f);
+        assert!(
+            y.contains("--dev-allow-same-device-durability"),
+            "{f} must pass the dev-only same-device durability opt-in"
+        );
+    }
+    // The production-facing template stays armed: the key must only be
+    // injected by `vrt init --dev-allow-same-device-durability`.
+    let sql = read("examples/standalone-vrt-sql.toml");
+    assert!(!sql.contains("allowSameDeviceDurability"), "{sql}");
+}
+
+#[test]
 fn t24_gitignore_covers_workerd_binaries() {
     let gi = read(".gitignore");
     assert!(
