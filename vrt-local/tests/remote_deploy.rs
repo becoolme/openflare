@@ -19,12 +19,21 @@ impl Drop for TmpDir {
     }
 }
 
+/// Unique per test: `Instant`'s `Debug` output is not a uniqueness
+/// guarantee (two threads can observe the same clock tick), and sharing a
+/// root makes `init_begin` delete the other test's staging dir as crash
+/// residue. The rest of the suite already uses this pid+sequence shape.
 fn root() -> TmpDir {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "vrt-remote-{}-{:?}",
+        "vrt-remote-{}-{}",
         std::process::id(),
-        std::time::Instant::now()
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
+    // A reused pid may leave a directory from an interrupted earlier run;
+    // `init` fails closed on a non-empty root, so clear ours first.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     TmpDir(dir)
 }
