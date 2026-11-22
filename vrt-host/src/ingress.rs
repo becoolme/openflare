@@ -1204,6 +1204,24 @@ async fn handle_routed(
         _ => return Err(IngressError::TenantUnavailable("tenant not ready")),
     }
 
+    // IMG1: `/cdn-cgi/image/` — request-path transforms owned by the
+    // host (same-origin fetch through the tenant socket, transform via
+    // the `<workerId>-images.sock` facade). Only workers carrying an
+    // `images` binding are intercepted; everything else falls through
+    // to tenant code untouched.
+    if let Some(result) = crate::cdn_cgi::maybe_handle(
+        req.method(),
+        req.uri().path(),
+        req.headers(),
+        host,
+        target,
+        &runtime,
+    )
+    .await
+    {
+        return result;
+    }
+
     // Slot acquire with one re-lookup: between `endpoint_slot` and
     // `acquire` the generation may close (switch/drain) — retry once on
     // the freshly swapped map.
@@ -2404,6 +2422,7 @@ mod cf_blob_tests {
             tenant_id: "t".into(),
             worker_id: "w".into(),
             assets_first: false,
+            images: false,
         };
         let inbound = cf_inbound(&[
             ("cf-ipcountry", "JP"),
@@ -2611,6 +2630,7 @@ mod ws_tests {
             tenant_id: "t".into(),
             worker_id: "w".into(),
             assets_first: false,
+            images: false,
         };
         scrubbed_headers(
             inbound,

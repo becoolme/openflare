@@ -1351,6 +1351,13 @@ fn images_binding_renders_wrapped_images_api() {
         out.contains("service = (name = \"facade-images\""),
         "inner fetcher must reach facade-images:\n{out}"
     );
+    // IMG1: the ingress `/cdn-cgi/image/` transform endpoint renders as
+    // a loopback socket pointing at the same facade service.
+    let wid = &tenant.workers[0].worker_id;
+    assert!(
+        out.contains(&format!("{wid}-images.sock\"")),
+        "images facade socket must render for cdn-cgi:\n{out}"
+    );
 }
 
 // ---- per-worker quotas (`limits`) ----

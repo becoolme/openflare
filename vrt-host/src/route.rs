@@ -18,6 +18,11 @@ pub struct RouteTarget {
     /// only then is the `x-vrt-asset-route` response marker honored for
     /// metrics (a legacy worker cannot self-label as an asset hit).
     pub assets_first: bool,
+    /// IMG1: the worker declares an `images` binding — the ingress owns
+    /// `/cdn-cgi/image/` for its hostnames (transforms run through the
+    /// per-worker `facade-images` socket). Without the binding the path
+    /// falls through to tenant code untouched.
+    pub images: bool,
 }
 
 /// Immutable host→target map. Swapped atomically (`ArcSwap`) on each
@@ -99,10 +104,17 @@ impl RouteTable {
                     }
                     _ => false,
                 });
+                let images = worker.bindings.iter().any(|b| {
+                    matches!(
+                        b,
+                        snapshot_protocol::compute_desired::BindingDesired::Images(_)
+                    )
+                });
                 only_target = Some(RouteTarget {
                     tenant_id: tenant.tenant_id.clone(),
                     worker_id: worker.worker_id.clone(),
                     assets_first,
+                    images,
                 });
                 for route in &worker.routes {
                     // Snapshot validation guarantees global uniqueness;
@@ -113,6 +125,7 @@ impl RouteTable {
                             tenant_id: tenant.tenant_id.clone(),
                             worker_id: worker.worker_id.clone(),
                             assets_first,
+                            images,
                         });
                 }
             }

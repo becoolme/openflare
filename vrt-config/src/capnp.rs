@@ -1151,6 +1151,25 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
             capnp_text(&cron_facade_service_name(&worker.worker_id)),
         ));
     }
+    // IMG1: `<id>-images.sock` — the ingress intercepts `/cdn-cgi/image/`
+    // on this worker's hostnames and POSTs multipart transform requests
+    // here. Loopback unix only; present iff the worker declares an
+    // `images` binding (capability-gated like every other facade).
+    if worker
+        .bindings
+        .iter()
+        .any(|b| matches!(b, snapshot_protocol::compute_desired::BindingDesired::Images(_)))
+    {
+        out.push_str(&format!(
+            "    (name = {}, address = {}, http = (), service = {}),\n",
+            capnp_text(&format!("sock-images-{}", worker.worker_id)),
+            capnp_text(&format!(
+                "unix:{}/{}-images.sock",
+                input.params.socket_dir, worker.worker_id
+            )),
+            capnp_text(&input.params.facades.images.service),
+        ));
+    }
 }
 
 /// Emit the per-worker `do-storage-<workerId>` DiskDirectory service

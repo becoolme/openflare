@@ -102,6 +102,45 @@ and the rest of the upstream op set).
 | `input().transform()/.draw().output()` | The upstream shim serializes the op chain into the `transforms` multipart field (plus `output_format`/`output_quality`/`background`/`anim`/`text_input`/`draw_*`). The facade validates, decodes every `image`/`draw_image` file, applies the ops, flattens alpha over `background` when required, and encodes. `input()`'s `encoding: "base64"` decode and `text()` sources are handled inside the shim already. |
 | `hosted.*` (`env.IMAGES.hosted.image()/.upload()/.list()/.createDirectUpload()`) | Cloudflare Images **product** RPC surface — not implemented; the facade exposes no such methods so calls reject. |
 
+## Request-path transforms (`/cdn-cgi/image/`)
+
+When a worker declares an `images` binding, the ingress intercepts
+`/cdn-cgi/image/<options>/<src>` on its hostnames **before** the tenant
+worker — the Cloudflare request-path transform surface:
+
+```
+GET /cdn-cgi/image/width=300,fit=cover,format=auto/uploads/cat.png
+```
+
+- The source is fetched **same-origin only**: `/relative/path` resolves
+  through the tenant's own worker socket (worker code, assets, or the
+  platform asset route). Absolute `http(s)://` URLs are accepted only
+  when their host equals the request `Host` — there is no remote-fetch
+  allowlist yet, so the endpoint can never proxy third-party content
+  (SSRF-closed by construction). CF's allow-any-URL behavior and its
+  `imageResizingAllowedHosts` zone setting are not implemented.
+- The transform runs through the same `facade-images` engine: capnp
+  emits a loopback `<workerId>-images.sock` service socket when the
+  worker has the binding, and the ingress POSTs a multipart body
+  identical to the binding wire.
+- Tenants **without** an `images` binding keep `/cdn-cgi/` as an
+  ordinary path (conservative gating — CF intercepts unconditionally,
+  but a silent 4xx on tenants that never opted in would fork behavior).
+- Options map onto the same op vocabulary: `width`, `height`, `fit`,
+  `gravity` (named anchors or `XxY` fractions), `rotate`, `blur`,
+  `sharpen`, `brightness`, `contrast`, `gamma`, `saturation`,
+  `background`, `trim` (`TxRxBxL` or `border`), `border` (`WxCOLOR`),
+  `padding`, `dpr`, `quality`, `format` (`auto` negotiates on the
+  request `Accept` header — avif > webp > jpeg), `anim`, `metadata`
+  (returns the `/info` JSON), `zoom`, `segment`, `onerror=redirect`.
+  Unknown or malformed keys fail closed `ERROR 9423`; keys the engine
+  lacks (`zoom`, `segment`, `anim`) reach the facade and surface its
+  typed `ERROR 9401`.
+- Errors render in CF's own shape: `ERROR <code>` text bodies with the
+  facade's status; `onerror=redirect` swaps any failure for a 302 to
+  the original source path. Upstream fetch failures collapse to
+  `ERROR 9411`.
+
 ## Backends
 
 None. `facade-images` transforms only the bytes streamed to it — the
@@ -164,14 +203,18 @@ resource-identifying keys besides `binding`.
   content/format, 9420 corrupt/undecodable, 9423 malformed request,
   9424 output too large) and reserved `94xx` values where it does not
   (9490 engine-internal).
-- **`cf.image` fetch options and `/cdn-cgi/image/` URL resizing** are
-  separate surfaces and remain unimplemented — this binding only
-  covers the in-Worker `env.IMAGES` API.
+- **`cf.image` fetch options** are a separate surface and remain
+  unimplemented — `/cdn-cgi/image/` request-path transforms ARE
+  implemented (same-origin only, see above); the `env.IMAGES` binding
+  covers the in-Worker API.
 
 ## Examples and tests
 
 - `vrt-local/src/project_cfg.rs` — `[images]` normalization
   (accept `binding`/`remote`, reject everything else).
+- `vrt-host/src/cdn_cgi.rs` — `/cdn-cgi/image/` ingress interception:
+  option→transform JSON mapping, same-origin source resolution, facade
+  socket fan-out, `ERROR <code>` shaping (5 unit tests).
 - `vrt-config/tests/render.rs` — `images_binding_renders_wrapped_images_api`
   (wrapped module + inner fetcher service name).
 - `facade/test/images.test.mjs` — `/info` shape cases plus end-to-end
