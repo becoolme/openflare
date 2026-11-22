@@ -41,9 +41,15 @@ export default {
     const u = new URL(req.url);
     if (u.pathname === "/arm") {
       const ms = parseInt(u.searchParams.get("ms") ?? "1500");
+      const tail = parseInt(u.searchParams.get("tail") ?? "0");
       ctx.waitUntil((async () => {
         await new Promise((r) => setTimeout(r, ms));
         await env.SIDE.fetch("http://side/hit");
+        // Optional post-hit tail: keeps the generation draining
+        // (pending>0) after the side effect lands. SIGTERM follows
+        // Pending(0) in the same actor turn, so without a tail the hit
+        // counter dies with the process before a poll can observe it.
+        await new Promise((r) => setTimeout(r, tail));
       })());
       return new Response("armed");
     }
@@ -522,6 +528,10 @@ async fn waituntil_side_effect_survives_generation_switch() {
     // preflight of gen2 (slow on loaded CI runners), so "gen2 served while
     // gen1 still had it pending" is an ordering fact, not a wall-clock race.
     const ARM_MS: u64 = 15_000;
+    // After the hit lands the waitUntil keeps gen1 draining for this
+    // long — widening "hits=1 AND gen1 alive" from the sub-poll
+    // SIGTERM-teardown race window to seconds of observable runway.
+    const TAIL_MS: u64 = 3_000;
     let mut params = wu_params();
     params.wait_until_grace = Duration::from_secs(40);
     // `wait_until_grace` is capped by `drain_timeout` (15 s in `wu_params`).
@@ -534,7 +544,9 @@ async fn waituntil_side_effect_survives_generation_switch() {
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
     // Arm the long waitUntil, then immediately switch generations.
-    let (st, body) = get(p1_w1, &format!("/arm?ms={ARM_MS}")).await.expect("arm reply");
+    let (st, body) = get(p1_w1, &format!("/arm?ms={ARM_MS}&tail={TAIL_MS}"))
+        .await
+        .expect("arm reply");
     assert_eq!((st, body.as_str()), (200, "armed"));
 
     let t_switch = Instant::now();
@@ -570,7 +582,9 @@ async fn waituntil_side_effect_survives_generation_switch() {
     assert_eq!(early.trim(), "0", "side effect landed before gen2 served ({switch_latency:?})");
 
     // THE GATE: the deferred SIGTERM lets the waitUntil complete — the
-    // side effect must land on w2 while gen1 is still alive.
+    // side effect must land on w2 while gen1 is still alive. The tail
+    // keeps the generation draining for TAIL_MS after the hit, so this
+    // poll reads a live counter instead of racing teardown.
     let deadline = t_switch + Duration::from_millis(ARM_MS) + Duration::from_secs(10);
     let mut hits = String::new();
     while Instant::now() < deadline {
@@ -588,12 +602,14 @@ async fn waituntil_side_effect_survives_generation_switch() {
     assert_eq!(hits.trim(), "1", "waitUntil side effect must be delivered");
 
     // Tenant forgery: the worker's own `/vrt/waituntil`-shaped route is
-    // its own code — it cannot move the platform counter.
+    // its own code — it cannot move the platform counter. The real
+    // probe still reports the armed tail (pending:1) — the forged
+    // route moved nothing and failed stayed clean.
     let (fst, _) = get(p1_w1, "/forge").await.unwrap_or((0, String::new()));
     assert_eq!(fst, 200, "tenant route serves its own code");
     let (_, body) = get(p1_wu, "/vrt/waituntil").await.unwrap();
     assert!(
-        body.contains("\"pending\":0") && body.contains("\"failed\":0"),
+        body.contains("\"pending\":1") && body.contains("\"failed\":0"),
         "forged tenant output must not move the platform count: {body}"
     );
 
