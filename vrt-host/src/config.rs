@@ -2532,6 +2532,8 @@ pub fn params_json_from_manifest(
             "email": endpoint(&manifest.facades.email),
             // Images binding facade (REQUIRED_FACADES).
             "images": endpoint(&manifest.facades.images),
+            // Vectorize binding facade (REQUIRED_FACADES).
+            "vectorize": endpoint(&manifest.facades.vectorize),
         },
         "systemWorkers": manifest.system_workers.iter().map(|w| {
             serde_json::json!({
@@ -2681,6 +2683,7 @@ struct FacadeRefsToml {
     ratelimit: ServiceEndpointToml,
     email: ServiceEndpointToml,
     images: ServiceEndpointToml,
+    vectorize: ServiceEndpointToml,
 }
 
 impl From<FacadeRefsToml> for vrt_config::FacadeRefs {
@@ -2696,6 +2699,7 @@ impl From<FacadeRefsToml> for vrt_config::FacadeRefs {
             ratelimit: v.ratelimit.into(),
             email: v.email.into(),
             images: v.images.into(),
+            vectorize: v.vectorize.into(),
         }
     }
 }

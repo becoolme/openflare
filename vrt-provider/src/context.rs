@@ -25,6 +25,8 @@ pub enum ResourceKind {
     K2,
     /// Email sending binding — upstream adapter relay, no VRT storage.
     Email,
+    /// Vectorize index — sqlite-vec exact-KNN backend in-process.
+    Vectorize,
 }
 
 /// Typed binding resource resolved from the authorized desired state.
@@ -84,6 +86,16 @@ pub enum BindingResource {
         /// `allowed_sender_addresses` allowlist.
         allowed_sender_addresses: Vec<String>,
     },
+    /// `{"type":"vectorize"}` — server-assigned index id + signed spec.
+    VectorizeIndex {
+        /// Platform index id (26 lowercase alnum).
+        id: String,
+        /// Fixed dimension count — signed at deploy; the on-disk index
+        /// must match (fail closed on drift).
+        dimensions: u32,
+        /// Distance metric (`cosine`/`euclidean`/`dot-product`).
+        metric: String,
+    },
 }
 
 impl BindingResource {
@@ -98,6 +110,7 @@ impl BindingResource {
             Self::Queue { .. } => ResourceKind::Queue,
             Self::K2Stream { .. } => ResourceKind::K2,
             Self::SendEmail { .. } => ResourceKind::Email,
+            Self::VectorizeIndex { .. } => ResourceKind::Vectorize,
         }
     }
 
@@ -114,6 +127,7 @@ impl BindingResource {
             // No server resource id exists; the binding name is the
             // resource key (the signed props are the state).
             Self::SendEmail { name, .. } => name,
+            Self::VectorizeIndex { id, .. } => id,
         }
     }
 }

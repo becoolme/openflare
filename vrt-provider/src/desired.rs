@@ -173,6 +173,11 @@ fn binding_resource(binding: &BindingDesired) -> BindingResource {
             allowed_destination_addresses: b.allowed_destination_addresses.clone(),
             allowed_sender_addresses: b.allowed_sender_addresses.clone(),
         },
+        BindingDesired::Vectorize(b) => BindingResource::VectorizeIndex {
+            id: b.index_id.clone(),
+            dimensions: b.dimensions,
+            metric: b.metric.clone(),
+        },
         // Var/secret/service bindings have no provider-backed resource;
         // they never reach this protocol, so map them to a sentinel
         // that always mismatches on resource comparison.

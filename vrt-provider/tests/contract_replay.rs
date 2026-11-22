@@ -88,6 +88,7 @@ fn contract_service(fixture: &serde_json::Value) -> Arc<TenantService> {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     })
 }
 

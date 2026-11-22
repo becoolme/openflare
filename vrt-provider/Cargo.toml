@@ -37,8 +37,11 @@ uuid = { version = "1", features = ["v4", "v7"] }
 vrt-metrics = { path = "../vrt-metrics" }
 vrt-objstore = { path = "../vrt-objstore" }
 vrt-securefs = { path = "../vrt-securefs" }
+sqlite-vec = "0.1.9"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
 vrt-sql = { path = "../vrt-sql" }
 tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3.27.0"

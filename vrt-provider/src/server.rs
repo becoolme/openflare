@@ -70,6 +70,8 @@ pub struct TenantService {
     /// P1: PG HTTP data plane (absent → PG ops fail closed
     /// `PG_CREDENTIAL_UNAVAILABLE` — authorized but undeliverable).
     pub pg: Option<Arc<crate::pg::PgBackend>>,
+    /// Vectorize index store (absent → vectorize ops fail closed).
+    pub vectorize: Option<Arc<crate::vectorize::VectorizeStore>>,
 }
 
 impl std::fmt::Debug for TenantService {
@@ -179,6 +181,8 @@ async fn dispatch(State(svc): State<Arc<TenantService>>, request: Request) -> Re
         ("k2", k2_dispatch(svc, request).await)
     } else if path.starts_with("/internal/bindings/v1/email/") {
         ("email", email_dispatch(svc, request).await)
+    } else if path.starts_with("/internal/bindings/v1/vectorize/") {
+        ("vectorize", vectorize_dispatch(svc, request).await)
     } else if path == "/internal/assets/v1/fetch" {
         ("assets", assets_dispatch(svc, request).await)
     } else if path == "/internal/assets/v1/route-index" || path == "/internal/assets/v1/can-fetch" {
@@ -292,6 +296,8 @@ fn permit_denied_response(path: &str) -> Response<Body> {
             "provider busy; retry",
             true,
         )
+    } else if path.starts_with("/internal/bindings/v1/vectorize/") {
+        vectorize_wire_error(StatusCode::TOO_MANY_REQUESTS, 3059, "provider busy; retry")
     } else if path.starts_with("/internal/bindings/v1/pg/") {
         error_response(
             "PG_RATE_LIMITED",
@@ -2481,6 +2487,131 @@ async fn email_dispatch(svc: Arc<TenantService>, request: Request) -> Response<B
             e.code,
             &e.message,
             e.retryable,
+        ),
+    }
+}
+
+/// Vectorize wire envelope: `{code:number, error:string}` — the
+/// upstream `cloudflare-internal:vectorize-api` shim maps any non-200
+/// `{code,error}` body to `<OP>_ERROR (code = N)`.
+fn vectorize_wire_error(status: StatusCode, code: u32, message: &str) -> Response<Body> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({"code": code, "error": message}).to_string(),
+        ))
+        .unwrap()
+}
+
+fn parse_vectorize_path(path: &str) -> Option<(String, String)> {
+    let rest = path.strip_prefix("/internal/bindings/v1/vectorize/")?;
+    let mut parts = rest.split('/');
+    let binding_id = parts.next()?.to_string();
+    let op = parts.next()?.to_string();
+    if binding_id.is_empty() || op.is_empty() || parts.next().is_some() {
+        return None;
+    }
+    Some((binding_id, op))
+}
+
+/// `facade-vectorize` -> provider -> sqlite-vec index. Identity comes
+/// from the signed props (authorizer); the path bindingId is only a
+/// routing hint verified against the desired binding.
+async fn vectorize_dispatch(svc: Arc<TenantService>, request: Request) -> Response<Body> {
+    let Some((binding_id, op)) = parse_vectorize_path(request.uri().path()) else {
+        return vectorize_wire_error(StatusCode::BAD_REQUEST, 3000, "bad vectorize route");
+    };
+    const VEC_MAX_BODY: usize = 8 * 1024 * 1024;
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|n| n > VEC_MAX_BODY)
+    {
+        return vectorize_wire_error(StatusCode::PAYLOAD_TOO_LARGE, 3001, "request too large");
+    }
+    let identity = match parse_request_identity(&binding_id, request.headers()) {
+        Ok(identity) => identity,
+        Err(err) => {
+            return vectorize_wire_error(err.status(), 3003, "identity rejected");
+        }
+    };
+    let ctx = match svc.authorizer.authorize(
+        &svc.tenant_id,
+        &identity,
+        &binding_id,
+        ResourceKind::Vectorize,
+    ) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            return vectorize_wire_error(err.status(), 3003, "authorization denied");
+        }
+    };
+    let permissions = ctx.permissions();
+    // Writes (insert/upsert/deleteByIds) need the signed write grant;
+    // reads (info/query/getByIds) need read.
+    let write_op = matches!(op.as_str(), "insert" | "upsert" | "deleteByIds");
+    if (write_op && !permissions.write) || (!write_op && !permissions.read) {
+        return vectorize_wire_error(
+            StatusCode::FORBIDDEN,
+            3004,
+            "binding lacks required permission",
+        );
+    }
+    let (index_id, dimensions, metric_owned) = match ctx.resource() {
+        crate::context::BindingResource::VectorizeIndex {
+            id,
+            dimensions,
+            metric,
+        } => (id.clone(), *dimensions, metric.clone()),
+        _ => {
+            return vectorize_wire_error(StatusCode::FORBIDDEN, 3003, "binding type mismatch");
+        }
+    };
+    let Some(store) = svc.vectorize.clone() else {
+        return vectorize_wire_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            3100,
+            "vectorize backend unavailable",
+        );
+    };
+    let body = if request.method() == axum::http::Method::GET {
+        Vec::new()
+    } else {
+        match tokio::time::timeout(
+            svc.body_read_timeout,
+            to_bytes(request.into_body(), VEC_MAX_BODY),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b.to_vec(),
+            _ => {
+                return vectorize_wire_error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    3001,
+                    "failed to read request body",
+                );
+            }
+        }
+    };
+    let tenant = svc.tenant_id.clone();
+    let op_owned = op.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.op(&tenant, &index_id, dimensions, &metric_owned, &op_owned, &body)
+    })
+    .await;
+    match result {
+        Ok((status, value)) => Response::builder()
+            .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(value.to_string()))
+            .unwrap(),
+        Err(_) => vectorize_wire_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            3058,
+            "vectorize backend panic",
         ),
     }
 }

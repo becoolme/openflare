@@ -307,7 +307,8 @@ impl ProviderError {
             | ResourceKind::D1
             | ResourceKind::Queue
             | ResourceKind::K2
-            | ResourceKind::Email => {
+            | ResourceKind::Email
+            | ResourceKind::Vectorize => {
                 matches!(self, Self::ResourceUnavailable)
             }
             ResourceKind::Pg => matches!(

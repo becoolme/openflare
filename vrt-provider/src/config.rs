@@ -37,6 +37,10 @@ pub struct ProviderConfig {
     /// closed (`ASSET_STORAGE_UNAVAILABLE`), bindings still authorize.
     #[serde(default)]
     pub assets: Option<FsAssetsConfig>,
+    /// Vectorize index store (sqlite-vec, one DB file per index).
+    /// Absent → vectorize ops fail closed (`VECTORIZE_UNAVAILABLE`).
+    #[serde(default)]
+    pub vectorize: Option<FsVectorizeConfig>,
     /// T34: vrt-sql data-plane backend; absent → D1 ops return
     /// `{success:false}` unavailable surface.
     #[serde(default)]
@@ -315,6 +319,15 @@ fn default_kv_connect_timeout_ms() -> u64 {
 pub struct FsKvConfig {
     /// Data root (`0700`, created if absent). Layout:
     /// `<dir>/<tenant>/<namespace>/<sha256(key)>`.
+    pub dir: PathBuf,
+}
+
+/// Local-filesystem Vectorize index store. One sqlite DB per index:
+/// `<dir>/<tenant>/<indexId>.vec.db` (`0700`, created if absent).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FsVectorizeConfig {
+    /// Data root (`0700`, created if absent).
     pub dir: PathBuf,
 }
 

@@ -45,6 +45,7 @@ pub mod server;
 pub mod smtp;
 pub mod unixsock;
 pub(crate) mod upstream_body;
+pub mod vectorize;
 
 pub use authorize::Authorizer;
 pub use context::{BindingContext, BindingResource, Permissions, ResourceKind};

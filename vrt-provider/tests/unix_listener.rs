@@ -70,6 +70,7 @@ async fn unix_listener_serves_kv_protocol() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
 
     let listener = unixsock::bind_listener(dir.path(), TENANT).expect("bind");

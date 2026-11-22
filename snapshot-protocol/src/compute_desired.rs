@@ -403,6 +403,12 @@ pub enum BindingDesired {
     /// as workerd `wrapped` → `cloudflare-internal:images-api` —
     /// the upstream Miniflare module name.
     Images(ImagesBinding),
+    /// `{"type":"vectorize"}` — CF Vectorize index (`env.<name>` is the
+    /// upstream `Vectorize` API: `describe/query/insert/upsert/
+    /// getByIds/deleteByIds/queryById`). Rendered as `wrapped` →
+    /// `cloudflare-internal:vectorize-api` → `facade-vectorize` →
+    /// provider vectorize backend (sqlite-vec index files).
+    Vectorize(VectorizeBinding),
     /// `{"type":"analyticsEngine"}` — Analytics Engine dataset
     /// (`env.<name>` is a `AnalyticsEngineDataset` with
     /// `writeDataPoint()`). Rendered as workerd `analyticsEngine`
@@ -761,6 +767,29 @@ pub struct WorkerLoaderBinding {
 pub struct ImagesBinding {
     /// Binding name (`env.<name>`), JS identifier.
     pub name: String,
+}
+
+/// `{"type":"vectorize"}` — a Vectorize index binding. `index_id` is
+/// the platform-assigned index resource id (`namespaceResourceId` in
+/// props); `index_name`/`dimensions`/`metric` are the index spec the
+/// control plane signed at deploy time — the provider validates the
+/// on-disk index against them, so a client can never reshape the index
+/// from a request (T37 precedent: routing ids are server-minted).
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VectorizeBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// Platform index id (26 lowercase alnum).
+    pub index_id: String,
+    /// Index name — kebab-case, unique per tenant (wrangler `index_name`).
+    pub index_name: String,
+    /// Fixed vector dimension count (1..=1536, Cloudflare's bound).
+    pub dimensions: u32,
+    /// Distance metric: `cosine` | `euclidean` | `dot-product`.
+    pub metric: String,
+    /// Access grant for this binding.
+    pub permissions: BindingPermissions,
 }
 
 /// `{"type":"analyticsEngine"}` — an Analytics Engine dataset binding.
@@ -1792,6 +1821,36 @@ impl WorkerDesired {
                         }
                     }
                 }
+                BindingDesired::Vectorize(v) => {
+                    // indexId is server-minted — same `^[0-9a-z]{26}$`
+                    // alphabet as D1/queue ids.
+                    if v.index_id.len() != 26
+                        || !v
+                            .index_id
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    {
+                        return Err(DesiredError::Identifier("bindings.indexId"));
+                    }
+                    // indexName is kebab-case (wrangler `index_name`).
+                    if v.index_name.is_empty()
+                        || v.index_name.len() > 64
+                        || !v
+                            .index_name
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+                        || v.index_name.starts_with('-')
+                        || v.index_name.ends_with('-')
+                    {
+                        return Err(DesiredError::Identifier("bindings.indexName"));
+                    }
+                    if v.dimensions == 0 || v.dimensions > 1536 {
+                        return Err(DesiredError::Identifier("bindings.dimensions"));
+                    }
+                    if !matches!(v.metric.as_str(), "cosine" | "euclidean" | "dot-product") {
+                        return Err(DesiredError::Identifier("bindings.metric"));
+                    }
+                }
                 // WorkerLoader carries no resource reference — `name`
                 // (validated as a binding name at the match head) is
                 // the only field.
@@ -1999,6 +2058,7 @@ impl BindingDesired {
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
             Self::Images(b) => &b.name,
+            Self::Vectorize(b) => &b.name,
             Self::AnalyticsEngine(b) => &b.name,
             Self::UnsafeEval(b) => &b.name,
             Self::Flagship(b) => &b.name,
@@ -2019,6 +2079,7 @@ impl BindingDesired {
             Self::Queue(b) => Some(&b.permissions),
             Self::K2(b) => Some(&b.permissions),
             Self::SendEmail(b) => Some(&b.permissions),
+            Self::Vectorize(b) => Some(&b.permissions),
             Self::Var(_)
             | Self::Secret(_)
             | Self::Service(_)
