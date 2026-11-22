@@ -384,11 +384,12 @@ fn render_produces_expected_structure() {
     let denied = out
         .matches("globalOutbound = (name = \"vrt-no-network\", entrypoint = \"DenyAll\")")
         .count();
-    // 10 facades (kv/r2/assets/pg/d1/queue/k2/ratelimit/email/images) + facade-cron-w-alpha-1
+    // 11 facades (kv/r2/assets/pg/d1/queue/k2/ratelimit/email/images/vectorize)
+    // + facade-cron-w-alpha-1
     // (CR1: the cron dispatcher is also deny-routed — it reaches the
     // tenant worker only through the TARGET service binding, never
     // the network) + vrt-no-network itself.
-    assert_eq!(denied, 12, "all non-egress system workers are deny-routed");
+    assert_eq!(denied, 13, "all non-egress system workers are deny-routed");
     // No worker emits any other globalOutbound spelling.
     assert_eq!(
         out.matches("globalOutbound =").count(),
@@ -1357,6 +1358,54 @@ fn images_binding_renders_wrapped_images_api() {
     assert!(
         out.contains(&format!("{wid}-images.sock\"")),
         "images facade socket must render for cdn-cgi:\n{out}"
+    );
+}
+
+/// `vectorize` renders a `wrapped` binding over
+/// `cloudflare-internal:vectorize-api` with the shim's required
+/// innerBindings: `fetcher` → facade-vectorize (signed props carrying
+/// `namespaceResourceId` = indexId), `indexId` text, `indexVersion`
+/// "v2" — the GA wire surface.
+#[test]
+fn vectorize_binding_renders_wrapped_vectorize_api() {
+    let mut tenant = tenant();
+    tenant.workers[0].bindings = serde_json::from_value(serde_json::json!([
+        {
+            "type": "vectorize",
+            "name": "VEC",
+            "indexId": "abcdefghijklmnopqrstuvwxyz",
+            "indexName": "docs-ix",
+            "dimensions": 768,
+            "metric": "cosine",
+            "permissions": {"read": true, "write": true}
+        }
+    ]))
+    .unwrap();
+    let bs = bundles();
+    let out = render_tenant_config(&input(&tenant, &bs, &runtime_params()))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains(
+            "(name = \"VEC\", wrapped = (moduleName = \"cloudflare-internal:vectorize-api\""
+        ),
+        "vectorize must render the wrapped vectorize-api module:\n{out}"
+    );
+    assert!(
+        out.contains("service = (name = \"facade-vectorize\""),
+        "inner fetcher must reach facade-vectorize:\n{out}"
+    );
+    assert!(
+        out.contains("(name = \"indexId\", text = \"abcdefghijklmnopqrstuvwxyz\")"),
+        "indexId must ride an inner text binding:\n{out}"
+    );
+    assert!(
+        out.contains("(name = \"indexVersion\", text = \"v2\")"),
+        "indexVersion must pin the v2 wire:\n{out}"
+    );
+    assert!(
+        out.contains("\\\"namespaceResourceId\\\":\\\"abcdefghijklmnopqrstuvwxyz\\\""),
+        "signed props must carry the index id:\n{out}"
     );
 }
 

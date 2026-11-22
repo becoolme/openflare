@@ -106,6 +106,7 @@ fn svc_with_queue(queue_client: Option<Arc<QueueClient>>, f: &Fixture) -> Arc<Te
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     })
 }
 
@@ -372,6 +373,7 @@ async fn permission_denied_read_only_binding() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     let (st, _) = call(
         svc.clone(),

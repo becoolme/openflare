@@ -266,6 +266,17 @@ async fn run() -> ExitCode {
         None => None,
     };
 
+    let vectorize = match &config.vectorize {
+        Some(fs) => match vrt_provider::vectorize::VectorizeStore::new(fs.dir.clone()) {
+            Ok(store) => Some(std::sync::Arc::new(store)),
+            Err(e) => {
+                tracing::error!(error = %e, "vectorize store init failed");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let authorizer = Arc::new(Authorizer::new(desired.clone(), config.operation_timeout()));
     // RV-R8 #2: `tenant_concurrency` is PER TENANT — each listener's
     // TenantService gets its own semaphore (the Arc dies with the
@@ -449,6 +460,7 @@ async fn run() -> ExitCode {
         let d1 = d1_client.clone();
         let queue_client = queue_client.clone();
         let pg = pg_backend.clone();
+        let vectorize = vectorize.clone();
         let signer = signer.clone();
         let assets = assets.clone();
         let r2_max_object_bytes = config
@@ -499,6 +511,7 @@ async fn run() -> ExitCode {
                 k2: k2_client.clone(),
                 email: email_backend.clone(),
                 pg: pg.clone(),
+                vectorize: vectorize.clone(),
             });
             // RV-R67: one quota per listener (bounded by live tenants).
             let quota = Arc::new(vrt_provider::quota::TenantQuota::new(

@@ -1305,6 +1305,78 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 b.insert("name".into(), Value::from(binding));
                 bindings.push(Value::Object(b));
             }
+            "vectorize" => {
+                // CF `[[vectorize]] {binding, index_name}` — the
+                // Vectorize binding (v2 GA wire). CF carries
+                // dimensions/metric on the provisioned index; the VRT
+                // spec is signed at deploy so both keys are REQUIRED
+                // here (documented deviation — there is no separate
+                // index-provisioning API surface).
+                for (i, e) in table_list(value, "vectorize")?.iter().enumerate() {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "binding" | "index_name" | "dimensions" | "metric" | "remote" => {}
+                            _ => return Err(unsupported(&format!("vectorize[{i}].{k}"), None)),
+                        }
+                    }
+                    let binding = req_str(
+                        e.get("binding").unwrap_or(&Value::Null),
+                        &format!("vectorize[{i}].binding"),
+                    )?;
+                    let index_name = req_str(
+                        e.get("index_name").unwrap_or(&Value::Null),
+                        &format!("vectorize[{i}].index_name"),
+                    )?;
+                    if index_name.is_empty()
+                        || index_name.len() > 64
+                        || !index_name
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                        || index_name.starts_with('-')
+                        || index_name.ends_with('-')
+                    {
+                        return Err(invalid(
+                            &format!("vectorize[{i}].index_name"),
+                            "must be 1-64 chars of lowercase kebab-case",
+                        ));
+                    }
+                    let dimensions = e
+                        .get("dimensions")
+                        .and_then(|v| v.as_u64())
+                        .filter(|d| (1..=1536).contains(d))
+                        .ok_or_else(|| {
+                            invalid(
+                                &format!("vectorize[{i}].dimensions"),
+                                "must be an integer in 1..=1536",
+                            )
+                        })?;
+                    let metric = e
+                        .get("metric")
+                        .and_then(|v| v.as_str())
+                        .filter(|m| matches!(*m, "cosine" | "euclidean" | "dot-product"))
+                        .ok_or_else(|| {
+                            invalid(
+                                &format!("vectorize[{i}].metric"),
+                                "must be cosine, euclidean or dot-product",
+                            )
+                        })?;
+                    if let Some(v) = e.get("remote") {
+                        if !v.is_boolean() {
+                            return Err(invalid(
+                                &format!("vectorize[{i}].remote"),
+                                "must be a boolean",
+                            ));
+                        }
+                    }
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("vectorize"));
+                    b.insert("name".into(), Value::from(binding));
+                    b.insert("index_name".into(), Value::from(index_name));
+                    b.insert("dimensions".into(), Value::from(dimensions));
+                    b.insert("metric".into(), Value::from(metric));
+                    bindings.push(Value::Object(b));
+                }
+            }
             "streaming_tail_consumers" => {
                 // CF `streaming_tail_consumers = [{service = "..."}]` —
                 // same-table shape as `tail_consumers` (worker-level,
@@ -2627,6 +2699,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut flagship = Map::new();
         let mut k2 = Map::new();
         let mut send_email = Map::new();
+        let mut vectorize = Map::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -2762,6 +2835,26 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     // workerLoaders): no resource reference.
                     images.push(Value::from(name));
                 }
+                "vectorize" => {
+                    // `{type:"vectorize", index_name, dimensions,
+                    // metric}` → `[bindings].vectorize.<name>`; the
+                    // real indexId is derived at pack time
+                    // (`vrt-vx:{tenant}:{index_name}`).
+                    let mut v = Map::new();
+                    v.insert(
+                        "index_name".into(),
+                        b.get("index_name").cloned().unwrap_or(Value::Null),
+                    );
+                    v.insert(
+                        "dimensions".into(),
+                        b.get("dimensions").cloned().unwrap_or(Value::Null),
+                    );
+                    v.insert(
+                        "metric".into(),
+                        b.get("metric").cloned().unwrap_or(Value::Null),
+                    );
+                    vectorize.insert(name.into(), Value::Object(v));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -2821,6 +2914,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !send_email.is_empty() {
             bind.insert("sendEmail".into(), Value::Object(send_email));
+        }
+        if !vectorize.is_empty() {
+            bind.insert("vectorize".into(), Value::Object(vectorize));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));

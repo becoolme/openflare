@@ -229,11 +229,26 @@ pub(crate) struct BindingsToml {
     /// the vendored WASM engine via facade-images (no resource ref).
     #[serde(default)]
     pub(crate) images: Vec<String>,
+    /// CF `[[vectorize]]` — `binding name -> {index_name, dimensions,
+    /// metric}`; indexId is derived at pack time from
+    /// `vrt-vx:{tenant}:{index_name}` (first 26 hex chars of sha256).
+    #[serde(default)]
+    pub(crate) vectorize: BTreeMap<String, VectorizeToml>,
     /// CF `[[flagship]]` — `binding name -> app_id` (the app record
     /// lives tenant-side: standalone resolves it in `flagship.json`,
     /// the platform in the Flagship app store).
     #[serde(default)]
     pub(crate) flagship: BTreeMap<String, String>,
+}
+
+/// `[bindings].vectorize.<name>` normalized shape — mirrors CF
+/// `[[vectorize]]` wrangler fields (snake_case kept for parity).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VectorizeToml {
+    pub(crate) index_name: String,
+    pub(crate) dimensions: u32,
+    pub(crate) metric: String,
 }
 
 /// `[bindings].ratelimit.<name>` normalized shape.
@@ -1207,6 +1222,24 @@ pub fn assemble(
                 snapshot_protocol::compute_desired::ImagesBinding { name: name.clone() },
             ));
         }
+        for (binding, spec) in &b.vectorize {
+            // indexId derivation — first 26 hex chars of
+            // sha256("vrt-vx:{tenant}:{index_name}") — same rule as
+            // queue/database ids; the signed snapshot covers the
+            // derived value. dims/metric validation runs in
+            // `VectorizeBinding::validate`.
+            let index_id = derive_index_id(tenant_id, &spec.index_name)?;
+            bindings.push(BindingDesired::Vectorize(
+                snapshot_protocol::compute_desired::VectorizeBinding {
+                    name: binding.clone(),
+                    index_id,
+                    index_name: spec.index_name.clone(),
+                    dimensions: spec.dimensions,
+                    metric: spec.metric.clone(),
+                    permissions: read_write.clone(),
+                },
+            ));
+        }
         for (binding, db) in &b.pg {
             // P1: `name → logical tenant id` — the provider resolves
             // credentials from `secrets/pg-credentials.json` under
@@ -2071,6 +2104,26 @@ pub fn derive_stream_id(tenant_id: &str, stream_name: &str) -> Result<String, Lo
         format!("vrt-k2:{tenant_id}:{stream_name}").as_bytes(),
     ));
     Ok(digest[..32].to_string())
+}
+
+/// Vectorize index id: first 26 hex chars of
+/// sha256("vrt-vx:{tenant}:{index_name}") — hex ⊂ the `[a-z0-9]{26}`
+/// id charset; the signed snapshot covers the derived value.
+pub fn derive_index_id(tenant_id: &str, index_name: &str) -> Result<String, LocalError> {
+    if index_name.is_empty()
+        || index_name.len() > 64
+        || !index_name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    {
+        return Err(LocalError::Worker(
+            "index name must be 1-64 chars of lowercase kebab-case",
+        ));
+    }
+    let digest = hex::encode(sha2::Sha256::digest(
+        format!("vrt-vx:{tenant_id}:{index_name}").as_bytes(),
+    ));
+    Ok(digest[..26].to_string())
 }
 
 /// Modules → pack-format JSON: explicit `[modules]` type override
@@ -2951,5 +3004,49 @@ mod module_rules_tests {
         let files: BTreeMap<String, Vec<u8>> =
             [("index.mjs".to_string(), b"export default {}".to_vec())].into();
         assert!(build_pack_json(&m, &files).is_err());
+    }
+}
+
+#[cfg(test)]
+mod vectorize_tests {
+    use super::*;
+
+    #[test]
+    fn derive_index_id_is_26_hex_and_deterministic() {
+        let a = derive_index_id("tenant-1", "docs-ix").unwrap();
+        let b = derive_index_id("tenant-1", "docs-ix").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 26);
+        assert!(a.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        // Different tenant or index name → different id.
+        assert_ne!(a, derive_index_id("tenant-2", "docs-ix").unwrap());
+        assert_ne!(a, derive_index_id("tenant-1", "other-ix").unwrap());
+        // Rejected shapes.
+        assert!(derive_index_id("t", "").is_err());
+        assert!(derive_index_id("t", "UPPER").is_err());
+        assert!(derive_index_id("t", "has_underscore").is_err());
+        assert!(derive_index_id("t", &"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn vectorize_toml_deserializes_spec() {
+        let b: BindingsToml = toml::from_str(
+            r#"
+            [vectorize.VEC]
+            index_name = "docs-ix"
+            dimensions = 768
+            metric = "cosine"
+            "#,
+        )
+        .unwrap();
+        let spec = b.vectorize.get("VEC").unwrap();
+        assert_eq!(spec.index_name, "docs-ix");
+        assert_eq!(spec.dimensions, 768);
+        assert_eq!(spec.metric, "cosine");
+        // Unknown keys fail closed.
+        assert!(toml::from_str::<BindingsToml>(
+            "[vectorize.VEC]\nindex_name = \"x\"\ndimensions = 1\nmetric = \"cosine\"\nbogus = 1\n"
+        )
+        .is_err());
     }
 }

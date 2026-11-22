@@ -74,6 +74,7 @@ fn parses_generated_manifest_into_system_workers() {
         "facade-k2",
         "facade-email",
         "facade-images",
+        "facade-vectorize",
         "vrt-egress",
         "vrt-no-network",
     ] {
@@ -192,6 +193,7 @@ fn minimal() -> serde_json::Value {
         "facade-k2",
         "facade-email",
         "facade-images",
+        "facade-vectorize",
         "vrt-egress",
         "vrt-no-network",
     ] {

@@ -36,7 +36,7 @@ host/provider configuration, not per-binding provider plug-ins.
 | [WebSockets](websockets.md) | Partial | HTTP/1.1 upgrade passthrough to workers and Durable Objects. 300 s idle / 4 h max session, 4096 sessions per ingress, 256 per tenant. |
 | [Vars and secrets](vars-and-secrets.md) | Partial | `vars` become `text` bindings, so non-string values arrive JSON-encoded as strings. Secrets are `vrt secret put` + `[secrets]` name→ref maps injected as process env vars; `secrets_store_secrets` is rejected. |
 | Workers AI (`ai`) | Unsupported | Any unrecognized top-level key fails the deploy with `VRT_CONFIG_UNSUPPORTED_FIELD`. |
-| Vectorize (`vectorize`) | Unsupported | Same typed deploy error. |
+| [Vectorize](vectorize.md) | Partial | `[[vectorize]]` / `[bindings.vectorize.*]` → a `wrapped` binding over `cloudflare-internal:vectorize-api` (v2 wire) reaching `facade-vectorize` → per-index sqlite-vec files. Exact-KNN backend; all v2 ops implemented. |
 | `ai_search` / `ai_search_namespaces` | Unsupported | Same typed deploy error. |
 | [Tail Workers](tail-workers.md) | Partial | `tail_consumers = [{service = "…"}]` → same-tenant `tail` consumers as workerd `tails` designators; `streaming_tail_consumers` → `tailStream` consumers as `streamingTails` designators. Both lists are versioned (rollback restores the consumer set), capped at 16, reject self-targets and dual-channel delivery. Same-tenant only. |
 | [Analytics Engine](analytics-engine.md) | Partial | `[[analytics_engine_datasets]]` → a native `analyticsEngine` binding (`writeDataPoint`). Events ingest to a per-tenant socket, spool as JSONL, and flush to canonical Parquet — full fidelity, no sampling; query via DuckDB/ClickHouse. |

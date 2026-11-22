@@ -110,6 +110,7 @@ fn spawn_provider(dir: &Path, digest: &str, port: u16) -> std::thread::JoinHandl
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()

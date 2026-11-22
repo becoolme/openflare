@@ -67,6 +67,9 @@ const WORKERS = [
   // CF Images binding — inner `fetcher` of `cloudflare-internal:images-api`.
   // Pure in-worker transforms (vendored WASM engine); no binding-backend.
   { serviceName: "facade-images", entrypoint: "ImagesFacade", entry: "facade-images.ts", needsBindingBackend: false },
+  // CF Vectorize binding — inner `fetcher` of `cloudflare-internal:vectorize-api`
+  // (v2 GA wire); forwards ops to the provider's sqlite-vec backend.
+  { serviceName: "facade-vectorize", entrypoint: "VectorizeFacade", entry: "facade-vectorize.ts", needsBindingBackend: true },
   // MIG-16: in-process Rate Limiting binding — pure RPC entrypoint, no
   // binding-backend (state is local to the workerd process).
   { serviceName: "facade-ratelimit", entrypoint: "RateLimiter", entry: "facade-ratelimit.ts", needsBindingBackend: false },

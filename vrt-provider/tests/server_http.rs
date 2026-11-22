@@ -51,6 +51,7 @@ fn service_fixture() -> (Fixture, Arc<TenantService>) {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     (f, svc)
 }
@@ -822,6 +823,7 @@ async fn missing_snapshot_fails_closed_over_http() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     let (socket, shutdown) = spawn_tenant(svc).await;
     let (status, _, body) = http_post(
@@ -942,6 +944,7 @@ fn perm_service(bindings: Vec<BindingDesired>) -> Arc<TenantService> {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     })
 }
 
@@ -1192,6 +1195,7 @@ async fn saturated_tenant_permits_answer_429() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     // Hold the only global permit — the next request must 429 fast.
     let held = svc.global_permits.clone().try_acquire_owned().unwrap();
@@ -1250,6 +1254,7 @@ fn service_fixture_mp() -> (Fixture, Arc<TenantService>) {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     (f, svc)
 }
@@ -1288,6 +1293,7 @@ fn service_fixture_readonly_r2() -> (Fixture, Arc<TenantService>) {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     (f, svc)
 }
@@ -1670,6 +1676,7 @@ async fn multipart_complete_outer_timeout_is_result_unknown() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     let (socket, shutdown) = spawn_tenant(svc).await;
     let (status, created) = mp_create(socket, "mp/t").await;
@@ -1752,6 +1759,7 @@ fn tenant_svc(tenant_permits: usize, global: &Arc<tokio::sync::Semaphore>) -> Ar
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     })
 }
 
@@ -1860,6 +1868,7 @@ async fn kv_body_read_deadline_returns_typed_busy() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     let (socket, shutdown) = spawn_tenant(svc).await;
 

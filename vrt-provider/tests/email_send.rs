@@ -71,6 +71,7 @@ fn svc_with(
             k2: None,
             email: backend,
             pg: None,
+            vectorize: None,
         }),
     )
 }

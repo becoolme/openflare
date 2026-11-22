@@ -163,6 +163,10 @@ pub struct FacadeRefs {
     /// `send_email` bindings → wrapped `cloudflare-internal:send-email`
     /// whose inner `fetcher` service is this facade (POST /send).
     pub email: ServiceEndpoint,
+    /// `vectorize` bindings → wrapped `cloudflare-internal:vectorize-api`
+    /// whose inner `fetcher` service is this facade → provider's
+    /// sqlite-vec index backend.
+    pub vectorize: ServiceEndpoint,
 }
 
 /// A system module referenced by content digest (the artifact for a
@@ -494,6 +498,7 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         ("facades.pg", &input.params.facades.pg),
         ("facades.d1", &input.params.facades.d1),
         ("facades.ratelimit", &input.params.facades.ratelimit),
+        ("facades.vectorize", &input.params.facades.vectorize),
     ] {
         // An endpoint must resolve to a defined system worker — and can
         // never be an internal service (`binding-backend`/`outbound-network`
@@ -1666,6 +1671,9 @@ fn emit_binding(
         BindingDesired::Images(img) => {
             emit_images_binding(out, img, worker, input)?;
         }
+        BindingDesired::Vectorize(v) => {
+            emit_vectorize_binding(out, v, worker, input)?;
+        }
         BindingDesired::Ratelimit(r) => {
             emit_ratelimit_binding(out, r, worker, input)?;
         }
@@ -2137,6 +2145,47 @@ fn emit_images_binding(
         capnp_text("cloudflare-internal:images-api"),
         capnp_text(&facade.service),
         capnp_text(&facade.entrypoint),
+    ));
+    Ok(())
+}
+
+/// `vectorize` — `wrapped` binding over `cloudflare-internal:vectorize-api`.
+/// innerBindings: `fetcher` → facade-vectorize (signed props like k2/d1 —
+/// `namespaceResourceId` = indexId), `indexVersion` = "v2" (the current
+/// GA wire; v1 is the deprecated beta surface with the same user API).
+/// `useNdJson` is omitted so the shim always posts `{vectors:[...]}`
+/// JSON — the backend accepts exactly that shape.
+fn emit_vectorize_binding(
+    out: &mut String,
+    v: &snapshot_protocol::compute_desired::VectorizeBinding,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+) -> Result<(), ConfigError> {
+    let props = String::from_utf8(canonical_bytes(&json!({
+        "bindingId": format!("{}~{}", worker.worker_id, v.name),
+        "descriptorSha256": worker.active_version.artifact_digest,
+        "instanceId": input.tenant.tenant_id,
+        "namespaceResourceId": v.index_id,
+        "permissions": {"read": v.permissions.read, "write": v.permissions.write},
+        "resourceSpecGeneration": input.revision,
+        "versionId": worker.active_version.version_id,
+        "workerId": worker.worker_id,
+    })))
+    .expect("canonical props are utf8");
+    let facade = &input.params.facades.vectorize;
+    out.push_str(&format!(
+        "        (name = {}, wrapped = (moduleName = {}, innerBindings = [
+            (name = \"fetcher\", service = (name = {}, entrypoint = {}, props = (json = {}))),
+            (name = \"indexId\", text = {}),
+            (name = \"indexVersion\", text = \"v2\")
+        ])),
+",
+        capnp_text(&v.name),
+        capnp_text("cloudflare-internal:vectorize-api"),
+        capnp_text(&facade.service),
+        capnp_text(&facade.entrypoint),
+        capnp_text(&props),
+        capnp_text(&v.index_id),
     ));
     Ok(())
 }
@@ -3072,6 +3121,7 @@ fn validate_params(params: &RuntimeParams) -> Result<(), ConfigError> {
         ("facades.r2", &params.facades.r2),
         ("facades.assets", &params.facades.assets),
         ("facades.pg", &params.facades.pg),
+        ("facades.vectorize", &params.facades.vectorize),
     ] {
         if !valid_service_name(&endpoint.service) {
             return Err(ConfigError::Identifier(field));

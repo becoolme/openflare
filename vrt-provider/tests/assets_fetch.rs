@@ -120,6 +120,7 @@ fn env(files: &[(&str, &[u8])], not_found: &str, store_tenant: &str) -> Env {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     Env {
         app: tenant_router(svc),
@@ -889,6 +890,7 @@ async fn route_index_over_limit_returns_too_large_flag() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     let app = tenant_router(svc);
     let res = probe(&app, "route-index", &digest, &[]).await;

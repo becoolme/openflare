@@ -52,6 +52,7 @@ fn svc() -> Arc<TenantService> {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     })
 }
 
@@ -117,6 +118,7 @@ async fn assets_backend_reports_storage_unavailable() {
         k2: None,
         email: None,
         pg: None,
+        vectorize: None,
     });
     let app = tenant_router(svc);
     // unauthenticated → 400 before the store check
