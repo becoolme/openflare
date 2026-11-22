@@ -58,6 +58,10 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
     // MIG-14: wrangler `[placement]` (CF Smart Placement / region
     // hints) — dropped; the runtime has no placement semantics.
     "placement",
+    // `$schema` is the standard JSON-Schema annotation wrangler.jsonc
+    // files carry (`"$schema": "node_modules/wrangler/config-schema.json"`)
+    // — editor metadata, not config.
+    "$schema",
 ];
 /// Mirrors @wdl-dev/cli NON_INHERITABLE_ENV_KEYS — env blocks REPLACE
 /// these keys wholesale instead of merging the top-level value.
