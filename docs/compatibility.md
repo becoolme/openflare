@@ -35,7 +35,8 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | Observability (`[observability]` Worker Logs gates + head sampling) | Partial | [wrangler-config.md](wrangler-config.md) |
 | Vectorize | Partial | [bindings/vectorize.md](bindings/vectorize.md) |
 | Analytics Engine | Partial | [bindings/analytics-engine.md](bindings/analytics-engine.md) |
-| E-mail (`send_email`) | Partial | [wrangler-config.md](wrangler-config.md) — binding page pending |
+| E-mail (`send_email`) | Partial | [bindings/send-email.md](bindings/send-email.md) |
+| K2 (durable event log) | Partial | [bindings/k2.md](bindings/k2.md) |
 | Workers AI, AI Search, Pipelines, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
 
 ## Known platform differences
@@ -143,10 +144,10 @@ Any unrecognized wrangler key fails the deploy with
 `VRT_CONFIG_UNSUPPORTED_FIELD` — see
 [`docs/wrangler-config.md`](wrangler-config.md) for the full table.
 Notable Cloudflare features with no OpenFlare counterpart: Workers AI
-(`ai`), Vectorize (`vectorize`), AI Search (`ai_search`,
+(`ai`), AI Search (`ai_search`,
 `ai_search_namespaces`), Secrets Store
 (`secrets_store_secrets`), Pipelines, dispatch namespaces
-(`dispatch_namespaces`), `send_email`, `mtls_certificates`, `browser`,
+(`dispatch_namespaces`), `mtls_certificates`, `browser`,
 `containers`, raw
 `wasm_modules`/`text_blobs`/`data_blobs`/`version_metadata` upload keys.
 `[unsafe]` is partially supported: `[[unsafe.bindings]]` entries with
