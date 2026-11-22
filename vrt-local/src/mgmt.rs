@@ -104,6 +104,7 @@ fn routes(api: Arc<Api>) -> Router {
                 .route_layer(middleware::from_fn(content_length_gate)),
         )
         .route("/v1/rollback", post(rollback))
+        .route("/v1/promote", post(promote))
         .route("/v1/hostnames", get(hostnames_list).post(hostname_set))
         .route("/v1/secrets", get(secrets_list).put(secret_put))
         .route("/v1/secrets/{secret_ref}", delete(secret_rm))
@@ -276,15 +277,23 @@ async fn versions(
     Query(q): Query<WorkerQuery>,
 ) -> Result<Json<serde_json::Value>, Response> {
     let root = api.root.clone();
-    let st = op(move || local(&root)?.status()).await.map_err(fail)?;
-    let w = st
-        .workers
+    let worker = q.worker.clone();
+    let details = op(move || local(&root)?.versions(&worker))
+        .await
+        .map_err(fail)?;
+    let ids: Vec<String> = details
+        .versions
         .iter()
-        .find(|w| w.name == q.worker || w.worker_id == q.worker)
-        .ok_or_else(|| fail(LocalError::NotFound("worker")))?;
+        .map(|v| v.version_id.clone())
+        .collect();
     Ok(Json(serde_json::json!({
-        "worker": w.name, "workerId": w.worker_id,
-        "activeVersionId": w.active_version_id, "versions": w.versions,
+        "worker": details.worker,
+        "workerId": details.worker_id,
+        "activeVersionId": details.active_version_id,
+        // Legacy shape: ids only.
+        "versions": ids,
+        // Versioning MVP: lifecycle, timestamps, bundle/config refs.
+        "versionDetails": details.versions,
     })))
 }
 
@@ -294,6 +303,9 @@ struct DeployBody {
     worker_dir: String,
     /// Optional worker name override (`vrt.toml name` otherwise).
     name: Option<String>,
+    /// Store the version without switching traffic.
+    #[serde(default)]
+    preview: bool,
 }
 
 async fn deploy(
@@ -312,14 +324,18 @@ async fn deploy(
     }
     let root = api.root.clone();
     let name = b.name.clone();
+    let preview = b.preview;
     let r = op(move || {
-        local(&root)?.deploy(
-            &dir,
-            &worker_pkg::DeployOverrides {
-                name,
-                ..Default::default()
-            },
-        )
+        let l = local(&root)?;
+        let overrides = worker_pkg::DeployOverrides {
+            name,
+            ..Default::default()
+        };
+        if preview {
+            l.deploy_preview(&dir, &overrides)
+        } else {
+            l.deploy(&dir, &overrides)
+        }
     })
     .await
     .map_err(fail)?;
@@ -363,6 +379,29 @@ async fn rollback(
         .await
         .map_err(fail)?;
     Ok(Json(serde_json::json!({"revision": revision})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PromoteBody {
+    version_id: String,
+    /// Optional owner; omitted means the version id must be unique
+    /// across all workers.
+    worker: Option<String>,
+}
+
+async fn promote(
+    State(api): State<Arc<Api>>,
+    body: Result<Json<PromoteBody>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<serde_json::Value>, Response> {
+    let Json(b) = body.map_err(|_| err_body(StatusCode::BAD_REQUEST, "body", None))?;
+    let root = api.root.clone();
+    let result = op(move || local(&root)?.promote_version(&b.version_id, b.worker.as_deref()))
+        .await
+        .map_err(fail)?;
+    serde_json::to_value(&result)
+        .map(Json)
+        .map_err(|_| err_body(StatusCode::INTERNAL_SERVER_ERROR, "internal", None))
 }
 
 #[derive(Deserialize)]

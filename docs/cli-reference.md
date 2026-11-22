@@ -14,7 +14,9 @@ of init --root <dir> --cell <id> --tenant <id> [--mode capnp|stub]
          [--facade-dist <dir>] [--workerd <path>] [--ingress-listen <addr>]
 of serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
 of deploy --root <dir> <worker_dir>
+of deploy --preview --root <dir> <worker_dir>
 of check [--env <name>] [--var K:V]… [--tag <t>] <worker_dir>
+of promote --root <dir> [--worker <name|workerId>] <version_id>
 of rollback --root <dir> <worker> <version_id>
 of hostnames add --root <dir> <worker> <hostname>
 of hostnames rm  --root <dir> <worker> <hostname>
@@ -24,6 +26,7 @@ of secret rm  --root <dir> <secret_ref>
 of secret ls  --root <dir>
 of status  --root <dir>
 of versions --root <dir> <worker>
+of versions list --root <dir> <worker>
 of renew   --root <dir>
 of key     --root <dir>                        (print trusted public key)
 of health  --root <dir>                        (mgmt /healthz → exit code)
@@ -44,3 +47,6 @@ Two root-level ops are implemented but not in the usage banner:
 of metrics       --root <dir>                    (Prometheus text off the mgmt socket)
 of queue-metrics --root <dir> (--queue-id <26 chars> | --queue-name <name> [--tenant <id>])
 ```
+
+Version lifecycle details (`deploy --preview`, `promote`, `versions
+list`, and the current MVP limits) are in [deploy versions](versioning.md).

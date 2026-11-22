@@ -144,13 +144,21 @@ compose="docker compose -f deploy/standalone/docker-compose.yml exec vrt"
 $compose of status --root /data
 $compose of deploy --root /data <dir>
 $compose of deploy --root /data --env staging <dir>
+$compose of deploy --root /data --preview <dir>
+$compose of promote --root /data <worker> <version_id>
 $compose of rollback --root /data <worker> <version_id>
 $compose of hostnames add --root /data <worker> <host>
 printf 's3cret' | $compose of secret put --root /data <ref>
-$compose of versions --root /data <worker>
+$compose of versions list --root /data <worker>
 $compose of logs --root /data <worker> --follow --since 10m --level error
 $compose of doctor --root /data          # add --json or --strict
 ```
+
+`deploy --preview` stores an immutable version without moving traffic;
+`promote` switches the worker's active version through the same signed
+desired revision path as `rollback`. See
+[deploy versions](../../docs/versioning.md) for lifecycle, concurrency
+and current limits.
 
 `of logs` is a read-only tail of the host log hub (console.log,
 exceptions, platform codes; secrets are already redacted at ingest).

@@ -31,9 +31,10 @@ USAGE:
            [--workerd <p>] [--stub] [--allow-unpinned-workerd]
            [--vrt-host-bin <p>] [--vrt-provider-bin <p>] [--vrt-sql-bin <p>]
            [--facade-dist <dir>]
-  of deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--tag <t>] [--dry-run] <worker_dir>
+  of deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--tag <t>] [--preview] [--dry-run] <worker_dir>
   of deploy --url <http://host:port> --token-file <p> [same options] <worker_dir>
   of check [--env <name>] [--var K:V]… [--tag <t>] <worker_dir>
+  of promote --root <dir> [--worker <name|workerId>] <version_id>
   of logs --root <dir> <worker> [--follow] [--since <dur>] [--level <lvl>] [--json]
   of doctor [--root <dir>] [--env <name>] [--json] [--strict]
   of rollback --root <dir> <worker> <version_id>
@@ -45,6 +46,7 @@ USAGE:
   of secret ls  --root <dir>
   of status  --root <dir>
   of versions --root <dir> <worker>
+  of versions list --root <dir> <worker>
   of renew   --root <dir>
   of key     --root <dir>                        (print trusted public key)
   of health  --root <dir>                        (mgmt /healthz → exit code)
@@ -100,6 +102,7 @@ const BARE_FLAGS: &[&str] = &[
     "--json",
     "--follow",
     "--strict",
+    "--preview",
 ];
 
 /// Positional args (everything not consumed as a `--flag value` pair
@@ -160,6 +163,27 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             println!("{revision}");
             Ok(())
         }
+        "promote" => {
+            let root = root_of(&args[1..])?;
+            let pos = positional(&args[1..]);
+            // Accept both `promote --worker W <version>` and
+            // `promote <worker> <version>`; a lone version id is
+            // resolved globally and rejected when ambiguous.
+            let (hint, version) = match (arg(&args[1..], "--worker"), pos.as_slice()) {
+                (Some(worker), [version, ..]) => (Some(worker.to_string()), version.clone()),
+                (None, [worker, version, ..]) => (Some(worker.clone()), version.clone()),
+                (None, [version]) => (None, version.clone()),
+                _ => return Err("version required".into()),
+            };
+            let result = direct(&root, |l| {
+                l.promote_version(&version, hint.as_deref())
+            })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).unwrap_or_default()
+            );
+            Ok(())
+        }
         "hostnames" => cmd_hostnames(&args[1..]).await,
         "secret" => cmd_secret(&args[1..]).await,
         "status" => {
@@ -194,20 +218,24 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         "versions" => {
             let root = root_of(&args[1..])?;
             let pos = positional(&args[1..]);
-            let worker = pos.first().ok_or("worker required")?.clone();
-            let v = direct(&root, |l| {
-                let st = l.status()?;
-                let w = st
-                    .workers
-                    .into_iter()
-                    .find(|w| w.name == worker || w.worker_id == worker)
-                    .ok_or(LocalError::NotFound("worker"))?;
-                Ok(serde_json::json!({
-                    "worker": w.name, "activeVersionId": w.active_version_id,
-                    "versions": w.versions,
-                }))
-            })?;
-            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            // `versions list <worker>` and the legacy `versions <worker>`
+            // are the same read-only query.
+            let rest = if pos.first().is_some_and(|p| p == "list") {
+                &pos[1..]
+            } else {
+                &pos[..]
+            };
+            let worker = match rest.first() {
+                Some(worker) => worker.clone(),
+                None => arg(&args[1..], "--worker")
+                    .ok_or("worker required")?
+                    .to_string(),
+            };
+            let v = direct(&root, |l| l.versions(&worker))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v).unwrap_or_default()
+            );
             Ok(())
         }
         // P3c-2-r2: read-only identity queries — single-line stdout so
@@ -1123,6 +1151,14 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
     };
     let secrets = collect_secrets(args)?;
     let dry_run = args.iter().any(|a| a == "--dry-run");
+    let preview = args.iter().any(|a| a == "--preview");
+    if preview && !secrets.is_empty() {
+        // Secret values are tenant-level, not versioned: applying them
+        // during a preview would change the currently serving version.
+        return Err(
+            "--preview cannot apply secret values (use `of secret put` or a normal deploy)".into(),
+        );
+    }
     if arg(args, "--url").is_some() && arg(args, "--root").is_some() {
         return Err("--url and --root are mutually exclusive".into());
     }
@@ -1175,6 +1211,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             secrets,
             name: overrides.name.clone(),
             tag: overrides.tag.clone(),
+            preview,
             meta: g.meta.clone(),
             flagship_apps: g.flagship_apps.clone(),
         };
@@ -1212,7 +1249,12 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
                 l.put_secret(&tenant, sref, value)?;
             }
         }
-        l.deploy(Path::new(&dir), &overrides).map(|r| {
+        let deployed = if preview {
+            l.deploy_preview(Path::new(&dir), &overrides)
+        } else {
+            l.deploy(Path::new(&dir), &overrides)
+        };
+        deployed.map(|r| {
             serde_json::json!({"versionId": r.version_id, "artifactDigest": r.artifact_digest, "revision": r.revision})
         })
     })?;

@@ -113,6 +113,7 @@ fn upload_body(dir: &Path) -> vrt_local::worker_pkg::DeployUpload {
         secrets: BTreeMap::from([("api-key-ref".to_string(), "s3cr3t-value".to_string())]),
         name: None,
         tag: None,
+        preview: false,
         flagship_apps: g.flagship_apps.clone(),
     }
 }
@@ -288,6 +289,31 @@ async fn rate_limited() {
 }
 
 /// Tamper surface — every forged byte fails closed server-side.
+/// Versioning MVP: a remote preview with secret values is refused (the
+/// secret store is tenant-level and would change the serving version);
+/// without secrets the upload stores a preview and activates nothing.
+#[test]
+fn preview_upload_is_secret_free_and_does_not_activate() {
+    let root = root();
+    let local = init(&root);
+    let dir = worker_dir(&root, "previewed");
+
+    let mut body = upload_body(&dir);
+    body.preview = true;
+    let err = local.deploy_upload(&body).expect_err("preview secret values");
+    assert!(
+        err.to_string().contains("previewSecrets"),
+        "typed refusal, got {err}"
+    );
+
+    body.secrets.clear();
+    let result = local.deploy_upload(&body).unwrap();
+    let st = local.status().unwrap();
+    assert_eq!(st.workers.len(), 1);
+    assert!(st.workers[0].active_version_id.is_none());
+    assert_eq!(st.workers[0].versions, vec![result.version_id]);
+}
+
 #[test]
 fn tampered_upload_rejected() {
     let root = root();
