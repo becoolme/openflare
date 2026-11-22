@@ -86,6 +86,15 @@ fn valid_class_key(key: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// Engine instance ids are workerd `localDisk` file stems: 64 lowercase hex.
+/// Anything else (legacy `sqlite.db`, user scratch files) is not an instance.
+fn valid_instance_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -173,13 +182,21 @@ fn scan_class_dir(dir: &Path) -> Result<(Vec<InstanceFile>, u64, bool), String> 
             truncated = true;
             break;
         }
-        let Ok(meta) = entry.metadata() else { continue };
-        if !meta.is_file() {
+        // `file_type()` never follows symlinks: a link in the class dir is
+        // neither counted nor allowed to report an arbitrary target's size.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() || !file_type.is_file() {
             continue;
         }
+        let Ok(meta) = entry.metadata() else { continue };
         storage_bytes = storage_bytes.saturating_add(meta.len());
         let name = entry.file_name().to_string_lossy().to_string();
         if let Some(id) = name.strip_suffix(".sqlite") {
+            if !valid_instance_id(id) {
+                continue;
+            }
             if instances.len() >= MAX_INSTANCES {
                 truncated = true;
                 continue;
@@ -217,6 +234,7 @@ mod tests {
         std::fs::write(dir.join("a".repeat(64) + ".sqlite"), b"123").unwrap();
         std::fs::write(dir.join("a".repeat(64) + ".sqlite-wal"), b"wal").unwrap();
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::fs::write(dir.join("legacy.sqlite"), b"legacy").unwrap();
 
         let (instances, bytes, truncated) = scan_class_dir(&dir).unwrap();
         assert_eq!(instances.len(), 2);
@@ -224,12 +242,27 @@ mod tests {
         assert_eq!(instances[0].bytes, 3);
         assert_eq!(instances[1].id, "b".repeat(64));
         assert!(!truncated);
-        // main files + wal + notes
-        assert_eq!(bytes, 3 + 5 + 3 + 1);
+        // main files + wal + notes + the non-instance legacy sqlite
+        assert_eq!(bytes, 3 + 5 + 3 + 1 + 6);
         // missing dir is an empty class, never an error
         let (none, zero, _) = scan_class_dir(&tmp.path().join("absent")).unwrap();
         assert!(none.is_empty());
         assert_eq!(zero, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_never_followed_or_counted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("class");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = tmp.path().join("outside.sqlite");
+        std::fs::write(&outside, b"secret").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(format!("{}.sqlite", "e".repeat(64))))
+            .unwrap();
+        let (instances, bytes, _) = scan_class_dir(&dir).unwrap();
+        assert!(instances.is_empty());
+        assert_eq!(bytes, 0);
     }
 
     #[test]
