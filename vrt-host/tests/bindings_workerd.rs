@@ -1,23 +1,26 @@
-//! Real-workerd wrapped-binding smoke matrix: `vectorize`, `send_email`
-//! and `k2`, one tenant worker per binding.
+//! Real-workerd wrapped-binding smoke matrix: `vectorize`, `send_email`,
+//! `k2` and `flagship`, one tenant worker per binding.
 //!
 //! What unit tests cannot prove and this does:
 //! - the rendered `wrapped` bindings load under the pinned binary:
 //!   `cloudflare-internal:vectorize-api` is the upstream shim and is
 //!   asserted strictly; `cloudflare-internal:send-email` /
-//!   `cloudflare-internal:k2` are FORK shims — when the pinned binary
-//!   predates them the service cannot instantiate, and those tests
-//!   SKIP with the workerd log printed (they turn green automatically
-//!   once the pin contains them);
-//! - the shims' fetch calls reach facade-vectorize / facade-email /
-//!   facade-k2 through the inner `fetcher` service binding, and each
-//!   facade forwards to `BINDING_BACKEND` under the signed-props
-//!   `bindingId` (`{workerId}~{name}`) at the provider path
-//!   `/internal/bindings/v1/<product>/<bindingId>/<leaf>`;
+//!   `cloudflare-internal:k2` / `cloudflare-internal:flagship` are FORK
+//!   shims — when the pinned binary predates them the service cannot
+//!   instantiate, and those tests SKIP with the workerd log printed
+//!   (they turned green when the pin gained the shims);
+//! - the provider-backed shims' fetch calls reach facade-vectorize /
+//!   facade-email / facade-k2 through the inner `fetcher` service
+//!   binding, and each facade forwards to `BINDING_BACKEND` under the
+//!   signed-props `bindingId` (`{workerId}~{name}`) at the provider
+//!   path `/internal/bindings/v1/<product>/<bindingId>/<leaf>`;
+//!   flagship has no backend hop — the app config rides the `config`
+//!   innerBinding and evaluates in-isolate;
 //! - the typed envelopes round-trip: vectorize `{code,error}` throws
 //!   `<OP>_ERROR (code = N)`, send_email `{success,error}` throws an
 //!   Error carrying `.code`, k2 `{success:false,error}` resolves
-//!   without throwing — exactly the contracted classes.
+//!   without throwing, flagship throws FlagshipEvaluationError
+//!   carrying `.errorCode` — exactly the contracted classes.
 //!
 //! The `binding-backend` external is replaced by a stub worker that
 //! speaks the provider envelope; provider internals are covered by the
@@ -103,6 +106,22 @@ const USER_MODULE: &str = r#"export default {
           retryable: fail.error && fail.error.retryable,
         });
       }
+      if (p === "/flagship") {
+        const pro = await env.FLAGS.getBooleanValue("dark-mode", false, { plan: "pro" });
+        const free = await env.FLAGS.getBooleanValue("dark-mode", true, { plan: "free" });
+        const det = await env.FLAGS.getStringDetails("banner", "d?");
+        let missing = "no-error";
+        try {
+          await env.FLAGS.get("no-such-flag");
+        } catch (e) {
+          missing = "err:" + (e.errorCode || e.name);
+        }
+        return Response.json({
+          pro, free,
+          banner: det.value, variant: det.variant, reason: det.reason,
+          missing,
+        });
+      }
       return new Response("ok");
     } catch (e) {
       return new Response("unexpected:" + String((e && e.stack) || e), { status: 500 });
@@ -172,11 +191,19 @@ const BACKEND_STUB: &str = r#"export default {
 "#;
 
 /// Render the tenant capnp into `dir` for ONE worker carrying
-/// `bindings`, materialize every embed, retarget the worker socket
-/// onto `port` and replace the `binding-backend` external with the
-/// provider-protocol stub worker. `needles` are the structural
-/// substrings the emitted text must contain for this binding set.
-fn render_and_write(dir: &Path, port: u16, bindings: serde_json::Value, needles: &[&str]) -> PathBuf {
+/// `bindings` (plus optional `flagship_apps` tenant resources),
+/// materialize every embed, retarget the worker socket onto `port`
+/// and — when the render emitted one — replace the `binding-backend`
+/// external with the provider-protocol stub worker. `needles` are the
+/// structural substrings the emitted text must contain for this
+/// binding set.
+fn render_and_write(
+    dir: &Path,
+    port: u16,
+    bindings: serde_json::Value,
+    flagship_apps: serde_json::Value,
+    needles: &[&str],
+) -> PathBuf {
     let worker_id = "wsmoke";
     let bundle = VersionBundle::build(
         DeployManifest::from_pack(&json!({
@@ -204,7 +231,8 @@ fn render_and_write(dir: &Path, port: u16, bindings: serde_json::Value, needles:
             "crons": [],
             "quotas": {"cpuMs": 50, "memoryMb": 128,
                        "subrequests": 100, "outboundConnections": 16}
-        }]
+        }],
+        "flagshipApps": flagship_apps
     }))
     .unwrap();
     let params = smoke_params();
@@ -280,20 +308,18 @@ fn render_and_write(dir: &Path, port: u16, bindings: serde_json::Value, needles:
     // still exercises the binding paths (CI's pinned binary parses it).
     text = strip_field(&text, "limits");
     let external = "(name = \"binding-backend\", external = (http = ()))";
-    assert!(
-        text.contains(external),
-        "expected binding-backend external in render:\n{text}"
-    );
-    text = text.replace(
-        external,
-        "(name = \"binding-backend\", worker = (\n            \
-           modules = [(name = \"backend.js\", \
-           esModule = embed \"backend-stub.js\")],\n            \
-           compatibilityDate = \"2026-09-08\",\n            \
-           globalOutbound = (name = \"vrt-no-network\", \
-           entrypoint = \"DenyAll\"),\n        ))",
-    );
-    std::fs::write(dir.join("backend-stub.js"), BACKEND_STUB).unwrap();
+    if text.contains(external) {
+        text = text.replace(
+            external,
+            "(name = \"binding-backend\", worker = (\n            \
+               modules = [(name = \"backend.js\", \
+               esModule = embed \"backend-stub.js\")],\n            \
+               compatibilityDate = \"2026-09-08\",\n            \
+               globalOutbound = (name = \"vrt-no-network\", \
+               entrypoint = \"DenyAll\"),\n        ))",
+        );
+        std::fs::write(dir.join("backend-stub.js"), BACKEND_STUB).unwrap();
+    }
 
     let path = dir.join("cfg.capnp");
     std::fs::write(&path, text).unwrap();
@@ -420,6 +446,7 @@ fn vectorize_binding_traverses_shim_end_to_end() {
             "metric": "cosine",
             "permissions": {"read": true, "write": true}
         }]),
+        json!([]),
         &[
             "moduleName = \"cloudflare-internal:vectorize-api\"",
             "(name = \"indexId\", text = \"abcdefghijklmnopqrstuvwxyz\")",
@@ -471,6 +498,7 @@ fn send_email_binding_traverses_shim_end_to_end() {
             "type": "sendEmail", "name": "EMAIL",
             "permissions": {"read": false, "write": true}
         }]),
+        json!([]),
         &["moduleName = \"cloudflare-internal:send-email\""],
     );
     let proc = spawn(&bin, &cfg, &dir);
@@ -515,6 +543,7 @@ fn k2_binding_traverses_shim_end_to_end() {
             "streamId": "0123456789abcdef0123456789abcdef",
             "permissions": {"read": false, "write": true}
         }]),
+        json!([]),
         &["moduleName = \"cloudflare-internal:k2\""],
     );
     let proc = spawn(&bin, &cfg, &dir);
@@ -529,4 +558,80 @@ fn k2_binding_traverses_shim_end_to_end() {
     assert_eq!(v["ok"], true, "send commit: {v}");
     assert_eq!(v["failCode"], "SLOTS_FULL", "typed failure code: {v}");
     assert_eq!(v["retryable"], true, "typed failure retryable: {v}");
+}
+
+/// `env.FLAGS` evaluates inside the isolate through the fork flagship
+/// shim: a targeting rule serves `TARGETING_MATCH`, a rule-less flag
+/// serves `STATIC`, and `get()` without a default throws
+/// `FlagshipEvaluationError` carrying `errorCode = FLAG_NOT_FOUND` —
+/// the shim's contracted classes. There is no backend hop by design:
+/// the app config rides the `config` innerBinding verbatim.
+#[test]
+#[ignore = "needs VRT_WORKERD_BIN"]
+fn flagship_binding_evaluates_in_isolate() {
+    let Some(bin) = workerd_bin() else {
+        eprintln!("SKIP: VRT_WORKERD_BIN unset — real workerd required");
+        return;
+    };
+    let Some(dir) = smoke_root("vrt-bindings-smoke") else {
+        return;
+    };
+    let port = free_port();
+    let app_config = json!({
+        "appId": "app-smoke",
+        "accountTag": "acct-1",
+        "flags": {
+            "dark-mode": {
+                "enabled": true,
+                "type": "boolean",
+                "defaultVariant": "off",
+                "variants": {"on": true, "off": false},
+                "rules": [{
+                    "conditions": [
+                        {"attribute": "plan", "operator": "equals", "value": "pro"}
+                    ],
+                    "serve_variation": "on"
+                }]
+            },
+            "banner": {
+                "enabled": true,
+                "type": "string",
+                "defaultVariant": "plain",
+                "variants": {"plain": "hello", "fancy": "HELLO!"},
+                "rules": []
+            }
+        }
+    })
+    .to_string();
+    let cfg = render_and_write(
+        &dir,
+        port,
+        json!([{
+            "type": "flagship", "name": "FLAGS", "appId": "app-smoke"
+        }]),
+        json!([{"appId": "app-smoke", "config": app_config}]),
+        &[
+            "moduleName = \"cloudflare-internal:flagship\"",
+            "name = \"config\"",
+            "dark-mode",
+        ],
+    );
+    let proc = spawn(&bin, &cfg, &dir);
+    assert!(wait_ready(port), "workerd did not start:\n{}", log_text(&proc));
+
+    let Some((st, body)) = try_get(port, "/flagship") else {
+        skip_fork_shim(&proc, "cloudflare-internal:flagship");
+        return;
+    };
+    assert_eq!(st, 200, "flagship route: {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["pro"], true, "targeting rule must serve on=true: {v}");
+    assert_eq!(v["free"], false, "no rule match must serve default off=false: {v}");
+    assert_eq!(v["banner"], "hello", "static flag value: {v}");
+    assert_eq!(v["variant"], "plain", "static flag variant: {v}");
+    assert_eq!(v["reason"], "STATIC", "rule-less flag reason: {v}");
+    assert_eq!(
+        v["missing"], "err:FLAG_NOT_FOUND",
+        "get() without default must surface the typed code: {v}"
+    );
 }
