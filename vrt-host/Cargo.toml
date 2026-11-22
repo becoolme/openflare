@@ -62,6 +62,7 @@ required-features = ["dev-stub"]
 [dev-dependencies]
 
 vrt-local = { path = "../vrt-local" }
+base64 = "0.22"
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
 # Self dev-dependency: integration tests always build the library with

@@ -141,9 +141,21 @@ old active version and the old envelope intact.
   absent from desired, promote switching traffic and being idempotent,
   cross-worker rejection, missing artifact rejection, concurrent
   promote invariant.
+- Control-plane HTTP tests in `vrt-host/tests/versioning_http.rs`: a
+  real management listener (loopback TCP, bearer auth) drives deploy /
+  preview / promote / versions, and the same root is converged through
+  `SupervisorHost` + ingress so "traffic did/didn't move" is asserted
+  at the edge, not just in 200s. Covers preview isolation (including
+  the version-scoped var/env marker the edge reports), promote +
+  idempotent replay, preview-with-secret-values refusal (no version,
+  no secret write), unknown/ambiguous/cross-worker promote errors,
+  concurrent promotes (one active, highest-revision success must be
+  the final pointer), and management/host restarts.
 
 ## Changelog
 
 - 2026-11-22: initial versioning MVP (`deploy --preview`, `promote`,
   `versions list`), lifecycle fields on `VersionRecord`, and
   preview-only workers skipped by `to_desired`.
+- 2026-11-22: control-plane HTTP integration coverage for the MVP
+  (`vrt-host/tests/versioning_http.rs`); no behavior change.
