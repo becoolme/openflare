@@ -798,11 +798,18 @@
       "mainModule": "facade/egress/egress.js",
       "modules": [
         {
+          "name": "facade/egress/cf-image.js",
+          "dist": "facade/dist/facade/egress/cf-image.js",
+          "source": "facade/egress/cf-image.ts",
+          "sourceSha256": "e90a46c5cc6901c66d640b538628801bcf68981017ad0f3437b8ecf50657aa61",
+          "sha256": "53e822f938f6a9801a33e2f928ed0b7a66fe4072a2e8259f9e154489452c40e3"
+        },
+        {
           "name": "facade/egress/egress.js",
           "dist": "facade/dist/facade/egress/egress.js",
           "source": "facade/egress/egress.ts",
-          "sourceSha256": "d9b7dd7b8a5f30cd95c2ad06940233989c6265aaf29c8ad6fc460e04b0d26f63",
-          "sha256": "fbea734df54b11e66b2157123c5fb7f36d4f624d6cf2ea4f0691df548bc4c3d1"
+          "sourceSha256": "e0b655422083f86eb01b51ec3f4396a54202e2a415c26c6cea248db6beea5498",
+          "sha256": "65ab2aa3980e197c3258f378238c395a9a83f205f4d8183b371f94e46295ff61"
         },
         {
           "name": "facade/egress/ip.js",
@@ -824,6 +831,13 @@
           "source": "facade/egress/shared.ts",
           "sourceSha256": "7d5ccf2cb744b6c202ac1985a6d9278e44056db5593be8b58962ad186dd98ce7",
           "sha256": "353d7aa02d71f0745c83d132dd884378b3ff2fc2ec2215ebdd8e08d5e4ab89dc"
+        },
+        {
+          "name": "facade/images-wire.js",
+          "dist": "facade/dist/facade/images-wire.js",
+          "source": "facade/images-wire.ts",
+          "sourceSha256": "9ec45de3235dc7e8ea73733fbd97e2e0a5b257062a4aaaead7183ef23df3db92",
+          "sha256": "092f5e374b124771938623bed2c0c6cf908a64f4029118112519dcc11dcce483"
         }
       ]
     },

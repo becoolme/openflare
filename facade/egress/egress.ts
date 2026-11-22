@@ -50,6 +50,8 @@ import {
   tcpDenied,
   upstreamFetchError,
 } from "./shared.js";
+import { cfImageBody, cfImagePlan, SRC_MAX, type CfImagePlan } from "./cf-image.js";
+import { sniffImage } from "../images-wire.js";
 
 function denied(code: string, detail?: string): Response {
   const body = JSON.stringify({
@@ -312,11 +314,96 @@ export class EgressProxy extends WorkerEntrypoint {
         return upstreamError();
       }
     }
+    // IMG2: `cf.image` — the tenant's cf blob arrives whole on
+    // `request.cf` via the subrequest channel; transform the upstream
+    // body through facade-images exactly like the env.IMAGES binding.
+    // Failure shape mirrors CF: `cf-resized: err=<code>` + ERROR body —
+    // never a silently untransformed image.
+    const plan = cfImagePlan(request);
+    if (plan !== undefined) {
+      return this.#transformImage(request, upstream, plan);
+    }
     return new Response(upstream.body, {
       status: upstream.status,
       statusText: upstream.statusText,
       headers: stripInternalHeaders(upstream.headers),
     });
+  }
+
+  /** POST the upstream body to facade-images over the service binding. */
+  async #transformImage(
+    request: Request,
+    upstream: Response,
+    plan: CfImagePlan,
+  ): Promise<Response> {
+    const url = new URL(request.url);
+    const redirect = () =>
+      new Response(null, {
+        status: 302,
+        headers: { location: url.toString() },
+      });
+    const svc = (this.#env as Record<string, unknown>)?.["VRT_IMAGES"] as
+      | { fetch(input: string, init?: RequestInit): Promise<Response> }
+      | undefined;
+    if (svc === undefined || typeof svc.fetch !== "function") {
+      return new Response(`ERROR 9490\n`, {
+        status: 500,
+        headers: { "content-type": "text/plain", "cf-resized": "err=9490" },
+      });
+    }
+    let out: Response;
+    try {
+      const src = new Uint8Array(await upstream.arrayBuffer());
+      if (src.length > SRC_MAX) {
+        return new Response("ERROR 9424\n", {
+          status: 413,
+          headers: { "content-type": "text/plain", "cf-resized": "err=9424" },
+        });
+      }
+      out = await svc.fetch("http://vrt-images.internal/transform", {
+        method: "POST",
+        body: cfImageBody(src, plan),
+      });
+    } catch {
+      // Transport-level failure to the facade — CF surfaces these as
+      // err=9523 through cf-resized too.
+      if (plan.onerrorRedirect) return redirect();
+      return new Response("ERROR 9523\n", {
+        status: 500,
+        headers: { "content-type": "text/plain", "cf-resized": "err=9523" },
+      });
+    }
+    const err = out.headers.get("cf-images-binding");
+    if (err !== null) {
+      const code = /^err=\d+$/.test(err) ? err.slice(4) : "9523";
+      if (plan.onerrorRedirect) return redirect();
+      return new Response(`ERROR ${code}\n`, {
+        status: out.status,
+        headers: {
+          "content-type": "text/plain",
+          "cf-resized": `err=${code}`,
+        },
+      });
+    }
+    if (plan.json) {
+      // `format:"json"` reports the TRANSFORMED result's metadata —
+      // sniff the encoded bytes rather than trusting op intent.
+      const bytes = new Uint8Array(await out.arrayBuffer());
+      const info = sniffImage(bytes);
+      return new Response(
+        JSON.stringify({
+          width: info?.width ?? 0,
+          height: info?.height ?? 0,
+          // CF reports the full mime (`image/jpeg`), not the short name.
+          format: info ? `image/${info.format}` : "unknown",
+          size: bytes.length,
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    }
+    const headers = stripInternalHeaders(out.headers);
+    headers.delete("content-length");
+    return new Response(out.body, { status: out.status, headers });
   }
 
   // MIG-14: controlled raw-TCP forwarding. workerd VERIFIED to deliver

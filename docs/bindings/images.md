@@ -141,6 +141,44 @@ GET /cdn-cgi/image/width=300,fit=cover,format=auto/uploads/cat.png
   the original source path. Upstream fetch failures collapse to
   `ERROR 9411`.
 
+## Subrequest transforms (`cf.image`)
+
+`fetch(url, {cf: {image: {...}}})` — Cloudflare's fetch-option
+transform — works end to end. workerd serializes the tenant's whole
+`cf` object into the subrequest channel (`Request::serializeCfBlobJson`),
+so the egress worker receives `request.cf.image` verbatim, fetches the
+upstream as usual, then POSTs the response body to `facade-images` over
+a `VRT_IMAGES` service binding wired unconditionally on the egress
+worker (`cf.image` is a fetch option, not a declared binding — it must
+transform even when the worker never declares `images`).
+
+```js
+const r = await fetch("https://cdn.example.com/cat.png", {
+  cf: { image: { width: 300, fit: "cover", format: "webp", quality: 80 } },
+});
+// r.body is the transformed WebP, not the original PNG.
+```
+
+- Options map onto the same op vocabulary: `width`, `height`, `dpr`,
+  `fit`, `gravity` (named or `{x,y,mode}`), `rotate`, `blur`,
+  `sharpen`, `brightness`, `contrast`, `gamma`, `saturation`,
+  `background`, `trim`, `border`, `padding`, `zoom`, `segment`,
+  `quality`, `format` (`avif`/`webp`/`jpeg`/`baseline-jpeg`/`png`/
+  `png-force`/`json`/`gif`/`rgb`/`rgba`), `anim`, `metadata`, `onerror`.
+- `format: "json"` returns the **transformed** result's metadata
+  (`{width, height, format, size}`), not an image body.
+- Failure shape mirrors CF: transform errors return `ERROR <code>`
+  text with a `cf-resized: err=<code>` header — never a silently
+  untransformed image. `onerror: "redirect"` swaps any transform
+  failure for a 302 to the original URL. Malformed options (unknown
+  key, out-of-range value) reject `fetch()` with `TypeError`, matching
+  CF's invalid-option behavior.
+- `draw`, `image`, `origin-auth` and `slow-connection-quality` are
+  recognized but unsupported → `TypeError` (fail closed).
+- The upstream fetch still runs through the egress policy, so
+  `cf.image` can only transform origins the tenant was already allowed
+  to fetch — it grants no new network reach.
+
 ## Backends
 
 None. `facade-images` transforms only the bytes streamed to it — the
@@ -203,10 +241,13 @@ resource-identifying keys besides `binding`.
   content/format, 9420 corrupt/undecodable, 9423 malformed request,
   9424 output too large) and reserved `94xx` values where it does not
   (9490 engine-internal).
-- **`cf.image` fetch options** are a separate surface and remain
-  unimplemented — `/cdn-cgi/image/` request-path transforms ARE
-  implemented (same-origin only, see above); the `env.IMAGES` binding
-  covers the in-Worker API.
+- **`cf.image` / `/cdn-cgi/` nuances**: `cf.image` transforms any
+  policy-allowed upstream (the fetch already reached it), while
+  `/cdn-cgi/` stays same-origin only. `cf.image` metadata options
+  (`keep`/`copyright`) are parsed but metadata stripping behavior is
+  the community engine's default — CF's EXIF-preserving modes are not
+  reproduced. `draw`/`image`/`origin-auth`/`slow-connection-quality`
+  reject with `TypeError`.
 
 ## Examples and tests
 

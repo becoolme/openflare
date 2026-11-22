@@ -528,3 +528,87 @@ fn images_binding_info_and_transform_end_to_end() {
     );
     drop(proc);
 }
+
+/// cf.image mechanism probe (IMG2): the egress-worker transform relies
+/// on workerd serializing `Request.cf` — including arbitrary keys like
+/// `image` — into the subrequest channel that `globalOutbound`
+/// delivers to the next worker. This minimal two-worker config proves
+/// the sink's `request.cf` carries the tenant's cf verbatim; the
+/// openflare half (EgressProxy branch + VRT_IMAGES binding + facade
+/// transform) is covered by the node harness against the real
+/// facade-images handler.
+#[test]
+#[ignore = "needs VRT_WORKERD_BIN"]
+fn cf_blob_reaches_global_outbound() {
+    let Some(bin) = workerd_bin() else {
+        eprintln!("SKIP: VRT_WORKERD_BIN unset — real workerd required");
+        return;
+    };
+    let Some(dir) = smoke_root() else {
+        return;
+    };
+    let port = free_port();
+
+    let tenant = r#"export default {
+  async fetch() {
+    try {
+      const r = await fetch("http://probe.invalid/img.png", {
+        cf: { image: { width: 2, format: "webp" }, marker: "cf-probe" },
+      });
+      return new Response("status:" + r.status + "|" + (await r.text()));
+    } catch (e) {
+      return new Response("threw:" + (e && e.message));
+    }
+  },
+};"#;
+    let sink = r#"export default {
+  async fetch(req) {
+    return Response.json(req.cf ?? null);
+  },
+};"#;
+    std::fs::write(dir.join("tenant.js"), tenant).unwrap();
+    std::fs::write(dir.join("sink.js"), sink).unwrap();
+    let cfg_text = format!(
+        r#"using Workerd = import "/workerd/workerd.capnp";
+const cfg :Workerd.Config = (
+  services = [
+    (name = "internet", network = ()),
+    (name = "tenant", worker = (
+      modules = [ (name = "tenant.js", esModule = embed "tenant.js") ],
+      compatibilityDate = "2024-01-01",
+      globalOutbound = (name = "sink"),
+    )),
+    (name = "sink", worker = (
+      modules = [ (name = "sink.js", esModule = embed "sink.js") ],
+      compatibilityDate = "2024-01-01",
+      globalOutbound = (name = "internet"),
+    )),
+  ],
+  sockets = [
+    (name = "http", address = "127.0.0.1:{port}", http = (),
+     service = (name = "tenant")),
+  ],
+);"#,
+    );
+    let cfg = dir.join("cf-probe.capnp");
+    std::fs::write(&cfg, cfg_text).unwrap();
+
+    let proc = spawn(&bin, &cfg, &dir);
+    if !wait_ready(port) {
+        panic!(
+            "workerd never listened on {port}\n-- workerd.log --\n{}",
+            log_text(&proc)
+        );
+    }
+    let (st, body) = http_get(port, "/");
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(st, 200, "probe failed: {body}\n{}", log_text(&proc));
+    // The sink must see the whole cf object — `image` included — or the
+    // openflare egress can never observe cf.image.
+    assert!(
+        body.contains("image") && body.contains("marker"),
+        "cf blob did not reach the globalOutbound worker: {body}\n{}",
+        log_text(&proc)
+    );
+    drop(proc);
+}

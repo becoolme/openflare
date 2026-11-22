@@ -2,6 +2,8 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { connect as upstreamConnect } from "cloudflare:sockets";
 import { evaluateTarget, evaluateTcpTarget, parseEgressPolicy } from "./policy.js";
 import { classifyUpstreamError, closeQuietly, DENIED_HEADER, ERROR_HEADER, logTcpClose, logTcpDeny, logUpstreamError, POLICY_BINDING, stripInternalHeaders, tcpDenied, upstreamFetchError } from "./shared.js";
+import { cfImageBody, cfImagePlan, SRC_MAX } from "./cf-image.js";
+import { sniffImage } from "../images-wire.js";
 function denied(code, detail) {
     const body = JSON.stringify({
         error: "EGRESS_DENIED",
@@ -159,10 +161,91 @@ export class EgressProxy extends WorkerEntrypoint {
                 return upstreamError();
             }
         }
+        const plan = cfImagePlan(request);
+        if (plan !== undefined) {
+            return this.#transformImage(request, upstream, plan);
+        }
         return new Response(upstream.body, {
             status: upstream.status,
             statusText: upstream.statusText,
             headers: stripInternalHeaders(upstream.headers)
+        });
+    }
+    async #transformImage(request, upstream, plan) {
+        const url = new URL(request.url);
+        const redirect = ()=>new Response(null, {
+                status: 302,
+                headers: {
+                    location: url.toString()
+                }
+            });
+        const svc = this.#env?.["VRT_IMAGES"];
+        if (svc === undefined || typeof svc.fetch !== "function") {
+            return new Response(`ERROR 9490\n`, {
+                status: 500,
+                headers: {
+                    "content-type": "text/plain",
+                    "cf-resized": "err=9490"
+                }
+            });
+        }
+        let out;
+        try {
+            const src = new Uint8Array(await upstream.arrayBuffer());
+            if (src.length > SRC_MAX) {
+                return new Response("ERROR 9424\n", {
+                    status: 413,
+                    headers: {
+                        "content-type": "text/plain",
+                        "cf-resized": "err=9424"
+                    }
+                });
+            }
+            out = await svc.fetch("http://vrt-images.internal/transform", {
+                method: "POST",
+                body: cfImageBody(src, plan)
+            });
+        } catch  {
+            if (plan.onerrorRedirect) return redirect();
+            return new Response("ERROR 9523\n", {
+                status: 500,
+                headers: {
+                    "content-type": "text/plain",
+                    "cf-resized": "err=9523"
+                }
+            });
+        }
+        const err = out.headers.get("cf-images-binding");
+        if (err !== null) {
+            const code = /^err=\d+$/.test(err) ? err.slice(4) : "9523";
+            if (plan.onerrorRedirect) return redirect();
+            return new Response(`ERROR ${code}\n`, {
+                status: out.status,
+                headers: {
+                    "content-type": "text/plain",
+                    "cf-resized": `err=${code}`
+                }
+            });
+        }
+        if (plan.json) {
+            const bytes = new Uint8Array(await out.arrayBuffer());
+            const info = sniffImage(bytes);
+            return new Response(JSON.stringify({
+                width: info?.width ?? 0,
+                height: info?.height ?? 0,
+                format: info ? `image/${info.format}` : "unknown",
+                size: bytes.length
+            }), {
+                headers: {
+                    "content-type": "application/json"
+                }
+            });
+        }
+        const headers = stripInternalHeaders(out.headers);
+        headers.delete("content-length");
+        return new Response(out.body, {
+            status: out.status,
+            headers
         });
     }
     async connect(socket) {

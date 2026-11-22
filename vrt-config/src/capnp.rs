@@ -2206,6 +2206,15 @@ fn emit_system_worker(
             capnp_text(EGRESS_POLICY_BINDING),
             capnp_text(&egress_policy_json(input)?),
         ));
+        // IMG2: `cf.image` fetch options transform through the shared
+        // facade-images worker — wired unconditionally because cf.image
+        // is a fetch option, not a declared binding (a tenant that never
+        // declares `images` must not get a silently untransformed image).
+        bindings.push(format!(
+            "(name = \"VRT_IMAGES\", service = (name = {}, entrypoint = {}))",
+            capnp_text(&params.facades.images.service),
+            capnp_text(&params.facades.images.entrypoint),
+        ));
     }
     if system.service_name == params.egress.service
         && !internal_tcp_targets(input).is_empty()
