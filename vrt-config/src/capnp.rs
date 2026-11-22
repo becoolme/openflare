@@ -456,6 +456,17 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         if !service_names.insert(worker_service_name(&worker.worker_id)) {
             return Err(ConfigError::ServiceReference("services"));
         }
+        // `worker-<id>-secrets-store` is emitted for workers carrying
+        // `secretsStore` bindings — reserve the name so a defined
+        // system worker can never shadow it.
+        if worker
+            .bindings
+            .iter()
+            .any(|b| matches!(b, BindingDesired::SecretsStore(_)))
+            && !service_names.insert(secrets_store_service_name(&worker.worker_id))
+        {
+            return Err(ConfigError::ServiceReference("services"));
+        }
         if collects_logs(worker, input.params)
             && !service_names.insert(crate::logs::tail_service_name(&worker.worker_id))
         {
@@ -733,6 +744,15 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         if !worker.crons.is_empty() {
             emit_cron_facade(&mut out, worker, input, &mut embeds)?;
         }
+    }
+
+    // Secrets Store: per-worker `worker-<id>-secrets-store` service —
+    // the bundled `/workerd/secrets-store.js` worker whose `env:<name>`
+    // bindings carry the resolved secret values via `fromEnvironment`
+    // (values stay out of the config; upstream `secrets_service`
+    // convention). Emitted only for workers that declare bindings.
+    for worker in &input.tenant.workers {
+        emit_secrets_store_service(&mut out, worker, input)?;
     }
 
     let mut systems: Vec<&SystemWorkerRef> = input
@@ -1022,6 +1042,10 @@ fn emit_worker_surface(
     if !worker.crons.is_empty() {
         emit_cron_facade(out, worker, input, embeds)?;
     }
+    // Secrets Store bundled worker — the worker's own surface (a
+    // divergent `env:<name>` mapping or an unresolvable ref is a
+    // per-worker fault, not a render-fatal one).
+    emit_secrets_store_service(out, worker, input)?;
     emit_worker_sockets(out, worker, input);
     Ok(())
 }
@@ -1793,6 +1817,46 @@ fn emit_binding(
                 capnp_text(&app.config),
             ));
         }
+        BindingDesired::SecretsStore(ss) => {
+            // CF `[[secrets_store_secrets]] — `env.<name>` is a
+            // `SecretsStoreSecret` RPC stub on the per-worker
+            // `secrets-store` bundled-module worker; `get()` resolves
+            // to the value (read-only, as on Cloudflare). The value
+            // never enters the config: it resolves against this
+            // tenant's secret map and rides an `env:<secret_name>`
+            // `fromEnvironment` binding on that worker (upstream
+            // wrangler.rs `secrets_service` convention).
+            let value = resolve_secret(
+                &input.params.secrets,
+                &input.tenant.tenant_id,
+                &ss.secret_ref,
+            )?;
+            let env_name = secrets_store_env_name(&worker.worker_id, &ss.secret_name);
+            match env.entry(env_name) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(value.clone());
+                }
+                // Same secret_name via two bindings shares the env
+                // slot — emit_secrets_store_service refused divergent
+                // refs for one name.
+                std::collections::btree_map::Entry::Occupied(o) if o.get() == value => {}
+                std::collections::btree_map::Entry::Occupied(_) => {
+                    return Err(ConfigError::Identifier("secretEnv"));
+                }
+            }
+            let props = String::from_utf8(canonical_bytes(&json!({
+                "store_id": ss.store_id,
+                "secret_name": ss.secret_name,
+            })))
+            .expect("canonical props are utf8");
+            out.push_str(&format!(
+                "        (name = {}, service = (name = {}, entrypoint = {}, props = (json = {}))),\n",
+                capnp_text(&ss.name),
+                capnp_text(&secrets_store_service_name(&worker.worker_id)),
+                capnp_text("SecretsStoreSecret"),
+                capnp_text(&props),
+            ));
+        }
     }
     Ok(())
 }
@@ -2423,6 +2487,52 @@ fn emit_cron_facade(
     Ok(())
 }
 
+/// Secrets Store: emit `worker-<workerId>-secrets-store` — the bundled
+/// `/workerd/secrets-store.js` worker serving `SecretsStoreSecret`
+/// entrypoints. One `env:<secret_name>` `fromEnvironment` binding per
+/// distinct secret_name the worker's `secretsStore` bindings declare
+/// (upstream `secrets_service` shape; the value arrives through the
+/// child process env, never the config). Two bindings naming the same
+/// `secret_name` must resolve the same ref — a name can only have one
+/// value per worker, as on Cloudflare.
+fn emit_secrets_store_service(
+    out: &mut String,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+) -> Result<(), ConfigError> {
+    let mut by_secret: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for binding in &worker.bindings {
+        if let BindingDesired::SecretsStore(ss) = binding {
+            match by_secret.insert(ss.secret_name.as_str(), ss.secret_ref.as_str()) {
+                Some(prev) if prev != ss.secret_ref => {
+                    return Err(ConfigError::Identifier("secretsStoreSecretName"));
+                }
+                _ => {}
+            }
+        }
+    }
+    if by_secret.is_empty() {
+        return Ok(());
+    }
+    let mut bindings = String::new();
+    for secret_name in by_secret.keys() {
+        bindings.push_str(&format!(
+            "        (name = {}, fromEnvironment = {}),\n",
+            capnp_text(&format!("env:{secret_name}")),
+            capnp_text(&secrets_store_env_name(&worker.worker_id, secret_name)),
+        ));
+    }
+    out.push_str(&format!(
+        "    (name = {}, worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = \"secrets-store.js\", bundled = \"/workerd/secrets-store.js\"),\n      ],\n      bindings = [\n{}      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
+        capnp_text(&secrets_store_service_name(&worker.worker_id)),
+        capnp_text(&input.params.system_compat_date),
+        bindings,
+        capnp_text(&input.params.deny_outbound.service),
+        capnp_text(&input.params.deny_outbound.entrypoint),
+    ));
+    Ok(())
+}
+
 /// W3: emit the platform wfops facade service for a worker. Bindings:
 /// `WFOP_TABLE` json = {workflowName: {binding, token}} where token =
 /// sha256("vrt-wfop:" + uniqueKey) — the cell executor derives the same
@@ -2799,6 +2909,21 @@ pub fn secret_env_name(worker_id: &str, binding_name: &str) -> String {
     format!("VRT_S_{}__{}", enc(worker_id), enc(binding_name))
 }
 
+/// Env var name backing a Secrets Store binding's `env:<secret_name>`
+/// `fromEnvironment` on the bundled secrets-store worker — scoped by
+/// worker so two workers' same-named secrets never collide in the one
+/// process env.
+fn secrets_store_env_name(worker_id: &str, secret_name: &str) -> String {
+    secret_env_name(worker_id, &format!("secrets-store:{secret_name}"))
+}
+
+/// `worker-<workerId>-secrets-store` capnp service name — the
+/// per-worker bundled-module worker that serves `SecretsStoreSecret`
+/// entrypoints for that worker's bindings.
+fn secrets_store_service_name(worker_id: &str) -> String {
+    format!("worker-{worker_id}-secrets-store")
+}
+
 /// T17/F1: shared `var` binding resolution — ONE lookup used by both
 /// the capnp emitter and the stub/standalone env path. A missing ref
 /// fails closed, never silently renders empty.
@@ -2849,6 +2974,23 @@ pub fn resolve_tenant_env(
                     let env_name = secret_env_name(&worker.worker_id, &secret.name);
                     if env.insert(env_name, value.clone()).is_some() {
                         return Err(ConfigError::Identifier("secretEnv"));
+                    }
+                }
+                snapshot_protocol::compute_desired::BindingDesired::SecretsStore(ss) => {
+                    let value = resolve_secret(secrets, &tenant.tenant_id, &ss.secret_ref)?;
+                    let env_name = secrets_store_env_name(&worker.worker_id, &ss.secret_name);
+                    match env.entry(env_name) {
+                        std::collections::btree_map::Entry::Vacant(v) => {
+                            v.insert(value.clone());
+                        }
+                        // Same secret_name via two bindings shares the
+                        // env slot — the render already refused
+                        // divergent refs for one name.
+                        std::collections::btree_map::Entry::Occupied(o)
+                            if o.get() == value => {}
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            return Err(ConfigError::Identifier("secretEnv"));
+                        }
                     }
                 }
                 _ => {}

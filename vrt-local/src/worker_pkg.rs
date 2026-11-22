@@ -165,6 +165,18 @@ pub(crate) struct DevToml {
     pub(crate) host: Option<String>,
 }
 
+/// CF `[[secrets_store_secrets]]` target: the account store and the
+/// secret's name inside it — the binding is read-only (`get()`), as
+/// on Cloudflare.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SecretsStoreToml {
+    /// CF `store_id` (CF default `"default"` when unset).
+    #[serde(default)]
+    pub(crate) store_id: Option<String>,
+    pub(crate) secret_name: String,
+}
+
 /// CF `[[send_email]]` restriction set (send-bindings): the
 /// destination pin and the allowlists travel through signed desired
 /// state; the provider enforces them at send time.
@@ -204,6 +216,11 @@ pub(crate) struct BindingsToml {
     /// `send_email` bindings: `name -> CF send-bindings restriction set`.
     #[serde(default)]
     pub(crate) send_email: BTreeMap<String, SendEmailToml>,
+    /// CF `[[secrets_store_secrets]]`: `name -> {storeId, secretName}`;
+    /// the value resolves from the tenant secret map under the derived
+    /// `secrets-store:{store_id}:{secret_name}` ref at render.
+    #[serde(default)]
+    pub(crate) secrets_store: BTreeMap<String, SecretsStoreToml>,
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
     /// `binding name -> vrt database tenant name`; credentials are resolved
@@ -1278,6 +1295,23 @@ pub fn assemble(
                 snapshot_protocol::compute_desired::FlagshipBinding {
                     name: binding.clone(),
                     app_id: app_id.clone(),
+                },
+            ));
+        }
+        for (binding, s) in &b.secrets_store {
+            let store_id = s
+                .store_id
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            bindings.push(BindingDesired::SecretsStore(
+                snapshot_protocol::compute_desired::SecretsStoreBinding {
+                    name: binding.clone(),
+                    secret_ref: snapshot_protocol::compute_desired::secrets_store_secret_ref(
+                        &store_id,
+                        &s.secret_name,
+                    ),
+                    store_id,
+                    secret_name: s.secret_name.clone(),
                 },
             ));
         }

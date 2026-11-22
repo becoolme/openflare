@@ -191,6 +191,7 @@ fn desired_ack_fixture() {
             k2: true,
             email: true,
             images: true,
+            secrets_store: true,
         }),
     };
     check(

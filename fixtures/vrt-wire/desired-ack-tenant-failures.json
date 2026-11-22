@@ -14,6 +14,7 @@
     "queue": true,
     "queueDeliveryDelay": true,
     "quotas": true,
+    "secretsStore": true,
     "serviceEntrypoint": true,
     "serviceProps": true,
     "storagePurge": true,

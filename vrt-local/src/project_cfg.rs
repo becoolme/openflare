@@ -1276,6 +1276,50 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     bindings.push(Value::Object(b));
                 }
             }
+            "secrets_store_secrets" => {
+                // CF `[[secrets_store_secrets]] {binding, store_id?,
+                // secret_name}` — Secrets Store binding; `env.<binding>`
+                // is a read-only `SecretsStoreSecret` stub (`.get()`).
+                // `store_id` defaults to `"default"` per CF; `remote`
+                // does not exist for this binding. The value resolves
+                // from the tenant secret map under the derived
+                // `secrets-store:{store_id}:{secret_name}` ref.
+                for (i, e) in table_list(value, "secrets_store_secrets")?
+                    .iter()
+                    .enumerate()
+                {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "binding" | "store_id" | "secret_name" => {}
+                            _ => {
+                                return Err(unsupported(
+                                    &format!("secrets_store_secrets[{i}].{k}"),
+                                    None,
+                                ))
+                            }
+                        }
+                    }
+                    let binding = req_str(
+                        e.get("binding").unwrap_or(&Value::Null),
+                        &format!("secrets_store_secrets[{i}].binding"),
+                    )?;
+                    let secret_name = req_str(
+                        e.get("secret_name").unwrap_or(&Value::Null),
+                        &format!("secrets_store_secrets[{i}].secret_name"),
+                    )?;
+                    let store_id = opt_str(
+                        e.get("store_id"),
+                        &format!("secrets_store_secrets[{i}].store_id"),
+                    )?
+                    .unwrap_or("default");
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("secrets_store"));
+                    b.insert("name".into(), Value::from(binding));
+                    b.insert("storeId".into(), Value::from(store_id));
+                    b.insert("secretName".into(), Value::from(secret_name));
+                    bindings.push(Value::Object(b));
+                }
+            }
             "images" => {
                 // CF `[images] {binding}` — the Images binding
                 // (`env.<binding>.info()`/`.input().transform().output()`);
@@ -2699,6 +2743,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut flagship = Map::new();
         let mut k2 = Map::new();
         let mut send_email = Map::new();
+        let mut secrets_store = Map::new();
         let mut vectorize = Map::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -2830,6 +2875,20 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     }
                     send_email.insert(name.into(), Value::Object(r));
                 }
+                "secrets_store" => {
+                    // `[[secrets_store_secrets]]` normalized target —
+                    // pass `{storeId, secretName}` through to
+                    // BindingsToml::SecretsStoreToml.
+                    let mut s = Map::new();
+                    if let Some(v) = b.get("storeId") {
+                        s.insert("storeId".into(), v.clone());
+                    }
+                    s.insert(
+                        "secretName".into(),
+                        b.get("secretName").cloned().unwrap_or(Value::Null),
+                    );
+                    secrets_store.insert(name.into(), Value::Object(s));
+                }
                 "images" => {
                     // `[images] {binding}` — name list only (like
                     // workerLoaders): no resource reference.
@@ -2914,6 +2973,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !send_email.is_empty() {
             bind.insert("sendEmail".into(), Value::Object(send_email));
+        }
+        if !secrets_store.is_empty() {
+            bind.insert("secretsStore".into(), Value::Object(secrets_store));
         }
         if !vectorize.is_empty() {
             bind.insert("vectorize".into(), Value::Object(vectorize));

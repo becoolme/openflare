@@ -153,6 +153,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // workerd ships `cloudflare-internal:images-api` and the
         // sysmanifest requires `facade-images`) -- unconditionally on.
         images: true,
+        // `secretsStore` bindings render with this generation (the
+        // bundled `/workerd/secrets-store.js` worker ships in every
+        // pinned binary — upstream, no fork shim) -- unconditionally on.
+        secrets_store: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,
