@@ -560,6 +560,27 @@ fn is_json_value(v: &Value) -> bool {
     }
 }
 
+/// CF `custom_domain` route: `pattern` is the hostname itself — a bare
+/// lowercase FQDN (>=2 labels), no wildcard, no path, no port. The same
+/// strict rule `snapshot-protocol` applies to wire `hostnames`, so a
+/// config that would be rejected downstream fails here instead.
+fn validate_custom_domain(pattern: &str, field: &str) -> Result<String, ProjectConfigError> {
+    let h = pattern.trim().to_lowercase();
+    if h.contains('*') {
+        return Err(unsupported(
+            field,
+            Some("wildcard custom domains are not supported"),
+        ));
+    }
+    if !snapshot_protocol::compute_desired::valid_hostname(&h) {
+        return Err(invalid(
+            field,
+            "custom_domain must be a bare hostname (no path, port, or wildcard)",
+        ));
+    }
+    Ok(h)
+}
+
 fn route_to_hostname(pattern: &str, field: &str) -> Result<String, ProjectConfigError> {
     let mut p = pattern.trim().to_lowercase();
     if let Some(stripped) = p.strip_suffix("/*") {
@@ -584,6 +605,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
     out.insert("schemaVersion".into(), Value::from(1));
     let mut bindings: Vec<Value> = Vec::new();
     let mut hostnames: Vec<String> = Vec::new();
+    let mut custom_domains: Vec<String> = Vec::new();
     let mut routes_seen = false;
     let mut route_seen = false;
 
@@ -1586,7 +1608,55 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 for (i, e) in entries.iter().enumerate() {
                     let field = format!("{key}[{i}]");
                     let pattern = match e {
-                        Value::Object(o) => opt_str(o.get("pattern"), &format!("{field}.pattern"))?,
+                        Value::Object(o) => {
+                            // Booleans first — they decide which CF route
+                            // shape this entry is (`custom_domain: true` →
+                            // CustomDomainRoute, else zone/pattern route).
+                            for flag in ["custom_domain", "enabled", "previews_enabled"] {
+                                if let Some(v) = o.get(flag) {
+                                    if !v.is_boolean() {
+                                        return Err(invalid(
+                                            &format!("{field}.{flag}"),
+                                            "must be a boolean",
+                                        ));
+                                    }
+                                }
+                            }
+                            let is_custom = o
+                                .get("custom_domain")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let enabled =
+                                o.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                            // CF route-shape whitelist: zone refs are
+                            // accepted and ignored (VRT has no zone
+                            // registry); `enabled`/`previews_enabled` exist
+                            // only on the CustomDomainRoute shape.
+                            for k in o.keys() {
+                                match k.as_str() {
+                                    "pattern" | "custom_domain" | "zone_id" | "zone_name" => {}
+                                    "enabled" | "previews_enabled" if is_custom => {}
+                                    _ => return Err(unsupported(&format!("{field}.{k}"), None)),
+                                }
+                            }
+                            let p = opt_str(o.get("pattern"), &format!("{field}.pattern"))?
+                                .ok_or_else(|| {
+                                    invalid(&field, "must be a pattern string or { pattern }")
+                                })?;
+                            if is_custom {
+                                if enabled {
+                                    // Custom domain: `pattern` IS the
+                                    // hostname — no wildcard/suffix.
+                                    custom_domains.push(validate_custom_domain(
+                                        p,
+                                        &format!("{field}.pattern"),
+                                    )?);
+                                }
+                            } else {
+                                hostnames.push(route_to_hostname(p, &field)?);
+                            }
+                            continue;
+                        }
                         Value::String(_) => Some(e.as_str().unwrap()),
                         _ => {
                             return Err(invalid(&field, "must be a pattern string or { pattern }"))
@@ -1795,6 +1865,21 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
         // control plane they must name ALREADY-claimed hostnames (they
         // never auto-claim, unlike the native `hostnames` field).
         out.insert("routeHostnames".into(), Value::Array(dedup));
+    }
+    if !custom_domains.is_empty() {
+        let dedup: Vec<Value> = {
+            let mut seen = std::collections::BTreeSet::new();
+            custom_domains
+                .into_iter()
+                .filter(|h| seen.insert(h.clone()))
+                .map(Value::from)
+                .collect()
+        };
+        // CF `custom_domain` routes attach the whole hostname to the
+        // worker — the control plane auto-claims them (idempotent
+        // vrtHostname claim + async verify), unlike `routeHostnames`
+        // which must name already-claimed hostnames.
+        out.insert("customDomains".into(), Value::Array(dedup));
     }
     Ok(Value::Object(out))
 }
@@ -2119,7 +2204,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         // hostnames and native hostnames both become wire `hostnames`
         // (deduped, order-preserving).
         let mut merged: Vec<Value> = Vec::new();
-        for key in ["hostnames", "routeHostnames"] {
+        for key in ["hostnames", "routeHostnames", "customDomains"] {
             if let Some(Value::Array(list)) = obj.get(key) {
                 for v in list {
                     if !merged.contains(v) {
@@ -2182,6 +2267,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "assets",
         "hostnames",
         "routeHostnames",
+        "customDomains",
         "crons",
         "queueConsumers",
         "observability",
@@ -2616,6 +2702,114 @@ mod tests {
         // missing kv id → binding name derivation
         let bind = meta.bindings.unwrap();
         assert_eq!(bind.kv.get("K").map(|s| s.as_str()), Some("K"));
+    }
+
+    fn wrangler_meta(toml: &str) -> Result<WorkerToml, LocalError> {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("wrangler.toml"), toml).unwrap();
+        load_worker_meta(dir.path()).map(|(m, _)| m)
+    }
+
+    #[test]
+    fn custom_domain_routes_into_hostnames() {
+        // `{pattern, custom_domain = true}` — CF CustomDomainRoute: the
+        // pattern IS the hostname (uppercase folds to lowercase; zone
+        // refs are accepted and ignored, matching CF's anyOf shapes).
+        let meta = wrangler_meta(
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             routes=[{pattern=\"API.Example.com\",custom_domain=true},\n\
+             {pattern=\"api.example.com/*\",zone_name=\"example.com\"}]\n",
+        )
+        .unwrap();
+        // Both land in standalone `hostnames` (wire merge dedupes).
+        assert_eq!(meta.hostnames, vec!["api.example.com"]);
+
+        // Multiple custom domains dedup to first-occurrence order (same
+        // as `routeHostnames`).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.toml"),
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             routes=[{pattern=\"b.example.com\",custom_domain=true},\n\
+             {pattern=\"a.example.com\",custom_domain=true},\n\
+             {pattern=\"b.example.com\",custom_domain=true}]\n",
+        )
+        .unwrap();
+        let (cfg, _, _) = load_wrangler_project_config(dir.path(), None, None).unwrap();
+        assert_eq!(
+            cfg["customDomains"],
+            serde_json::json!(["b.example.com", "a.example.com"])
+        );
+        // Singular `route` form carries the same entry shape.
+        let meta = wrangler_meta(
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             route={pattern=\"one.example.com\",custom_domain=true}\n",
+        )
+        .unwrap();
+        assert_eq!(meta.hostnames, vec!["one.example.com"]);
+    }
+
+    #[test]
+    fn custom_domain_disabled_and_false_are_not_claimed() {
+        // `enabled = false` → not served, not claimed; `custom_domain
+        // = false` on a zone route stays a plain pattern route.
+        let meta = wrangler_meta(
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             routes=[{pattern=\"off.example.com\",custom_domain=true,enabled=false},\n\
+             {pattern=\"on.example.com/*\",zone_id=\"z1\",custom_domain=false}]\n",
+        )
+        .unwrap();
+        assert_eq!(meta.hostnames, vec!["on.example.com"]);
+    }
+
+    #[test]
+    fn custom_domain_fail_closed() {
+        let bad = [
+            // wildcard custom domains are out of the claim model's scope
+            (
+                "routes=[{pattern=\"*.example.com\",custom_domain=true}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // a path/port is not a bare hostname
+            (
+                "routes=[{pattern=\"a.example.com/v1\",custom_domain=true}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            (
+                "routes=[{pattern=\"a.example.com:443\",custom_domain=true}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // single label is not a routable FQDN claim
+            (
+                "routes=[{pattern=\"localhost\",custom_domain=true}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // non-boolean custom_domain
+            (
+                "routes=[{pattern=\"a.example.com\",custom_domain=\"yes\"}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // `enabled` only exists on the custom-domain shape
+            (
+                "routes=[{pattern=\"a.example.com/*\",enabled=false}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // unknown keys fail closed (CF additionalProperties:false)
+            (
+                "routes=[{pattern=\"a.example.com\",custom_domain=true,ttl=60}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+        ];
+        for (routes, code) in bad {
+            let err = wrangler_meta(&format!(
+                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{routes}\n"
+            ))
+            .expect_err(&format!("{routes} must fail"));
+            assert!(
+                format!("{err:?}").contains(code),
+                "{routes} → {err:?}, want {code}"
+            );
+        }
     }
 
     #[test]

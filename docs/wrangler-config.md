@@ -75,7 +75,7 @@ environment blocks.
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
 | `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1179` |
-| `route` / `routes` | supported — pattern strings or `{ pattern }`; only plain hostnames or `<fqdn>/*`; `route` and `routes` are mutually exclusive (`VRT_CONFIG_INVALID`) | `project_cfg.rs:1202`, `route_to_hostname` `:510` |
+| `route` / `routes` | supported — pattern strings or `{ pattern }` → `routeHostnames`; `{ pattern, custom_domain = true }` → `customDomains` (bare FQDN claim, `enabled = false` drops it); `zone_name`/`zone_id`/`previews_enabled` accepted and ignored; `route` and `routes` are mutually exclusive (`VRT_CONFIG_INVALID`) | `project_cfg.rs:1591`, `route_to_hostname` `:555` |
 | `assets` | supported — see [Static assets](bindings/static-assets.md); `directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first` | `project_cfg.rs:1235` |
 | `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1269` |
 | `tail_consumers` | supported — see [Tail Workers](bindings/tail-workers.md); `service` table or legacy string entries; distinct same-tenant already-deployed consumers, deduped, max 16; empty list valid | `project_cfg.rs:1352` |
@@ -112,6 +112,11 @@ Also type-checked then dropped inside supported blocks:
 - `services[].props` — becomes the `{ service, props }` table form
   (or joins `entrypoint`); must be a JSON object of at most 8 KiB and is
   rendered into the signed workerd service designator as `ctx.props`.
+- `routes[].custom_domain` — merges into the worker's wire `hostnames`
+  (standalone: same as `vrt hostnames add`). Standalone has no DNS/TLS
+  pipeline: the operator must point the domain at the vrt-host listener
+  and terminate TLS in front (Caddy/nginx) or serve plain HTTP — same
+  responsibility CF assigns to a zone it does not manage.
 
 ## Rejected
 
@@ -129,9 +134,10 @@ That includes, non-exhaustively: `ai`, `vectorize`, `ai_search`,
 `version_metadata`, `secrets_store_secrets`,
 `migrations_pattern`,
 `logpush`, `site`, `preview_id` (top level),
-`node_compat`, `route`-shaped `custom_domain` fields inside routes
-objects (`zone_name`, `zone_id`, `custom_domain` on `routes[]` entries
-are not carried — only `pattern` is read).
+`node_compat`. Inside `routes[]` objects, CF carries `custom_domain`,
+`enabled`, `previews_enabled` and zone refs — all handled above;
+wildcard `custom_domain` patterns (`*.example.com`) are rejected
+(`VRT_CONFIG_UNSUPPORTED_FIELD`).
 
 Inside supported blocks the rule is the same — an unrecognized nested
 key names the path, e.g. `queues.consumers[0].max_ack`,

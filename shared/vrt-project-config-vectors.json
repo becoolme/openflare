@@ -1403,6 +1403,122 @@
     "code": "VRT_CONFIG_INVALID",
     "field": "flagship[0].app_id"
    }
+  },
+  {
+   "name": "custom_domain route claims the hostname",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"Shop.Example.com\", custom_domain = true}]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "customDomains": [
+      "shop.example.com"
+     ]
+    }
+   }
+  },
+  {
+   "name": "custom_domain mixed with pattern routes",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"api.example.com/*\", zone_name = \"example.com\"}, {pattern = \"cdn.example.com\", custom_domain = true}, {pattern = \"b.example.com\", custom_domain = true, zone_id = \"z1\"}]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "routeHostnames": [
+      "api.example.com"
+     ],
+     "customDomains": [
+      "cdn.example.com",
+      "b.example.com"
+     ]
+    }
+   }
+  },
+  {
+   "name": "custom_domain disabled is not claimed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"off.example.com\", custom_domain = true, enabled = false}, {pattern = \"on.example.com/*\", zone_id = \"z\", custom_domain = false}]\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "routeHostnames": [
+      "on.example.com"
+     ]
+    }
+   }
+  },
+  {
+   "name": "custom_domain wildcard fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"*.example.com\", custom_domain = true}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "routes[0].pattern"
+   }
+  },
+  {
+   "name": "custom_domain path fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"a.example.com/v1\", custom_domain = true}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "routes[0].pattern"
+   }
+  },
+  {
+   "name": "route entry unknown key fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"a.example.com\", custom_domain = true, ttl = 60}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "routes[0].ttl"
+   }
+  },
+  {
+   "name": "custom_domain must be boolean",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"a.example.com\", custom_domain = \"yes\"}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "routes[0].custom_domain"
+   }
+  },
+  {
+   "name": "enabled only exists on custom_domain routes",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\nroutes = [{pattern = \"a.example.com/*\", zone_name = \"example.com\", enabled = false}]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "routes[0].enabled"
+   }
   }
  ]
 }

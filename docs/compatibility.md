@@ -129,8 +129,10 @@ These are not tied to one binding.
   sampling/`_sample_interval`); query via DuckDB or ClickHouse
   `s3(...,'Parquet')` — see [Analytics Engine](bindings/analytics-engine.md).
 - **No D1 migrations runner** — `migrations_dir` is an unsupported key.
-- **Routes**: only plain hostnames and `<fqdn>/*` patterns; no zone
-  management, no `custom_domain`.
+- **Routes**: plain hostnames and `<fqdn>/*` patterns, plus CF
+  `custom_domain` entries (`{ pattern = "host", custom_domain = true }` —
+  the bare hostname attaches to the worker; `enabled = false` disables).
+  Wildcard custom domains and zone management are not carried.
 
 ## Unsupported bindings
 
