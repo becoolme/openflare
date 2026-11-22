@@ -16,3 +16,4 @@ node_modules/
 
 # Generated conformance reports (conformance/run.mjs output)
 conformance/results/
+docs/backlog.md
