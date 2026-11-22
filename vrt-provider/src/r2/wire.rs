@@ -3,8 +3,11 @@
 
 use crate::error::ProviderError;
 use crate::limits::{R2_MAX_CUSTOM_METADATA_JSON_BYTES, R2_MAX_KEY_BYTES};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt;
 
 /// Six HTTP metadata fields supported by the facade.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -236,6 +239,59 @@ impl R2StorageClass {
     }
 }
 
+/// Customer-provided SSE-C key (32 raw bytes).
+///
+/// The Workers API accepts `ssecKey` as a 64-character hex string or a
+/// 32-byte `ArrayBuffer`, and workerd forwards the hex form on the
+/// binding wire (`buildSsecKey` in `r2-bucket.c++`: `^[0-9a-f]+$`,
+/// length 64; the vendored native adapter validates the same shape).
+/// S3 itself takes the raw key base64-encoded in
+/// `x-amz-server-side-encryption-customer-key`, so that conversion is
+/// backend-local and never leaks into the wire DTOs.
+#[derive(Clone, Eq, PartialEq)]
+pub struct R2SsecKey([u8; 32]);
+
+impl R2SsecKey {
+    /// Parse the wire form: exactly 64 lowercase hex characters.
+    pub fn parse(hex_key: &str) -> Result<Self, ProviderError> {
+        if hex_key.len() != 64
+            || !hex_key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(ProviderError::R2SsecInvalid);
+        }
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(hex_key, &mut bytes).map_err(|_| ProviderError::R2SsecInvalid)?;
+        Ok(Self(bytes))
+    }
+
+    /// Tenant-visible key MD5: lowercase hex (`R2Object.ssecKeyMd5`
+    /// documents a hex-encoded hash, unlike the base64 S3 header).
+    #[must_use]
+    pub fn md5_hex(&self) -> String {
+        hex::encode(md5::compute(self.0).0)
+    }
+
+    /// S3 `x-amz-server-side-encryption-customer-key` value.
+    #[must_use]
+    pub fn s3_key_b64(&self) -> String {
+        B64.encode(self.0)
+    }
+
+    /// S3 `x-amz-server-side-encryption-customer-key-MD5` value.
+    #[must_use]
+    pub fn s3_key_md5_b64(&self) -> String {
+        B64.encode(md5::compute(self.0).0)
+    }
+}
+
+impl fmt::Debug for R2SsecKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("R2SsecKey(<redacted>)")
+    }
+}
+
 /// Exactly one caller-supplied checksum algorithm.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum R2ChecksumAlgorithm {
@@ -374,7 +430,8 @@ pub struct R2ObjectMetadata {
     pub checksums: R2Checksums,
     /// Worker API storage class.
     pub storage_class: String,
-    /// MD5 of the SSE-C key when encrypted (never emitted — v1 rejects SSE-C).
+    /// Hex MD5 of the SSE-C key when the object is encrypted; absent
+    /// for plain objects.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssec_key_md5: Option<String>,
 }
@@ -446,6 +503,9 @@ pub struct R2PutOptions {
     pub checksum: Option<R2ChecksumAlgorithm>,
     /// Storage class.
     pub storage_class: R2StorageClass,
+    /// SSE-C key supplied by the caller; only the S3 backend can honor
+    /// it (fs/memory fail closed).
+    pub ssec_key: Option<R2SsecKey>,
 }
 
 /// Minimum size for every part except the final one (upstream R2/S3).
@@ -476,6 +536,9 @@ pub struct R2MultipartCreateOptions {
     pub custom_metadata: BTreeMap<String, String>,
     /// Storage class.
     pub storage_class: R2StorageClass,
+    /// SSE-C key supplied by the caller; only the S3 backend can honor
+    /// it (fs/memory fail closed).
+    pub ssec_key: Option<R2SsecKey>,
 }
 
 /// Multipart create result (trait placeholder).
@@ -610,7 +673,7 @@ pub struct GetOptions {
     pub range: Option<R2Range>,
     /// Read precondition.
     pub only_if: Option<R2Condition>,
-    /// SSE-C key hex (64 chars) — rejected: unsupported in v1.
+    /// SSE-C key as forwarded by workerd: 64 lowercase hex chars.
     pub ssec_key: Option<String>,
 }
 
@@ -643,7 +706,7 @@ pub struct PutWireOptions {
     pub checksum: Option<ChecksumWire>,
     /// `Standard` | `InfrequentAccess`.
     pub storage_class: Option<String>,
-    /// SSE-C key hex — rejected: unsupported in v1.
+    /// SSE-C key as forwarded by workerd: 64 lowercase hex chars.
     pub ssec_key: Option<String>,
 }
 
@@ -658,16 +721,14 @@ pub struct ChecksumWire {
 }
 
 impl PutWireOptions {
-    fn validate(&self) -> Result<(), ProviderError> {
+    fn validate(&self) -> Result<Option<R2SsecKey>, ProviderError> {
         if let Some(class) = self.storage_class.as_deref() {
             R2StorageClass::parse(class)?;
         }
-        // SSE-C is unsupported in v1 — reject any supplied key material
-        // rather than silently treating the write as unencrypted.
-        if self.ssec_key.is_some() {
-            return Err(ProviderError::R2SsecInvalid);
-        }
-        Ok(())
+        // Never silently drop supplied key material: malformed →
+        // `R2_SSEC_INVALID`, valid is carried into the backend (which
+        // fails closed unless it can actually encrypt).
+        self.ssec_key.as_deref().map(R2SsecKey::parse).transpose()
     }
 }
 
@@ -707,7 +768,7 @@ impl TryFrom<PutWireOptions> for R2PutOptions {
     type Error = ProviderError;
 
     fn try_from(value: PutWireOptions) -> Result<Self, Self::Error> {
-        value.validate()?;
+        let ssec_key = value.validate()?;
         Ok(Self {
             http_metadata: value.http_metadata,
             custom_metadata: value.custom_metadata,
@@ -719,6 +780,7 @@ impl TryFrom<PutWireOptions> for R2PutOptions {
                 .map(R2StorageClass::parse)
                 .transpose()?
                 .unwrap_or_default(),
+            ssec_key,
         })
     }
 }
@@ -782,7 +844,6 @@ pub fn list_object_json(mut metadata: R2ObjectMetadata, mask: u8) -> serde_json:
 }
 
 /// `createMultipartUpload` request body — upstream `{key, options}`.
-/// `ssecKey` presence is rejected (SSE-C unsupported), matching `put`.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateMultipartRequest {
@@ -803,7 +864,7 @@ pub struct MultipartCreateWireOptions {
     pub custom_metadata: Option<BTreeMap<String, String>>,
     /// Storage class.
     pub storage_class: Option<String>,
-    /// SSE-C key — present → `R2_SSEC_INVALID`.
+    /// SSE-C key as forwarded by workerd: 64 lowercase hex chars.
     pub ssec_key: Option<String>,
 }
 
@@ -817,7 +878,7 @@ pub struct UploadPartHeader {
     pub upload_id: String,
     /// Part number `1..=10000`.
     pub part_number: i64,
-    /// SSE-C key — present → `R2_SSEC_INVALID`.
+    /// SSE-C key as forwarded by workerd: 64 lowercase hex chars.
     pub ssec_key: Option<String>,
 }
 
@@ -844,15 +905,12 @@ pub struct AbortMultipartRequest {
     pub upload_id: String,
 }
 
-/// Normalize `MultipartCreateWireOptions` into the provider-facing type;
-/// rejects `ssecKey`.
+/// Normalize `MultipartCreateWireOptions` into the provider-facing type.
 impl MultipartCreateWireOptions {
-    /// Convert to [`R2MultipartCreateOptions`]; `ssecKey` →
+    /// Convert to [`R2MultipartCreateOptions`]; malformed `ssecKey` →
     /// `R2_SSEC_INVALID`, unknown storage class → `R2_INVALID_OPTIONS`.
     pub fn into_options(self) -> Result<R2MultipartCreateOptions, ProviderError> {
-        if self.ssec_key.is_some() {
-            return Err(ProviderError::R2SsecInvalid);
-        }
+        let ssec_key = self.ssec_key.as_deref().map(R2SsecKey::parse).transpose()?;
         Ok(R2MultipartCreateOptions {
             http_metadata: self.http_metadata.unwrap_or_default(),
             custom_metadata: self.custom_metadata.unwrap_or_default(),
@@ -862,6 +920,7 @@ impl MultipartCreateWireOptions {
                 .map(R2StorageClass::parse)
                 .transpose()?
                 .unwrap_or_default(),
+            ssec_key,
         })
     }
 }

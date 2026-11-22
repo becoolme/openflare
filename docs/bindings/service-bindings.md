@@ -2,7 +2,8 @@
 
 Worker-to-worker bindings inside one tenant: `env.SVC.fetch()` and RPC
 methods reach the named worker's default entrypoint, or a named
-`WorkerEntrypoint` export when `entrypoint` is set.
+`WorkerEntrypoint` export when `entrypoint` is set. A JSON `props`
+object, when declared, is surfaced to the target as `ctx.props`.
 
 **Status: Partial**
 
@@ -17,6 +18,7 @@ service = "other-worker"   # worker name in the same tenant
 binding = "GREETER"
 service = "other-worker"
 entrypoint = "Greeter"     # named WorkerEntrypoint export (optional)
+props = { region = "eu", flags = { beta = true } }   # ctx.props (optional)
 ```
 
 Native `vrt.toml` equivalent:
@@ -25,11 +27,13 @@ Native `vrt.toml` equivalent:
 [bindings.service]
 SVC = "other-worker"
 GREETER = { service = "other-worker", entrypoint = "Greeter" }
+REGIONAL = { service = "other-worker", props = { region = "eu" } }
 ```
 
 The plain-string form is the default entrypoint and keeps its original
-wire bytes; the table form accepts exactly `service` and `entrypoint`
-(unknown keys fail closed).
+wire bytes; the table form accepts exactly `service`, `entrypoint` and
+`props` (unknown keys fail closed). `entrypoint` and `props` are both
+optional inside the table.
 
 ## Where it runs
 
@@ -39,9 +43,12 @@ closed. The emitted workerd binding is a service designator to
 `worker-<workerId>` (`vrt-config/src/capnp.rs`), with
 `entrypoint = "<name>"` added only when a named entrypoint is set, so
 `fetch()`, `connect()` and RPC work against either the default export or
-the named class. Cross-tenant service bindings are impossible by
-construction (the target must exist in the same tenant's worker list,
-enforced both at pack and in snapshot validation).
+the named class. When `props` is declared it is emitted as
+`props = (json = "<canonical compact JSON>")` on the same designator and
+arrives as `ctx.props` in the target entrypoint. Cross-tenant service
+bindings are impossible by construction (the target must exist in the
+same tenant's worker list, enforced both at pack and in snapshot
+validation).
 
 Named entrypoints reach workerd because the platform `waitUntil`
 wrapper re-exports the user module (`export * from <main>`).
@@ -64,6 +71,28 @@ from the generation while its siblings keep serving). Older hosts that
 predate the field reject it via `deny_unknown_fields` — fail closed, not
 silently routed to the default export.
 
+## Props rules
+
+`props` is optional. When present it must be:
+
+- a JSON **object** (Cloudflare's documented `ctx.props` shape; scalars,
+  arrays and `null` are rejected — an explicit `null` is not treated as
+  absent);
+- at most **8 KiB** (8192 bytes) as compact JSON;
+- free of sibling keys inside the `[bindings.service]` table — the table
+  itself accepts only `service`, `entrypoint` and `props`.
+
+Nested objects, arrays, strings, numbers, booleans and `null` are legal
+*inside* the object. The value is canonicalized (object keys sorted by
+UTF-16 code unit order, no insignificant whitespace) before it is written
+into the signed workerd designator, so identical declarations always
+render identical bytes. The rules are enforced at wrangler normalization
+(`services[].props`), at pack for both config paths
+(`LocalError::Worker("service props")`), at snapshot validation
+(`DESIRED_SERVICE_PROPS`), and again at render
+(`CONFIG_CAPACITY_EXCEEDED`). Snapshots that predate the field stay
+byte-identical because absent `props` is omitted from the wire.
+
 ## Backends
 
 None — a service binding is direct workerd-to-workerd service dispatch
@@ -83,16 +112,21 @@ inside the tenant's process.
 - The target must be deployed before the referencing worker (deploy
   order matters); there is no Cloudflare-style account-wide registry —
   only the tenant's own workers.
-- `props` on service bindings are not supported.
 
 ## Unsupported keys and error shape
 
-- `services[]` accepts only `binding`, `service`, `entrypoint` —
-  anything else → `VRT_CONFIG_UNSUPPORTED_FIELD`
+- `services[]` accepts only `binding`, `service`, `entrypoint` and
+  `props` — anything else → `VRT_CONFIG_UNSUPPORTED_FIELD`
   (`services[0].<key>`).
 - An `entrypoint` that breaks the rules above →
   `VRT_CONFIG_UNSUPPORTED_FIELD` (`bindings.<name>.entrypoint`), or
   `VRT_CONFIG_INVALID` for an empty string.
+- A `props` that is not an object or exceeds 8 KiB →
+  `VRT_CONFIG_INVALID` (`services[0].props`) at normalization, or
+  `LocalError::Worker("service props")` for the native `vrt.toml`
+  table/library path; snapshot validation reports
+  `DESIRED_SERVICE_PROPS` and render uses
+  `CONFIG_CAPACITY_EXCEEDED`.
 - A `service` that does not resolve to a deployed worker →
   `LocalError::Worker("service target")` at deploy.
 
@@ -101,11 +135,16 @@ inside the tenant's process.
 - `shared/vrt-project-config-vectors.json` — golden vectors covering
   `services` normalization (`service binding keeps entrypoint`).
 - `vrt-local/src/project_cfg.rs` — normalization tests (golden vector
-  harness `golden_vectors_match_typescript`) and the standalone
-  entrypoint tests (`service_entrypoint_into_pack_shape`,
-  `service_entrypoint_rules_fail_closed`, `vrt_toml_service_table_shape`).
+  harness `golden_vectors_match_typescript`), the standalone entrypoint
+  tests (`service_entrypoint_into_pack_shape`,
+  `service_entrypoint_rules_fail_closed`, `vrt_toml_service_table_shape`),
+  and the props tests (`service_props_fail_closed`,
+  `native_service_props_reach_pack_and_fail_closed`).
 - `snapshot-protocol/src/compute_desired.rs` —
-  `service_entrypoint_wire_shape`, `service_entrypoint_rules`.
+  `service_entrypoint_wire_shape`, `service_entrypoint_rules`,
+  `service_props_wire_shape`, `service_props_rules`.
 - `vrt-config/tests/render.rs` —
   `service_binding_named_entrypoint_renders`,
-  `service_binding_reserved_entrypoint_is_refused`.
+  `service_binding_reserved_entrypoint_is_refused`,
+  `service_binding_props_render_only_when_declared`,
+  `service_binding_invalid_props_is_refused_at_render`.
