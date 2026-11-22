@@ -896,11 +896,9 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
     // real. An empty `waituntil_socket` therefore means NO marker —
     // prewarm cannot prove reload completion and the supervisor falls
     // back to the classic serialized switch.
-    let has_do_storage = input
-        .tenant
-        .workers
-        .iter()
-        .any(|w| !w.durable_object_classes.is_empty() || !wf_targets(input, &w.worker_id).is_empty());
+    let has_do_storage = input.tenant.workers.iter().any(|w| {
+        !w.durable_object_classes.is_empty() || !wf_targets(input, &w.worker_id).is_empty()
+    });
     if has_do_storage
         && !input.params.waituntil_socket.is_empty()
         && !input.tenant.workers.is_empty()
@@ -1103,8 +1101,9 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
         "    (name = {}, address = {}, http = (forwardedProtoHeader = \"x-forwarded-proto\", cfBlobHeader = {}), service = {}),\n",
         capnp_text(&worker_socket_name(&worker.worker_id)),
         capnp_text(&format!(
-            "unix:{}/{}.sock",
-            input.params.socket_dir, worker.worker_id
+            "unix:{}/{}",
+            input.params.socket_dir,
+            socket_file(&worker.worker_id)
         )),
         capnp_text(CF_BLOB_HEADER),
         capnp_text(&if worker_assets_first(worker).is_some() {
@@ -1120,8 +1119,9 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
             "    (name = {}, address = {}, http = (), service = {}),\n",
             capnp_text(&qconsumer_socket_name(&worker.worker_id)),
             capnp_text(&format!(
-                "unix:{}/{}-qconsumer.sock",
-                input.params.socket_dir, worker.worker_id
+                "unix:{}/{}",
+                input.params.socket_dir,
+                socket_file(&format!("{}-qconsumer", worker.worker_id))
             )),
             capnp_text(&qconsumer_service_name(&worker.worker_id)),
         ));
@@ -1134,8 +1134,9 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
             "    (name = {}, address = {}, http = (), service = {}),\n",
             capnp_text(&wfops_socket_name(&worker.worker_id)),
             capnp_text(&format!(
-                "unix:{}/{}-wfops.sock",
-                input.params.socket_dir, worker.worker_id
+                "unix:{}/{}",
+                input.params.socket_dir,
+                socket_file(&format!("{}-wfops", worker.worker_id))
             )),
             capnp_text(&wfops_service_name(&worker.worker_id)),
         ));
@@ -1150,8 +1151,9 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
             "    (name = {}, address = {}, http = (), service = {}),\n",
             capnp_text(&cron_socket_name(&worker.worker_id)),
             capnp_text(&format!(
-                "unix:{}/{}-cron.sock",
-                input.params.socket_dir, worker.worker_id
+                "unix:{}/{}",
+                input.params.socket_dir,
+                socket_file(&format!("{}-cron", worker.worker_id))
             )),
             capnp_text(&cron_facade_service_name(&worker.worker_id)),
         ));
@@ -1160,17 +1162,19 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
     // on this worker's hostnames and POSTs multipart transform requests
     // here. Loopback unix only; present iff the worker declares an
     // `images` binding (capability-gated like every other facade).
-    if worker
-        .bindings
-        .iter()
-        .any(|b| matches!(b, snapshot_protocol::compute_desired::BindingDesired::Images(_)))
-    {
+    if worker.bindings.iter().any(|b| {
+        matches!(
+            b,
+            snapshot_protocol::compute_desired::BindingDesired::Images(_)
+        )
+    }) {
         out.push_str(&format!(
             "    (name = {}, address = {}, http = (), service = {}),\n",
             capnp_text(&format!("sock-images-{}", worker.worker_id)),
             capnp_text(&format!(
-                "unix:{}/{}-images.sock",
-                input.params.socket_dir, worker.worker_id
+                "unix:{}/{}",
+                input.params.socket_dir,
+                socket_file(&format!("{}-images", worker.worker_id))
             )),
             capnp_text(&input.params.facades.images.service),
         ));
@@ -1705,10 +1709,7 @@ fn emit_binding(
             // real credentials never enter the isolate (the provider
             // holds them under `credentialRef`). The host is the
             // platform-minted unresolvable synthetic name.
-            let conn = format!(
-                "postgres://vrt-hd:vrt-hd@{}:5432/vrt",
-                hd.synthetic_host
-            );
+            let conn = format!("postgres://vrt-hd:vrt-hd@{}:5432/vrt", hd.synthetic_host);
             let obj = format!(
                 "{{\"connectionString\":\"{}\",\"host\":\"{}\",\"port\":5432,\"user\":\"vrt-hd\",\"password\":\"vrt-hd\",\"database\":\"vrt\"}}",
                 conn, hd.synthetic_host
@@ -2265,9 +2266,7 @@ fn emit_system_worker(
             capnp_text(&params.facades.images.entrypoint),
         ));
     }
-    if system.service_name == params.egress.service
-        && !internal_tcp_targets(input).is_empty()
-    {
+    if system.service_name == params.egress.service && !internal_tcp_targets(input).is_empty() {
         // MIG-15: `connect()` to a synthetic internal host is routed
         // through this service binding to the loopback-only network
         // that terminates at the provider's pg-wire proxy.
@@ -2390,10 +2389,7 @@ fn emit_cron_facade(
     if !flags.contains(&"service_binding_extra_handlers") {
         flags.push("service_binding_extra_handlers");
     }
-    let flags = crate::compat_flags::flags_for_compat_date(
-        flags,
-        &input.params.system_compat_date,
-    );
+    let flags = crate::compat_flags::flags_for_compat_date(flags, &input.params.system_compat_date);
     out.push_str(&format!(
         "    (name = {}, worker = (
       compatibilityDate = {},
@@ -2863,6 +2859,24 @@ fn worker_socket_name(worker_id: &str) -> String {
     format!("sock-{worker_id}")
 }
 
+/// Socket **file** name for a segment — the same `%XX` encoding as
+/// `vrt_securefs::socket_path`, implemented locally because vrt-config does
+/// not depend on vrt-securefs. The socket NAME remains `sock-<workerId>`;
+/// this only keeps the unix path safe for platform ids containing `:`.
+pub fn socket_file(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len() + 5);
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out.push_str(".sock");
+    out
+}
+
 /// T37b: `facade-qconsumer-<workerId>` capnp service name — the
 /// dispatch delivery facade bound `CONSUMER → worker-<id>`.
 pub fn qconsumer_service_name(worker_id: &str) -> String {
@@ -2987,7 +3001,8 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
         if quotas.subrequests > snapshot_protocol::compute_desired::MAX_SUBREQUESTS {
             return Err(ConfigError::Quotas("subrequests"));
         }
-        if quotas.outbound_connections > snapshot_protocol::compute_desired::MAX_OUTBOUND_CONNECTIONS
+        if quotas.outbound_connections
+            > snapshot_protocol::compute_desired::MAX_OUTBOUND_CONNECTIONS
         {
             return Err(ConfigError::Quotas("outboundConnections"));
         }
@@ -3266,6 +3281,16 @@ pub(crate) fn is_lower_hex(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn socket_file_matches_securefs_encoding() {
+        assert_eq!(super::socket_file("w1"), "w1.sock");
+        assert_eq!(super::socket_file("team-1:edge"), "team-1%3Aedge.sock");
+        assert_eq!(
+            super::socket_file("team-1:edge-qconsumer"),
+            "team-1%3Aedge-qconsumer.sock"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -3495,10 +3520,7 @@ fn emit_qconsumer_worker(
     if !flags.contains(&"service_binding_extra_handlers") {
         flags.push("service_binding_extra_handlers");
     }
-    let flags = crate::compat_flags::flags_for_compat_date(
-        flags,
-        &input.params.system_compat_date,
-    );
+    let flags = crate::compat_flags::flags_for_compat_date(flags, &input.params.system_compat_date);
     out.push_str(&format!(
         "      compatibilityFlags = [{}],\n",
         flags
