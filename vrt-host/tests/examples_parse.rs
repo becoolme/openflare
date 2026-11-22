@@ -123,7 +123,7 @@ fn platform_and_standalone_host_examples_validate_and_emit() {
             .unwrap_or_else(|e| panic!("{name} emit_mode failed: {e}"));
         match mode {
             vrt_host::assemble::EmitMode::Capnp { params } => {
-                assert_eq!(params.system_workers.len(), 14); // +facade-qconsumer (T37b), +facade-ratelimit (MIG-16), +facade-k2, +facade-email, +facade-images
+                assert_eq!(params.system_workers.len(), 15); // +facade-qconsumer (T37b), +facade-ratelimit (MIG-16), +facade-k2, +facade-email, +facade-images, +facade-vectorize
                 assert!(!params.system_compat_date.is_empty());
             }
             #[cfg(feature = "dev-stub")]
@@ -221,7 +221,8 @@ fn params_json_from_manifest_fails_closed() {
     assert_eq!(doc["facades"]["ratelimit"]["service"], "facade-ratelimit");
     assert_eq!(doc["facades"]["email"]["service"], "facade-email");
     assert_eq!(doc["facades"]["images"]["service"], "facade-images");
-    assert_eq!(doc["systemWorkers"].as_array().unwrap().len(), 14);
+    assert_eq!(doc["facades"]["vectorize"]["service"], "facade-vectorize");
+    assert_eq!(doc["systemWorkers"].as_array().unwrap().len(), 15);
 }
 
 /// T27/N0: a supervisor config whose failure window cannot hold
