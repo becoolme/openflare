@@ -759,7 +759,15 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 out.insert("name".into(), Value::from(req_str(value, "name")?));
             }
             "main" => {
-                out.insert("main".into(), Value::from(req_str(value, "main")?));
+                // Wrangler accepts `main = "./x.js"` and normalizes the
+                // leading `./`; the signed bundle forbids a `.` path
+                // segment, so fold it here rather than fail at pack.
+                let mut main = req_str(value, "main")?;
+                while let Some(rest) = main.strip_prefix("./") {
+                    main = rest;
+                }
+                let main = main.to_string();
+                out.insert("main".into(), Value::from(main));
             }
             "compatibility_date" => {
                 out.insert(
@@ -3221,6 +3229,18 @@ mod tests {
             meta.vars.get("ONLY_STAGING").map(String::as_str),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn wrangler_main_leading_dot_slash_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"w","main":"./sub/m.js","compatibility_date":"2025-01-01"}"#,
+        )
+        .unwrap();
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.main_module, "sub/m.js");
     }
 
     #[test]
