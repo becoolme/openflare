@@ -778,8 +778,15 @@ mod tests {
             queue_root_for(&writer_root),
             vrt_sql::paths::ResourceKind::Queue,
         ));
+        let k2 = std::sync::Arc::new(Persister::new(
+            d1.store().clone(),
+            d1.config().clone(),
+            d1.clock().clone(),
+            vrt_sql::paths::k2_root_for(&writer_root),
+            vrt_sql::paths::ResourceKind::K2,
+        ));
         let reg = EngineRegistry::new(writer_root.clone())
-            .with_persisters(PersisterPair { d1, queue });
+            .with_persisters(PersisterPair { d1, queue, k2 });
         let engine = reg.get(D1, DB).unwrap();
         write(&engine, "CREATE TABLE t(v INTEGER)");
         write(&engine, "INSERT INTO t VALUES (1)");
