@@ -3871,6 +3871,42 @@ mod tests {
     }
 
     #[test]
+    fn secrets_store_bindings_into_pack_shape() {
+        // CF `[[secrets_store_secrets]] {binding, store_id?,
+        // secret_name}` → `{type:"secrets_store"}` records + the
+        // pack-shape `secretsStore` map (name → {storeId, secretName}).
+        // `store_id` defaults to `"default"` per CF.
+        let dir = wrangler_loader_body(
+            "[[secrets_store_secrets]]\nbinding=\"SECRET\"\nsecret_name=\"api-key\"\n[[secrets_store_secrets]]\nbinding=\"PROD\"\nstore_id=\"prod-store\"\nsecret_name=\"db-pw\"\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let b = meta.bindings.unwrap();
+        let s = b.secrets_store.get("SECRET").unwrap();
+        assert_eq!(s.secret_name, "api-key");
+        assert_eq!(s.store_id.as_deref(), Some("default"));
+        let p = b.secrets_store.get("PROD").unwrap();
+        assert_eq!(p.secret_name, "db-pw");
+        assert_eq!(p.store_id.as_deref(), Some("prod-store"));
+
+        // Fail closed: missing binding/secret_name, non-string values,
+        // `remote` (does not exist for this binding), unknown keys,
+        // non-table-list shape.
+        for toml in [
+            "[[secrets_store_secrets]]\nsecret_name=\"s\"\n",
+            "[[secrets_store_secrets]]\nbinding=\"B\"\n",
+            "[[secrets_store_secrets]]\nbinding=1\nsecret_name=\"s\"\n",
+            "[[secrets_store_secrets]]\nbinding=\"B\"\nsecret_name=7\n",
+            "[[secrets_store_secrets]]\nbinding=\"B\"\nsecret_name=\"s\"\nstore_id=3\n",
+            "[[secrets_store_secrets]]\nbinding=\"B\"\nsecret_name=\"s\"\nremote=true\n",
+            "[[secrets_store_secrets]]\nbinding=\"B\"\nsecret_name=\"s\"\nextra=1\n",
+            "secrets_store_secrets={binding=\"B\",secret_name=\"s\"}\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+    }
+
+    #[test]
     fn send_email_bindings_into_pack_shape() {
         // CF `[[send_email]] {name, destination_address?,
         // allowed_*}` → `{type:"send_email"}` records + the pack-shape
