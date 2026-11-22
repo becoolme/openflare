@@ -131,6 +131,38 @@ async fn instances(
     let Some(dir) = view.class_dir(&query.worker_id, &query.class_key) else {
         return Json(empty(&query, false)).into_response();
     };
+    // The class dir is assembled from trusted parts, but a filesystem symlink
+    // could still point outside the tenant root. Canonicalize both and refuse
+    // an escape; a missing dir is simply an empty class.
+    let root = match std::fs::canonicalize(&view.tenant_dir) {
+        Ok(root) => root,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Json(empty(&query, true)).into_response()
+        }
+        Err(error) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"code": "scan_failed", "error": error.to_string()}})),
+        )
+            .into_response(),
+    };
+    let dir = match std::fs::canonicalize(&dir) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Json(empty(&query, true)).into_response()
+        }
+        Err(error) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"code": "scan_failed", "error": error.to_string()}})),
+        )
+            .into_response(),
+    };
+    if !dir.starts_with(&root) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": {"code": "class_dir_escape"}})),
+        )
+            .into_response();
+    }
     match scan_class_dir(&dir) {
         Ok((instances, storage_bytes, truncated)) => Json(InstancesView {
             tenant_id: query.tenant_id,

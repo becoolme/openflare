@@ -73,6 +73,42 @@ async fn introspect_lists_declared_class_instances_over_http() {
     assert_eq!(body["declared"], false, "{body}");
     assert_eq!(body["instances"].as_array().unwrap().len(), 0);
 
+    #[cfg(unix)]
+    {
+        // A class dir symlinked outside the tenant root is refused, never listed.
+        let tenant_root = tmp.path().join("tenant2");
+        std::fs::create_dir_all(tenant_root.join("team2:w2")).unwrap();
+        let outside = tmp.path().join("outside2");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(format!("{}.sqlite", "f".repeat(64))), b"x").unwrap();
+        let escape_key = "9".repeat(64);
+        std::os::unix::fs::symlink(&outside, tenant_root.join("team2:w2").join(&escape_key))
+            .unwrap();
+        let registry2 = TenantRegistry::new();
+        let rt2 = TenantRuntime::new("team2");
+        rt2.set_do_storage_view(Some(DoStorageView {
+            tenant_dir: tenant_root,
+            worker_classes: BTreeMap::from([("team2:w2".to_string(), vec![escape_key.clone()])]),
+        }));
+        registry2.insert("team2".into(), rt2);
+        let app2 = introspect::router(registry2.clone());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/introspect/instances")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "tenantId": "team2",
+                    "workerId": "team2:w2",
+                    "classKey": escape_key,
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let res = app2.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
     // Forged shapes never reach a path.
     for bad in [
         serde_json::json!({"tenantId": "team", "workerId": "../x", "classKey": "a".repeat(64)}),

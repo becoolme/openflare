@@ -36,6 +36,10 @@ pub const MAX_TOTAL_INSTANCES: usize = 5000;
 pub const MAX_TABLES_PER_DB: usize = 500;
 /// Total table names across every D1 database in one report.
 pub const MAX_TOTAL_TABLES: usize = 5000;
+/// Error strings carried in a report / returned by a tick (the plane caps
+/// each at 512 chars; an unbounded error list would fail schema validation).
+pub const MAX_REPORT_ERRORS: usize = 500;
+pub const MAX_ERROR_CHARS: usize = 512;
 /// Hard cap on the report body pushed to the control plane.
 pub const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
 /// Default collection cadence.
@@ -832,6 +836,10 @@ fn instance_set(mut view: InstancesView, budget: usize) -> InstanceSet {
 /// Last-resort shrink for an oversize report: drop the point-in-time resource
 /// lists (metrics are the important part) and mark them truncated. If the
 /// document is still too large, the caller drops `resources` entirely.
+fn bounded_error(value: impl std::fmt::Display) -> String {
+    value.to_string().chars().take(MAX_ERROR_CHARS).collect()
+}
+
 fn shrink_report(mut report: CellReport) -> CellReport {
     if let Some(resources) = &mut report.resources {
         for classes in resources
@@ -944,7 +952,7 @@ impl<T: ReportIo> Reporter<T> {
                                 entry.database_id,
                                 entry
                                     .error
-                                    .map(|e| e.to_string())
+                                    .map(bounded_error)
                                     .unwrap_or_else(|| "unknown error".into())
                             )),
                         }
@@ -971,7 +979,7 @@ impl<T: ReportIo> Reporter<T> {
                                 entry.queue_id,
                                 entry
                                     .error
-                                    .map(|e| e.to_string())
+                                    .map(bounded_error)
                                     .unwrap_or_else(|| "unknown error".into())
                             )),
                         }
@@ -1040,6 +1048,10 @@ impl<T: ReportIo> Reporter<T> {
                 }
                 Err(e) => report.errors.push(format!("do class {}: {e}", target.name)),
             }
+        }
+        if report.errors.len() > MAX_REPORT_ERRORS {
+            report.errors.truncate(MAX_REPORT_ERRORS - 1);
+            report.errors.push("errors truncated".into());
         }
         resources.errors = report.errors.clone();
 
@@ -1380,6 +1392,12 @@ vrt_host_wake_seconds_count 1
         assert_eq!(set.instance_count, 2);
         assert_eq!(set.instances.len(), 2);
         assert!(set.truncated);
+    }
+
+    #[test]
+    fn errors_are_bounded() {
+        let long = "x".repeat(MAX_ERROR_CHARS * 10);
+        assert_eq!(bounded_error(long).chars().count(), MAX_ERROR_CHARS);
     }
 
     #[test]
