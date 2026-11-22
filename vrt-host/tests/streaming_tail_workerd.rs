@@ -266,30 +266,42 @@ fn real_workerd_streaming_tail_delivers_to_tail_stream() {
     std::fs::create_dir_all(&dir).unwrap();
     let _guard = DirGuard(dir.clone());
 
-    let port = free_port();
-    let consumer_port = free_port();
     let (tenant, bundles) = tenant();
-    let cfg = emit_config(&dir, &tenant, &bundles, port, consumer_port);
     let log_path = dir.join("workerd.log");
-    let log = std::fs::File::create(&log_path).unwrap();
-    let err = log.try_clone().unwrap();
-    let child = Command::new(&bin)
-        .arg("serve")
-        .arg("--external-addr=binding-backend=127.0.0.1:1")
-        .arg(&cfg)
-        .arg("--experimental")
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(err))
-        .spawn()
-        .unwrap();
-    let _proc = WorkerProc { child };
-
-    assert!(
-        wait_ready(port),
-        "workerd did not listen on {port}.\n--- workerd log ---\n{}\n--- capnp ---\n{}",
-        std::fs::read_to_string(&log_path).unwrap_or_default(),
-        std::fs::read_to_string(&cfg).unwrap_or_default()
-    );
+    // `free_port` drops the listener before workerd binds it, so another
+    // process can steal the port between the two calls. Retry with fresh
+    // ports when that happens instead of failing the whole suite.
+    let mut last_cfg = PathBuf::new();
+    let (port, _proc) = (1..=5)
+        .find_map(|_| {
+            let port = free_port();
+            let consumer_port = free_port();
+            let cfg = emit_config(&dir, &tenant, &bundles, port, consumer_port);
+            let log = std::fs::File::create(&log_path).unwrap();
+            let err = log.try_clone().unwrap();
+            let child = Command::new(&bin)
+                .arg("serve")
+                .arg("--external-addr=binding-backend=127.0.0.1:1")
+                .arg(&cfg)
+                .arg("--experimental")
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(err))
+                .spawn()
+                .unwrap();
+            let proc = WorkerProc { child };
+            last_cfg = cfg.clone();
+            if wait_ready(port) {
+                return Some((port, proc));
+            }
+            None
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "workerd did not listen after 5 attempts.\n--- workerd log ---\n{}\n--- capnp ---\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default(),
+                std::fs::read_to_string(&last_cfg).unwrap_or_default()
+            )
+        });
 
     // One invocation on the producer.
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -316,7 +328,7 @@ fn real_workerd_streaming_tail_delivers_to_tail_stream() {
     }
     panic!(
         "tailStream events not delivered within 20s.\n--- workerd log ---\n{text}\n--- capnp ---\n{}",
-        std::fs::read_to_string(&cfg).unwrap_or_default()
+        std::fs::read_to_string(&last_cfg).unwrap_or_default()
     );
 }
 
