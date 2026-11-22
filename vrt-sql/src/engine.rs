@@ -379,6 +379,9 @@ struct EngineInner {
     wal_be: bool,
     /// T36: lease + persistence slot (when a persistence backend exists).
     persist: Option<PersistSlot>,
+    /// Time Travel index: commits not yet flushed to a timeline chunk. Best-effort history --
+    /// a crash loses at most [`crate::timeline::FLUSH_COMMITS`] entries.
+    timeline: Vec<crate::timeline::TimelineEntry>,
 }
 
 /// T36: persistence state held by the engine (maintained under the inner lock -- all persistence
@@ -535,6 +538,7 @@ impl RusqliteEngine {
                 wal_cksum: (0, 0),
                 wal_be: false,
                 persist: None,
+                timeline: Vec::new(),
             }),
             commit_lsn: AtomicU64::new(0),
             served_by: "vrt-sql".into(),
@@ -586,6 +590,7 @@ impl RusqliteEngine {
                 wal_cksum: (0, 0),
                 wal_be: false,
                 persist: None,
+                timeline: Vec::new(),
             }),
             commit_lsn: AtomicU64::new(lsn),
             served_by: "vrt-sql-replica".into(),
@@ -642,6 +647,8 @@ impl RusqliteEngine {
     pub fn release_lease(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let epoch = self.lease_epoch();
+        // Best effort: persist the timeline tail before the next writer takes over.
+        self.flush_timeline(&mut inner);
         if let Some(slot) = inner.persist.as_mut() {
             let p = slot.persister.clone();
             let now = p.clock().now_ms();
@@ -887,6 +894,11 @@ impl RusqliteEngine {
             Ok(()) => {
                 self.commit_lsn.store(new_lsn, Ordering::SeqCst);
                 self.degraded.store(slot.handle.degraded, Ordering::SeqCst);
+                inner.timeline.push(crate::timeline::TimelineEntry {
+                    lsn: new_lsn,
+                    epoch: slot_epoch,
+                    committed_at_ms: slot.persister.clock().now_ms(),
+                });
             }
             Err(e) => {
                 crate::metrics::persistence_failure("publish");
@@ -901,6 +913,9 @@ impl RusqliteEngine {
                 }
                 return Err(fenced);
             }
+        }
+        if inner.timeline.len() >= crate::timeline::FLUSH_COMMITS {
+            self.flush_timeline(inner);
         }
         // Periodic checkpoint: TRUNCATE wal + upload snapshot + GC old segments.
         // T36b: trigger on the dynamic `ckpt_gap` (exponential backoff on failure) rather than the fixed
@@ -973,15 +988,41 @@ impl RusqliteEngine {
             }
             Err(e) => return Err(EngineError::Sqlite(e)),
         }
-        p.checkpoint(
+        match p.checkpoint(
             &self.database_id,
             &mut inner.persist.as_mut().unwrap().handle,
             &self.db_file,
-        )
-        .map_err(|e| match e {
-            crate::persist::PersistError::Fenced => self.fence(epoch),
-            _ => EngineError::Message(format!("checkpoint: {e}")),
-        })
+        ) {
+            Ok(()) => {
+                self.flush_timeline(inner);
+                Ok(())
+            }
+            Err(crate::persist::PersistError::Fenced) => Err(self.fence(epoch)),
+            Err(e) => Err(EngineError::Message(format!("checkpoint: {e}"))),
+        }
+    }
+
+    /// Persist the buffered Time Travel timeline (best effort: history must never fail a commit).
+    fn flush_timeline(&self, inner: &mut EngineInner) {
+        if inner.timeline.is_empty() {
+            return;
+        }
+        let Some(slot) = inner.persist.as_ref() else {
+            inner.timeline.clear();
+            return;
+        };
+        let p = slot.persister.clone();
+        match p.upload_timeline(&self.database_id, &inner.timeline) {
+            Ok(()) => inner.timeline.clear(),
+            Err(e) => {
+                tracing::warn!(db = %self.database_id, error = %e,
+                    "timeline flush failed; keeping entries for the next attempt");
+                if inner.timeline.len() > crate::timeline::MAX_BUFFERED_ENTRIES {
+                    let drop = inner.timeline.len() - crate::timeline::MAX_BUFFERED_ENTRIES;
+                    inner.timeline.drain(..drop);
+                }
+            }
+        }
     }
 
     /// size_after: pragma_*() functions are rejected by the authorizer; go through the internal bypass.

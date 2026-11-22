@@ -18,5 +18,7 @@ pub mod replica;
 pub mod security;
 pub mod seg;
 pub mod service;
+pub mod timeline;
+pub mod time_travel;
 pub mod wal;
 pub mod wire;
