@@ -149,7 +149,7 @@ These are not tied to one binding.
   allowlist, 60 s deadline, capped stdout/stderr) but **not a sandbox** —
   a config file is arbitrary Node code with the invoking user's
   filesystem and network access. `cf-worker` entrypoints are never
-  executed by the loader, but `vrt` still ships projects unbundled, so a
+  executed by the loader, but `of` still ships projects unbundled, so a
   TypeScript worker entrypoint must be pre-built to JS. `wrangler.config.*`
   is not evaluated. [`docs/wrangler-config.md`](wrangler-config.md)
 

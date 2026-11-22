@@ -88,7 +88,7 @@ docker compose -f deploy/standalone/docker-compose.yml \
   of status --root /data
 ```
 
-The stub overlay pins `WORKERD_SOURCE=stub` + `--mode stub`; `vrt
+The stub overlay pins `WORKERD_SOURCE=stub` + `--mode stub`; `of
 init` verifies the binary is really `vrt-stub-workerd` (`--version`
 marker) — a mode/binary mismatch fails closed instead of silently
 running the wrong runtime.
@@ -169,7 +169,7 @@ polls the `controlListen` endpoint, `--since`/`--level` filter
 client-side, `--json` prints one record per line.
 
 `vrt-init` is idempotent: rerunning `up` with unchanged settings is
-a no-op. If settings drifted (e.g. you changed `VRT_CELL`), `vrt
+a no-op. If settings drifted (e.g. you changed `VRT_CELL`), `of
 init` exits non-zero and names the differing config fields — apply
 the change with `--reconfigure` (rewrites `config/` only; keys and
 state are never regenerated). `vrt-init` compose service: edit its
@@ -178,7 +178,7 @@ state are never regenerated). `vrt-init` compose service: edit its
 ## Remote deploy over TCP
 
 The management API normally lives on the container's unix socket.
-`of serve` can additionally bind a TCP listener so a host-side `vrt`
+`of serve` can additionally bind a TCP listener so a host-side `of`
 CLI can deploy a local directory without copying it in:
 
 ```sh
