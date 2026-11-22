@@ -473,6 +473,7 @@ mod tests {
             tail_consumers: vec![],
             observability: None,
             streaming_tail_consumers: vec![],
+            flagship_apps: vec![],
             durable_object_classes: vec![],
             workflows: vec![],
             hostnames: vec![],

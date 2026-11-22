@@ -113,6 +113,7 @@ mod tests {
         TenantDesired {
             tenant_id: "t1".into(),
             workers,
+            flagship_apps: Vec::new(),
         }
     }
 
