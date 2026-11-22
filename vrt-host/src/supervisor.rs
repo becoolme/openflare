@@ -12407,6 +12407,8 @@ sleep 10
                 artifact_digest: "0".repeat(64),
                 compatibility_date: "2024-01-01".into(),
                 compatibility_flags: vec![],
+                tag: String::new(),
+                created_at: String::new(),
             },
             bindings,
             routes: vec![RouteDesired {

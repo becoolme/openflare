@@ -84,6 +84,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "streaming_tail_consumers",
     "secrets",
     "secrets_store_secrets",
+    "version_metadata",
     "worker_loaders",
 ];
 /// Mirrors @wdl-dev/cli TOP_LEVEL_ONLY_ENV_KEYS.
@@ -1346,6 +1347,30 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 }
                 let mut b = Map::new();
                 b.insert("type".into(), Value::from("images"));
+                b.insert("name".into(), Value::from(binding));
+                bindings.push(Value::Object(b));
+            }
+            "version_metadata" => {
+                // CF `[version_metadata] {binding}` — `env.<binding>`
+                // is `{id, tag, timestamp}` of the worker's active
+                // version (`WorkerVersionMetadata`). One binding only;
+                // `tag`/`timestamp` are version-scoped (deploy `--tag`
+                // + record creation), not config keys.
+                let t = value
+                    .as_object()
+                    .ok_or_else(|| invalid("version_metadata", "must be a table"))?;
+                for k in t.keys() {
+                    match k.as_str() {
+                        "binding" => {}
+                        _ => return Err(unsupported(&format!("version_metadata.{k}"), None)),
+                    }
+                }
+                let binding = req_str(
+                    t.get("binding").unwrap_or(&Value::Null),
+                    "version_metadata.binding",
+                )?;
+                let mut b = Map::new();
+                b.insert("type".into(), Value::from("versionMetadata"));
                 b.insert("name".into(), Value::from(binding));
                 bindings.push(Value::Object(b));
             }
@@ -2744,6 +2769,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut k2 = Map::new();
         let mut send_email = Map::new();
         let mut secrets_store = Map::new();
+        let mut version_metadata: Option<String> = None;
         let mut vectorize = Map::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -2889,6 +2915,11 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     );
                     secrets_store.insert(name.into(), Value::Object(s));
                 }
+                "versionMetadata" => {
+                    // `[version_metadata]` normalized target — a single
+                    // binding name → `versionMetadata: "<name>"`.
+                    version_metadata = Some(name.to_string());
+                }
                 "images" => {
                     // `[images] {binding}` — name list only (like
                     // workerLoaders): no resource reference.
@@ -2976,6 +3007,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !secrets_store.is_empty() {
             bind.insert("secretsStore".into(), Value::Object(secrets_store));
+        }
+        if let Some(vm) = version_metadata {
+            bind.insert("versionMetadata".into(), Value::from(vm));
         }
         if !vectorize.is_empty() {
             bind.insert("vectorize".into(), Value::Object(vectorize));
@@ -3580,6 +3614,7 @@ mod tests {
                 bindings: vec![],
                 hostnames: vec![],
                 vars: BTreeMap::new(),
+                tag: None,
             };
             pack_with_resolver(dir.path(), &overrides, "tenant", &|_| Some("w-target".into()))
         };
@@ -3904,6 +3939,39 @@ mod tests {
             let dir = wrangler_loader_body(toml);
             assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
         }
+    }
+
+    #[test]
+    fn version_metadata_binding_into_pack_shape() {
+        // CF `[version_metadata] {binding}` → `{type:"versionMetadata"}`
+        // record + the pack-shape `versionMetadata` scalar. The values
+        // are version-scoped (deploy --tag + record creation), never
+        // config keys — `binding` is the only accepted field.
+        let dir = wrangler_loader_body("[version_metadata]\nbinding=\"CF_VERSION_METADATA\"\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let b = meta.bindings.unwrap();
+        assert_eq!(b.version_metadata.as_deref(), Some("CF_VERSION_METADATA"));
+
+        // Fail closed: missing binding, non-string binding, unknown
+        // keys (`tag`/`timestamp` are not config), non-table shape.
+        for toml in [
+            "[version_metadata]\n",
+            "[version_metadata]\nbinding=1\n",
+            "[version_metadata]\nbinding=\"V\"\ntag=\"v1\"\n",
+            "[version_metadata]\nbinding=\"V\"\nextra=1\n",
+            "version_metadata=\"V\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+        // The equivalent inline-table form is accepted (same TOML
+        // table shape as `[version_metadata]`).
+        let dir = wrangler_loader_body("version_metadata={binding=\"V_META\"}\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(
+            meta.bindings.unwrap().version_metadata.as_deref(),
+            Some("V_META")
+        );
     }
 
     #[test]

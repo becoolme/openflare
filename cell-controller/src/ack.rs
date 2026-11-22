@@ -231,6 +231,13 @@ pub struct AckCapabilities {
     /// false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub secrets_store: bool,
+    /// `{"type":"versionMetadata"}` bindings + the `activeVersion`
+    /// `tag`/`createdAt` wire fields — a cell predating either fails
+    /// the snapshot parse (`deny_unknown_fields`), so the control
+    /// plane only admits version-metadata bindings onto cells that
+    /// claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub version_metadata: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

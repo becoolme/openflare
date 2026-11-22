@@ -51,6 +51,8 @@ pub fn version(version_id: &str, digest: &str) -> VersionDesired {
         artifact_digest: digest.to_string(),
         compatibility_date: "2026-01-01".to_string(),
         compatibility_flags: vec![],
+        tag: String::new(),
+        created_at: String::new(),
     }
 }
 

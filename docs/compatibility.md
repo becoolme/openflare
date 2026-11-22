@@ -147,8 +147,10 @@ Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 (`ai`), AI Search (`ai_search`,
 `ai_search_namespaces`), Pipelines, dispatch namespaces
 (`dispatch_namespaces`), `mtls_certificates`, `browser`,
-`containers`, raw
-`wasm_modules`/`text_blobs`/`data_blobs`/`version_metadata` upload keys.
+`containers`, and the legacy
+`wasm_modules`/`text_blobs`/`data_blobs` upload keys (their modern
+replacement — `rules` module typing with `Text`/`Data`/`CompiledWasm`
++ full-tree module discovery — is supported).
 `[unsafe]` is partially supported: `[[unsafe.bindings]]` entries with
 `type = "unsafe_eval"` bind workerd's `unsafeEval` capability; other
 `type` values and other `unsafe.*` keys fail closed.

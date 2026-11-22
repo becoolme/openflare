@@ -411,6 +411,7 @@ impl VrtLocal {
             &worker_pkg::DeployOverrides {
                 name: upload.name.clone(),
                 vars: upload.vars.clone(),
+                tag: upload.tag.clone(),
                 ..Default::default()
             },
             st_probe.tenant_id(),

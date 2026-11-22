@@ -31,7 +31,7 @@ USAGE:
            [--workerd <p>] [--stub] [--allow-unpinned-workerd]
            [--vrt-host-bin <p>] [--vrt-provider-bin <p>] [--vrt-sql-bin <p>]
            [--facade-dist <dir>]
-  vrt deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--dry-run] <worker_dir>
+  vrt deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--tag <t>] [--dry-run] <worker_dir>
   vrt deploy --url <http://host:port> --token-file <p> [same options] <worker_dir>
   vrt logs --root <dir> <worker> [--follow] [--since <dur>] [--level <lvl>] [--json]
   vrt doctor [--root <dir>] [--env <name>] [--json] [--strict]
@@ -1083,6 +1083,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
         name: arg(args, "--name").map(String::from),
         env_name: arg(args, "--env").map(String::from),
         vars: collect_vars(args)?,
+        tag: arg(args, "--tag").map(String::from),
         ..Default::default()
     };
     let secrets = collect_secrets(args)?;
@@ -1138,6 +1139,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             vars: overrides.vars.clone(),
             secrets,
             name: overrides.name.clone(),
+            tag: overrides.tag.clone(),
             meta: g.meta.clone(),
             flagship_apps: g.flagship_apps.clone(),
         };
