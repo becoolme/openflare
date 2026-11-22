@@ -214,6 +214,7 @@ fn render_write(dir: &Path) -> (PathBuf, u16, u16) {
         cache_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
+        ae_addr: String::new(),
         log_tail: vrt_config::LogTailParams::default(),
     };
     let out = vrt_config::render_tenant_config(&vrt_config::TenantRenderInput {

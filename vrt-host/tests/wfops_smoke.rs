@@ -247,6 +247,7 @@ fn render_write(dir: &Path, wf_port: u16, ingress_port: u16) -> PathBuf {
         wfop_pepper: WFOP_PEPPER.into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),

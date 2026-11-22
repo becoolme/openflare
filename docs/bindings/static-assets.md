@@ -135,7 +135,10 @@ that does not match the bytes is never committed.
   or unreadable `_routes.json` fails closed
   (`ASSET_STORAGE_UNAVAILABLE` / 503 from the router) instead of
   guessing a side; the packer rejects it before publish.
-  `_routes.json` is configuration and is never served. An explicit
+  `_routes.json` is configuration and is never served. It only picks the
+  side that answers a path; the asset side still applies `html_handling`,
+  so `/index.html` (matching neither list) is served by assets and
+  answers the documented `307 to /` instead of a 200. An explicit
   `run_worker_first` policy (`true` or a rule list) takes precedence and
   ignores the file, mirroring Workers config authority;
   `run_worker_first: false`/absent leaves `_routes.json` in control.

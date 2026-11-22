@@ -26,6 +26,7 @@ pub mod egress;
 pub mod error;
 mod escape;
 pub mod heartbeat;
+pub mod launch_args;
 pub mod logs;
 pub mod manifest;
 pub mod netpolicy;
@@ -42,9 +43,10 @@ pub use capnp::{
     OUTBOUND_NETWORK_SERVICE, SYS_DIR_PREFIX,
 };
 pub use compat_flags::{is_experimental_compat_flag, is_tenant_allowed_compat_flag};
-pub use logs::{log_token, tail_service_name, LogTailParams, LOGSINK_SERVICE};
 pub use egress::{EgressAllowEntry, EgressNameRule, EgressPolicy, EGRESS_POLICY_BINDING};
 pub use error::{BundleError, ConfigError};
+pub use launch_args::{experimental_extra_args, tenant_experimental_extra_args, ExperimentalNeeds};
+pub use logs::{log_token, tail_service_name, LogTailParams, LOGSINK_SERVICE};
 pub use manifest::{
     valid_compat_date, valid_compat_flag, DataModule, DeployManifest, Module, ModuleType,
     TextModule,

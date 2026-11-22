@@ -108,3 +108,32 @@ fn vrt_sql_addr_allows_cluster_http_but_not_public_http() {
         .validate()
         .unwrap();
 }
+
+#[test]
+fn vrt_sql_replicas_are_optional_but_validated() {
+    let sql = |replicas: &str| {
+        format!(
+            "[vrtSql]\naddr = \"http://vrt-sql:8082\"\nauthSecretFile = \"/tmp/x\"\nreplicas = [{replicas}]"
+        )
+    };
+    parse("", &sql("")).validate().unwrap();
+    parse("", &sql("\"http://vrt-sql-replica-0:8082\", \"http://127.0.0.1:8091\""))
+        .validate()
+        .unwrap();
+    for bad in [
+        "\"http://sql.example.com:8082\"",
+        "\"http://vrt-sql-replica-0:8082/\"",
+        "\"\"",
+    ] {
+        let e = err("", &sql(bad));
+        assert!(e.contains("vrtSql.replicas"), "{bad}: {e}");
+    }
+    let many = (0..9)
+        .map(|i| format!("\"http://replica-{i}:8082\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert!(err("", &sql(&many)).contains("vrtSql.replicas"));
+    parse("allowDevBackend = true", &sql("\"http://sql.example.com:8082\""))
+        .validate()
+        .unwrap();
+}

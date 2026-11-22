@@ -115,6 +115,47 @@ fn deploy_consumer_only_change_removes_it() {
     let _ = st;
 }
 
+/// `[observability]` is version-scoped state (stored on VersionRecord,
+/// replayed by to_desired, restored by rollback) — so it MUST be part of
+/// the deploy dedup identity. A redeploy that changes only the sampling
+/// rate mints a new version id; before the fix the second deploy was
+/// silently deduped and the old gates stayed active.
+#[test]
+fn observability_is_part_of_version_identity() {
+    let root = root();
+    let local = init(&root);
+    let dir = root.join("worker-obs");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("main.js"), "export default {}\n").unwrap();
+    let base =
+        "name = \"obs\"\nmain = \"main.js\"\ncompatibility_date = \"2024-09-25\"\n";
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        format!("{base}[observability.logs]\nhead_sampling_rate = 0.3\n"),
+    )
+    .unwrap();
+    let r1 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        format!("{base}[observability.logs]\nhead_sampling_rate = 0.7\n"),
+    )
+    .unwrap();
+    let r2 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    assert_ne!(
+        r1.version_id, r2.version_id,
+        "observability-only change must mint a new version"
+    );
+    // The active version carries the NEW rate on the wire.
+    let desired: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("desired").join("envelope.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        desired["payload"]["tenants"][0]["workers"][0]["observability"]
+            ["headSamplingRatePpm"],
+        serde_json::json!(700_000)
+    );
+}
+
 /// P3c-2-r2: `vrt worker-id` / `vrt do-key` typed resolution — the
 /// e2e used to grep `vrt status` JSON positionally and died silently
 /// (alphabetical serialization puts `versions` between `name` and
@@ -1213,4 +1254,266 @@ fn status_reports_quotas_and_enforcement() {
         serde_json::to_value(&st).unwrap()["workers"][0]["quotasEnforced"],
         true
     );
+}
+
+/// `streamingTailConsumers` pack invariants — shared resolver with
+/// `tailConsumers` so self-target/dedupe/cap cannot drift: a
+/// self-designator would amplify each invocation into another
+/// unboundedly; duplicates collapse on the declared name; the resolved
+/// list stays within MAX_TAIL_CONSUMERS_PER_WORKER.
+#[test]
+fn streaming_tail_consumers_self_dedupe_cap() {
+    let root = root();
+    let _local = init(&root);
+    let resolve = |n: &str| Some(format!("w_{n}"));
+
+    // Self-target is refused before resolution even runs (the resolver
+    // above would resolve "svc" too — the name check must come first).
+    let dir = worker_dir(&root, "svc");
+    std::fs::write(
+        dir.join("vrt.toml"),
+        "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+         streamingTailConsumers = [{service = \"svc\"}]\n",
+    )
+    .unwrap();
+    assert!(vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &resolve)
+        .is_err());
+
+    // Duplicate declarations collapse to one designator.
+    std::fs::write(
+        dir.join("vrt.toml"),
+        "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+         streamingTailConsumers = [{service = \"a\"}, {service = \"a\"}]\n",
+    )
+    .unwrap();
+    let pkg =
+        vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &resolve).unwrap();
+    assert_eq!(pkg.streaming_tail_consumers.len(), 1);
+
+    // One entry past the cap fails closed.
+    let entries: String = (0..=snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER)
+        .map(|i| format!("{{service = \"c{i}\"}}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.join("vrt.toml"),
+        format!(
+            "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+             streamingTailConsumers = [{entries}]\n"
+        ),
+    )
+    .unwrap();
+    assert!(vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &resolve)
+        .is_err());
+}
+
+/// `streamingTailConsumers` is per-version state — a deploy that only
+/// changes the consumer list must mint a new version (same class the
+/// `queueConsumers` identity fix covered).
+#[test]
+fn streaming_tail_consumers_change_mints_new_version() {
+    let root = root();
+    let local = init(&root);
+    let consumer = worker_dir(&root, "consumer");
+    local.deploy(&consumer, &DeployOverrides::default()).unwrap();
+
+    let dir = worker_dir(&root, "svc");
+    let r1 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    std::fs::write(
+        dir.join("vrt.toml"),
+        "name = \"svc\"\nmainModule = \"main.js\"\ncompatibilityDate = \"2024-09-25\"\n\
+         streamingTailConsumers = [{service = \"consumer\"}]\n",
+    )
+    .unwrap();
+    let r2 = local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    assert_ne!(
+        r1.version_id, r2.version_id,
+        "a consumer-only change must mint a new version"
+    );
+    // And the new version's desired carries the designator.
+    let envelope = std::fs::read_to_string(root.join("desired").join("envelope.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+    let workers = &v["payload"]["tenants"][0]["workers"];
+    let svc = workers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == "svc")
+        .unwrap();
+    assert_eq!(
+        svc["streamingTailConsumers"].as_array().map(|a| a.len()),
+        Some(1),
+        "{v}"
+    );
+}
+
+/// CF `[[flagship]]` + `flagship.json` — the standalone flag store
+/// gathers into tenant-level `flagshipApps` on the signed desired doc;
+/// the binding itself is version-scoped. A bound-but-undeclared app
+/// synthesizes an empty store (CF local-dev semantics); a redeploy
+/// that drops the file keeps previously merged apps (tenant-level
+/// data is not version data).
+#[test]
+fn flagship_bindings_and_flag_store_deploy() {
+    let root = root();
+    let local = init(&root);
+    // `[[flagship]]` is wrangler surface and vrt.toml shadows
+    // wrangler.toml — build the dir by hand with wrangler.toml only.
+    let dir = root.join("worker-flags-svc");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("main.js"), "export default {}\n").unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"flags-svc\"\nmain = \"main.js\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         [[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-01\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("flagship.json"),
+        r#"{"app-01":{"flags":{"new-checkout":{"enabled":true,"type":"boolean","variants":{"on":true,"off":false},"defaultVariant":"off"}}},"#
+            .to_string()
+                + r#""app-extra":{"flags":{"p":{"enabled":false,"type":"string","variants":{"a":"x"},"defaultVariant":"a"}}}}"#,
+    )
+    .unwrap();
+    local.deploy(&dir, &DeployOverrides::default()).unwrap();
+
+    let raw = std::fs::read(vrt_local::layout::desired_dir(&root).join("envelope.json")).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let tenant = &doc["payload"]["tenants"][0];
+    // The binding rides the worker version.
+    let bindings = tenant["workers"][0]["bindings"].as_array().unwrap();
+    let f = bindings
+        .iter()
+        .find(|b| b["type"] == "flagship")
+        .expect("flagship binding");
+    assert_eq!(f["name"], "FLAGS");
+    assert_eq!(f["appId"], "app-01");
+    // Apps are tenant-level: both the declared app and the extra one
+    // ship; the declared flag content is verbatim.
+    let apps = tenant["flagshipApps"].as_array().unwrap();
+    assert_eq!(apps.len(), 2, "{apps:?}");
+    assert_eq!(apps[0]["appId"], "app-01");
+    assert!(apps[0]["config"].as_str().unwrap().contains("new-checkout"));
+    assert_eq!(apps[1]["appId"], "app-extra");
+
+    // Update the store: app-01's flags flip, app-extra removed —
+    // merge semantics overwrite app-01 only (tenant-level updates are
+    // per-app, like the CF flag store).
+    std::fs::write(
+        dir.join("flagship.json"),
+        r#"{"app-01":{"flags":{"new-checkout":{"enabled":false,"type":"boolean","variants":{"on":true,"off":false},"defaultVariant":"on"}}}}"#,
+    )
+    .unwrap();
+    local.deploy(&dir, &DeployOverrides::default()).unwrap();
+    let st_raw = std::fs::read_to_string(root.join("state/state.json")).unwrap();
+    assert!(st_raw.contains("\"appId\": \"app-01\""));
+    assert!(st_raw.contains("app-extra"), "prior app survives: {st_raw}");
+    // `config` is a serialized-JSON string field — quotes escape in
+    // state.json.
+    assert!(
+        st_raw.contains("defaultVariant\\\":\\\"on"),
+        "updated config landed: {st_raw}"
+    );
+
+    // A bound app absent from the file AND from prior state still
+    // resolves — the synthesized empty config ships the local-store
+    // contract (evaluations return call-site defaults).
+    let dir2 = root.join("worker-flags-two");
+    std::fs::create_dir_all(&dir2).unwrap();
+    std::fs::write(dir2.join("main.js"), "export default {}\n").unwrap();
+    std::fs::write(
+        dir2.join("wrangler.toml"),
+        "name = \"flags-two\"\nmain = \"main.js\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         [[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-missing\"\n",
+    )
+    .unwrap();
+    local.deploy(&dir2, &DeployOverrides::default()).unwrap();
+    let raw = std::fs::read(vrt_local::layout::desired_dir(&root).join("envelope.json")).unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    let apps = doc["payload"]["tenants"][0]["flagshipApps"]
+        .as_array()
+        .unwrap();
+    let missing = apps.iter().find(|a| a["appId"] == "app-missing").unwrap();
+    assert_eq!(
+        missing["config"].as_str().unwrap(),
+        r#"{"appId":"app-missing","flags":{}}"#
+    );
+
+    // Malformed flag content fails closed before anything publishes.
+    let dir3 = root.join("worker-flags-bad");
+    std::fs::create_dir_all(&dir3).unwrap();
+    std::fs::write(dir3.join("main.js"), "export default {}\n").unwrap();
+    std::fs::write(
+        dir3.join("wrangler.toml"),
+        "name = \"flags-bad\"\nmain = \"main.js\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         [[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-x\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir3.join("flagship.json"),
+        r#"{"app-x":{"flags":{"bad":{"enabled":true,"type":"nope","variants":{},"defaultVariant":"x"}}}}"#,
+    )
+    .unwrap();
+    assert!(local.deploy(&dir3, &DeployOverrides::default()).is_err());
+}
+
+/// CF `rules`/`base_dir` — a wrangler project carries them into the
+/// pack: globs type gathered files against the `base_dir` root, the
+/// entry is never retyped, and unmatched files keep the extension
+/// table. Deployed end-to-end through `pack_with_resolver`.
+#[test]
+fn wrangler_rules_classify_pack_modules() {
+    let root = root();
+    let dir = root.join("worker-rules");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/index.mjs"), "export default {}\n").unwrap();
+    std::fs::write(dir.join("src/readme.md"), "# hi\n").unwrap();
+    std::fs::write(dir.join("src/page.html"), "<p/>\n").unwrap();
+    std::fs::write(dir.join("src/blob.wasm"), [0u8, 97, 115, 109]).unwrap();
+    // Root-level file: outside the `src/` rule root — no glob sees it
+    // (not even the implicit defaults); the extension table types it.
+    std::fs::write(dir.join("notes.txt"), "x\n").unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"rules-svc\"\nmain = \"src/index.mjs\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         base_dir = \"src\"\n\
+         rules = [{type = \"Text\", globs = [\"**/*.md\"], fallthrough = true},\n\
+         {type = \"Data\", globs = [\"*.wasm\"]}]\n",
+    )
+    .unwrap();
+
+    let pkg = vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &|_| None)
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&pkg.stored_document).unwrap();
+    let ty_of = |name: &str| -> String {
+        doc["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap_or_else(|| panic!("module {name} missing"))["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // `readme.md` → user Text rule; `blob.wasm` → user Data rule
+    // (first match wins over the implicit CompiledWasm default);
+    // entry stays esModule despite the `*.wasm` glob.
+    assert_eq!(ty_of("src/readme.md"), "text");
+    assert_eq!(
+        ty_of("src/blob.wasm"),
+        "data",
+        "user Data rule shadows the implicit CompiledWasm default"
+    );
+    assert_eq!(ty_of("src/index.mjs"), "esModule");
+    // `page.html` inside `src/` hits the implicit Text default (kept
+    // alive by the user's `fallthrough = true`).
+    assert_eq!(ty_of("src/page.html"), "text");
+    // `notes.txt` sits outside `src/` — rule-invisible, typed by the
+    // extension table like before.
+    assert_eq!(ty_of("notes.txt"), "text");
 }

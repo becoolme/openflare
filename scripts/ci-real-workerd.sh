@@ -29,13 +29,14 @@
 #
 #   Tier 2 — `#[ignore = "requires VRT_WORKERD_BIN..."]`; run per-target
 #   with `-- --ignored`:
-#     vrt-host:  do_w1r4_workerd do_wal_poc isolation_gate_egress
+#     vrt-host:  ae_smoke do_w1r4_workerd do_wal_poc isolation_gate_egress
 #                isolation_gate_limits kv_r2_contract
 #                m13r2_swap_workerd m13r5_swap_unix_workerd
 #                m14_tcp_connect_workerd m16_ratelimit
 #                m17_hyperdrive_workerd m18_hyperdrive_node_pg
 #                runaway_workerd s2z_hibernate_workerd
-#                waituntil_workerd workerd_entry_smoke
+#                streaming_tail_workerd waituntil_workerd
+#                workerd_entry_smoke
 #     m13r5 + m16 additionally need real unix-socket binds (fine on a
 #     normal CI host; restricted sandboxes may deny bind(2) — those
 #     tests fail there rather than skip). m17/m18 need a PostgreSQL 16
@@ -104,6 +105,7 @@ echo "== tier 2: #[ignore]d test binaries (-- --ignored) =="
 # tests in it, and targets that need extra resources (PG16, node)
 # self-skip inside their tests.
 TIER2=(
+  ae_smoke
   do_w1r4_workerd
   do_wal_poc
   isolation_gate_egress
@@ -117,6 +119,7 @@ TIER2=(
   m18_hyperdrive_node_pg
   runaway_workerd
   s2z_hibernate_workerd
+  streaming_tail_workerd
   waituntil_workerd
   workerd_entry_smoke
 )

@@ -1705,6 +1705,11 @@ pub struct SupervisorDeps {
     /// `caches.*` throws `No Cache was configured` — explicit, never
     /// a fake store.
     pub cache: Option<Arc<crate::cache::CacheService>>,
+    /// AE (the SAME condition under which assemble emits
+    /// `analyticsEngine` externals): `None` ⇒ AE-carrying renders
+    /// fail closed (`aeAddr`) instead of dropping datapoints on the
+    /// floor.
+    pub ae: Option<Arc<crate::ae::AeService>>,
     /// PT1: bounded event-loop liveness probe for the runaway
     /// watchdog. Injected so unit tests never touch sockets; the
     /// production impl requires a response byte, not just a connect.
@@ -1793,6 +1798,7 @@ impl Default for SupervisorDeps {
             }),
             wf_tomb_dir: std::path::PathBuf::new(),
             cache: None,
+            ae: None,
             heartbeat: Arc::new(crate::runaway::OsHeartbeatProbe),
             do_storage_root: None,
             purge: None,
@@ -1874,6 +1880,7 @@ pub fn spawn_supervisor(
         do_tenant_dir,
         undeploy: false,
         cache_listener: None,
+        ae_listener: None,
         runaway: None,
         runaway_kill: None,
         probe_in_flight: None,
@@ -2090,6 +2097,12 @@ struct Actor {
     /// is keyed by listener scope, so identity cannot leak). Dropped
     /// with the actor → socket unlinked + tenant key space purged.
     cache_listener: Option<crate::cache::CacheListener>,
+    /// AE: same once-per-actor rule as `cache_listener` — bound on the
+    /// first AE-carrying generation, kept afterwards (an AE-less
+    /// generation emits no `external` service, so the socket is simply
+    /// unreachable — nothing to tear down eagerly). Dropped with the
+    /// actor → socket unlinked.
+    ae_listener: Option<crate::ae::AeListener>,
     /// MIG-10: throttled fenced-acquire ERROR logging — the first
     /// event logs at once; repeats emit only when `next` passes, with
     /// the interval doubling to a 60 s cap (a held foreign lease used
@@ -2241,6 +2254,9 @@ impl Drop for Actor {
         if let Some(svc) = &self.deps.cache {
             svc.remove_tenant(&self.tenant_id);
         }
+        // AE: unlink the ingest socket — a tombstoned tenant must not
+        // keep accepting datapoints.
+        drop(self.ae_listener.take());
     }
 }
 
@@ -5191,6 +5207,42 @@ impl Actor {
                 }
             }
         }
+        // AE: bind this tenant's ingest socket once per actor — ONLY
+        // when this generation actually emits dataset externals at it
+        // (the rendered `external_addrs` is the single source of
+        // truth). A bind failure DEGRADES like the cache path: the
+        // emitted designator then points at a missing socket and
+        // `writeDataPoint()` fails inside workerd instead of faking
+        // ingest. Observable via metric + last_error.
+        if self.ae_listener.is_none() {
+            if let Some(svc) = &self.deps.ae {
+                let needs = svc
+                    .tenant_addr(&self.tenant_id)
+                    .ok()
+                    .map(|addr| desired.external_addrs.iter().any(|e| e.address == addr))
+                    .unwrap_or(false);
+                if needs {
+                    match svc
+                        .serve_tenant(&self.tenant_id, desired.isolation.map(|i| (i.uid, i.gid)))
+                    {
+                        Ok(l) => self.ae_listener = Some(l),
+                        Err(e) => {
+                            crate::metrics::registry().inc(
+                                "vrt_host_ae_listener_errors_total",
+                                &[("tenant", self.tenant_id.as_str()), ("stage", "bind")],
+                                1.0,
+                            );
+                            tracing::error!(
+                                tenant = %self.tenant_id,
+                                %e,
+                                "ae listener bind failed; launching degraded (writeDataPoint fails explicitly)"
+                            );
+                            self.runtime.set_last_error(Some(format!("ae-bind: {e}")));
+                        }
+                    }
+                }
+            }
+        }
         {
             let new_has_do = desired.do_storage.is_some();
             let old_has_do = self
@@ -7842,12 +7894,13 @@ async fn swap_finalize(
         }
         match gen.child.inner.try_wait() {
             // MIG-13-r5: a dead warm child can never emit the marker.
-            // workerd 1.20260916.1 fataled fast on any bind/load error
-            // after the execve; 1.20261120 tolerates a failed `--watch`
-            // reload instead (it reports the errors and keeps serving
-            // what it can), so an EADDRINUSE now surfaces through this
-            // loop's deadline rather than as a child exit — still fail
-            // closed, just bounded by `ready_timeout`.
+            // workerd VRT #4 (`e699fea`) made environmental bind
+            // failures fatal again even under `--watch`, so a stale
+            // unix socket shows up here as a fast child exit
+            // (`swap-child-exit`) exactly like the pre-1.20261120
+            // binaries. The poll still covers every other reload crash
+            // and any build that only reports the error: either way
+            // the swap fails closed.
             Ok(Some(_)) | Err(_) => {
                 child_died = true;
                 break false;
@@ -8525,6 +8578,7 @@ impl SupervisorHost {
                                     do_snap: self.deps.do_snap.clone(),
                                     wf_tomb_dir: self.deps.wf_tomb_dir.clone(),
                                     cache: self.deps.cache.clone(),
+                                    ae: self.deps.ae.clone(),
                                     heartbeat: self.deps.heartbeat.clone(),
                                     do_storage_root: self.deps.do_storage_root.clone(),
                                     purge: self.deps.purge.clone(),
@@ -9405,6 +9459,7 @@ mod tests {
             do_snap_due: Default::default(),
             do_snap_ok_at: Default::default(),
             cache_listener: None,
+            ae_listener: None,
             fenced_log: (None, Duration::from_secs(5)),
             s2z: None,
             ready_since: Instant::now(),
@@ -12359,6 +12414,7 @@ sleep 10
             }],
             crons: vec![],
             queue_consumers: vec![],
+                        observability: None,
             durable_object_classes: if has_do {
                 vec![DoClassDesired {
                     class_name: "C".into(),
@@ -12371,6 +12427,7 @@ sleep 10
             },
             workflows: vec![],
             tail_consumers: vec![],
+            streaming_tail_consumers: vec![],
             quotas: WorkerQuotas {
                 cpu_ms: 50,
                 memory_mb: 128,
@@ -12386,6 +12443,7 @@ sleep 10
         do_tainted_workers(&snapshot_protocol::compute_desired::TenantDesired {
             tenant_id: "t".into(),
             workers,
+            flagship_apps: Vec::new(),
         })
     }
 
@@ -12701,6 +12759,7 @@ sleep 10
             tenant: snapshot_protocol::compute_desired::TenantDesired {
                 tenant_id: "t".into(),
                 workers: vec![taint_worker("w0", vec![], true)],
+                flagship_apps: vec![],
             },
             revision: 9,
         });
@@ -13208,6 +13267,7 @@ sleep 10
             tenant: snapshot_protocol::compute_desired::TenantDesired {
                 tenant_id: "t".into(),
                 workers: vec![taint_worker("w0", vec![], true)],
+                flagship_apps: vec![],
             },
             revision: 9,
         });

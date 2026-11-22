@@ -92,6 +92,10 @@ pub struct D1Client {
     http: reqwest::Client,
     /// e.g. `http://127.0.0.1:8090` (no trailing slash).
     addr: String,
+    /// Optional read-only followers (`vrt-sql follower` -> `/dbs/{id}/query` only).
+    replicas: Vec<String>,
+    /// Round-robin cursor across `replicas`.
+    replica_cursor: AtomicU64,
     signer: SqlAuthSigner,
     timeout: Duration,
     /// Globally monotonic seq (monotonic across databaseIds => the per-database subsequence is monotonic too).
@@ -127,10 +131,23 @@ impl D1Client {
         Ok(Self {
             http,
             addr,
+            replicas: Vec::new(),
+            replica_cursor: AtomicU64::new(0),
             signer: SqlAuthSigner::new(secret),
             timeout,
             seq: AtomicU64::new(unix_nanos()),
         })
+    }
+
+    /// Attach read-only followers. Addresses are validated by the provider config loader.
+    pub fn with_replicas(mut self, replicas: Vec<String>) -> Self {
+        self.replicas = replicas;
+        self
+    }
+
+    /// Configured read-only followers (diagnostics/tests).
+    pub fn replicas(&self) -> &[String] {
+        &self.replicas
     }
 
     /// Allocate the next seq (public for metering/tests; called internally by forward).
@@ -217,10 +234,107 @@ impl D1Client {
             );
             return Err(ProviderError::ResourceUnavailable);
         }
+        let deadline = std::time::Instant::now() + budget;
         let seq = self.next_seq();
         let path_query = format!("/dbs/{database_id}/{op}{path_query_suffix}");
-        let url = format!("{}{}", self.addr, path_query);
         let auth = self.signer.sign("POST", &path_query, &body, epoch, seq);
+        let first_primary = session_headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case(BOOKMARK_HEADER)
+                && v.trim().eq_ignore_ascii_case("first-primary")
+        });
+        // Only reads are routed to followers. `/execute` and `/dump` must stay on the writer;
+        // `/query` may still attempt a write, which the replica rejects with
+        // `VRT_REPLICA_READ_ONLY` and we retry here (the replica never executes it).
+        if op == "query" && !self.replicas.is_empty() && !first_primary {
+            let start = self.replica_cursor.fetch_add(1, Ordering::Relaxed) as usize;
+            for i in 0..self.replicas.len() {
+                let addr = &self.replicas[(start + i) % self.replicas.len()];
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                // Reserve at least half the remaining budget for the writer fallback: a hung
+                // replica must not consume the entire request and turn a retryable read into 503.
+                let replica_budget = remaining
+                    .min(budget / 2)
+                    .max(Duration::from_millis(1))
+                    .min(remaining);
+                match self
+                    .attempt(
+                        addr,
+                        &path_query,
+                        &auth,
+                        &session_headers,
+                        &body,
+                        epoch,
+                        seq,
+                        replica_budget,
+                    )
+                    .await
+                {
+                    Ok((status, bookmark, bytes)) => {
+                        if let Some(reason) = replica_fallback_code(status, &bytes) {
+                            tracing::warn!(
+                                worker = ctx.worker_id(),
+                                binding = ctx.binding_name(),
+                                replica = %addr,
+                                status,
+                                reason,
+                                "d1 replica cannot serve the read; falling back to the writer"
+                            );
+                            continue;
+                        }
+                        return Ok((status, bookmark, bytes));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            worker = ctx.worker_id(),
+                            binding = ctx.binding_name(),
+                            replica = %addr,
+                            error = %e,
+                            "d1 replica call failed; falling back to the writer"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(
+                worker = ctx.worker_id(),
+                binding = ctx.binding_name(),
+                "d1 request budget exhausted before the writer attempt"
+            );
+            return Err(ProviderError::ResourceUnavailable);
+        }
+        self.attempt(
+            &self.addr,
+            &path_query,
+            &auth,
+            &session_headers,
+            &body,
+            epoch,
+            seq,
+            remaining,
+        )
+        .await
+    }
+
+    /// One send + capped body read against one vrt-sql address. Never retries internally.
+    #[allow(clippy::too_many_arguments)]
+    async fn attempt(
+        &self,
+        addr: &str,
+        path_query: &str,
+        auth: &str,
+        session_headers: &[(String, String)],
+        body: &Bytes,
+        epoch: u64,
+        seq: u64,
+        budget: Duration,
+    ) -> Result<(u16, Option<String>, Bytes), ProviderError> {
+        let url = format!("{addr}{path_query}");
         let mut req = self
             .http
             .post(&url)
@@ -233,11 +347,11 @@ impl D1Client {
             .header(SQL_EPOCH_HEADER, epoch.to_string())
             .header(SQL_SEQ_HEADER, seq.to_string())
             .header(SQL_AUTH_HEADER, auth)
-            .body(body);
+            .body(body.clone());
         for (k, v) in session_headers {
             if let (Ok(name), Ok(value)) = (
                 k.parse::<reqwest::header::HeaderName>(),
-                reqwest::header::HeaderValue::from_str(&v),
+                reqwest::header::HeaderValue::from_str(v),
             ) {
                 req = req.header(name, value);
             }
@@ -245,12 +359,7 @@ impl D1Client {
         let started = std::time::Instant::now();
         let overall = tokio::time::timeout(budget, async {
             let resp = req.send().await.map_err(|e| {
-                tracing::warn!(
-                    worker = ctx.worker_id(),
-                    binding = ctx.binding_name(),
-                    error = %e,
-                    "vrt-sql backend call failed (no retry)"
-                );
+                tracing::warn!(error = %e, addr = %addr, "vrt-sql backend call failed");
                 ProviderError::ResourceUnavailable
             })?;
             let status = resp.status().as_u16();
@@ -264,14 +373,12 @@ impl D1Client {
             let bytes = crate::upstream_body::read_body_capped(resp, D1_MAX_RESPONSE_BYTES)
                 .await
                 .map_err(|e| {
-                    match e {
-                        crate::upstream_body::UpstreamBodyErr::TooLarge => tracing::warn!(
-                            worker = ctx.worker_id(),
-                            binding = ctx.binding_name(),
+                    if matches!(e, crate::upstream_body::UpstreamBodyErr::TooLarge) {
+                        tracing::warn!(
+                            addr = %addr,
                             cap = D1_MAX_RESPONSE_BYTES,
                             "d1 upstream response exceeded byte cap"
-                        ),
-                        crate::upstream_body::UpstreamBodyErr::Transport => {}
+                        );
                     }
                     ProviderError::ResourceUnavailable
                 })?;
@@ -281,17 +388,39 @@ impl D1Client {
         match overall {
             Ok(r) => r,
             Err(_) => {
-                // Deadline cut: the write may or may not have committed
-                // upstream; surface as unavailable and NEVER retry here.
                 tracing::warn!(
-                    worker = ctx.worker_id(),
-                    binding = ctx.binding_name(),
+                    addr = %addr,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "d1 forward cut at request deadline"
                 );
                 Err(ProviderError::ResourceUnavailable)
             }
         }
+    }
+}
+
+/// Replica responses that mean "ask the writer" rather than a tenant-visible SQL result.
+/// The codes are defined in `vrt-sql/src/replica.rs`.
+fn replica_fallback_code(status: u16, body: &[u8]) -> Option<&'static str> {
+    if status == 429 || status >= 500 {
+        return Some("replica_unavailable");
+    }
+    if status != 409 {
+        return None;
+    }
+    let code = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("code")?
+        .as_str()?
+        .to_string();
+    match code.as_str() {
+        "VRT_REPLICA_STALE" => Some("stale"),
+        "VRT_REPLICA_PRIMARY_REQUIRED" => Some("primary_required"),
+        "VRT_REPLICA_READ_ONLY" => Some("read_only"),
+        "VRT_REPLICA_BOOKMARK_INVALID" => Some("bookmark_invalid"),
+        "VRT_REPLICA_UNKNOWN_DB" => Some("unknown_db"),
+        "VRT_REPLICA_NOT_READY" => Some("not_ready"),
+        _ => None,
     }
 }
 
@@ -430,6 +559,348 @@ mod tests {
             req.contains("x-cf-d1-session-commit-token: first-unconstrained"),
             "session header not forwarded to vrt-sql: {req}"
         );
+    }
+
+    struct FakeBackend {
+        addr: String,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn spawn_fake(status: u16, body: impl Into<String>) -> FakeBackend {
+        let body = body.into();
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = format!("http://{}", l.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut s, _)) = l.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = vec![0u8; 16 * 1024];
+                let _ = s.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(reply.as_bytes()).await;
+            }
+        });
+        FakeBackend { addr, hits }
+    }
+
+    fn client(primary: &str, replicas: Vec<String>) -> D1Client {
+        D1Client::new(primary.to_string(), b"s".to_vec(), Duration::from_secs(5))
+            .unwrap()
+            .with_replicas(replicas)
+    }
+
+    #[tokio::test]
+    async fn query_uses_replica_but_execute_stays_on_the_writer() {
+        let primary = spawn_fake(200, "PRIMARY").await;
+        let replica = spawn_fake(200, "REPLICA").await;
+        let c = client(&primary.addr, vec![replica.addr.clone()]);
+        let body = Bytes::from_static(b"[]");
+
+        let (status, _, out) = c
+            .forward(&ctx(2_000), "query", "", body.clone(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(&out[..], b"REPLICA");
+        assert_eq!(replica.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(primary.hits.load(Ordering::SeqCst), 0);
+
+        let (_, _, out) = c
+            .forward(&ctx(2_000), "execute", "", body, vec![])
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"PRIMARY");
+        assert_eq!(replica.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(primary.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_or_read_only_replica_falls_back_to_the_writer() {
+        for code in ["VRT_REPLICA_STALE", "VRT_REPLICA_READ_ONLY"] {
+            let primary = spawn_fake(200, "PRIMARY").await;
+            let replica = spawn_fake(409, format!(r#"{{"code":"{code}"}}"#)).await;
+            let c = client(&primary.addr, vec![replica.addr.clone()]);
+            let (status, _, out) = c
+                .forward(&ctx(2_000), "query", "", Bytes::from_static(b"[]"), vec![])
+                .await
+                .unwrap();
+            assert_eq!((status, &out[..]), (200, &b"PRIMARY"[..]), "{code}");
+            assert_eq!(replica.hits.load(Ordering::SeqCst), 1, "{code}");
+            assert_eq!(primary.hits.load(Ordering::SeqCst), 1, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn first_primary_skips_the_replica() {
+        let primary = spawn_fake(200, "PRIMARY").await;
+        let replica = spawn_fake(200, "REPLICA").await;
+        let c = client(&primary.addr, vec![replica.addr.clone()]);
+        let (_, _, out) = c
+            .forward(
+                &ctx(2_000),
+                "query",
+                "",
+                Bytes::from_static(b"[]"),
+                vec![(BOOKMARK_HEADER.to_string(), "first-primary".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"PRIMARY");
+        assert_eq!(replica.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unreachable_replica_falls_back() {
+        let primary = spawn_fake(200, "PRIMARY").await;
+        let c = client(&primary.addr, vec!["http://127.0.0.1:1".to_string()]);
+        let (_, _, out) = c
+            .forward(&ctx(2_000), "query", "", Bytes::from_static(b"[]"), vec![])
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"PRIMARY");
+    }
+
+    #[tokio::test]
+    async fn replica_sql_error_is_returned_without_retry() {
+        let primary = spawn_fake(200, "PRIMARY").await;
+        let replica = spawn_fake(200, r#"{"success":false,"error":"no such table"}"#).await;
+        let c = client(&primary.addr, vec![replica.addr.clone()]);
+        let (status, _, out) = c
+            .forward(&ctx(2_000), "query", "", Bytes::from_static(b"[]"), vec![])
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert!(out.starts_with(br#"{"success":false"#));
+        assert_eq!(primary.hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn fallback_codes_are_exactly_the_routing_signals() {
+        for (code, want) in [
+            ("VRT_REPLICA_STALE", Some("stale")),
+            ("VRT_REPLICA_READ_ONLY", Some("read_only")),
+            ("VRT_REPLICA_PRIMARY_REQUIRED", Some("primary_required")),
+            ("VRT_REPLICA_BOOKMARK_INVALID", Some("bookmark_invalid")),
+            ("VRT_REPLICA_UNKNOWN_DB", Some("unknown_db")),
+            ("VRT_REPLICA_NOT_READY", Some("not_ready")),
+            ("SOMETHING_ELSE", None),
+        ] {
+            let body = format!(r#"{{"code":"{code}"}}"#);
+            assert_eq!(replica_fallback_code(409, body.as_bytes()), want, "{code}");
+        }
+        assert_eq!(replica_fallback_code(200, b"[]"), None);
+        assert_eq!(replica_fallback_code(503, b"{}"), Some("replica_unavailable"));
+    }
+
+    /// End-to-end: provider -> replica for eligible reads, writer for writes and stale bookmarks.
+    #[tokio::test]
+    async fn replica_routing_round_trip_over_tcp() {
+        use crate::context::Permissions;
+        use vrt_objstore::{MemoryStore, ObjectStore};
+        use vrt_sql::bookmark::BookmarkSigner;
+        use vrt_sql::clock::{Clock, TestClock};
+        use vrt_sql::engine::{
+            EngineRegistry, PersisterPair, ResultsFormat, RusqliteEngine, SqlStmt, TxnCtx,
+        };
+        use vrt_sql::follower::Follower;
+        use vrt_sql::paths::queue_root_for;
+        use vrt_sql::paths::ResourceKind::D1;
+        use vrt_sql::persist::{PersistConfig, Persister};
+        use vrt_sql::replica::{self, ReplicaState};
+        use vrt_sql::service::ServiceAuth;
+
+        const DB: &str = "abcdefghijklmnopqrstuvwxyz";
+        const SECRET: &[u8] = b"replica-e2e-secret";
+
+        fn write(e: &RusqliteEngine, sql: &str) {
+            e.query_batch_sync(
+                &[SqlStmt {
+                    sql: sql.into(),
+                    params: None,
+                }],
+                &TxnCtx {
+                    epoch: 1,
+                    deadline: std::time::Instant::now() + Duration::from_secs(30),
+                    dedup: None,
+                },
+                ResultsFormat::ArrayOfObjects,
+            )
+            .unwrap();
+        }
+
+        fn served_by(body: &[u8]) -> String {
+            let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+            v[0]["meta"]["served_by"].as_str().unwrap_or("").to_string()
+        }
+
+        async fn serve(app: axum::Router) -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = format!("http://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            addr
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "vrt-d1-replica-e2e-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store: std::sync::Arc<dyn ObjectStore> = std::sync::Arc::new(MemoryStore::new());
+        let clock = std::sync::Arc::new(TestClock::new(1_000_000));
+        let writer_root = root.join("writer");
+        let d1 = std::sync::Arc::new(Persister::new(
+            store.clone(),
+            PersistConfig {
+                lease_ms: 10_000,
+                clock_skew_margin_ms: 500,
+                holder: "writer".into(),
+                checkpoint_every_commits: 0,
+                retention_ms: 60_000,
+                snapshot_max_bytes: 1 << 30,
+            },
+            clock.clone(),
+            writer_root.clone(),
+            D1,
+        ));
+        let queue = std::sync::Arc::new(Persister::new(
+            d1.store().clone(),
+            d1.config().clone(),
+            d1.clock().clone(),
+            queue_root_for(&writer_root),
+            vrt_sql::paths::ResourceKind::Queue,
+        ));
+        let reg = EngineRegistry::new(writer_root.clone())
+            .with_persisters(PersisterPair { d1, queue });
+        let engine = reg.get(D1, DB).unwrap();
+        write(&engine, "CREATE TABLE t(v INTEGER)");
+        write(&engine, "INSERT INTO t VALUES (1)");
+
+        let auth = ServiceAuth::new(SECRET.to_vec());
+        let bookmark_key = [7u8; 32];
+        let mut writer_state =
+            vrt_sql::wire::AppState::new(writer_root, bookmark_key).with_auth(auth.clone());
+        writer_state.registry = std::sync::Arc::new(reg);
+        let writer_addr = serve(vrt_sql::wire::app(writer_state)).await;
+
+        let follower = std::sync::Arc::new(
+            Follower::new(
+                store.clone(),
+                D1,
+                DB,
+                root.join("replica"),
+                clock.clone() as std::sync::Arc<dyn Clock>,
+            )
+            .unwrap(),
+        );
+        follower.sync_once().unwrap();
+        let replica_addr = serve(replica::app(
+            ReplicaState::new(follower.clone())
+                .with_auth(auth)
+                .with_signer(BookmarkSigner::new(bookmark_key)),
+        ))
+        .await;
+
+        let client = D1Client::new(writer_addr, SECRET.to_vec(), Duration::from_secs(5))
+            .unwrap()
+            .with_replicas(vec![replica_addr]);
+
+        let request = || {
+            crate::context::BindingContext::grant(
+                "tenant".into(),
+                "worker".into(),
+                "version".into(),
+                "worker~DB".into(),
+                "DB".into(),
+                BindingResource::D1Database {
+                    id: DB.into(),
+                    epoch: 1,
+                },
+                Permissions {
+                    read: true,
+                    write: true,
+                },
+                1,
+                1,
+                tokio::time::Instant::now() + Duration::from_secs(10),
+            )
+        };
+        let query = br#"[{"sql":"SELECT count(*) AS n FROM t"}]"#;
+
+        let (status, _, body) = client
+            .forward(
+                &request(),
+                "query",
+                "",
+                Bytes::from_static(query),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(served_by(&body), "vrt-sql-replica");
+
+        let (_, _, body) = client
+            .forward(
+                &request(),
+                "query",
+                "",
+                Bytes::from_static(query),
+                vec![(BOOKMARK_HEADER.to_string(), "first-primary".to_string())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(served_by(&body), "vrt-sql");
+
+        let (status, write_bookmark, _) = client
+            .forward(
+                &request(),
+                "execute",
+                "",
+                Bytes::from_static(br#"[{"sql":"INSERT INTO t VALUES (2)"}]"#),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        let write_bookmark = write_bookmark.expect("writer mints a bookmark");
+
+        let (_, _, body) = client
+            .forward(
+                &request(),
+                "query",
+                "",
+                Bytes::from_static(query),
+                vec![(BOOKMARK_HEADER.to_string(), write_bookmark.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(served_by(&body), "vrt-sql");
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v[0]["results"][0]["n"], 2);
+
+        follower.sync_once().unwrap();
+        let (_, _, body) = client
+            .forward(
+                &request(),
+                "query",
+                "",
+                Bytes::from_static(query),
+                vec![(BOOKMARK_HEADER.to_string(), write_bookmark)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(served_by(&body), "vrt-sql-replica");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

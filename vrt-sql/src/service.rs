@@ -19,7 +19,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use vrt_objstore::ObjectStore;
 
 /// Auth request header.
 pub const AUTH_HEADER: &str = "x-vrt-sql-auth";
@@ -121,6 +122,144 @@ pub struct PersistenceConfig {
     /// MIG-9: backoff cap (ms); grows x2 up to this ceiling.
     #[serde(default = "default_self_check_max_backoff_ms")]
     pub self_check_max_backoff_ms: u64,
+    /// Time Travel retention window (ms): snapshots/segments inside the window are kept and the
+    /// commit timeline resolves restore targets. 0 = disabled (bounded two-snapshot GC only).
+    #[serde(default)]
+    pub time_travel_retention_ms: u64,
+}
+
+impl PersistenceConfig {
+    /// Fail-closed persistence validation, shared by the writer (`serve`) and the read-only
+    /// follower (`follower`) so both reject the same misconfiguration.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self.backend.as_str() {
+            "none" => {
+                if !self.allow_dev_backend {
+                    return Err(
+                        "persistence.backend=none requires persistence.allowDevBackend=true (dev only)",
+                    );
+                }
+            }
+            "fs" => {
+                if self.fs.is_none() {
+                    return Err("persistence.fs.root required");
+                }
+            }
+            "s3" => {
+                let Some(s3) = &self.s3 else {
+                    return Err("persistence.s3 required");
+                };
+                if s3.endpoint.is_empty() || s3.bucket.is_empty() || s3.region.is_empty() {
+                    return Err("persistence.s3 endpoint/bucket/region");
+                }
+                // RV-R72: endpoint parse validation (https; http only for loopback/dev).
+                if vrt_objstore::endpoint::validate_object_store_endpoint(
+                    &s3.endpoint,
+                    self.allow_dev_backend,
+                )
+                .is_err()
+                {
+                    return Err("persistence.s3.endpoint must be https (http only loopback, <svc>.<ns>.svc:port, or allowDevBackend)");
+                }
+                // T36b: s3 snapshot upload is an in-memory path -- over the cap fails closed.
+                if self.snapshot_max_bytes > S3_SNAPSHOT_MAX_BYTES {
+                    return Err("persistence.snapshotMaxBytes exceeds s3 in-memory cap (256MiB)");
+                }
+            }
+            _ => return Err("persistence.backend must be fs|s3|none"),
+        }
+        if self.lease_ms <= self.clock_skew_margin_ms * 4 {
+            // margin must be much smaller than lease (default 500ms vs 15s).
+            return Err("persistence.leaseMs too small vs clockSkewMarginMs");
+        }
+        // MIG-9: self-check retry parameter bounds -- budget/backoff must be positive and self-consistent;
+        // the budget is capped at 10 minutes (anything longer should rely on the pod restart policy, not
+        // a single startup self-check).
+        if self.self_check_initial_backoff_ms == 0 || self.self_check_max_backoff_ms == 0 {
+            return Err("persistence.selfCheck* backoff must be > 0");
+        }
+        if self.self_check_max_backoff_ms < self.self_check_initial_backoff_ms {
+            return Err("persistence.selfCheckMaxBackoffMs < selfCheckInitialBackoffMs");
+        }
+        if self.self_check_budget_ms == 0 || self.self_check_budget_ms > 600_000 {
+            return Err("persistence.selfCheckBudgetMs out of range (0, 600000]");
+        }
+        if self.time_travel_retention_ms > 366 * 24 * 60 * 60 * 1000 {
+            return Err("persistence.timeTravelRetentionMs out of range (<= 366 days)");
+        }
+        Ok(())
+    }
+
+    /// Build the persister config shared by `serve`. `holder` defaults to `host:pid:start_nanos`.
+    pub fn persist_config(&self) -> crate::persist::PersistConfig {
+        let holder = self.holder.clone().unwrap_or_else(|| {
+            let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "vrt-sql".into());
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{host}:{}:{nanos}", std::process::id())
+        });
+        crate::persist::PersistConfig {
+            lease_ms: self.lease_ms,
+            clock_skew_margin_ms: self.clock_skew_margin_ms,
+            holder,
+            checkpoint_every_commits: self.checkpoint_every_commits,
+            retention_ms: self.retention_ms,
+            snapshot_max_bytes: self.snapshot_max_bytes,
+        }
+    }
+}
+
+/// Open the object store described by `[persistence]`.
+///
+/// `backend="none"` -> `Ok(None)` (local-only test/dev; the caller decides whether to warn).
+/// Credentials are loaded from 0600 files and never logged.
+pub fn open_object_store(
+    p: &PersistenceConfig,
+) -> Result<Option<Arc<dyn ObjectStore>>, String> {
+    Ok(Some(match p.backend.as_str() {
+        "none" => return Ok(None),
+        "fs" => {
+            let fs = p.fs.as_ref().ok_or("persistence.fs missing")?;
+            let root = fs.root.clone();
+            match vrt_objstore::FsStore::new(root.clone()) {
+                Ok(s) => {
+                    tracing::info!(root = %root.display(), "persistence backend = fs");
+                    Arc::new(s)
+                }
+                Err(e) => return Err(format!("fs store init: {e}")),
+            }
+        }
+        "s3" => {
+            let s3 = p.s3.as_ref().ok_or("persistence.s3 missing")?;
+            let access = load_secret_0600(&s3.access_key_file, vrt_securefs::SecretPurpose::Credential)
+                .map_err(|e| format!("s3 access key file: {e}"))?;
+            let secret = load_secret_0600(&s3.secret_key_file, vrt_securefs::SecretPurpose::Credential)
+                .map_err(|e| format!("s3 secret key file: {e}"))?;
+            let cfg = vrt_objstore::S3StoreConfig {
+                endpoint: s3.endpoint.clone(),
+                region: s3.region.clone(),
+                bucket: s3.bucket.clone(),
+                access_key: String::from_utf8_lossy(&access).trim().to_string(),
+                secret_key: vrt_objstore::sigv4::SecretString::new(
+                    String::from_utf8_lossy(&secret).trim().to_string(),
+                ),
+                timeout: std::time::Duration::from_millis(s3.timeout_ms),
+                conditional_writes: s3.conditional_writes,
+                retries: 2,
+                prefix: s3.prefix.clone(),
+            };
+            match vrt_objstore::S3Store::new(cfg) {
+                Ok(s) => {
+                    tracing::info!(endpoint = %s3.endpoint, bucket = %s3.bucket, "persistence backend = s3");
+                    Arc::new(s)
+                }
+                Err(e) => return Err(format!("s3 store init: {e}")),
+            }
+        }
+        other => return Err(format!("persistence.backend {other}")),
+    }))
 }
 
 /// RV-R66: typed startup error for a same-device persistence layer (fail closed).
@@ -302,60 +441,7 @@ impl ServiceConfig {
             }
         }
         // T36 persistence validation (fail closed).
-        match self.persistence.backend.as_str() {
-            "none" => {
-                if !self.persistence.allow_dev_backend {
-                    return Err(
-                        "persistence.backend=none requires persistence.allowDevBackend=true (dev only)",
-                    );
-                }
-            }
-            "fs" => {
-                if self.persistence.fs.is_none() {
-                    return Err("persistence.fs.root required");
-                }
-            }
-            "s3" => {
-                let Some(s3) = &self.persistence.s3 else {
-                    return Err("persistence.s3 required");
-                };
-                if s3.endpoint.is_empty() || s3.bucket.is_empty() || s3.region.is_empty() {
-                    return Err("persistence.s3 endpoint/bucket/region");
-                }
-                // RV-R72: endpoint parse validation (https; http only for loopback/dev).
-                if vrt_objstore::endpoint::validate_object_store_endpoint(
-                    &s3.endpoint,
-                    self.persistence.allow_dev_backend,
-                )
-                .is_err()
-                {
-                    return Err("persistence.s3.endpoint must be https (http only loopback, <svc>.<ns>.svc:port, or allowDevBackend)");
-                }
-                // T36b: s3 snapshot upload is an in-memory path -- over the cap fails closed.
-                if self.persistence.snapshot_max_bytes > S3_SNAPSHOT_MAX_BYTES {
-                    return Err("persistence.snapshotMaxBytes exceeds s3 in-memory cap (256MiB)");
-                }
-            }
-            _ => return Err("persistence.backend must be fs|s3|none"),
-        }
-        if self.persistence.lease_ms <= self.persistence.clock_skew_margin_ms * 4 {
-            // margin must be much smaller than lease (default 500ms vs 15s).
-            return Err("persistence.leaseMs too small vs clockSkewMarginMs");
-        }
-        // MIG-9: self-check retry parameter bounds -- budget/backoff must be positive and self-consistent;
-        // the budget is capped at 10 minutes (anything longer should rely on the pod restart policy, not
-        // a single startup self-check).
-        let p = &self.persistence;
-        if p.self_check_initial_backoff_ms == 0 || p.self_check_max_backoff_ms == 0 {
-            return Err("persistence.selfCheck* backoff must be > 0");
-        }
-        if p.self_check_max_backoff_ms < p.self_check_initial_backoff_ms {
-            return Err("persistence.selfCheckMaxBackoffMs < selfCheckInitialBackoffMs");
-        }
-        if p.self_check_budget_ms == 0 || p.self_check_budget_ms > 600_000 {
-            return Err("persistence.selfCheckBudgetMs out of range (0, 600000]");
-        }
-        Ok(())
+        self.persistence.validate()
     }
 }
 

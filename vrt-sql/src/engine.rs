@@ -174,6 +174,11 @@ pub enum EngineError {
     /// dedup ledger commits in the same transaction).
     #[error("commit outcome unknown (deadline exceeded after commit)")]
     ResultUnknown,
+    /// Read-only replica refused a statement that would write. The wire maps this to
+    /// HTTP 409 + `code:"VRT_REPLICA_READ_ONLY"` so the provider can retry on the writer.
+    /// Never produced by the writer engine.
+    #[error("attempt to write a readonly database")]
+    ReadOnly,
     #[error("path: {0}")]
     Path(#[from] PathError),
     #[error("io: {0}")]
@@ -374,6 +379,9 @@ struct EngineInner {
     wal_be: bool,
     /// T36: lease + persistence slot (when a persistence backend exists).
     persist: Option<PersistSlot>,
+    /// Time Travel index: commits not yet flushed to a timeline chunk. Best-effort history --
+    /// a crash loses at most [`crate::timeline::FLUSH_COMMITS`] entries.
+    timeline: Vec<crate::timeline::TimelineEntry>,
 }
 
 /// T36: persistence state held by the engine (maintained under the inner lock -- all persistence
@@ -409,7 +417,12 @@ pub struct RusqliteEngine {
     degraded: AtomicBool,
     /// T36: db file path (to locate the WAL sidecar).
     db_file: PathBuf,
-    _lock_file: std::fs::File, // keeps the flock until drop
+    /// Writer engines hold an flock for their lifetime; a read-only replica generation is
+    /// immutable and has no lock.
+    _lock_file: Option<std::fs::File>,
+    /// Feature follow-up (D1 follower): read-only replica engine. Skips commit-lsn accounting
+    /// and maps SQLITE_READONLY to [`EngineError::ReadOnly`].
+    read_only: bool,
 }
 
 impl RusqliteEngine {
@@ -525,6 +538,7 @@ impl RusqliteEngine {
                 wal_cksum: (0, 0),
                 wal_be: false,
                 persist: None,
+                timeline: Vec::new(),
             }),
             commit_lsn: AtomicU64::new(0),
             served_by: "vrt-sql".into(),
@@ -535,8 +549,66 @@ impl RusqliteEngine {
             lease_epoch: AtomicU64::new(1),
             degraded: AtomicBool::new(false),
             db_file: db_file.to_path_buf(),
-            _lock_file: lock_file,
+            _lock_file: Some(lock_file),
+            read_only: false,
         })
+    }
+
+    /// Open a published follower generation as a read-only engine.
+    ///
+    /// The file is immutable by construction (the follower renames a completed generation into
+    /// place and never writes it again), so `immutable=1` is safe and avoids requiring a writable
+    /// `-shm`. No lock file is created: readers do not exclude the follower.
+    ///
+    /// `epoch`/`lsn` are the follower watermark that produced this generation; they seed the
+    /// engine position for diagnostics and bookmark minting.
+    pub fn open_immutable(
+        db_file: &Path,
+        database_id: &str,
+        epoch: u64,
+        lsn: u64,
+    ) -> Result<Self, EngineError> {
+        let path = std::fs::canonicalize(db_file)?;
+        let uri = format!("file:{}?immutable=1", crate::follower::sqlite_uri_path(&path));
+        let conn = Connection::open_with_flags(
+            uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )?;
+        let internal = security::configure(&conn)?;
+        let page_size = conn
+            .query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))
+            .unwrap_or(4096);
+        Ok(Self {
+            inner: Mutex::new(EngineInner {
+                conn,
+                internal,
+                page_size,
+                wal_frames: 0,
+                wal_salt: None,
+                wal_cksum: (0, 0),
+                wal_be: false,
+                persist: None,
+                timeline: Vec::new(),
+            }),
+            commit_lsn: AtomicU64::new(lsn),
+            served_by: "vrt-sql-replica".into(),
+            database_id: database_id.into(),
+            dropped: AtomicBool::new(false),
+            fenced: AtomicBool::new(false),
+            snapshot_over_cap: AtomicBool::new(false),
+            lease_epoch: AtomicU64::new(epoch),
+            degraded: AtomicBool::new(false),
+            db_file: path,
+            _lock_file: None,
+            read_only: true,
+        })
+    }
+
+    /// Whether this engine is a read-only follower generation.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// T36: the registry installs persistence state after a successful claim; commit_lsn and
@@ -575,6 +647,8 @@ impl RusqliteEngine {
     pub fn release_lease(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let epoch = self.lease_epoch();
+        // Best effort: persist the timeline tail before the next writer takes over.
+        self.flush_timeline(&mut inner);
         if let Some(slot) = inner.persist.as_mut() {
             let p = slot.persister.clone();
             let now = p.clock().now_ms();
@@ -820,6 +894,11 @@ impl RusqliteEngine {
             Ok(()) => {
                 self.commit_lsn.store(new_lsn, Ordering::SeqCst);
                 self.degraded.store(slot.handle.degraded, Ordering::SeqCst);
+                inner.timeline.push(crate::timeline::TimelineEntry {
+                    lsn: new_lsn,
+                    epoch: slot_epoch,
+                    committed_at_ms: slot.persister.clock().now_ms(),
+                });
             }
             Err(e) => {
                 crate::metrics::persistence_failure("publish");
@@ -834,6 +913,9 @@ impl RusqliteEngine {
                 }
                 return Err(fenced);
             }
+        }
+        if inner.timeline.len() >= crate::timeline::FLUSH_COMMITS {
+            self.flush_timeline(inner);
         }
         // Periodic checkpoint: TRUNCATE wal + upload snapshot + GC old segments.
         // T36b: trigger on the dynamic `ckpt_gap` (exponential backoff on failure) rather than the fixed
@@ -906,15 +988,41 @@ impl RusqliteEngine {
             }
             Err(e) => return Err(EngineError::Sqlite(e)),
         }
-        p.checkpoint(
+        match p.checkpoint(
             &self.database_id,
             &mut inner.persist.as_mut().unwrap().handle,
             &self.db_file,
-        )
-        .map_err(|e| match e {
-            crate::persist::PersistError::Fenced => self.fence(epoch),
-            _ => EngineError::Message(format!("checkpoint: {e}")),
-        })
+        ) {
+            Ok(()) => {
+                self.flush_timeline(inner);
+                Ok(())
+            }
+            Err(crate::persist::PersistError::Fenced) => Err(self.fence(epoch)),
+            Err(e) => Err(EngineError::Message(format!("checkpoint: {e}"))),
+        }
+    }
+
+    /// Persist the buffered Time Travel timeline (best effort: history must never fail a commit).
+    fn flush_timeline(&self, inner: &mut EngineInner) {
+        if inner.timeline.is_empty() {
+            return;
+        }
+        let Some(slot) = inner.persist.as_ref() else {
+            inner.timeline.clear();
+            return;
+        };
+        let p = slot.persister.clone();
+        match p.upload_timeline(&self.database_id, &inner.timeline) {
+            Ok(()) => inner.timeline.clear(),
+            Err(e) => {
+                tracing::warn!(db = %self.database_id, error = %e,
+                    "timeline flush failed; keeping entries for the next attempt");
+                if inner.timeline.len() > crate::timeline::MAX_BUFFERED_ENTRIES {
+                    let drop = inner.timeline.len() - crate::timeline::MAX_BUFFERED_ENTRIES;
+                    inner.timeline.drain(..drop);
+                }
+            }
+        }
     }
 
     /// Read-only size/shape snapshot for the control-plane stats report.
@@ -1162,7 +1270,7 @@ impl RusqliteEngine {
                     });
                 }
                 Err(e) => {
-                    failed = Some(e);
+                    failed = Some(self.normalize_error(e));
                     break;
                 }
             }
@@ -1222,6 +1330,9 @@ impl RusqliteEngine {
                         Ok(_) => Ok(out),
                         Err(e) => Err(e),
                     }
+                } else if self.read_only {
+                    // A read transaction commits as a no-op; the replica watermark does not move.
+                    Ok(out)
                 } else {
                     self.commit_lsn.fetch_add(1, Ordering::SeqCst);
                     Ok(out)
@@ -1230,6 +1341,18 @@ impl RusqliteEngine {
         };
         security::disarm_deadline(&mut inner.conn);
         result
+    }
+
+    /// Map a statement error on a read-only engine to a typed routing signal.
+    fn normalize_error(&self, e: EngineError) -> EngineError {
+        if self.read_only {
+            if let EngineError::Sqlite(ref sqlite) = e {
+                if sqlite.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly) {
+                    return EngineError::ReadOnly;
+                }
+            }
+        }
+        e
     }
 
     /// `dump()`: export the user database as a SQLite-compatible SQL

@@ -48,6 +48,12 @@ pub struct LocalState {
     pub system_objects: BTreeSet<String>,
     /// `worker name → record`. BTreeMap = deterministic desired order.
     pub workers: BTreeMap<String, WorkerRecord>,
+    /// Tenant-level Flagship app store — flag definitions ride the
+    /// desired doc's tenant section so edits propagate without a
+    /// redeploy (CF ≤30s propagation analog). `#[serde(default)]`
+    /// keeps pre-feature state files loadable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flagship_apps: Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>,
 }
 
 fn default_max_versions() -> u32 {
@@ -70,8 +76,15 @@ pub struct WorkerRecord {
 
 /// One immutable version — code identity PLUS everything that decides
 /// runtime behavior (platform `VrtWorkerVersion` parity, F2).
+///
+/// Deliberately NOT `deny_unknown_fields`: a cell running an older
+/// build must be able to read a `state.json` written by a newer build
+/// that added version-scoped fields. Dropping an unknown field is safe
+/// here (the state is re-projected through `to_desired`, and the host
+/// re-validates), whereas failing the decode bricks the tenant on a
+/// rollback. Same downgrade rule #48 established for `observability`.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct VersionRecord {
     pub version_id: String,
     pub artifact_digest: String,
@@ -91,6 +104,15 @@ pub struct VersionRecord {
     /// consumer relations follow the version, and rollback restores the original consumption relations).
     #[serde(default)]
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
+    /// `[observability]` — version-scoped collection gates; a
+    /// rollback restores the earlier gates with the version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// Streaming tail consumers — version-scoped like `tail_consumers`
+    /// (CF treats `streaming_tail_consumers` as a deploy-time setting;
+    /// rollback restores the earlier set).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// P3c-1: the DO class set declared by this version (migrations were already
     /// resolved to the final set at pack time, `uniqueKey` is fixed; rollback restores the original declaration --
     /// the storage identity of the `renamed_classes` lineage follows the version).
@@ -120,6 +142,7 @@ impl LocalState {
             max_versions_per_worker: DEFAULT_MAX_VERSIONS,
             system_objects: BTreeSet::new(),
             workers: BTreeMap::new(),
+            flagship_apps: Vec::new(),
         }
     }
 
@@ -134,55 +157,56 @@ impl LocalState {
         self.max_versions_per_worker.clamp(1, MAX_VERSIONS_CEILING) as usize
     }
 
-    /// Semantic version identity — mirrors platform `computeVersionSha`
-    /// coverage (code digest + compat + bindings + var values + crons +
-    /// quotas). A var-only change MUST yield a new version (F2).
+    /// Semantic version identity — the canonical serialization of the
+    /// [`VersionRecord`] this deploy would store, minus the two fields
+    /// that describe the record rather than the behavior (`versionId`
+    /// and `createdAtUnixMs`).
+    ///
+    /// Deriving the input from the record's own struct (instead of a
+    /// hand-maintained `json!` list) makes every version-scoped field
+    /// join identity automatically: a field added to `VersionRecord`
+    /// — and therefore replayed by `to_desired`/rollback — cannot be
+    /// silently deduped away by `apply_deploy` because someone forgot
+    /// to copy it here. This was the root cause of repeated fail-open
+    /// bugs (`queueConsumers`, `tailConsumers`, `observability`,
+    /// `streamingTailConsumers`): a pure config change "deployed"
+    /// successfully but never reached desired.
+    ///
+    /// Absent/skipped fields keep their old canonical bytes, so
+    /// workers that never declared the newer fields retain their
+    /// pre-feature version ids (no churn on upgrade).
     fn version_id(pkg: &crate::worker_pkg::PackedWorker) -> String {
-        // T37b-r3: `queueConsumers` MUST be part of version identity —
-        // it lives on VersionRecord (per-version config), so a deploy
-        // that changes ONLY the consumer set must mint a new version.
-        // Without it the dedup at apply_deploy silently dropped the
-        // new consumer config and desired kept dispatching the removed
-        // queue — fail-open on a data-plane knob.
-        let canonical = serde_json::json!({
-            "artifactDigest": pkg.digest,
-            "compatibilityDate": pkg.compatibility_date,
-            "compatibilityFlags": pkg.compatibility_flags,
-            "bindings": pkg.bindings,
-            "varValues": pkg.var_values,
-            "crons": pkg.crons,
-            "queueConsumers": pkg.queue_consumers,
-            // P3c-1: DO class declarations (incl. uniqueKey lineage)
-            // are version identity — a pure class-set change must mint
-            // a new version so rollback restores the exact namespace set.
-            "durableObjectClasses": pkg.durable_object_classes,
-            "quotas": pkg.quotas,
-        });
-        // W1: `workflows` joins version identity ONLY when declared —
-        // workers without workflows keep their pre-W1 version ids
-        // (same canonical bytes) so a runtime upgrade doesn't mint
-        // churn versions.
-        let canonical = if pkg.workflows.is_empty() {
-            canonical
-        } else {
-            let mut c = canonical;
-            c["workflows"] = serde_json::json!(pkg.workflows);
-            c
-        };
-        // Tail consumers are per-version behavior too: a deploy that only
-        // changes `tail_consumers` must mint a new version (rollback then
-        // restores the previous consumer set). Only added when declared so
-        // workers without tails keep their pre-existing version ids.
-        let canonical = if pkg.tail_consumers.is_empty() {
-            canonical
-        } else {
-            let mut c = canonical;
-            c["tailConsumers"] = serde_json::json!(pkg.tail_consumers);
-            c
-        };
+        let record = Self::version_record(pkg, String::new());
+        let mut canonical = serde_json::to_value(&record).unwrap_or_default();
+        if let Some(obj) = canonical.as_object_mut() {
+            obj.remove("versionId");
+            obj.remove("createdAtUnixMs");
+        }
         let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         format!("vrt_{}", &digest[..28])
+    }
+
+    /// One stored version record for `pkg` — shared by `version_id`
+    /// (identity input) and `apply_deploy` (persisted row) so the two
+    /// can never drift.
+    fn version_record(pkg: &crate::worker_pkg::PackedWorker, version_id: String) -> VersionRecord {
+        VersionRecord {
+            version_id,
+            artifact_digest: pkg.digest.clone(),
+            compatibility_date: pkg.compatibility_date.clone(),
+            compatibility_flags: pkg.compatibility_flags.clone(),
+            bindings: pkg.bindings.clone(),
+            var_values: pkg.var_values.clone(),
+            crons: pkg.crons.clone(),
+            queue_consumers: pkg.queue_consumers.clone(),
+            streaming_tail_consumers: pkg.streaming_tail_consumers.clone(),
+            tail_consumers: pkg.tail_consumers.clone(),
+            observability: pkg.observability.clone(),
+            durable_object_classes: pkg.durable_object_classes.clone(),
+            workflows: pkg.workflows.clone(),
+            quotas: pkg.quotas.clone(),
+        }
     }
 
     /// Apply a packed worker dir: dedup identical versions by content
@@ -218,20 +242,9 @@ impl LocalState {
                     .ok_or("versions")?;
                 record.versions.remove(pos);
             }
-            record.versions.push(VersionRecord {
-                version_id: version_id.clone(),
-                artifact_digest: pkg.digest.clone(),
-                compatibility_date: pkg.compatibility_date.clone(),
-                compatibility_flags: pkg.compatibility_flags.clone(),
-                bindings: pkg.bindings.clone(),
-                var_values: pkg.var_values.clone(),
-                crons: pkg.crons.clone(),
-                queue_consumers: pkg.queue_consumers.clone(),
-                durable_object_classes: pkg.durable_object_classes.clone(),
-                workflows: pkg.workflows.clone(),
-                tail_consumers: pkg.tail_consumers.clone(),
-                quotas: pkg.quotas.clone(),
-            });
+            record
+                .versions
+                .push(Self::version_record(pkg, version_id.clone()));
         }
         record.active_version_id = Some(version_id.clone());
         Ok((version_id, pkg.digest.clone()))
@@ -338,6 +351,8 @@ impl LocalState {
                     .collect(),
                 crons: active.crons.clone(),
                 queue_consumers: active.queue_consumers.clone(),
+                observability: active.observability.clone(),
+                streaming_tail_consumers: active.streaming_tail_consumers.clone(),
                 durable_object_classes: active.durable_object_classes.clone(),
                 workflows: active.workflows.clone(),
                 tail_consumers: active.tail_consumers.clone(),
@@ -351,9 +366,10 @@ impl LocalState {
             tenants: vec![TenantDesired {
                 tenant_id: self.tenant_id.clone(),
                 workers,
+                flagship_apps: self.flagship_apps.clone(),
             }],
             deletions: vec![],
-})
+        })
     }
 
     pub fn worker_status(&self, quotas_enforced: bool) -> Vec<WorkerStatus> {
@@ -419,4 +435,120 @@ pub fn write_vars(root: &Path, vars: &BTreeMap<String, String>) -> Result<(), Lo
     let bytes = serde_json::to_vec(vars).map_err(|_| LocalError::State("vars"))?;
     vrt_securefs::atomic_write(&crate::layout::vars_file(root), &bytes, 0o600)
         .map_err(|_| LocalError::Layout("vars write"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snapshot_protocol::compute_desired::{ObservabilityDesired, TailConsumerDesired};
+
+    fn obs(rate_ppm: u32) -> ObservabilityDesired {
+        ObservabilityDesired {
+            enabled: true,
+            logs_enabled: true,
+            head_sampling_rate_ppm: rate_ppm,
+            invocation_logs: true,
+        }
+    }
+
+    fn tail(id: &str) -> TailConsumerDesired {
+        TailConsumerDesired {
+            worker_id: id.into(),
+        }
+    }
+
+    /// Minimal pack input — every version-scoped field at its empty
+    /// default so a test can change exactly one dimension.
+    fn pkg() -> crate::worker_pkg::PackedWorker {
+        crate::worker_pkg::PackedWorker {
+            name: "svc".into(),
+            digest: "a".repeat(64),
+            stored_document: Vec::new(),
+            compatibility_date: "2025-01-01".into(),
+            compatibility_flags: vec![],
+            bindings: vec![],
+            var_values: BTreeMap::new(),
+            crons: vec![],
+            queue_consumers: vec![],
+            tail_consumers: vec![],
+            observability: None,
+            streaming_tail_consumers: vec![],
+            flagship_apps: vec![],
+            durable_object_classes: vec![],
+            workflows: vec![],
+            hostnames: vec![],
+            quotas: WorkerQuotas::platform_default(),
+            first_deploy_id: "0123456789abcdef".into(),
+            pending_assets: None,
+        }
+    }
+
+    /// Regression for the root cause (#48/#51): version identity is
+    /// derived from the stored record's fields, so a deploy that
+    /// changes ONLY `observability` (or a tail-consumer list) mints a
+    /// new version instead of being deduped away by `apply_deploy`.
+    #[test]
+    fn version_id_covers_every_version_scoped_field() {
+        let base = pkg();
+        let base_id = LocalState::version_id(&base);
+
+        let mut rate = pkg();
+        rate.observability = Some(obs(500_000));
+        assert_ne!(base_id, LocalState::version_id(&rate), "sampling rate");
+
+        let mut gates = pkg();
+        gates.observability = Some(ObservabilityDesired {
+            enabled: false,
+            ..obs(1_000_000)
+        });
+        assert_ne!(base_id, LocalState::version_id(&gates), "enabled gate");
+
+        let mut tails = pkg();
+        tails.tail_consumers = vec![tail("w-consumer")];
+        assert_ne!(base_id, LocalState::version_id(&tails), "tail consumers");
+
+        let mut streaming = pkg();
+        streaming.streaming_tail_consumers = vec![tail("w-live")];
+        assert_ne!(
+            base_id,
+            LocalState::version_id(&streaming),
+            "streaming tail consumers"
+        );
+        assert_ne!(
+            LocalState::version_id(&tails),
+            LocalState::version_id(&streaming),
+            "the two channels must not alias"
+        );
+
+        let mut queues = pkg();
+        queues.queue_consumers = vec![snapshot_protocol::compute_desired::QueueConsumerDesired {
+            queue_id: "q-1".into(),
+            queue_name: "q".into(),
+            dead_letter_queue_id: None,
+            max_batch_size: None,
+            max_batch_timeout_secs: None,
+            max_retries: None,
+            retry_delay_secs: None,
+            max_concurrency: None,
+        }];
+        assert_ne!(base_id, LocalState::version_id(&queues), "queue consumers");
+
+        // And identity is a pure function of the record (no clock).
+        assert_eq!(base_id, LocalState::version_id(&pkg()));
+    }
+
+    /// Downgrade compatibility: a newer cell may persist fields an
+    /// older build does not know. `VersionRecord` must ignore them
+    /// instead of failing the whole state decode (which would brick
+    /// the tenant on rollback).
+    #[test]
+    fn version_record_ignores_unknown_fields() {
+        let mut value =
+            serde_json::to_value(LocalState::version_record(&pkg(), "vrt_test".into())).unwrap();
+        value["futureKnob"] = serde_json::json!({"x": 1});
+        let raw = serde_json::to_vec(&value).unwrap();
+        let rec: VersionRecord =
+            serde_json::from_slice(&raw).expect("unknown version field must be ignored");
+        assert_eq!(rec.version_id, "vrt_test");
+    }
 }

@@ -251,9 +251,11 @@ mod tests {
             routes: Vec::new(),
             crons: Vec::new(),
             queue_consumers: Vec::new(),
+                        observability: None,
             durable_object_classes: Vec::new(),
             workflows: Vec::new(),
             tail_consumers: Vec::new(),
+            streaming_tail_consumers: Vec::new(),
             quotas: WorkerQuotas {
                 cpu_ms: 10,
                 memory_mb: 32,
@@ -267,6 +269,7 @@ mod tests {
         TenantDesired {
             tenant_id: "team-a".to_string(),
             workers: ids.iter().map(|id| w(id)).collect(),
+            flagship_apps: Vec::new(),
         }
     }
 

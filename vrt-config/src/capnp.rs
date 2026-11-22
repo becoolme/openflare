@@ -279,6 +279,12 @@ pub struct RuntimeParams {
     /// emitted and `caches.*` throws `No Cache was configured`
     /// (explicit failure, never silent success).
     pub cache_addr: String,
+    /// AE: this tenant's Analytics Engine ingest socket
+    /// `--external-addr` target (`unix:<path>`). Empty ⇒ a tenant
+    /// declaring `analyticsEngine` bindings fails the whole render
+    /// closed — an unbound dataset external would resolve to nothing
+    /// and `writeDataPoint()` would fail silently inside workerd.
+    pub ae_addr: String,
     /// PT1: watchdog heartbeat unix socket path INSIDE `socket_dir`.
     /// Non-empty ⇒ emit the `vrt-heartbeat` service + its private
     /// socket; empty ⇒ byte-identical legacy render (no heartbeat).
@@ -425,7 +431,7 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         if !service_names.insert(worker_service_name(&worker.worker_id)) {
             return Err(ConfigError::ServiceReference("services"));
         }
-        if input.params.log_tail.enabled()
+        if collects_logs(worker, input.params)
             && !service_names.insert(crate::logs::tail_service_name(&worker.worker_id))
         {
             return Err(ConfigError::ServiceReference("services"));
@@ -496,6 +502,14 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         && input.params.do_storage_dir.is_empty()
     {
         return Err(ConfigError::Identifier("doStorageDir"));
+    }
+
+    // AE: `analyticsEngine` bindings need the tenant ingest socket —
+    // without it the dataset-named `external` service would have no
+    // `--external-addr` and workerd could not resolve the designator
+    // (fail closed at assemble depth, same as `doStorageDir`).
+    if !ae_datasets(input.tenant).is_empty() && input.params.ae_addr.is_empty() {
+        return Err(ConfigError::Identifier("aeAddr"));
     }
 
     // W3-r2 P0: per-worker fault isolation. Every worker in a tenant
@@ -777,6 +791,19 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
             capnp_text(CACHE_SERVICE)
         ));
     }
+    // AE: one `external` service per DISTINCT dataset name — workerd
+    // copies the designator's service name into the event's `dataset`
+    // field (server/bindings.rs `engine.set_dataset(name)`), so the
+    // service must be named verbatim after the dataset. All of them
+    // resolve to this tenant's single AE ingest socket. Dataset
+    // charset `[A-Za-z0-9_]` can never collide with platform service
+    // names, which are all hyphenated (`worker-*`, `vrt-*`, `facade-*`).
+    for ds in ae_datasets(input.tenant) {
+        out.push_str(&format!(
+            "    (name = {}, external = (http = ())),\n",
+            capnp_text(ds)
+        ));
+    }
     out.push_str(&format!(
         "    (name = {}, network = (\n      allow = [\"public\"],\n      deny = [\"private\", \"local\", \"unix\", \"unix-abstract\"],\n      tlsOptions = (trustBrowserCas = true),\n    )),\n    (name = {}, network = (\n      allow = [\"local\"],\n      deny = [\"unix\", \"unix-abstract\"],\n    )),\n",
         capnp_text(OUTBOUND_NETWORK_SERVICE),
@@ -912,6 +939,12 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
                 v.push(ExternalAddr {
                     service: CACHE_SERVICE.into(),
                     address: input.params.cache_addr.clone(),
+                });
+            }
+            for ds in ae_datasets(input.tenant) {
+                v.push(ExternalAddr {
+                    service: ds.to_string(),
+                    address: input.params.ae_addr.clone(),
                 });
             }
             v
@@ -1300,7 +1333,7 @@ fn emit_tenant_worker(
     // is always first; user entries keep declaration order (validated
     // unique, resolved to same-tenant worker ids at pack time).
     let mut tails: Vec<String> = Vec::new();
-    if input.params.log_tail.enabled() {
+    if collects_logs(worker, input.params) {
         tails.push(crate::logs::tail_service_name(&worker.worker_id));
     }
     for tail in &worker.tail_consumers {
@@ -1333,12 +1366,48 @@ fn emit_tenant_worker(
         );
         out.push_str("],\n");
     }
+    // `streamingTails` designators: the worker's declared
+    // `streamingTailConsumers` — same same-tenant resolution rule as
+    // `tails`, but consumers get TailStream events via `tailStream()`
+    // instead of batched `tail()` calls.
+    if !worker.streaming_tail_consumers.is_empty() {
+        let mut names: Vec<String> = Vec::new();
+        for consumer in &worker.streaming_tail_consumers {
+            if !input
+                .tenant
+                .workers
+                .iter()
+                .any(|w| w.worker_id == consumer.worker_id)
+            {
+                return Err(ConfigError::Identifier("streamingTailConsumers.workerId"));
+            }
+            names.push(worker_service_name(&consumer.worker_id));
+        }
+        let designators = names
+            .iter()
+            .map(|n| format!("(name = {})", capnp_text(n)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("      streamingTails = [{designators}],\n"));
+    }
     out.push_str(&format!(
         "      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
         capnp_text(&input.params.egress.service),
         capnp_text(&input.params.egress.entrypoint),
     ));
     Ok(())
+}
+
+/// Whether this worker gets a `vrt-tail` collector: platform-wide log
+/// collection AND the worker's own `[observability]` gates
+/// (`enabled`/`logs.enabled` false => no collector, CF semantics).
+fn collects_logs(worker: &WorkerDesired, params: &RuntimeParams) -> bool {
+    params.log_tail.enabled()
+        && !worker
+            .observability
+            .as_ref()
+            .map(|o| !o.enabled || !o.logs_enabled)
+            .unwrap_or(false)
 }
 
 /// Emit the platform-owned `vrt-tail-<workerId>` collector for one
@@ -1351,18 +1420,51 @@ fn emit_tail_worker(
     worker: &WorkerDesired,
     input: &TenantRenderInput<'_>,
 ) -> Result<(), ConfigError> {
+    // `[observability]` gates — `enabled`/`logs.enabled` false means
+    // NO collector at all (CF: nothing is emitted or collected). Runs
+    // before the pepper check: a disabled worker must not fail a
+    // missing-pepper render.
+    if worker
+        .observability
+        .as_ref()
+        .map(|o| !o.enabled || !o.logs_enabled)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
     if input.params.log_tail.pepper.is_empty() {
         return Err(ConfigError::Identifier("logTailPepper"));
     }
     let token = crate::logs::log_token(&input.params.log_tail.pepper, &worker.worker_id);
+    // OBS carries the sampling/gate settings the collector applies
+    // per-invocation; absent `observability` renders no binding and
+    // the JS defaults (rate 1, invocation logs on) keep legacy
+    // renders byte-identical.
+    let obs_binding = worker
+        .observability
+        .as_ref()
+        .map(|o| {
+            format!(
+                "        (name = \"OBS\", text = {}),\n",
+                capnp_text(
+                    &json!({
+                        "headSamplingRate": o.head_sampling_rate_ppm as f64 / 1e6,
+                        "invocationLogs": o.invocation_logs,
+                    })
+                    .to_string()
+                )
+            )
+        })
+        .unwrap_or_default();
     out.push_str(&format!(
-        "    (name = {}, worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = \"vrt-tail.mjs\", esModule = {}),\n      ],\n      bindings = [\n        (name = \"SINK\", service = {}),\n        (name = \"WORKER_ID\", text = {}),\n        (name = \"TOKEN\", text = {}),\n      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
+        "    (name = {}, worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = \"vrt-tail.mjs\", esModule = {}),\n      ],\n      bindings = [\n        (name = \"SINK\", service = {}),\n        (name = \"WORKER_ID\", text = {}),\n        (name = \"TOKEN\", text = {}),\n{}      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
         capnp_text(&crate::logs::tail_service_name(&worker.worker_id)),
         capnp_text(&input.params.system_compat_date),
         capnp_text(crate::logs::TAIL_WORKER_JS),
         capnp_text(crate::logs::LOGSINK_SERVICE),
         capnp_text(&worker.worker_id),
         capnp_text(&token),
+        obs_binding,
         capnp_text(&input.params.deny_outbound.service),
         capnp_text(&input.params.deny_outbound.entrypoint),
     ));
@@ -1577,6 +1679,19 @@ fn emit_binding(
                 &pg.name,
             )?;
         }
+        BindingDesired::AnalyticsEngine(ae) => {
+            // `analyticsEngine` (@17 :ServiceDesignator) — the
+            // designator NAME becomes the event's `dataset` field
+            // (workerd `engine.set_dataset(designator.get_name())`),
+            // so the dataset-named `external` service emitted above is
+            // the verbatim target. `$experimental`-gated upstream —
+            // assemble derives `--experimental` from the binding.
+            out.push_str(&format!(
+                "        (name = {}, analyticsEngine = {}),\n",
+                capnp_text(&ae.name),
+                capnp_text(&ae.dataset),
+            ));
+        }
         BindingDesired::WorkerLoader(loader) => {
             // workerLoader is `$experimental`-gated upstream — assemble
             // adds `--experimental` to argv when a tenant declares one.
@@ -1589,6 +1704,36 @@ fn emit_binding(
                 "        (name = {}, workerLoader = (maxWorkers = {})),\n",
                 capnp_text(&loader.name),
                 WORKER_LOADER_MAX_WORKERS,
+            ));
+        }
+        BindingDesired::UnsafeEval(u) => {
+            // CF `unsafe.bindings[type="unsafe_eval"]` — workerd's
+            // native `unsafeEval` (@23 :Void): `env.<name>` is the
+            // `UnsafeEval` object (`.eval`/`.newFunction`/
+            // `.newWasmModule`); global eval stays blocked in handlers.
+            out.push_str(&format!(
+                "        (name = {}, unsafeEval = void),\n",
+                capnp_text(&u.name),
+            ));
+        }
+        BindingDesired::Flagship(f) => {
+            // CF `[[flagship]]` — `env.<name>` is the async Flagship
+            // evaluation API. Rendered as a `wrapped` binding over the
+            // `cloudflare-internal:flagship` internal module; the
+            // app's serialized flag config rides the `config`
+            // innerBinding so evaluation stays inside the isolate
+            // (Flagship semantics: no central-service round trip).
+            let app = input
+                .tenant
+                .flagship_apps
+                .iter()
+                .find(|a| a.app_id == f.app_id)
+                .ok_or(ConfigError::UnresolvedReference("flagshipAppId"))?;
+            out.push_str(&format!(
+                "        (name = {}, wrapped = (\n          moduleName = {},\n          innerBindings = [(\n            name = \"config\",\n            json = {}\n          )],\n        )),\n",
+                capnp_text(&f.name),
+                capnp_text("cloudflare-internal:flagship"),
+                capnp_text(&app.config),
             ));
         }
     }
@@ -1955,6 +2100,23 @@ fn emit_system_worker(
 /// `worker-<workerId>` capnp service name.
 fn worker_service_name(worker_id: &str) -> String {
     format!("worker-{worker_id}")
+}
+
+/// Sorted unique dataset names across a tenant's `analyticsEngine`
+/// bindings — one `external` service + one `--external-addr` entry per
+/// distinct name (the designator name doubles as the event `dataset`).
+fn ae_datasets(tenant: &TenantDesired) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    for worker in &tenant.workers {
+        for binding in &worker.bindings {
+            if let BindingDesired::AnalyticsEngine(ae) = binding {
+                out.push(ae.dataset.as_str());
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 /// P3c-1: `do-storage-<workerId>` capnp service name — the worker's
@@ -2628,6 +2790,21 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
         for binding in &worker.bindings {
             if !valid_binding_name(binding.name()) || !names.insert(binding.name()) {
                 return Err(ConfigError::Identifier("bindingName"));
+            }
+            // AE: `dataset` becomes an `--external-addr` service token
+            // AND a spool/parquet path segment — the `[A-Za-z0-9_]`
+            // bound must hold at emit depth too (defense-in-depth
+            // behind compute.desired validation).
+            if let BindingDesired::AnalyticsEngine(ae) = binding {
+                if ae.dataset.is_empty()
+                    || ae.dataset.len() > 256
+                    || !ae
+                        .dataset
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err(ConfigError::Identifier("bindings.dataset"));
+                }
             }
         }
         // P3c-1: DO class declarations — format + uniqueness at emit

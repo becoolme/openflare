@@ -19,8 +19,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Default ingress bind — loopback only; dev never listens publicly.
-const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
+/// Default ingress bind — IPv4 loopback only; dev never listens
+/// publicly. The port-only and no-`[dev]` paths derive from the same
+/// (IP, PORT) pair so they cannot drift apart.
+const DEFAULT_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+/// CF `[dev]` default port — same as `wrangler dev`.
+const DEFAULT_PORT: u16 = 8787;
+
+fn default_listen() -> String {
+    std::net::SocketAddr::new(DEFAULT_IP, DEFAULT_PORT).to_string()
+}
 /// Bound on waiting for `/readyz` after the children spawn.
 const READY_TIMEOUT: Duration = Duration::from_secs(90);
 /// File-watch poll cadence.
@@ -145,15 +153,26 @@ pub async fn start(opts: DevOptions) -> Result<DevSession, LocalError> {
     let root = worker_dir.join(".vrt");
     let local = ensure_root(&root, &opts, &runtime)?;
     let key = local.trusted_key()?;
-    let ports = DevPorts::alloc(&opts)?;
-
-    write_dev_configs(&root, &key, &runtime, &ports)?;
 
     // First deploy — also validates the worker dir before children
     // spawn, so config errors surface before "listening" prints.
-    let (meta, _src) =
+    let (meta, src) =
         crate::project_cfg::load_worker_meta_for_env(&worker_dir, opts.env_name.as_deref())?;
-    deploy_once(&local, &worker_dir, &meta, opts.env_name.as_deref())?;
+    // CF `[dev]` — session-local settings. Deploy accepted-and-dropped
+    // the table during normalize, so the strict parse runs here on the
+    // env-resolved config (wrangler sources); a native `vrt.toml`
+    // carries `dev` inside `WorkerToml` instead.
+    let dev_cfg = session_dev_table(&worker_dir, opts.env_name.as_deref(), &src, &meta)?;
+    let ports = DevPorts::alloc(&opts, dev_cfg.as_ref())?;
+
+    write_dev_configs(&root, &key, &runtime, &ports)?;
+    deploy_once(
+        &local,
+        &worker_dir,
+        &meta,
+        dev_cfg.as_ref(),
+        opts.env_name.as_deref(),
+    )?;
     let summary_bindings = binding_table(&meta);
     let worker_name = meta.name.clone();
 
@@ -337,32 +356,72 @@ fn redeploy(root: &Path, worker_dir: &Path, env_name: Option<&str>) {
             return;
         }
     };
-    let meta = match crate::project_cfg::load_worker_meta_for_env(worker_dir, env_name) {
-        Ok((m, _)) => m,
+    let (meta, src) = match crate::project_cfg::load_worker_meta_for_env(worker_dir, env_name) {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("dev: config reload failed: {e}");
             return;
         }
     };
-    match deploy_once(&local, worker_dir, &meta, env_name) {
+    let dev_cfg = match session_dev_table(worker_dir, env_name, &src, &meta) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("dev: [dev] reload failed: {e}");
+            return;
+        }
+    };
+    match deploy_once(&local, worker_dir, &meta, dev_cfg.as_ref(), env_name) {
         Ok(r) => eprintln!("dev: reloaded {} (version {})", meta.name, r.version_id),
         Err(e) => eprintln!("dev: redeploy failed: {e}"),
+    }
+}
+
+/// Resolve the `[dev]` table for this session: strictly parsed from
+/// the env-resolved wrangler config, or the `[dev]` section of a
+/// native `vrt.toml`. Both run on the dev entry only — the shared
+/// deploy path accepts-and-drops the table untouched.
+fn session_dev_table(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+    src: &crate::project_cfg::MetaSource,
+    meta: &crate::WorkerToml,
+) -> Result<Option<crate::worker_pkg::DevToml>, LocalError> {
+    match src {
+        crate::project_cfg::MetaSource::VrtToml => Ok(meta.dev.clone()),
+        crate::project_cfg::MetaSource::Wrangler(_) => {
+            crate::project_cfg::load_dev_table_for_env(worker_dir, env_name)
+        }
     }
 }
 
 /// Apply `.dev.vars` then deploy. Keys declared in `[secrets]` fill
 /// their secret refs (values never hit argv/logs); everything else
 /// merges into vars — matching wrangler's `.dev.vars` semantics.
+/// `dev.host` rides `DeployOverrides.hostnames` so the route actually
+/// reaches desired state — mutating the in-memory meta alone never
+/// leaves the session summary.
 fn deploy_once(
     local: &crate::VrtLocal,
     worker_dir: &Path,
     meta: &crate::WorkerToml,
+    dev: Option<&crate::worker_pkg::DevToml>,
     env_name: Option<&str>,
 ) -> Result<crate::DeployResult, LocalError> {
     let mut overrides = crate::worker_pkg::DeployOverrides {
         env_name: env_name.map(str::to_owned),
         ..Default::default()
     };
+    if let Some(host) = dev.and_then(|d| d.host.as_ref()) {
+        if !snapshot_protocol::compute_desired::valid_hostname(host) {
+            return Err(LocalError::Op(
+                "dev",
+                "dev.host must be a lowercase hostname with at least two labels".into(),
+            ));
+        }
+        if !meta.hostnames.iter().any(|h| h == host) {
+            overrides.hostnames.push(host.clone());
+        }
+    }
     let dev_vars_path = worker_dir.join(".dev.vars");
     if dev_vars_path.is_file() {
         let text = std::fs::read_to_string(&dev_vars_path)
@@ -708,11 +767,33 @@ struct DevPorts {
 }
 
 impl DevPorts {
-    fn alloc(opts: &DevOptions) -> Result<Self, LocalError> {
+    fn alloc(
+        opts: &DevOptions,
+        dev: Option<&crate::worker_pkg::DevToml>,
+    ) -> Result<Self, LocalError> {
+        // `--listen` wins over `[dev]` (same precedence as wrangler's
+        // `--ip`/`--port` flags over the config table); `[dev]` wins
+        // over the default.
+        // SocketAddr::new renders v6 literals bracketed (`[::1]:8787`),
+        // which `SocketAddr::parse` round-trips — `format!("{ip}:{port}")`
+        // would produce the unbindable `::1:8787`.
+        let dev_listen = match dev {
+            Some(d) if d.ip.is_some() || d.port.is_some() => {
+                let ip: std::net::IpAddr =
+                    d.ip.as_deref()
+                        .map(|s| s.parse())
+                        .transpose()
+                        .map_err(|_| LocalError::Op("dev", "dev.ip must be an IP address".into()))?
+                        .unwrap_or(DEFAULT_IP);
+                Some(std::net::SocketAddr::new(ip, d.port.unwrap_or(DEFAULT_PORT)).to_string())
+            }
+            _ => None,
+        };
         let listen = opts
             .listen
             .clone()
-            .unwrap_or_else(|| DEFAULT_LISTEN.to_string());
+            .or(dev_listen)
+            .unwrap_or_else(default_listen);
         // Fail fast on a busy user-facing port; internals race-safe.
         let listen_addr: std::net::SocketAddr = listen
             .parse()
@@ -1034,10 +1115,88 @@ mod tests {
             listen: Some("0.0.0.0:8787".into()),
             ..base
         };
-        assert!(DevPorts::alloc(&o).is_err(), "non-loopback must refuse");
+        assert!(
+            DevPorts::alloc(&o, None).is_err(),
+            "non-loopback must refuse"
+        );
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let busy = held.local_addr().unwrap().to_string();
         o.listen = Some(busy);
-        assert!(DevPorts::alloc(&o).is_err(), "busy port must refuse");
+        assert!(DevPorts::alloc(&o, None).is_err(), "busy port must refuse");
+    }
+
+    #[test]
+    fn dev_table_listen_precedence() {
+        use crate::worker_pkg::DevToml;
+        let dev = |ip: Option<&str>, port: Option<u16>| {
+            Some(DevToml {
+                ip: ip.map(str::to_string),
+                port,
+                host: None,
+            })
+        };
+        let opts = DevOptions::default();
+        // `[dev]` wins over the default.
+        let ports = DevPorts::alloc(&opts, dev(None, Some(0)).as_ref())
+            .expect("dev port-only must allocate");
+        assert!(ports.listen.starts_with("127.0.0.1:"), "{}", ports.listen);
+        // `--listen` wins over `[dev]` (wrangler flag-over-config order).
+        let opts = DevOptions {
+            listen: Some("127.0.0.1:0".into()),
+            ..DevOptions::default()
+        };
+        let ports = DevPorts::alloc(&opts, dev(Some("127.0.0.2"), Some(9999)).as_ref())
+            .expect("explicit --listen must allocate");
+        assert!(ports.listen.starts_with("127.0.0.1:"), "{}", ports.listen);
+        // A `[dev]` public bind is refused by the same loopback gate.
+        assert!(
+            DevPorts::alloc(&DevOptions::default(), dev(Some("0.0.0.0"), None).as_ref()).is_err()
+        );
+        // IPv6 loopback binds as a bracketed SocketAddr, not the
+        // unparseable `::1:PORT` a naive `format!("{ip}:{port}")` made.
+        let ports = DevPorts::alloc(&DevOptions::default(), dev(Some("::1"), None).as_ref())
+            .expect("v6 loopback must allocate");
+        assert!(ports.listen.starts_with("[::1]:"), "{}", ports.listen);
+    }
+
+    /// `dev.host` must reach desired state: deploy_once pushes it onto
+    /// `DeployOverrides.hostnames`, which assemble merges into the
+    /// routed list — the deployed `WorkerStatus.hostnames` proves the
+    /// route exists, not just a mutated in-memory meta.
+    #[test]
+    fn dev_host_reaches_deployed_hostnames() {
+        let dir = tmpdir();
+        let root = dir.join(".vrt");
+        crate::VrtLocal::init(
+            &root,
+            &crate::InitParams {
+                cell_id: "local".into(),
+                tenant_id: "local".into(),
+                facade_manifest: None,
+                facade_dist_root: None,
+                max_versions_per_worker: None,
+            },
+        )
+        .unwrap();
+        let local = crate::VrtLocal::open(&root).unwrap();
+        let wdir = dir.join("worker");
+        std::fs::create_dir_all(&wdir).unwrap();
+        std::fs::write(
+            wdir.join("wrangler.toml"),
+            "name = \"svc\"\nmain = \"main.js\"\ncompatibility_date = \"2025-01-01\"\n\n[dev]\nhost = \"dev.example.com\"\n",
+        )
+        .unwrap();
+        std::fs::write(wdir.join("main.js"), "export default {}\n").unwrap();
+        let (meta, src) = crate::project_cfg::load_worker_meta_for_env(&wdir, None).unwrap();
+        let dev_cfg = session_dev_table(&wdir, None, &src, &meta).unwrap();
+        deploy_once(&local, &wdir, &meta, dev_cfg.as_ref(), None).unwrap();
+        let st = local.status().unwrap();
+        let w = st.workers.iter().find(|w| w.name == "svc").unwrap();
+        assert!(
+            w.hostnames.iter().any(|h| h == "dev.example.com"),
+            "dev.host must reach deployed routes: {:?}",
+            w.hostnames
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -59,6 +59,21 @@ use snapshot_protocol::compute_desired::{
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// One `rules[]` entry — `{type, globs, fallthrough?}`. `type` holds
+/// the wrangler `ConfigModuleRuleType` spelling (`ESModule`, ...);
+/// validated against the supported set at pack time (vrt.toml authors
+/// it natively, wrangler sources arrive already normalized).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModuleRuleToml {
+    #[serde(rename = "type")]
+    pub(crate) ty: String,
+    #[serde(default)]
+    pub(crate) globs: Vec<String>,
+    #[serde(default)]
+    pub(crate) fallthrough: Option<bool>,
+}
+
 /// vrt.toml document (deny_unknown_fields — a typo must fail closed).
 /// pub(crate) — `project_cfg` synthesizes this shape from wrangler
 /// sources through the identical deserialize path.
@@ -73,6 +88,15 @@ pub struct WorkerToml {
     /// Explicit `path → type` overrides/additions.
     #[serde(default)]
     pub(crate) modules: BTreeMap<String, String>,
+    /// CF `rules` — ordered `{type, globs, fallthrough?}` module-typing
+    /// rules (wrangler sources; native `vrt.toml` may declare the same
+    /// shape). Evaluated per file before the extension table.
+    #[serde(default)]
+    pub(crate) module_rules: Vec<ModuleRuleToml>,
+    /// CF `base_dir` — the directory rule globs are evaluated against
+    /// (CF `moduleRoot`). Default = the `main` directory at pack time.
+    #[serde(default)]
+    pub(crate) base_dir: Option<String>,
     #[serde(default)]
     pub(crate) vars: BTreeMap<String, String>,
     #[serde(default)]
@@ -87,6 +111,18 @@ pub struct WorkerToml {
     /// is a display name, queueId is derived at pack time as `vrt-q:{tenant}:{name}`).
     #[serde(default)]
     pub(crate) queue_consumers: Vec<QueueConsumerToml>,
+    /// `[observability]` — normalized `{enabled, logsEnabled,
+    /// invocationLogs, headSamplingRate}`; gates the platform
+    /// `vrt-tail` collector and head sampling at render time.
+    #[serde(default)]
+    pub(crate) observability:
+        Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// `streamingTailConsumers` — same `{service}`-by-name shape as
+    /// `tailConsumers`, but the consumer receives TailStream events
+    /// via `tailStream()` instead of batched `tail()` calls (CF
+    /// `streaming_tail_consumers`; workerd `streamingTails`).
+    #[serde(default)]
+    pub(crate) streaming_tail_consumers: Vec<TailConsumerToml>,
     /// P3c-1: `durableObjectBindings` -- DO namespace bindings
     /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
@@ -107,6 +143,26 @@ pub struct WorkerToml {
     /// T21: `[assets]` directory declaration.
     #[serde(default)]
     pub(crate) assets: Option<AssetsToml>,
+    /// CF `[dev]` — wrangler dev-server settings (`ip`/`port`/`host`),
+    /// consumed by `vrt dev` for the loopback ingress; never part of
+    /// the desired state (dev-tooling config, not runtime semantics).
+    #[serde(default)]
+    pub(crate) dev: Option<DevToml>,
+}
+
+/// `[dev]` — wrangler dev-server settings (`vrt dev` only).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DevToml {
+    /// Loopback ingress IP (`localhost` normalizes to 127.0.0.1).
+    #[serde(default)]
+    pub(crate) ip: Option<String>,
+    /// Loopback ingress port.
+    #[serde(default)]
+    pub(crate) port: Option<u16>,
+    /// Extra hostname registered for the dev session (CF `dev.host`).
+    #[serde(default)]
+    pub(crate) host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +200,15 @@ pub(crate) struct BindingsToml {
     /// points at no resource (the tenant supplies the code at runtime).
     #[serde(default)]
     pub(crate) worker_loaders: Vec<String>,
+    /// CF `[[unsafe.bindings]] type="unsafe_eval"` — binding names only;
+    /// each renders as workerd's native `unsafeEval` capability.
+    #[serde(default)]
+    pub(crate) unsafe_evals: Vec<String>,
+    /// CF `[[flagship]]` — `binding name -> app_id` (the app record
+    /// lives tenant-side: standalone resolves it in `flagship.json`,
+    /// the platform in the Flagship app store).
+    #[serde(default)]
+    pub(crate) flagship: BTreeMap<String, String>,
 }
 
 /// `[bindings].ratelimit.<name>` normalized shape.
@@ -466,6 +531,12 @@ pub struct PackedWorker {
     pub crons: Vec<CronDesired>,
     /// T37b: desired queue consumers (queueId already resolved).
     pub queue_consumers: Vec<snapshot_protocol::compute_desired::QueueConsumerDesired>,
+    /// `[observability]` — version-scoped like `tail_consumers`:
+    /// rollback restores the earlier collection gates.
+    pub observability: Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// Desired streaming tail consumers — same resolution rule as
+    /// `tail_consumers`, rendered to `streamingTails` instead of `tails`.
+    pub streaming_tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
     /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
@@ -485,6 +556,11 @@ pub struct PackedWorker {
     /// T21: assets to materialize into the local asset store before
     /// the publish commits (`None` when no `[assets]` dir declared).
     pub pending_assets: Option<PendingAssets>,
+    /// Flagship app definitions the deploy carries — merged into the
+    /// tenant's `state.flagship_apps` at commit (file-provided apps
+    /// overwrite same-id entries; apps bound but undefined get an
+    /// empty `{"flags":{}}` config so every binding resolves).
+    pub flagship_apps: Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>,
 }
 
 /// T21: assets scanned at pack time — the deploy writes objects +
@@ -801,6 +877,10 @@ pub struct Gathered {
     pub skipped: Vec<String>,
     /// `[assets] dir` packed content (None when undeclared).
     pub pending_assets: Option<PendingAssets>,
+    /// `flagship.json` — the standalone flag store (CF's local flag
+    /// store analog): validated `FlagshipAppDesired`s, `None` when the
+    /// project ships no file.
+    pub flagship_apps: Option<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>>,
 }
 
 /// Collect `worker_dir` into a [`Gathered`]: meta normalization,
@@ -875,7 +955,62 @@ pub fn gather_dir_for_env(
         files,
         skipped,
         pending_assets,
+        flagship_apps: gather_flagship_apps(worker_dir)?,
     })
+}
+
+/// `flagship.json` cap — a standalone flag store stays small;
+/// oversized input fails before parse.
+const MAX_FLAGSHIP_FILE_BYTES: u64 = 256 * 1024;
+
+/// Read + validate `<worker_dir>/flagship.json` — the standalone flag
+/// store, the analog of CF's local flag store for `wrangler dev` (an
+/// app entry supplies the config the `cloudflare-internal:flagship`
+/// module receives; absent file → no store, `None`).
+fn gather_flagship_apps(
+    worker_dir: &Path,
+) -> Result<
+    Option<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>>,
+    LocalError,
+> {
+    let raw = match std::fs::read(worker_dir.join("flagship.json")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(LocalError::Worker("flagship.json")),
+    };
+    if raw.len() as u64 > MAX_FLAGSHIP_FILE_BYTES {
+        return Err(LocalError::Worker("flagship.json size"));
+    }
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_slice(&raw).map_err(|_| LocalError::Worker("flagship.json"))?;
+    build_flagship_apps(&map).map(Some)
+}
+
+/// `{<appId>: {accountTag?, flags}}` → validated
+/// `FlagshipAppDesired`s — shared by the local `flagship.json` gather
+/// and the remote upload body. The appId lands inside the serialized
+/// config so the module sees a self-describing document.
+pub fn build_flagship_apps(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>, LocalError> {
+    let mut apps = Vec::with_capacity(map.len());
+    for (app_id, body) in map {
+        let mut config = body
+            .as_object()
+            .cloned()
+            .ok_or(LocalError::Worker("flagship.json app"))?;
+        config.insert("appId".into(), serde_json::Value::from(app_id.clone()));
+        let config = serde_json::to_string(&serde_json::Value::Object(config))
+            .map_err(|_| LocalError::Worker("flagship.json"))?;
+        snapshot_protocol::compute_desired::validate_flagship_config(&config)
+            .map_err(|_| LocalError::Worker("flagship.json flag model"))?;
+        apps.push(snapshot_protocol::compute_desired::FlagshipAppDesired {
+            app_id: app_id.clone(),
+            config,
+        });
+    }
+    apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+    Ok(apps)
 }
 
 /// Validate a [`Gathered`] into a [`PackedWorker`]. Everything the
@@ -893,6 +1028,7 @@ pub fn assemble(
         mut meta,
         files,
         pending_assets: gathered_assets,
+        flagship_apps: gathered_flagship_apps,
         ..
     } = g;
     // Caller-side non-secret var overrides (`--var`, `.dev.vars`).
@@ -1043,6 +1179,14 @@ pub fn assemble(
                 period: config.period,
             }));
         }
+        for (binding, app_id) in &b.flagship {
+            bindings.push(BindingDesired::Flagship(
+                snapshot_protocol::compute_desired::FlagshipBinding {
+                    name: binding.clone(),
+                    app_id: app_id.clone(),
+                },
+            ));
+        }
         for (binding, target) in &b.service {
             let worker_id =
                 resolve_worker(target.service()).ok_or(LocalError::Worker("service target"))?;
@@ -1077,6 +1221,13 @@ pub fn assemble(
         for binding in &b.worker_loaders {
             bindings.push(BindingDesired::WorkerLoader(
                 snapshot_protocol::compute_desired::WorkerLoaderBinding {
+                    name: binding.clone(),
+                },
+            ));
+        }
+        for binding in &b.unsafe_evals {
+            bindings.push(BindingDesired::UnsafeEval(
+                snapshot_protocol::compute_desired::UnsafeEvalBinding {
                     name: binding.clone(),
                 },
             ));
@@ -1121,6 +1272,35 @@ pub fn assemble(
             retry_delay_secs: c.retry_delay_seconds,
             max_concurrency: c.max_concurrency,
         });
+    }
+
+    // `tailConsumers` / `streamingTailConsumers` — same name→id rule
+    // as `[bindings.service]`: the consumer is a sibling worker of
+    // THIS tenant/project, and an unresolvable name fails closed
+    // (never a dangling trace target). Both lists share one resolver
+    // so the self-target, dedupe and cap invariants cannot drift.
+    let tail_consumers =
+        resolve_tail_consumers(&meta.tail_consumers, &name, "tail_consumers", resolve_worker)?;
+    let streaming_tail_consumers = resolve_tail_consumers(
+        &meta.streaming_tail_consumers,
+        &name,
+        "streaming_tail_consumers",
+        resolve_worker,
+    )?;
+    // One consumer cannot appear on both channels: workerd would call
+    // its `tail()` AND `tailStream()` for the same event, doubling
+    // delivery with no way for the consumer to tell the copies apart.
+    // The signed-desired validator enforces the same rule on delivered
+    // snapshots; this is the fail-early config error.
+    if let Some(dup) = tail_consumers.iter().find(|c| {
+        streaming_tail_consumers
+            .iter()
+            .any(|s| s.worker_id == c.worker_id)
+    }) {
+        return Err(LocalError::WorkerOwned(format!(
+            "worker {} cannot be both a tail consumer and a streaming tail consumer",
+            dup.worker_id
+        )));
     }
 
     // Deterministic worker-id material: hash the worker name so a
@@ -1317,39 +1497,6 @@ pub fn assemble(
         }
     }
 
-    // Tail Workers (`tail_consumers`): resolve each service name inside
-    // this tenant. A miss (never deployed / typo) fails the deploy now —
-    // a dangling workerd `tails` designator would fail the whole config
-    // load at generation start, and a silently dropped consumer would
-    // lose events. Self-reference is rejected: CF documents tail
-    // consumers as watching OTHER Workers, and a self-tail has no
-    // documented recursion bound. Duplicates collapse to the first
-    // occurrence (order is preserved for deterministic rendering).
-    let mut tail_consumers = Vec::new();
-    {
-        use snapshot_protocol::compute_desired::{
-            TailConsumerDesired, MAX_TAIL_CONSUMERS_PER_WORKER,
-        };
-        let mut seen = std::collections::BTreeSet::new();
-        for consumer in &meta.tail_consumers {
-            if consumer.service == name {
-                return Err(LocalError::Worker(
-                    "tail_consumers service must be another worker",
-                ));
-            }
-            let target = resolve_worker(&consumer.service)
-                .ok_or(LocalError::Worker("tail_consumers service target"))?;
-            if seen.insert(target.clone()) {
-                tail_consumers.push(TailConsumerDesired { worker_id: target });
-            }
-        }
-        if tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
-            return Err(LocalError::Worker(
-                "tail_consumers at most 16 consumers per worker",
-            ));
-        }
-    }
-
     // T21: `[assets] dir` — pack the directory into the local
     // content-addressed store (materialized by `Local::deploy`; the
     // binding references the manifest digest it produced).
@@ -1380,6 +1527,31 @@ pub fn assemble(
     let mut hostnames = meta.hostnames.clone();
     hostnames.extend(overrides.hostnames.iter().cloned());
 
+    // Flagship: every bound `app_id` must resolve to an app — CF's
+    // local flag store starts empty and evaluations return defaults,
+    // so a bound app with no definitions synthesizes an empty
+    // `{"flags":{}}` config rather than failing the deploy.
+    let mut flagship_apps = gathered_flagship_apps.unwrap_or_default();
+    {
+        let mut have: std::collections::HashSet<String> =
+            flagship_apps.iter().map(|a| a.app_id.clone()).collect();
+        for b in &bindings {
+            if let BindingDesired::Flagship(f) = b {
+                if have.insert(f.app_id.clone()) {
+                    flagship_apps.push(snapshot_protocol::compute_desired::FlagshipAppDesired {
+                        app_id: f.app_id.clone(),
+                        config: format!(
+                            "{{\"appId\":{},\"flags\":{{}}}}",
+                            serde_json::to_string(&f.app_id)
+                                .map_err(|_| LocalError::Worker("flagship appId"))?
+                        ),
+                    });
+                }
+            }
+        }
+        flagship_apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+    }
+
     Ok(PackedWorker {
         name,
         digest: bundle.digest().to_string(),
@@ -1390,6 +1562,8 @@ pub fn assemble(
         var_values,
         crons: meta.crons,
         queue_consumers,
+        observability: meta.observability,
+        streaming_tail_consumers,
         durable_object_classes,
         workflows,
         tail_consumers,
@@ -1397,6 +1571,7 @@ pub fn assemble(
         quotas: normalize_quotas(meta.quotas)?,
         first_deploy_id: id_material[..16].to_string(),
         pending_assets,
+        flagship_apps,
     })
 }
 
@@ -1446,6 +1621,203 @@ fn type_for_extension(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// CF `ConfigModuleRuleType` → wire module type. `PythonModule` /
+/// `PythonRequirement` have no mapping (rejected at normalize; a
+/// native `moduleRules` carrying them fails here too).
+fn rule_type_to_module(ty: &str) -> Option<&'static str> {
+    match ty {
+        "ESModule" => Some("esModule"),
+        "CommonJS" => Some("commonJs"),
+        "CompiledWasm" => Some("wasm"),
+        "Text" => Some("text"),
+        "Data" => Some("data"),
+        _ => None,
+    }
+}
+
+/// CF wrangler implicit rules — appended AFTER user rules
+/// (`DEFAULT_MODULE_RULES` in `deployment-bundle/rules.ts`; JS types
+/// are intentionally absent — bundling is a wrangler-side concern and
+/// our extension table classifies them).
+const DEFAULT_MODULE_RULES: [(&str, &[&str]); 3] = [
+    ("Text", &["**/*.txt", "**/*.html", "**/*.sql"]),
+    ("Data", &["**/*.bin"]),
+    ("CompiledWasm", &["**/*.wasm", "**/*.wasm?module"]),
+];
+
+/// CF `parseRules`: user rules + implicit defaults, then per-type
+/// pruning — the first rule of a type without `fallthrough: true`
+/// completes that type; every later rule of the same type is dead and
+/// dropped (wrangler warns "does not have a fallback"; pruning keeps
+/// the semantics identical). Returns `(wire module type, globs)` in
+/// evaluation order.
+fn effective_module_rules(
+    rules: &[ModuleRuleToml],
+) -> Result<Vec<(&'static str, Vec<String>)>, LocalError> {
+    struct R {
+        module_ty: &'static str,
+        globs: Vec<String>,
+        fallthrough: bool,
+    }
+    let mut all: Vec<R> = Vec::with_capacity(rules.len() + DEFAULT_MODULE_RULES.len());
+    for r in rules {
+        let module_ty = rule_type_to_module(&r.ty).ok_or(LocalError::Worker("moduleRules type"))?;
+        for g in &r.globs {
+            if g.is_empty() || g.len() > 1024 || g.contains('\0') {
+                return Err(LocalError::Worker("moduleRules globs"));
+            }
+        }
+        all.push(R {
+            module_ty,
+            globs: r.globs.clone(),
+            fallthrough: r.fallthrough == Some(true),
+        });
+    }
+    for (ty, globs) in DEFAULT_MODULE_RULES {
+        all.push(R {
+            module_ty: rule_type_to_module(ty).unwrap(),
+            globs: globs.iter().map(|s| (*s).to_string()).collect(),
+            fallthrough: false,
+        });
+    }
+    let mut completed: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+    let mut out = Vec::with_capacity(all.len());
+    for r in all {
+        if completed.contains(r.module_ty) {
+            continue;
+        }
+        if !r.fallthrough {
+            completed.insert(r.module_ty);
+        }
+        out.push((r.module_ty, r.globs));
+    }
+    Ok(out)
+}
+
+/// Rule-eval root (CF `moduleRoot`): `base_dir` when declared, else
+/// the `main` directory — globs see paths relative to it, so an
+/// anchored `*.txt` only matches siblings of `main`.
+fn module_root(meta: &WorkerToml) -> Result<String, LocalError> {
+    if let Some(b) = &meta.base_dir {
+        // Re-prove at the pack boundary — a native vrt.toml can carry
+        // `baseDir` without normalize having seen it.
+        if b.is_empty()
+            || b.len() > 1024
+            || b.starts_with('/')
+            || b.contains('\\')
+            || b.contains('\0')
+            || b.contains(':')
+            || b.ends_with('/')
+            || b.split('/').any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(LocalError::Worker("baseDir"));
+        }
+        return Ok(b.clone());
+    }
+    Ok(match meta.main_module.rfind('/') {
+        Some(i) => meta.main_module[..i].to_string(),
+        None => String::new(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GlobTok {
+    Lit(char),
+    /// `*` — any run of non-`/` chars.
+    Star,
+    /// `**` between `/`s or string ends — any run incl. `/`, but it may
+    /// only stop at a segment boundary (mirrors
+    /// `((?:[^/]*(?:/|$))*)`).
+    Globstar,
+}
+
+/// Mirror of wrangler's `glob-to-regexp` ({globstar:true}, no
+/// `extended`): `*`/`**` are the only wildcards — `?`, `[...]`,
+/// `{a,b}` are LITERAL characters; `\` escapes the next char into a
+/// literal. Whole-string anchored match, memoized so `**` chains
+/// cannot backtrack exponentially.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let mut toks: Vec<GlobTok> = Vec::with_capacity(p.len());
+    let mut i = 0usize;
+    while i < p.len() {
+        match p[i] {
+            '*' => {
+                let start = i;
+                while p.get(i + 1) == Some(&'*') {
+                    i += 1;
+                }
+                let prev = if start == 0 { None } else { Some(p[start - 1]) };
+                let next = p.get(i + 1).copied();
+                if i + 1 - start > 1
+                    && (prev.is_none() || prev == Some('/'))
+                    && (next.is_none() || next == Some('/'))
+                {
+                    toks.push(GlobTok::Globstar);
+                    if next == Some('/') {
+                        i += 1;
+                    }
+                } else {
+                    toks.push(GlobTok::Star);
+                }
+            }
+            '\\' => {
+                i += 1;
+                toks.push(GlobTok::Lit(p.get(i).copied().unwrap_or('\\')));
+            }
+            c => toks.push(GlobTok::Lit(c)),
+        }
+        i += 1;
+    }
+    let s: Vec<char> = path.chars().collect();
+    let mut memo: std::collections::HashMap<(usize, usize), bool> =
+        std::collections::HashMap::new();
+    fn m(
+        toks: &[GlobTok],
+        ti: usize,
+        s: &[char],
+        si: usize,
+        memo: &mut std::collections::HashMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(&v) = memo.get(&(ti, si)) {
+            return v;
+        }
+        let v = match toks.get(ti) {
+            None => si == s.len(),
+            Some(GlobTok::Lit(c)) => s.get(si) == Some(c) && m(toks, ti + 1, s, si + 1, memo),
+            Some(GlobTok::Star) => {
+                let mut k = si;
+                let mut ok = false;
+                loop {
+                    if m(toks, ti + 1, s, k, memo) {
+                        ok = true;
+                        break;
+                    }
+                    match s.get(k) {
+                        Some(&ch) if ch != '/' => k += 1,
+                        _ => break,
+                    }
+                }
+                ok
+            }
+            Some(GlobTok::Globstar) => {
+                let mut ok = m(toks, ti + 1, s, si, memo);
+                let mut k = si + 1;
+                while !ok && k <= s.len() {
+                    if k == s.len() || s[k - 1] == '/' {
+                        ok = m(toks, ti + 1, s, k, memo);
+                    }
+                    k += 1;
+                }
+                ok
+            }
+        };
+        memo.insert((ti, si), v);
+        v
+    }
+    m(&toks, 0, &s, 0, &mut memo)
+}
+
 /// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`
 /// (reported via `skipped` so `--dry-run` can list them).
 /// Symlinks are rejected — a worker dir must be self-contained.
@@ -1486,6 +1858,45 @@ fn scan_dir(
         }
     }
     Ok(())
+}
+
+/// Resolve a `*Consumers[]` `{service}` list to workerIds — shared by
+/// `tail_consumers` and `streaming_tail_consumers` so the invariants
+/// cannot drift: a self-target is refused (a self `streamingTails`
+/// designator amplifies each invocation into another unboundedly, and
+/// a self `tails` edge has no documented recursion bound either),
+/// duplicates collapse on the declared name, and the resolved list
+/// stays within `MAX_TAIL_CONSUMERS_PER_WORKER` — the same bound the
+/// signed-desired validator re-checks.
+fn resolve_tail_consumers(
+    list: &[TailConsumerToml],
+    self_name: &str,
+    what: &str,
+    resolve_worker: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<snapshot_protocol::compute_desired::TailConsumerDesired>, LocalError> {
+    use snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER;
+    let mut out = Vec::with_capacity(list.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for c in list {
+        if c.service == self_name {
+            return Err(LocalError::WorkerOwned(format!(
+                "{what} service must be another worker"
+            )));
+        }
+        if !seen.insert(c.service.clone()) {
+            continue;
+        }
+        out.push(snapshot_protocol::compute_desired::TailConsumerDesired {
+            worker_id: resolve_worker(&c.service)
+                .ok_or_else(|| LocalError::WorkerOwned(format!("{what} service target")))?,
+        });
+    }
+    if out.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+        return Err(LocalError::WorkerOwned(format!(
+            "{what} at most {MAX_TAIL_CONSUMERS_PER_WORKER} consumers per worker"
+        )));
+    }
+    Ok(out)
 }
 
 /// P3c-1: JS identifier check (class names and binding names follow the same rule --
@@ -1592,6 +2003,18 @@ fn build_pack_json(
     let mut declared = meta.modules.clone();
     let mut typed: BTreeMap<String, String> = BTreeMap::new();
     let mut total: u64 = 0;
+    // CF `rules`: effective ordered rules (user + implicit defaults,
+    // per-type pruning) classify each gathered file by glob against
+    // the module root (`base_dir` ?? `main` dir). The entry is never
+    // rule-typed — on CF it is the bundle itself, not an external
+    // module. Files under no rule keep the extension table.
+    let rules = effective_module_rules(&meta.module_rules)?;
+    let root = module_root(meta)?;
+    let root_prefix = if root.is_empty() {
+        String::new()
+    } else {
+        format!("{root}/")
+    };
     for (rel, bytes) in files {
         total += bytes.len() as u64;
         if total > MAX_WORKER_DIR_BYTES {
@@ -1599,6 +2022,18 @@ fn build_pack_json(
         }
         let ty = declared
             .remove(rel)
+            .or_else(|| {
+                if rel == &meta.main_module {
+                    return None;
+                }
+                let eval = rel.strip_prefix(&root_prefix)?;
+                rules.iter().find_map(|(ty, globs)| {
+                    globs
+                        .iter()
+                        .any(|g| glob_match(g, eval))
+                        .then(|| (*ty).to_string())
+                })
+            })
             .or_else(|| type_for_extension(Path::new(rel)).map(str::to_string))
             .ok_or(LocalError::Worker("module type"))?;
         typed.insert(rel.clone(), ty);
@@ -1715,6 +2150,9 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
         for name in b.ratelimit.keys() {
             bindings.push(format!("ratelimit:{name}"));
         }
+        for name in b.flagship.keys() {
+            bindings.push(format!("flagship:{name}"));
+        }
         for name in b.service.keys() {
             bindings.push(format!("service:{name}"));
         }
@@ -1775,6 +2213,11 @@ pub struct DeployUpload {
     /// Worker name override (`vrt.toml` name otherwise).
     #[serde(default)]
     pub name: Option<String>,
+    /// Flagship app definitions gathered client-side
+    /// (`flagship.json`) — re-validated server-side with the same
+    /// wire-boundary flag-model proof before state application.
+    #[serde(default)]
+    pub flagship_apps: Option<Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>>,
 }
 
 /// Uploaded `[assets]` payload — canonical manifest + objects keyed
@@ -1824,6 +2267,16 @@ pub fn gathered_from_upload(body: &DeployUpload) -> Result<Gathered, LocalError>
         files,
         skipped: Vec::new(),
         pending_assets,
+        flagship_apps: match &body.flagship_apps {
+            Some(apps) => {
+                for app in apps {
+                    snapshot_protocol::compute_desired::validate_flagship_config(&app.config)
+                        .map_err(|_| LocalError::Worker("flagshipApps flag model"))?;
+                }
+                Some(apps.clone())
+            }
+            None => None,
+        },
     })
 }
 
@@ -2133,5 +2586,279 @@ mod quotas_tests {
                 other => panic!("{toml_src}: expected Worker({field}), got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tail_consumer_tests {
+    use super::*;
+
+    fn list(names: &[&str]) -> Vec<TailConsumerToml> {
+        names
+            .iter()
+            .map(|s| TailConsumerToml {
+                service: (*s).to_string(),
+            })
+            .collect()
+    }
+
+    fn resolve(name: &str) -> Option<String> {
+        Some(format!("w-{name}"))
+    }
+
+    /// Both lists share this resolver: self-targets are refused (no
+    /// recursion bound), duplicates collapse, and the cap is enforced
+    /// on the RESOLVED list.
+    #[test]
+    fn shared_invariants_hold_for_both_lists() {
+        let got =
+            resolve_tail_consumers(&list(&["a", "a", "b"]), "producer", "tail", &resolve).unwrap();
+        assert_eq!(
+            got.iter().map(|c| c.worker_id.as_str()).collect::<Vec<_>>(),
+            vec!["w-a", "w-b"]
+        );
+
+        let err =
+            resolve_tail_consumers(&list(&["producer"]), "producer", "tail", &resolve).unwrap_err();
+        assert!(format!("{err:?}").contains("another worker"), "{err:?}");
+
+        let many: Vec<TailConsumerToml> = (0..17)
+            .map(|i| TailConsumerToml {
+                service: format!("c{i}"),
+            })
+            .collect();
+        let err =
+            resolve_tail_consumers(&many, "producer", "streaming tail", &resolve).unwrap_err();
+        assert!(format!("{err:?}").contains("16"), "{err:?}");
+    }
+}
+
+mod module_rules_tests {
+    use super::*;
+
+    /// Mirrors `glob-to-regexp` ({globstar:true}) behavior — the
+    /// oracle for every case below is wrangler's own regex.
+    #[test]
+    fn glob_match_semantics() {
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            // `**/*.txt` — globstar crosses dirs AND matches root.
+            (
+                "**/*.txt",
+                &["a.txt", "d/a.txt", "d/e/a.txt"],
+                &["a.txt2", "a.md", "d/a.txt.bak"],
+            ),
+            // `*.txt` — single star never crosses `/`.
+            ("*.txt", &["a.txt"], &["d/a.txt", "a.txt2"]),
+            (
+                "lang/*.mjs",
+                &["lang/a.mjs"],
+                &["lang/d/a.mjs", "xlang/a.mjs"],
+            ),
+            // `?` is a LITERAL char (no `extended`) — `*.wasm?module`
+            // matches the query-suffixed name only.
+            (
+                "**/*.wasm?module",
+                &["a.wasm?module", "d/a.wasm?module"],
+                &["a.wasmXmodule", "a.wasm"],
+            ),
+            // `[...]`/`{a,b}` are literal too.
+            ("a[0-9].txt", &["a[0-9].txt"], &["a5.txt"]),
+            ("{a,b}.txt", &["{a,b}.txt"], &["a.txt", "b.txt"]),
+            // `a/**/b` — globstar consumes whole segments only; it may
+            // not stop mid-segment.
+            ("a/**/b", &["a/b", "a/x/b", "a/x/y/b"], &["a/xb", "a/bc"]),
+            // `a/**/x` cannot stop mid-segment (`a/xyz` has no stop
+            // where `x` aligns at a boundary).
+            ("a/**/x", &["a/x", "a/d/x"], &["a/xyz", "a/xy/xz"]),
+            // trailing `**` eats the rest including `/`.
+            ("a/**", &["a/b", "a/x/y"], &["a", "ab"]),
+            // `**` mid-segment collapses to a single `*`.
+            ("a**b", &["axb", "ab"], &["a/x/b"]),
+            // `.`/`+`/`(`... are literal.
+            ("a+.txt", &["a+.txt"], &["aa.txt", "ax.txt"]),
+            // `\.` escapes to a literal dot.
+            ("a\\.txt", &["a.txt"], &["axtxt"]),
+        ];
+        for (pat, yes, no) in cases {
+            for p in *yes {
+                assert!(glob_match(pat, p), "{pat} should match {p}");
+            }
+            for p in *no {
+                assert!(!glob_match(pat, p), "{pat} should NOT match {p}");
+            }
+        }
+    }
+
+    fn rules(src: &str) -> Vec<ModuleRuleToml> {
+        let doc: toml::Value = toml::from_str(src).unwrap();
+        let json = serde_json::to_value(&doc).unwrap();
+        serde_json::from_value(json["moduleRules"].clone()).unwrap()
+    }
+
+    /// CF `parseRules`: a non-fallthrough rule completes its type —
+    /// later same-type rules (incl. the implicit defaults) are dead.
+    #[test]
+    fn per_type_pruning() {
+        let user = rules(
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"] },
+            ]"#,
+        );
+        let eff = effective_module_rules(&user).unwrap();
+        // User Text rule completed `text` — the implicit Text default
+        // is gone; Data/Wasm defaults remain.
+        assert_eq!(
+            eff.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            ["text", "data", "wasm"]
+        );
+        // With fallthrough the default survives and .txt still types.
+        let user_ft = rules(
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"], fallthrough = true },
+            ]"#,
+        );
+        let eff = effective_module_rules(&user_ft).unwrap();
+        assert_eq!(
+            eff.iter().map(|(t, _)| *t).collect::<Vec<_>>(),
+            ["text", "text", "data", "wasm"]
+        );
+        // `fallthrough = false` completes the type exactly like unset.
+        let user_ff = rules(
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"], fallthrough = false },
+            ]"#,
+        );
+        assert_eq!(effective_module_rules(&user_ff).unwrap().len(), 3);
+    }
+
+    fn meta(src: &str) -> WorkerToml {
+        toml::from_str(&format!(
+            "name = \"w\"\nmainModule = \"index.mjs\"\ncompatibilityDate = \"2025-01-01\"\n{src}"
+        ))
+        .unwrap()
+    }
+
+    fn pack_modules(meta: &WorkerToml, files: &[(&str, &[u8])]) -> serde_json::Value {
+        let files: BTreeMap<String, Vec<u8>> = files
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.to_vec()))
+            .collect();
+        build_pack_json(meta, &files).unwrap().0["modules"].clone()
+    }
+
+    #[test]
+    fn rules_classify_gathered_files() {
+        let m = meta(
+            // `fallthrough = true` keeps the implicit Text default
+            // alive so `.html` still classifies (pruning semantics
+            // are covered separately in `per_type_pruning`).
+            r#"moduleRules = [
+                { type = "Text", globs = ["**/*.md"], fallthrough = true },
+                { type = "Data", globs = ["**/*.js"], fallthrough = true },
+            ]"#,
+        );
+        let mods = pack_modules(
+            &m,
+            &[
+                ("index.mjs", b"export default {}".as_slice()),
+                ("readme.md", b"# hi".as_slice()),
+                ("data.js", b"1".as_slice()),
+                ("page.html", b"<p/>".as_slice()), // implicit Text default
+                ("raw.bin", b"\x01".as_slice()),   // implicit Data default
+                ("lib.mjs", b"export {}".as_slice()),
+            ],
+        );
+        assert_eq!(mods["readme.md"], serde_json::json!({"text": "# hi"}));
+        assert_eq!(mods["data.js"], serde_json::json!({"data_b64": "MQ=="}));
+        assert_eq!(mods["page.html"], serde_json::json!({"text": "<p/>"}));
+        assert_eq!(mods["raw.bin"], serde_json::json!({"data_b64": "AQ=="}));
+        // Extension table still covers unmatched files; the entry is
+        // never rule-typed even though `**/*.js`-style globs exist.
+        assert_eq!(mods["lib.mjs"], serde_json::json!("export {}"));
+        assert_eq!(mods["index.mjs"], serde_json::json!("export default {}"));
+    }
+
+    /// The entry is never retyped by rules — `{ Data: ["**/*.mjs"] }`
+    /// cannot turn the main module into a data blob (CF: the entry is
+    /// the bundle, not an external module).
+    #[test]
+    fn entry_skips_rule_typing() {
+        let m = meta(r#"moduleRules = [{ type = "Data", globs = ["**/*.mjs"] }]"#);
+        let mods = pack_modules(
+            &m,
+            &[
+                ("index.mjs", b"export default {}".as_slice()),
+                ("lib.mjs", b"export {}".as_slice()),
+            ],
+        );
+        assert_eq!(mods["index.mjs"], serde_json::json!("export default {}"));
+        assert_eq!(
+            mods["lib.mjs"],
+            serde_json::json!({"data_b64": "ZXhwb3J0IHt9"})
+        );
+    }
+
+    /// `base_dir` scopes rule evaluation (CF `moduleRoot`): a file
+    /// outside the root is not a candidate and falls back to the
+    /// extension table.
+    #[test]
+    fn base_dir_scopes_rule_evaluation() {
+        let m = toml::from_str::<WorkerToml>(
+            "name = \"w\"\nmainModule = \"src/index.mjs\"\ncompatibilityDate = \"d\"\nbaseDir = \"src\"\nmoduleRules = [{ type = \"Data\", globs = [\"*.mjs\"] }]",
+        )
+        .unwrap();
+        let mods = pack_modules(
+            &m,
+            &[
+                ("src/index.mjs", b"export default {}".as_slice()),
+                ("src/lib.mjs", b"export {}".as_slice()),
+                ("lib.mjs", b"export {}".as_slice()),
+            ],
+        );
+        // `src/lib.mjs` evaluates as `lib.mjs` — `*.mjs` matches.
+        assert_eq!(
+            mods["src/lib.mjs"],
+            serde_json::json!({"data_b64": "ZXhwb3J0IHt9"})
+        );
+        // `lib.mjs` at the project root is outside `src/` — not a
+        // candidate, extension table types it.
+        assert_eq!(mods["lib.mjs"], serde_json::json!("export {}"));
+        assert_eq!(
+            mods["src/index.mjs"],
+            serde_json::json!("export default {}")
+        );
+    }
+
+    /// Without `base_dir`, the `main` directory is the rule root.
+    #[test]
+    fn main_dir_is_the_default_rule_root() {
+        let m = toml::from_str::<WorkerToml>(
+            "name = \"w\"\nmainModule = \"src/index.mjs\"\ncompatibilityDate = \"d\"\nmoduleRules = [{ type = \"Data\", globs = [\"*.txt\"] }]",
+        )
+        .unwrap();
+        let mods = pack_modules(
+            &m,
+            &[
+                ("src/index.mjs", b"export default {}".as_slice()),
+                ("src/a.txt", b"x".as_slice()),
+                ("b.txt", b"x".as_slice()),
+            ],
+        );
+        // `src/a.txt` → `a.txt` matches `*.txt`; root `b.txt` is
+        // outside `src/` but the implicit Text default still types it
+        // (its `**/*.txt` crosses the boundary? no — `b.txt` is
+        // outside the root, so NO rule sees it → extension table).
+        assert_eq!(mods["src/a.txt"], serde_json::json!({"data_b64": "eA=="}));
+        assert_eq!(mods["b.txt"], serde_json::json!({"text": "x"}));
+    }
+
+    /// Invalid rule types in a native `moduleRules` fail closed at the
+    /// pack boundary even without normalize having run.
+    #[test]
+    fn bad_rule_types_fail_closed() {
+        let m = meta(r#"moduleRules = [{ type = "PythonModule", globs = ["**/*.py"] }]"#);
+        let files: BTreeMap<String, Vec<u8>> =
+            [("index.mjs".to_string(), b"export default {}".to_vec())].into();
+        assert!(build_pack_json(&m, &files).is_err());
     }
 }

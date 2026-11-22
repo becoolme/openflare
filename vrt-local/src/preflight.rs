@@ -109,6 +109,9 @@ pub(crate) fn deploy_preflight(
         // degrades to an explicit 501 (fail closed).
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        // Standalone has no AE ingest service — `analyticsEngine`
+        // bindings fail the render closed (`aeAddr`).
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         // MIG-12: mirror the production probe-socket emit so the
         // workerd load check covers the wrapped-module surface.
@@ -276,21 +279,13 @@ fn materialize_and_check(
     )
     .map_err(LocalError::Io)?;
 
-    // `--experimental` argv parity with assemble's derivation: queue
-    // consumers, DO/workflow namespaces, or non-"experimental" system
-    // experimental flags all require it.
-    let needs_experimental = tenant.workers.iter().any(|w| {
-        !w.queue_consumers.is_empty()
-            || !w.durable_object_classes.is_empty()
-            || !w.workflows.is_empty()
-    }) || cfg
-        .system_compat_flags
-        .iter()
-        .any(|f| f != "experimental" && vrt_config::is_experimental_compat_flag(f));
-    let mut extra = Vec::new();
-    if needs_experimental {
-        extra.push("--experimental".to_string());
-    }
+    // `--experimental` argv parity with assemble's derivation: the
+    // predicate is shared (`vrt_config::launch_args`), so queue
+    // consumers, DO/workflow namespaces, cron facades, workerLoader
+    // bindings and non-"experimental" system experimental flags all
+    // force the arg here exactly as they do at serve time. Deriving it
+    // locally is how cron-basic deployments once failed the check.
+    let extra = vrt_config::tenant_experimental_extra_args(&cfg.system_compat_flags, tenant);
 
     // Needles: every env value the child would see — redacted out of
     // the failure tail just like the launch path.

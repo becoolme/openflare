@@ -183,6 +183,11 @@ fn desired_ack_fixture() {
             queue_delivery_delay: true,
             worker_loader: true,
             quotas: true,
+            analytics_engine: true,
+            unsafe_eval: true,
+            observability: true,
+            streaming_tail_consumers: true,
+            flagship: true,
         }),
     };
     check(
@@ -303,10 +308,21 @@ fn kv_capability_wire_shape() {
     })
     .unwrap();
     assert_eq!(q_on["quotas"], serde_json::json!(true));
+    // Analytics Engine: same omit-while-false shape — a pre-AE cell
+    // would reject the binding field, so dataset bindings only land on
+    // cells that claim it.
+    assert!(off.get("analyticsEngine").is_none());
+    let ae_on = serde_json::to_value(AckCapabilities {
+        analytics_engine: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(ae_on["analyticsEngine"], serde_json::json!(true));
     let back: AckCapabilities =
         serde_json::from_value(serde_json::json!({"cron": true, "assets": true})).unwrap();
     assert!(!back.kv);
     assert!(!back.service_entrypoint);
     assert!(!back.worker_loader);
     assert!(!back.quotas);
+    assert!(!back.analytics_engine);
 }

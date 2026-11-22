@@ -198,6 +198,13 @@ pub fn error_body(e: &EngineError) -> serde_json::Value {
             "code": "VRT_SQL_RESULT_UNKNOWN",
             "retryable": true,
         }),
+        // Read-only follower: the statement would write. The provider retries on the writer.
+        EngineError::ReadOnly => json!({
+            "success": false,
+            "error": e.wire_message(),
+            "code": "VRT_REPLICA_READ_ONLY",
+            "retryable": true,
+        }),
         _ => json!({ "success": false, "error": e.wire_message() }),
     }
 }
@@ -209,8 +216,31 @@ pub fn error_status(e: &EngineError) -> StatusCode {
         EngineError::Unavailable(_)
         | EngineError::DeadlineExceeded
         | EngineError::ResultUnknown => StatusCode::SERVICE_UNAVAILABLE,
+        // Routing signal, not a SQL result: the provider retries the read on the writer.
+        EngineError::ReadOnly => StatusCode::CONFLICT,
         _ => StatusCode::OK,
     }
+}
+
+/// Parse the D1 statement batch. Malformed input uses the non-`{success:false}` surface,
+/// because workerd treats it as a protocol error rather than a SQL error.
+fn parse_batch(body: &[u8]) -> Result<Vec<SqlStmt>, WireResponse> {
+    let parsed: Result<Vec<SqlStmt>, ()> = (|| {
+        let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
+        let one_or_many = match v {
+            serde_json::Value::Array(a) => serde_json::Value::Array(a),
+            o @ serde_json::Value::Object(_) => json!([o]),
+            _ => return Err(()),
+        };
+        serde_json::from_value::<Vec<SqlStmt>>(one_or_many).map_err(|_| ())
+    })();
+    parsed.map_err(|()| WireResponse {
+        status: StatusCode::BAD_REQUEST,
+        bookmark: None,
+        rows_read: 0,
+        rows_written: 0,
+        body: json!({ "error": "invalid request: expected {sql, params?} or array of such" }),
+    })
 }
 
 /// Pure-function handler: `/query` and `/execute` have identical semantics (section 2).
@@ -222,27 +252,9 @@ pub async fn handle_d1(
     call: TrustedCallCtx,
     body: &[u8],
 ) -> WireResponse {
-    // Malformed-request surface (not {success:false}): JSON parse failure or schema mismatch
-    let parsed: Result<Vec<SqlStmt>, ()> = (|| {
-        let v: serde_json::Value = serde_json::from_slice(body).map_err(|_| ())?;
-        let one_or_many = match v {
-            serde_json::Value::Array(a) => serde_json::Value::Array(a),
-            o @ serde_json::Value::Object(_) => json!([o]),
-            _ => return Err(()),
-        };
-        serde_json::from_value::<Vec<SqlStmt>>(one_or_many).map_err(|_| ())
-    })();
-    let stmts = match parsed {
+    let stmts = match parse_batch(body) {
         Ok(s) => s,
-        Err(()) => {
-            return WireResponse {
-                status: StatusCode::BAD_REQUEST,
-                bookmark: None,
-                rows_read: 0,
-                rows_written: 0,
-                body: json!({ "error": "invalid request: expected {sql, params?} or array of such" }),
-            }
-        }
+        Err(bad) => return bad,
     };
     let ctx = TxnCtx {
         epoch: call.epoch,
@@ -352,6 +364,94 @@ pub async fn handle_d1(
         // Path/lock/open failure -> {success:false} error surface (same shape as SQL failure);
         // T36: Unavailable -> 503 (held-elsewhere/restore failure is retryable).
         Err((e, _ran)) => WireResponse {
+            status: error_status(&e),
+            bookmark: None,
+            rows_read: 0,
+            rows_written: 0,
+            body: error_body(&e),
+        },
+    }
+}
+
+/// Execute a D1 batch on one engine, bypassing the registry.
+///
+/// This is the read-only follower path: the caller has already selected and opened an immutable
+/// generation. No dedup ledger and no bookmark are involved -- the replica handler signs its own
+/// `(epoch, lsn)` after the call.
+pub async fn handle_d1_on_engine(
+    engine: Arc<RusqliteEngine>,
+    database_id: &str,
+    results_format: Option<&str>,
+    call: TrustedCallCtx,
+    body: &[u8],
+) -> WireResponse {
+    let stmts = match parse_batch(body) {
+        Ok(s) => s,
+        Err(bad) => return bad,
+    };
+    let ctx = TxnCtx {
+        epoch: call.epoch,
+        deadline: call.deadline,
+        dedup: None,
+    };
+    let format = ResultsFormat::parse(results_format);
+    let read_only = engine.is_read_only();
+    let probe = crate::engine::CommitProbe::new();
+    let task = {
+        let probe = probe.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::engine::with_commit_probe(&probe, || run_query(&engine, &stmts, &ctx, format))
+        })
+    };
+    let cutoff = tokio::time::Instant::from_std(call.deadline) + D1_OUTER_GRACE;
+    let joined = match tokio::time::timeout_at(cutoff, task).await {
+        Ok(j) => j,
+        Err(_) => {
+            // On a replica nothing can commit, so a timeout is always retry-safe.
+            let e = if !read_only && probe.committed() {
+                EngineError::ResultUnknown
+            } else {
+                EngineError::DeadlineExceeded
+            };
+            return WireResponse {
+                status: error_status(&e),
+                bookmark: None,
+                rows_read: 0,
+                rows_written: 0,
+                body: error_body(&e),
+            };
+        }
+    };
+    let outcome = match joined {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(db = %database_id, "replica d1 blocking task panicked");
+            let e = EngineError::Unavailable("internal task failed");
+            return WireResponse {
+                status: error_status(&e),
+                bookmark: None,
+                rows_read: 0,
+                rows_written: 0,
+                body: error_body(&e),
+            };
+        }
+    };
+    match outcome {
+        Ok(results) => {
+            let rows_read = results.iter().map(|r| r.meta.rows_read.max(0) as u64).sum();
+            let rows_written = results
+                .iter()
+                .map(|r| r.meta.rows_written.max(0) as u64)
+                .sum();
+            WireResponse {
+                status: StatusCode::OK,
+                bookmark: None,
+                rows_read,
+                rows_written,
+                body: json!(results),
+            }
+        }
+        Err(e) => WireResponse {
             status: error_status(&e),
             bookmark: None,
             rows_read: 0,

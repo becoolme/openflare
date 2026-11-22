@@ -467,6 +467,21 @@ impl VrtLocal {
                 }
             }
         }
+        // Flagship: merge this deploy's app set into the tenant store —
+        // a file-provided app overwrites its same-id entry, a bound app
+        // with no definitions keeps the empty config `assemble`
+        // synthesized. Apps are never removed by a deploy that does
+        // not name them (the store is tenant-level, like CF's local
+        // flag store: updates land per app).
+        if !pkg.flagship_apps.is_empty() {
+            for app in pkg.flagship_apps.iter() {
+                match st.flagship_apps.iter_mut().find(|a| a.app_id == app.app_id) {
+                    Some(existing) => *existing = app.clone(),
+                    None => st.flagship_apps.push(app.clone()),
+                }
+            }
+            st.flagship_apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
+        }
         let (version_id, digest) = st.apply_deploy(&pkg).map_err(LocalError::Worker)?;
         // F3: NOTHING is persisted before the desired doc validates —
         // a rejected state must leave every file byte-identical.

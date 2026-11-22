@@ -7,7 +7,9 @@
 use crate::clock::Clock;
 use crate::paths;
 use crate::seg;
+use crate::timeline::{self, TimelineEntry, TimelineIndex};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vrt_objstore::{ObjectStore, StoreError};
@@ -76,6 +78,36 @@ pub struct SnapshotRef {
     pub lsn: u64,
     pub sha256: String,
     pub size: u64,
+    /// Wall clock (unix ms) when the snapshot was uploaded. Absent in older manifests (0).
+    #[serde(default)]
+    pub committed_at_ms: u64,
+}
+
+/// Sidecar metadata for a snapshot object, used by Time Travel to pick a baseline without
+/// downloading every snapshot. Older snapshots have no sidecar and are not eligible as a Time
+/// Travel baseline (the current manifest snapshot is always usable).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SnapshotMeta {
+    pub v: u32,
+    pub database_id: String,
+    pub epoch: u64,
+    pub lsn: u64,
+    pub sha256: String,
+    pub size: u64,
+    pub committed_at_ms: u64,
+}
+
+impl SnapshotMeta {
+    pub fn as_ref(&self) -> SnapshotRef {
+        SnapshotRef {
+            key: String::new(), // filled by the caller from the object key
+            lsn: self.lsn,
+            sha256: self.sha256.clone(),
+            size: self.size,
+            committed_at_ms: self.committed_at_ms,
+        }
+    }
 }
 
 /// epoch chain entry: the segments of that epoch's writer start at `first_lsn`.
@@ -213,6 +245,11 @@ pub enum PersistError {
 /// RV-R66: max number of objects a single `gc_orphans` deletes (including failed attempts).
 pub const MAX_GC_DELETES_PER_PASS: usize = 256;
 
+/// How many baseline snapshots GC keeps (the newest N). More than one lets a reader/follower that
+/// is one checkpoint behind continue with the segment chain instead of a full re-bootstrap.
+/// This is bounded retention, not PITR: GC still deletes everything older than the window.
+pub const SNAP_RETENTION: usize = 2;
+
 /// RV-R66: result of one GC (observable, errors not swallowed).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GcReport {
@@ -252,6 +289,8 @@ pub struct Persister {
     /// T37r: resource kind -- the object-key prefix (db/ or q/) and local root are bound when the
     /// Persister is constructed; on the same store each of the two kinds holds one instance.
     kind: crate::paths::ResourceKind,
+    /// Time Travel retention window (ms). 0 = disabled (bounded two-snapshot GC only).
+    time_travel_retention_ms: u64,
 }
 
 impl std::fmt::Debug for Persister {
@@ -279,7 +318,8 @@ fn manifest_key(kind: crate::paths::ResourceKind, id: &str) -> String {
 }
 
 /// lsn -> epoch key-space resolution (chain ascending).
-fn epoch_for_lsn(chain: &[EpochSpan], lsn: u64) -> Option<u64> {
+/// Epoch that owns `lsn` according to the manifest chain (None when no span covers it).
+pub fn epoch_for_lsn(chain: &[EpochSpan], lsn: u64) -> Option<u64> {
     let mut hit = None;
     for span in chain {
         if span.first_lsn <= lsn {
@@ -305,7 +345,15 @@ impl Persister {
             clock,
             db_root,
             kind,
+            time_travel_retention_ms: 0,
         }
+    }
+
+    /// Enable Time Travel retention (ms). GC keeps snapshots/segments inside the window and one
+    /// baseline snapshot before it. 0 keeps the bounded two-snapshot policy only.
+    pub fn with_time_travel_retention(mut self, ms: u64) -> Self {
+        self.time_travel_retention_ms = ms;
+        self
     }
 
     /// The resource kind bound to this instance (determines the object-key prefix + local root).
@@ -370,6 +418,11 @@ impl Persister {
 
     fn store_get(&self, key: &str) -> Result<Option<vrt_objstore::StoredObject>, PersistError> {
         Ok(vrt_objstore::block_on_store(self.store.get(key))?)
+    }
+    /// Unconditional put (timeline chunks / snapshot metadata: immutable-by-content, safe to rewrite).
+    fn store_put(&self, key: &str, body: &[u8]) -> Result<(), PersistError> {
+        vrt_objstore::block_on_store(self.store.put(key, body))?;
+        Ok(())
     }
     fn store_put_inm(&self, key: &str, body: &[u8]) -> Result<String, PersistError> {
         Ok(vrt_objstore::block_on_store(
@@ -991,11 +1044,31 @@ impl Persister {
                 StoreError::PreconditionFailed => PersistError::Fenced,
                 other => PersistError::Store(other),
             })?;
+        let committed_at_ms = self.clock.now_ms();
+        // Time Travel sidecar. Best-effort: the snapshot+manifest path does not depend on it, but
+        // without it an older snapshot is not eligible as a Time Travel baseline.
+        let meta = SnapshotMeta {
+            v: 1,
+            database_id: database_id.into(),
+            epoch,
+            lsn,
+            sha256: out.sha256.clone(),
+            size: out.len,
+            committed_at_ms,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&meta) {
+            let meta_key = seg::snap_meta_key(self.kind, database_id, epoch, lsn);
+            if let Err(e) = self.store_put(&meta_key, &bytes) {
+                tracing::warn!(db = %database_id, lsn, error = %e,
+                    "snapshot metadata write failed; Time Travel cannot use this baseline");
+            }
+        }
         Ok(SnapshotRef {
             key,
             lsn,
             sha256: out.sha256,
             size: out.len,
+            committed_at_ms,
         })
     }
 
@@ -1188,8 +1261,9 @@ impl Persister {
     ///   deleting it would leave restore without a baseline).
     /// RV-R66: per-run deletion cap (bounded); the remainder is left for the next round (deletion is idempotent).
     /// Deletion failures are no longer silent -- counted in `GcReport.failed` with a warn, retried next round.
-    /// Note: this GC only clears objects "covered by the baseline snapshot / not on the chain"; it has **no**
-    /// retention chain by time window / N generations, hence it provides no PITR (see the sql-storage doc).
+    /// Note: this GC keeps only a bounded window (the newest [`SNAP_RETENTION`] snapshots and the
+    /// segments above the older one). It is not a time-window PITR and does not retain history for
+    /// an arbitrarily lagging follower; beyond the window recovery is a fresh bootstrap.
     pub fn gc_orphans(
         &self,
         database_id: &str,
@@ -1209,18 +1283,92 @@ impl Persister {
                 return rep;
             }
         };
+        // Keep the newest SNAP_RETENTION snapshots and every segment above the oldest kept
+        // snapshot. A follower that is one checkpoint behind can then continue with the segment
+        // chain instead of re-downloading the whole database. `baseline_lsn` remains the upper
+        // bound (never delete a segment the current snapshot still needs).
+        let mut snapshots: Vec<(u64, String)> = page
+            .entries
+            .iter()
+            .filter_map(|e| parse_snap_name(&e.key).map(|lsn| (lsn, e.key.clone())))
+            .collect();
+        snapshots.sort_by(|a, b| b.0.cmp(&a.0));
+        let kept_snapshots: HashSet<&str> = snapshots
+            .iter()
+            .take(SNAP_RETENTION)
+            .map(|(_, key)| key.as_str())
+            .collect();
+        let mut protected_lsn = snapshots
+            .iter()
+            .take(SNAP_RETENTION)
+            .map(|(lsn, _)| *lsn)
+            .min()
+            .unwrap_or(baseline_lsn)
+            .min(baseline_lsn);
+        // Time Travel retention: keep every snapshot inside the window, plus one baseline before
+        // it so the oldest retained point remains restorable. Without metadata (older databases)
+        // fall back to the bounded two-snapshot policy above.
+        let mut time_travel_keep: Option<HashSet<u64>> = None;
+        if self.time_travel_retention_ms > 0 {
+            match self.snapshot_metas(database_id) {
+                Ok(metas) if !metas.is_empty() => {
+                    let cutoff = self
+                        .clock
+                        .now_ms()
+                        .saturating_sub(self.time_travel_retention_ms);
+                    let mut kept: Vec<&(String, SnapshotMeta)> = metas
+                        .iter()
+                        .filter(|(_, m)| m.committed_at_ms >= cutoff)
+                        .collect();
+                    if kept.is_empty() {
+                        if let Some(newest) = metas.first() {
+                            kept.push(newest);
+                        }
+                    }
+                    let oldest_kept = kept.iter().map(|(_, m)| m.lsn).min().unwrap();
+                    let baseline = metas.iter().find(|(_, m)| m.lsn < oldest_kept);
+                    let mut keep: HashSet<u64> = kept.iter().map(|(_, m)| m.lsn).collect();
+                    if let Some((_, m)) = baseline {
+                        keep.insert(m.lsn);
+                        protected_lsn = m.lsn.min(baseline_lsn);
+                    } else {
+                        protected_lsn = oldest_kept.saturating_sub(1).min(baseline_lsn);
+                    }
+                    // The manifest snapshot is always live even if its sidecar is missing/late.
+                    keep.insert(baseline_lsn);
+                    time_travel_keep = Some(keep);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(db = %database_id, error = %e,
+                    "time-travel GC could not read snapshot metadata; using bounded retention"),
+            }
+        }
         for e in page.entries {
             let doomed = if e.key.ends_with(".seg") {
                 match parse_seg_name(&e.key) {
                     Some((ep, lsn)) => {
                         let covered =
                             epoch_for_lsn(chain, lsn) == Some(ep) && lsn <= committed_lsn;
-                        !covered || lsn <= baseline_lsn
+                        !covered || lsn <= protected_lsn
                     }
                     None => false,
                 }
             } else if e.key.ends_with(".snap") {
-                matches!(parse_snap_name(&e.key), Some(lsn) if lsn < baseline_lsn)
+                match parse_snap_name(&e.key) {
+                    Some(lsn) => match &time_travel_keep {
+                        // Never touch a snapshot beyond the current manifest baseline (in-flight upload).
+                        Some(keep) => lsn <= baseline_lsn && !keep.contains(&lsn),
+                        None => lsn < baseline_lsn && !kept_snapshots.contains(e.key.as_str()),
+                    },
+                    None => false,
+                }
+            } else if e.key.contains("/snap-") && e.key.ends_with(".json") {
+                match (parse_snap_meta_lsn(&e.key), &time_travel_keep) {
+                    (Some(lsn), Some(keep)) => lsn <= baseline_lsn && !keep.contains(&lsn),
+                    // Without Time Travel metadata is not managed by the legacy policy: it is
+                    // tiny, and keeping it lets a later retention change use the history.
+                    _ => false,
+                }
             } else {
                 false
             };
@@ -1240,6 +1388,194 @@ impl Persister {
             }
         }
         rep
+    }
+
+    /// Append a Time Travel timeline chunk (`last_lsn` derives the key). Safe to re-upload.
+    pub fn upload_timeline(
+        &self,
+        database_id: &str,
+        entries: &[TimelineEntry],
+    ) -> Result<(), PersistError> {
+        let Some(last) = entries.last() else {
+            return Ok(());
+        };
+        let bytes = timeline::encode_chunk(database_id, entries);
+        self.store_put(&timeline::chunk_key(self.kind, database_id, last.lsn), &bytes)
+    }
+
+    /// Read and merge every timeline chunk for `database_id`.
+    ///
+    /// A truncated listing fails closed: resolving a time against a partial index could pick a
+    /// commit that is not the newest at/before the target.
+    pub fn read_timeline(&self, database_id: &str) -> Result<TimelineIndex, PersistError> {
+        let prefix = format!("{}/{database_id}/", self.kind.object_prefix());
+        let page = self.store_list(&prefix)?;
+        if page.truncated {
+            return Err(PersistError::Corrupt("timeline listing truncated".into()));
+        }
+        let mut idx = TimelineIndex::default();
+        for e in page.entries {
+            if !timeline::is_chunk_key(&e.key) {
+                continue;
+            }
+            let Some(obj) = self.store_get(&e.key)? else {
+                continue; // concurrent cleanup; the remaining chunks are still consistent
+            };
+            if obj.body.len() > timeline::MAX_CHUNK_BYTES {
+                return Err(PersistError::Corrupt("timeline chunk oversize".into()));
+            }
+            let chunk: timeline::TimelineChunk = serde_json::from_slice(&obj.body)
+                .map_err(|e| PersistError::Corrupt(format!("timeline chunk json: {e}")))?;
+            if chunk.v != 1 || chunk.database_id != database_id {
+                return Err(PersistError::Corrupt(
+                    "timeline chunk version/database mismatch".into(),
+                ));
+            }
+            for entry in chunk.entries {
+                idx.insert(entry)
+                    .map_err(|e| PersistError::Corrupt(format!("timeline: {e}")))?;
+            }
+        }
+        Ok(idx)
+    }
+
+    /// Snapshot metadata sidecars (newest first).
+    pub fn snapshot_metas(
+        &self,
+        database_id: &str,
+    ) -> Result<Vec<(String, SnapshotMeta)>, PersistError> {
+        let prefix = format!("{}/{database_id}/", self.kind.object_prefix());
+        let page = self.store_list(&prefix)?;
+        if page.truncated {
+            return Err(PersistError::Corrupt("snapshot listing truncated".into()));
+        }
+        let mut out = Vec::new();
+        for e in page.entries {
+            if !e.key.ends_with(".json") || !e.key.contains("/snap-") {
+                continue;
+            }
+            let Some(obj) = self.store_get(&e.key)? else {
+                continue;
+            };
+            let meta: SnapshotMeta = serde_json::from_slice(&obj.body)
+                .map_err(|e| PersistError::Corrupt(format!("snapshot meta json: {e}")))?;
+            if meta.v != 1 || meta.database_id != database_id {
+                continue;
+            }
+            let snap_key = format!("{}.snap", e.key.trim_end_matches(".json"));
+            out.push((snap_key, meta));
+        }
+        out.sort_by(|a, b| b.1.lsn.cmp(&a.1.lsn));
+        Ok(out)
+    }
+
+    /// Read the manifest (read-only helper for Time Travel; the writer path keeps the etag handle).
+    pub fn read_manifest_doc(&self, database_id: &str) -> Result<Option<Manifest>, PersistError> {
+        Ok(self.read_manifest(database_id)?.map(|(m, _)| m))
+    }
+
+    /// Local DB file path for a database.
+    pub fn db_file_path(&self, database_id: &str) -> PathBuf {
+        self.db_dir(database_id).join("db.sqlite")
+    }
+
+    /// Pick a restore baseline at or before `up_to_lsn`: the manifest snapshot when it qualifies,
+    /// else the newest snapshot metadata sidecar. Returns `None` when the chain must start at 0.
+    pub fn restore_plan(
+        &self,
+        database_id: &str,
+        up_to_lsn: u64,
+        chain: &[EpochSpan],
+    ) -> Result<RestorePlan, PersistError> {
+        let manifest = self.read_manifest_doc(database_id)?;
+        let mut best: Option<SnapshotRef> = manifest
+            .as_ref()
+            .and_then(|m| m.snapshot.clone())
+            .filter(|s| s.lsn <= up_to_lsn);
+        for (key, meta) in self.snapshot_metas(database_id)? {
+            if meta.lsn > up_to_lsn {
+                continue;
+            }
+            if best.as_ref().is_some_and(|b| b.lsn >= meta.lsn) {
+                continue;
+            }
+            best = Some(SnapshotRef {
+                key,
+                lsn: meta.lsn,
+                sha256: meta.sha256,
+                size: meta.size,
+                committed_at_ms: meta.committed_at_ms,
+            });
+        }
+        Ok(RestorePlan {
+            snapshot: best,
+            up_to_lsn,
+            chain: chain.to_vec(),
+        })
+    }
+
+    /// Publish the restored image as a **new** commit at `new_lsn` on the current epoch.
+    ///
+    /// The restored content becomes a fresh snapshot; lsn never rolls back. The epoch span is
+    /// adjusted so the next commit is `new_lsn + 1`.
+    pub fn publish_restored_state(
+        &self,
+        database_id: &str,
+        handle: &mut ManifestHandle,
+        db_file: &Path,
+        new_lsn: u64,
+    ) -> Result<(), PersistError> {
+        let snap = self.upload_snapshot(database_id, handle.epoch, new_lsn, db_file)?;
+        let mut next = handle.clone();
+        next.lsn = new_lsn;
+        next.snapshot = Some(snap.clone());
+        next.commits_since_ckpt = 0;
+        next.expires_at_ms = self.clock.now_ms() + self.cfg.lease_ms;
+        match next.chain.last_mut() {
+            Some(last) if last.epoch == handle.epoch => {
+                // The restored state itself belongs to the new epoch; the next commit is new_lsn+1.
+                last.first_lsn = new_lsn;
+            }
+            _ => next.chain.push(EpochSpan {
+                epoch: handle.epoch,
+                first_lsn: new_lsn,
+            }),
+        }
+        match self.write_manifest_im(database_id, &handle.etag, &next.to_manifest(false)) {
+            Ok(etag) => {
+                handle.lsn = new_lsn;
+                handle.snapshot = Some(snap);
+                handle.commits_since_ckpt = 0;
+                handle.expires_at_ms = next.expires_at_ms;
+                handle.etag = etag;
+                // Index the restored point immediately: a later `--at now` must resolve to the
+                // state we just published, not to the pre-restore head.
+                if let Err(e) = self.upload_timeline(
+                    database_id,
+                    &[TimelineEntry {
+                        lsn: new_lsn,
+                        epoch: handle.epoch,
+                        committed_at_ms: self.clock.now_ms(),
+                    }],
+                ) {
+                    tracing::warn!(db = %database_id, lsn = new_lsn, error = %e,
+                        "restored-state timeline write failed (bookmark restore still works)");
+                }
+                self.write_sidecar(
+                    &self.db_dir(database_id),
+                    &Sidecar {
+                        v: 1,
+                        lsn: new_lsn,
+                        file_frames: 0,
+                        intent: false,
+                    },
+                )
+            }
+            Err(PersistError::Store(StoreError::PreconditionFailed)) => {
+                Err(PersistError::Fenced)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// T36b graceful shutdown: set `expires_at` to now-margin (epoch/holder/lsn
@@ -1381,6 +1717,13 @@ fn parse_snap_name(key: &str) -> Option<u64> {
     let name = key.rsplit('/').next()?;
     let rest = name.strip_prefix("snap-")?;
     let lsn = rest.strip_suffix(".snap")?;
+    u64::from_str_radix(lsn, 16).ok()
+}
+
+fn parse_snap_meta_lsn(key: &str) -> Option<u64> {
+    let name = key.rsplit('/').next()?;
+    let rest = name.strip_prefix("snap-")?;
+    let lsn = rest.strip_suffix(".json")?;
     u64::from_str_radix(lsn, 16).ok()
 }
 

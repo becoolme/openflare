@@ -1077,6 +1077,47 @@ fn gc_orphans_is_bounded_per_pass_and_keeps_live_chain() {
     assert!(get(&seg::seg_key(D1, DB, 1, 1)).is_some());
 }
 
+/// GC keeps the newest two snapshots and the segments above the older one, so a follower that is
+/// one checkpoint behind can continue incrementally instead of re-bootstrapping.
+#[test]
+fn gc_keeps_one_previous_snapshot_and_its_segments() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<MemoryStore> = Arc::new(MemoryStore::new());
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(1_000_000));
+    let d1 = Persister::new(
+        store.clone(),
+        PersistConfig {
+            lease_ms: 10_000,
+            clock_skew_margin_ms: 500,
+            holder: "h1".into(),
+            checkpoint_every_commits: 0,
+            retention_ms: 60_000,
+            snapshot_max_bytes: 1 << 30,
+        },
+        clock,
+        tmp.path().join("dbs"),
+        D1,
+    );
+    let put = |k: &str| vrt_objstore::block_on_store(store.put(k, b"x")).unwrap();
+    let get = |k: &str| vrt_objstore::block_on_store(store.get(k)).unwrap();
+    for lsn in 1..=3 {
+        put(&seg::snap_key(D1, DB, 1, lsn));
+        put(&seg::seg_key(D1, DB, 1, lsn));
+    }
+    let chain = [vrt_sql::persist::EpochSpan {
+        epoch: 1,
+        first_lsn: 1,
+    }];
+    let rep = d1.gc_orphans(DB, 3, &chain, 3);
+    assert_eq!(rep.failed, 0);
+    assert!(get(&seg::snap_key(D1, DB, 1, 3)).is_some(), "current snapshot kept");
+    assert!(get(&seg::snap_key(D1, DB, 1, 2)).is_some(), "previous snapshot kept");
+    assert!(get(&seg::snap_key(D1, DB, 1, 1)).is_none(), "older snapshot collected");
+    assert!(get(&seg::seg_key(D1, DB, 1, 3)).is_some(), "lagging follower can still apply lsn 3");
+    assert!(get(&seg::seg_key(D1, DB, 1, 2)).is_none(), "segment covered by the kept snapshot collected");
+    assert!(get(&seg::seg_key(D1, DB, 1, 1)).is_none(), "older segment collected");
+}
+
 /// ---------- RV-R31 #1: dead frames from a rollback spill do not enter segments; commits that land
 /// within the old file length also produce segments ----------
 

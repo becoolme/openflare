@@ -92,6 +92,43 @@ failWindowMs = 90000
 # globalInflightBytes = 67108864
 # tenantInflightBytes = 33554432
 
+# GeoIP: fills request.cf geo/ASN fields (country, city, asn,
+# asOrganization, lat/long, ...) from a local merged MMDB when the
+# verified upstream Cloudflare chain did not provide them. Enabled by
+# default; the database downloads in the background on first boot and
+# refreshes on the interval — a missing/unreachable database only
+# means absent fields, never a startup or request failure.
+# Source: https://github.com/NetworkCats/Merged-IP-Data (daily
+# releases, ~100 MB). The project is MIT-licensed; the upstream
+# databases it merges carry their own attribution terms — keep the
+# NOTICE if you redistribute it.
+[geoip]
+# enabled = true                                     # default
+# mmdbPath = "__VRT_ROOT__/work/geoip/Merged-IP.mmdb"  # default <workDir>/geoip/Merged-IP.mmdb
+# refreshIntervalSecs = 43200                        # 12h, range 300..604800
+# -- mirror / air-gap: point both URLs at your own https mirror --
+# releasesApiUrl = ""                                # empty = mirror mode (no GitHub API; refreshes on file age)
+# downloadUrl = "https://mirror.example.com/Merged-IP.mmdb"
+# API-supplied asset links are untrusted: only the exact
+# github.com / objects.githubusercontent.com hosts (https, :443, no
+# userinfo) are accepted, redirects must stay on them, the body is
+# capped at 512 MiB, and the installed file's SHA-256 is re-checked
+# before a "same tag" restart trusts it.
+# Optional env: VRT_GEOIP_GITHUB_TOKEN raises the GitHub API rate
+# limit for cells behind a shared NAT (never written to config/logs).
+
+# Analytics Engine: per-tenant ingest sockets at
+# `<workDir>/ae/sock/<seg(tenant)>.sock` for `analyticsEngine`
+# bindings (`env.<binding>.writeDataPoint()`); JSONL spool +
+# canonical Parquet parts under `<workDir>/ae/`. Always on when the
+# service builds — the cell advertises the capability unconditionally,
+# so the only degrade path is a startup build failure (observable via
+# `vrt_host_ae_degraded`; AE renders then refuse, fail closed).
+[analyticsEngine]
+# maxBodyBytes = 262144                              # POST cap per event
+# maxSpoolBytes = 268435456                          # per-tenant spool cap (503 backpressure over it)
+# flushIntervalSecs = 60                             # spool→Parquet cadence, clamped 10..3600
+
 [ingress]
 requestTimeoutMs = 30000
 connectTimeoutMs = 500

@@ -338,7 +338,7 @@ fn corrupt_snapshot_fails_closed_with_bounded_backoff_and_isolates_other_dbs() {
         let k = m
             .objects
             .keys()
-            .find(|k| k.contains(DB_A) && k.contains("snap-"))
+            .find(|k| k.contains(DB_A) && k.ends_with(".snap"))
             .cloned()
             .expect("snapshot exists");
         let v = m.objects[&k].0.clone();

@@ -268,8 +268,10 @@ test("_routes.json include runs the worker even when an asset exists", async () 
     req("/api/public/data.txt"),
   );
   assert.equal(excluded.headers.get(HDR), "assets");
-  // Unmatched paths default to assets, with no existence probe.
-  for (const p of ["/index.html", "/missing"]) {
+  // Unmatched paths default to assets, with no existence probe. That
+  // includes the root index and its non-canonical `/index.html` form;
+  // the asset side applies html_handling and answers the 307.
+  for (const p of ["/", "/index.html", "/missing"]) {
     const res = await hit(env({}, userWorker([]), assetsWorker([], idx)), req(p));
     assert.equal(res.headers.get(HDR), "assets", p);
   }

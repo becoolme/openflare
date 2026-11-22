@@ -209,9 +209,11 @@ mod tests {
                     }],
                     crons: vec![],
                     queue_consumers: vec![],
+                                        observability: None,
                     durable_object_classes: vec![],
                     workflows: vec![],
                     tail_consumers: vec![],
+                    streaming_tail_consumers: vec![],
                     quotas: snapshot_protocol::compute_desired::WorkerQuotas {
                         cpu_ms: 50,
                         memory_mb: 128,
@@ -219,6 +221,7 @@ mod tests {
                         outbound_connections: 0,
                     },
                 }],
+                flagship_apps: vec![],
             }],
             deletions: vec![],
 };

@@ -161,6 +161,45 @@ pub struct AckCapabilities {
     /// the bit BEFORE any cell enables it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quotas: bool,
+    /// `analyticsEngine` bindings render AND the per-tenant AE ingest
+    /// socket is served by this generation's vrt-host (`AeService`
+    /// ships in the same release). A pre-AE cell would reject the
+    /// `analyticsEngine` wire field via `deny_unknown_fields` — the
+    /// control plane only admits dataset bindings onto cells that
+    /// claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub analytics_engine: bool,
+    /// `{"type":"unsafeEval"}` bindings (CF
+    /// `[[unsafe.bindings]] type="unsafe_eval"`) render to workerd's
+    /// `unsafeEval` capability — a pre-unsafe-eval cell rejects the
+    /// unknown binding variant via `deny_unknown_fields`, so the
+    /// control plane only admits them onto cells that claim it.
+    /// Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unsafe_eval: bool,
+    /// `observability` per-worker settings (CF `[observability]`) —
+    /// collection gates + head sampling applied by the rendered
+    /// `vrt-tail` collector. A pre-observability cell rejects the
+    /// unknown worker field via `deny_unknown_fields`, so the control
+    /// plane only admits observability-bearing workers onto cells
+    /// that claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observability: bool,
+    /// `streamingTailConsumers` renders to workerd `streamingTails`
+    /// designators — a pre-streaming-tail cell rejects the
+    /// `streamingTailConsumers` wire field via `deny_unknown_fields`,
+    /// so the control plane only admits consumer declarations onto
+    /// cells that claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub streaming_tail_consumers: bool,
+    /// `{"type":"flagship"}` bindings + `flagshipApps` tenant entries
+    /// render to a `wrapped` binding over the
+    /// `cloudflare-internal:flagship` module — a cell whose workerd
+    /// predates that module would fail the whole config load, so the
+    /// control plane only admits flagship bindings onto cells that
+    /// claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flagship: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

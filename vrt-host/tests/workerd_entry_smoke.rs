@@ -484,6 +484,126 @@ fn real_workerd_worker_loader() {
 }
 
 // ---------------------------------------------------------------------------
+// unsafe_eval smoke — the `unsafeEval = void` group `vrt-config` emits
+// must parse on the pinned binary and actually unlock eval/new
+// Function/WebAssembly through `env.<name>` in the holding worker, while a sibling worker
+// without the binding keeps all three refused.
+// ---------------------------------------------------------------------------
+
+/// The `unsafeEval` binding is an OBJECT exposed as `env.<name>` with
+/// `eval`/`newFunction`/`newAsyncFunction`/`newWasmModule` methods — it
+/// does NOT re-enable the global `eval()` inside request handlers
+/// (workerd keeps that blocked unless `allow_eval_during_startup`
+/// applies at module scope). The unbound worker has no `env.EVAL`, so
+/// every probe throws `TypeError` and reports `denied`.
+const UNSAFE_MAIN_JS: &str = r#"
+export default {
+  async fetch(_req, env) {
+    const probe = (f) => { try { return String(f()); } catch { return 'denied'; } };
+    const u = env.EVAL;
+    const wasm = new Uint8Array([0,97,115,109,1,0,0,0]);
+    const results = {
+      eval: probe(() => u.eval('1+1')),
+      fn: probe(() => u.newFunction('return 3')()),
+      wasm: probe(() => u.newWasmModule(wasm) instanceof WebAssembly.Module),
+    };
+    return new Response(JSON.stringify(results));
+  },
+};
+"#;
+
+fn write_unsafe_capnp(dir: &Path, port: u16, with_binding: bool) -> PathBuf {
+    std::fs::write(dir.join("main.js"), UNSAFE_MAIN_JS).unwrap();
+    let binding = if with_binding {
+        "bindings = [(name = \"EVAL\", unsafeEval = void)],\n      "
+    } else {
+        ""
+    };
+    let cfg = format!(
+        r#"using Workerd = import "/workerd/workerd.capnp";
+const cfg :Workerd.Config = (
+  services = [
+    (name = "main", worker = (
+      modules = [(name = "main.js", esModule = embed "main.js")],
+      compatibilityDate = "2025-01-01",
+      {binding}globalOutbound = (name = "deny", entrypoint = "DenyAll"),
+    )),
+    (name = "deny", worker = (
+      modules = [(name = "deny.js", esModule = embed "deny.js")],
+      compatibilityDate = "2025-01-01",
+    )),
+  ],
+  sockets = [(name = "http", address = "127.0.0.1:{port}",
+              http = (), service = (name = "main"))],
+);
+"#,
+        port = port,
+        binding = binding,
+    );
+    let path = dir.join("cfg.capnp");
+    std::fs::write(&path, cfg).unwrap();
+    path
+}
+
+#[test]
+#[ignore = "requires VRT_WORKERD_BIN"]
+fn real_workerd_unsafe_eval() {
+    let bin = workerd_bin().expect("VRT_WORKERD_BIN unset");
+    assert!(bin.exists(), "VRT_WORKERD_BIN does not exist: {bin:?}");
+
+    // With the binding: all three primitives work.
+    let Some(dir) = smoke_root() else {
+        return;
+    };
+    write_deny_stub(&dir);
+    let port = free_port();
+    let cfg = write_unsafe_capnp(&dir, port, true);
+    let proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port) {
+        panic!(
+            "unsafe_eval(bound): never listened\n-- workerd.log --\n{}",
+            log_text(&proc)
+        );
+    }
+    let (status, body) = http_get(port, "/");
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            200,
+            r#"{"eval":"2","fn":"3","wasm":"true"}"#
+        ),
+        "bound worker must run env.EVAL.eval/newFunction/newWasmModule: {body}"
+    );
+    drop(proc);
+
+    // Without the binding: the same worker loads fine but all three
+    // primitives throw (capability absent, not a parse failure).
+    let Some(dir) = smoke_root() else {
+        return;
+    };
+    write_deny_stub(&dir);
+    let port = free_port();
+    let cfg = write_unsafe_capnp(&dir, port, false);
+    let proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port) {
+        panic!(
+            "unsafe_eval(unbound): never listened\n-- workerd.log --\n{}",
+            log_text(&proc)
+        );
+    }
+    let (status, body) = http_get(port, "/");
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            200,
+            r#"{"eval":"denied","fn":"denied","wasm":"denied"}"#
+        ),
+        "unbound worker must refuse env.EVAL.eval/newFunction/newWasmModule: {body}"
+    );
+    drop(proc);
+}
+
+// ---------------------------------------------------------------------------
 // T31f: real-render router smoke (F0.3 real facade-assets + F1.2 custom name)
 // ---------------------------------------------------------------------------
 
@@ -555,6 +675,7 @@ fn smoke_params() -> RuntimeParams {
         wfop_pepper: "entry-smoke-pepper".into(),
         wf_delete_addr: String::new(),
         cache_addr: String::new(),
+        ae_addr: String::new(),
         heartbeat_socket: String::new(),
         waituntil_socket: String::new(),
         log_tail: vrt_config::LogTailParams::default(),

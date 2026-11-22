@@ -127,6 +127,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // strict schema knows it; until then declared quota overrides
         // are refused by the control plane (409, fail closed).
         quotas: config.quotas,
+        // `analyticsEngine` bindings render AND vrt-host's AeService
+        // ships in this release -- unconditionally on (same reasoning
+        // as `worker_loader`).
+        analytics_engine: true,
+        // `{"type":"unsafeEval"}` bindings (unsafe_eval) render ships
+        // with this generation -- unconditionally on.
+        unsafe_eval: true,
+        // `[observability]` worker fields render with this
+        // generation -- unconditionally on (same reasoning).
+        observability: true,
+        // `streamingTailConsumers` renders with this generation --
+        // unconditionally on (same reasoning).
+        streaming_tail_consumers: true,
+        // `flagship` bindings + `flagshipApps` render with this
+        // generation (the pinned workerd ships
+        // `cloudflare-internal:flagship`) -- unconditionally on.
+        flagship: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

@@ -413,9 +413,11 @@ pub fn worker(worker_id: &str, hostname: &str, digest: &str) -> WorkerDesired {
         }],
         crons: vec![],
         queue_consumers: vec![],
+        observability: None,
         durable_object_classes: vec![],
         workflows: vec![],
         tail_consumers: vec![],
+        streaming_tail_consumers: vec![],
         quotas: WorkerQuotas {
             cpu_ms: 50,
             memory_mb: 128,
@@ -430,6 +432,7 @@ pub fn tenant(tenant_id: &str, workers: Vec<WorkerDesired>) -> TenantDesired {
     TenantDesired {
         tenant_id: tenant_id.to_string(),
         workers,
+        flagship_apps: Vec::new(),
     }
 }
 

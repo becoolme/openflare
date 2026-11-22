@@ -40,6 +40,7 @@
 //! crate's own dev-dependency; production builds must never enable it —
 //! loopback TCP worker endpoints are reachable by any Pod process.
 
+pub mod ae;
 pub mod artifact;
 pub mod assemble;
 pub mod asset_sync;
@@ -61,6 +62,7 @@ pub mod do_transfer;
 pub mod do_wal;
 pub mod endpoint;
 pub mod exclusion;
+pub mod geoip;
 pub mod hibernate;
 pub mod ingress;
 pub mod initial_snapshot;

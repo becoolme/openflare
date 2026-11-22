@@ -36,20 +36,23 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
     "send_metrics",
     "keep_vars",
     "build",
-    "rules",
     "alias",
     "tsconfig",
     "jsx_factory",
     "jsx_fragment",
+    // `no_bundle`/`find_additional_modules`/`preserve_file_names` are
+    // wrangler bundler knobs: the VRT pack always ships the project
+    // module table unbundled (CF `no_bundle` + additional-modules
+    // semantics already), so they are accepted and ignored —
+    // `rules`/`base_dir` DO carry over (module typing + rule-eval
+    // root) and are normalized below.
     "no_bundle",
     "minify",
     "keep_names",
     "find_additional_modules",
     "preserve_file_names",
-    "base_dir",
     "define",
     "upload_source_maps",
-    "dev",
     "cwd",
     "config",
     // MIG-14: wrangler `[placement]` (CF Smart Placement / region
@@ -59,6 +62,8 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
 /// Mirrors @wdl-dev/cli NON_INHERITABLE_ENV_KEYS — env blocks REPLACE
 /// these keys wholesale instead of merging the top-level value.
 const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
+    "analytics_engine_datasets",
+    "flagship",
     "define",
     "vars",
     "d1_databases",
@@ -74,6 +79,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "queues",
     "workflows",
     "tail_consumers",
+    "streaming_tail_consumers",
     "secrets",
     "secrets_store_secrets",
     "worker_loaders",
@@ -213,6 +219,7 @@ pub fn load_worker_meta_for_env(
 /// Config-file basenames that are never worker modules (module scan).
 pub fn is_config_basename(name: &str) -> bool {
     name == "vrt.toml"
+        || name == "flagship.json"
         || CANDIDATES.contains(&name)
         || matches!(
             name,
@@ -453,6 +460,37 @@ pub fn resolve_env(
         if k == "__proto__" {
             continue;
         }
+        // `observability` is an inherited table, not a replace-only
+        // list: an env block that only tunes e.g.
+        // `logs.head_sampling_rate` must not silently reset the
+        // top-level `enabled = false` back to the default `true`
+        // (fail-open on a privacy/collection gate). Deep-merge the
+        // table (and its `logs` sub-table) so the env value overrides
+        // exactly the keys it declares.
+        if k == "observability" {
+            if let (Some(base), Some(over)) =
+                (resolved.get(k).and_then(Value::as_object), v.as_object())
+            {
+                let mut merged = base.clone();
+                for (ok, ov) in over {
+                    if ok == "logs" {
+                        if let (Some(b), Some(o)) =
+                            (merged.get(ok).and_then(Value::as_object), ov.as_object())
+                        {
+                            let mut logs = b.clone();
+                            for (lk, lv) in o {
+                                logs.insert(lk.clone(), lv.clone());
+                            }
+                            merged.insert(ok.clone(), Value::Object(logs));
+                            continue;
+                        }
+                    }
+                    merged.insert(ok.clone(), ov.clone());
+                }
+                resolved.insert(k.clone(), Value::Object(merged));
+                continue;
+            }
+        }
         resolved.insert(k.clone(), v.clone());
     }
     Ok(Value::Object(resolved))
@@ -478,6 +516,24 @@ fn opt_u64(v: Option<&Value>, field: &str) -> Result<Option<u64>, ProjectConfigE
         Some(v) => match v.as_u64() {
             Some(n) => Ok(Some(n)),
             None => Err(invalid(field, "must be a non-negative integer")),
+        },
+    }
+}
+fn opt_bool(v: Option<&Value>, field: &str) -> Result<Option<bool>, ProjectConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| invalid(field, "must be a boolean")),
+    }
+}
+fn opt_rate(v: Option<&Value>, field: &str) -> Result<Option<f64>, ProjectConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_f64().filter(|f| f.is_finite()) {
+            Some(f) => Ok(Some(f)),
+            None => Err(invalid(field, "must be a finite number")),
         },
     }
 }
@@ -508,6 +564,128 @@ fn is_json_value(v: &Value) -> bool {
     }
 }
 
+/// CF `custom_domain` route: `pattern` is the hostname itself — a bare
+/// lowercase FQDN (>=2 labels), no wildcard, no path, no port. The same
+/// strict rule `snapshot-protocol` applies to wire `hostnames`, so a
+/// config that would be rejected downstream fails here instead.
+fn validate_custom_domain(pattern: &str, field: &str) -> Result<String, ProjectConfigError> {
+    let h = pattern.trim().to_lowercase();
+    if h.contains('*') {
+        return Err(unsupported(
+            field,
+            Some("wildcard custom domains are not supported"),
+        ));
+    }
+    if !snapshot_protocol::compute_desired::valid_hostname(&h) {
+        return Err(invalid(
+            field,
+            "custom_domain must be a bare hostname (no path, port, or wildcard)",
+        ));
+    }
+    Ok(h)
+}
+
+/// wrangler `base_dir` — the directory rule globs are evaluated
+/// against (CF `moduleRoot`; the pack defaults it to the `main`
+/// directory). A tenant-controlled path: fail closed unless it is a
+/// clean relative directory inside the project — no absolute/drive
+/// roots, `\`, NUL, `:` or `.`/`..`/empty segments.
+fn validate_base_dir(value: &str, field: &str) -> Result<String, ProjectConfigError> {
+    let bad = || {
+        invalid(
+            field,
+            "must be a clean relative directory inside the project",
+        )
+    };
+    if value.is_empty()
+        || value.len() > 1024
+        || value.starts_with('/')
+        || value.contains('\\')
+        || value.contains('\0')
+        || value.contains(':')
+        || value.ends_with('/')
+    {
+        return Err(bad());
+    }
+    if value
+        .split('/')
+        .any(|c| c.is_empty() || c == "." || c == "..")
+    {
+        return Err(bad());
+    }
+    Ok(value.to_string())
+}
+
+/// CF `rules` — ordered `{type, globs, fallthrough?}` module-typing
+/// rules (wrangler `Rule` shape, `additionalProperties: false`). The
+/// five supported types map onto wire module types at pack time;
+/// `PythonModule`/`PythonRequirement` exist in the wrangler schema but
+/// VRT has no Python runtime, so they fail closed.
+fn normalize_module_rules(value: &Value) -> Result<Value, ProjectConfigError> {
+    const MODULE_RULE_TYPES: [&str; 5] = ["ESModule", "CommonJS", "CompiledWasm", "Text", "Data"];
+    const PYTHON_RULE_TYPES: [&str; 2] = ["PythonModule", "PythonRequirement"];
+    let arr = value
+        .as_array()
+        .ok_or_else(|| invalid("rules", "must be an array"))?;
+    if arr.len() > 64 {
+        return Err(invalid("rules", "must declare at most 64 rules"));
+    }
+    let mut out_arr = Vec::with_capacity(arr.len());
+    for (i, e) in arr.iter().enumerate() {
+        let field = format!("rules[{i}]");
+        let o = e
+            .as_object()
+            .ok_or_else(|| invalid(&field, "must be a { type, globs, fallthrough? } object"))?;
+        for k in o.keys() {
+            match k.as_str() {
+                "type" | "globs" | "fallthrough" => {}
+                _ => return Err(unsupported(&format!("{field}.{k}"), None)),
+            }
+        }
+        let ty = req_str(
+            o.get("type").unwrap_or(&Value::Null),
+            &format!("{field}.type"),
+        )?;
+        if PYTHON_RULE_TYPES.contains(&ty) {
+            return Err(unsupported(
+                &format!("{field}.type"),
+                Some(&format!(
+                    "'{ty}' requires the Python runtime — not supported on VRT"
+                )),
+            ));
+        }
+        if !MODULE_RULE_TYPES.contains(&ty) {
+            return Err(invalid(
+                &format!("{field}.type"),
+                &format!("must be one of {}", MODULE_RULE_TYPES.join(", ")),
+            ));
+        }
+        let globs_arr = o
+            .get("globs")
+            .ok_or_else(|| invalid(&format!("{field}.globs"), "is required"))?
+            .as_array()
+            .ok_or_else(|| invalid(&format!("{field}.globs"), "must be an array"))?;
+        let mut globs = Vec::with_capacity(globs_arr.len());
+        for (j, g) in globs_arr.iter().enumerate() {
+            globs.push(Value::from(req_str(g, &format!("{field}.globs[{j}]"))?));
+        }
+        let mut m = Map::new();
+        m.insert("type".into(), Value::from(ty));
+        m.insert("globs".into(), Value::Array(globs));
+        if let Some(ft) = o.get("fallthrough") {
+            if !ft.is_boolean() {
+                return Err(invalid(
+                    &format!("{field}.fallthrough"),
+                    "must be a boolean",
+                ));
+            }
+            m.insert("fallthrough".into(), ft.clone());
+        }
+        out_arr.push(Value::Object(m));
+    }
+    Ok(Value::Array(out_arr))
+}
+
 fn route_to_hostname(pattern: &str, field: &str) -> Result<String, ProjectConfigError> {
     let mut p = pattern.trim().to_lowercase();
     if let Some(stripped) = p.strip_suffix("/*") {
@@ -532,6 +710,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
     out.insert("schemaVersion".into(), Value::from(1));
     let mut bindings: Vec<Value> = Vec::new();
     let mut hostnames: Vec<String> = Vec::new();
+    let mut custom_domains: Vec<String> = Vec::new();
     let mut routes_seen = false;
     let mut route_seen = false;
 
@@ -565,6 +744,14 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
             "limits" => {
                 out.insert("quotas".into(), normalize_limits(value)?);
             }
+            // CF `[dev]` — wrangler dev-server settings, session-local
+            // and never part of a deployment: accepted and dropped
+            // here (mirroring the TS ignore list) so a config `wrangler
+            // deploy` accepts stays deployable — `ip = "0.0.0.0"` or an
+            // `inspector_port` must not fail `vrt deploy`. `vrt dev`
+            // re-validates it strictly at session start via
+            // `parse_dev_table` on the env-resolved config.
+            "dev" => {}
             "vars" => {
                 let vars = value
                     .as_object()
@@ -651,9 +838,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         match k.as_str() {
                             "binding" | "id" | "database_tenant" => {}
                             "localConnectionString" | "remote" => {}
-                            _ => {
-                                return Err(unsupported(&format!("hyperdrive[{i}].{k}"), None))
-                            }
+                            _ => return Err(unsupported(&format!("hyperdrive[{i}].{k}"), None)),
                         }
                     }
                     // Type-check only — the value is never used.
@@ -671,7 +856,10 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                                 .map(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
                                 .unwrap_or(false)
                             && tenant.bytes().all(|c| {
-                                c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                                c.is_ascii_lowercase()
+                                    || c.is_ascii_digit()
+                                    || c == b'-'
+                                    || c == b'_'
                             });
                         if !ok {
                             return Err(invalid(
@@ -714,7 +902,13 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         &format!("ratelimits[{i}].name"),
                     )?;
                     let ns = match e.get("namespace_id").and_then(|v| v.as_str()) {
-                        Some(s) if !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_digit()) => s,
+                        Some(s)
+                            if !s.is_empty()
+                                && s.len() <= 32
+                                && s.bytes().all(|c| c.is_ascii_digit()) =>
+                        {
+                            s
+                        }
                         _ => {
                             return Err(invalid(
                                 &format!("ratelimits[{i}].namespace_id"),
@@ -722,15 +916,17 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                             ))
                         }
                     };
-                    let simple = e
-                        .get("simple")
-                        .and_then(|v| v.as_object())
-                        .ok_or_else(|| invalid(&format!("ratelimits[{i}].simple"), "must be a table"))?;
+                    let simple = e.get("simple").and_then(|v| v.as_object()).ok_or_else(|| {
+                        invalid(&format!("ratelimits[{i}].simple"), "must be a table")
+                    })?;
                     for k in simple.keys() {
                         match k.as_str() {
                             "limit" | "period" => {}
                             _ => {
-                                return Err(unsupported(&format!("ratelimits[{i}].simple.{k}"), None))
+                                return Err(unsupported(
+                                    &format!("ratelimits[{i}].simple.{k}"),
+                                    None,
+                                ))
                             }
                         }
                     }
@@ -829,6 +1025,129 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     bindings.push(Value::Object(b));
                 }
             }
+            "analytics_engine_datasets" => {
+                // `[[analytics_engine_datasets]]` → analyticsEngine
+                // bindings. `dataset` defaults to the binding name
+                // (mirrors CF wrangler). `version` is rejected —
+                // upstream only ever shipped v1/v2 and now treats the
+                // key as deprecated; fail closed on unknown keys.
+                for (i, e) in table_list(value, "analytics_engine_datasets")?
+                    .iter()
+                    .enumerate()
+                {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "binding" | "dataset" | "remote" => {}
+                            _ => {
+                                return Err(unsupported(
+                                    &format!("analytics_engine_datasets[{i}].{k}"),
+                                    None,
+                                ))
+                            }
+                        }
+                    }
+                    let binding = req_str(
+                        e.get("binding").unwrap_or(&Value::Null),
+                        &format!("analytics_engine_datasets[{i}].binding"),
+                    )?;
+                    let dataset = opt_str(
+                        e.get("dataset"),
+                        &format!("analytics_engine_datasets[{i}].dataset"),
+                    )?
+                    .unwrap_or(binding);
+                    if dataset.is_empty()
+                        || dataset.len() > 256
+                        || !dataset
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return Err(invalid(
+                            &format!("analytics_engine_datasets[{i}].dataset"),
+                            "must match [A-Za-z0-9_]{1,256}",
+                        ));
+                    }
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("analyticsEngine"));
+                    b.insert("name".into(), Value::from(binding));
+                    b.insert("dataset".into(), Value::from(dataset));
+                    bindings.push(Value::Object(b));
+                }
+            }
+            "flagship" => {
+                // CF `[[flagship]] {binding, app_id}` — the Flagship
+                // feature-flag app binding; `env.<binding>` is the
+                // async evaluation API. `remote` is a CF local-dev
+                // knob (evaluate against the remote app instead of the
+                // local flag store): VRT has no remote/local split —
+                // evaluation always uses the propagated config — so it
+                // is accepted and ignored, same as AE's `remote`.
+                for (i, e) in table_list(value, "flagship")?.iter().enumerate() {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "binding" | "app_id" | "remote" => {}
+                            _ => return Err(unsupported(&format!("flagship[{i}].{k}"), None)),
+                        }
+                    }
+                    let binding = req_str(
+                        e.get("binding").unwrap_or(&Value::Null),
+                        &format!("flagship[{i}].binding"),
+                    )?;
+                    let app_id = req_str(
+                        e.get("app_id").unwrap_or(&Value::Null),
+                        &format!("flagship[{i}].app_id"),
+                    )?;
+                    if app_id.len() > 128 {
+                        return Err(invalid(
+                            &format!("flagship[{i}].app_id"),
+                            "must be at most 128 chars",
+                        ));
+                    }
+                    if let Some(v) = e.get("remote") {
+                        if !v.is_boolean() {
+                            return Err(invalid(
+                                &format!("flagship[{i}].remote"),
+                                "must be a boolean",
+                            ));
+                        }
+                    }
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("flagship"));
+                    b.insert("name".into(), Value::from(binding));
+                    b.insert("appId".into(), Value::from(app_id));
+                    bindings.push(Value::Object(b));
+                }
+            }
+            "streaming_tail_consumers" => {
+                // CF `streaming_tail_consumers = [{service = "..."}]` —
+                // same-table shape as `tail_consumers` (worker-level,
+                // same-tenant consumer referenced by name) but the
+                // consumer receives TailStream events via its
+                // `tailStream()` handler instead of batched `tail()`
+                // calls — workerd `streamingTails` designators.
+                // `{service}` is the only key CF's schema accepts.
+                let mut consumers: Vec<Value> = Vec::new();
+                for (i, e) in table_list(value, "streaming_tail_consumers")?
+                    .iter()
+                    .enumerate()
+                {
+                    for k in e.keys() {
+                        if k.as_str() != "service" {
+                            return Err(unsupported(
+                                &format!("streaming_tail_consumers[{i}].{k}"),
+                                None,
+                            ));
+                        }
+                    }
+                    let service = req_str(
+                        e.get("service").unwrap_or(&Value::Null),
+                        &format!("streaming_tail_consumers[{i}].service"),
+                    )?;
+                    let mut c = Map::new();
+                    c.insert("service".into(), Value::from(service));
+                    consumers.push(Value::Object(c));
+                }
+                out.insert("streamingTailConsumers".into(), Value::Array(consumers));
+            }
             "worker_loaders" => {
                 // Dynamic Workers (CF `[[worker_loaders]]`): a loader
                 // carries only a binding name — the tenant supplies code
@@ -837,10 +1156,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 for (i, e) in table_list(value, "worker_loaders")?.iter().enumerate() {
                     for k in e.keys() {
                         if k != "binding" {
-                            return Err(unsupported(
-                                &format!("worker_loaders[{i}].{k}"),
-                                None,
-                            ));
+                            return Err(unsupported(&format!("worker_loaders[{i}].{k}"), None));
                         }
                     }
                     let mut b = Map::new();
@@ -853,6 +1169,153 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                         )?),
                     );
                     bindings.push(Value::Object(b));
+                }
+            }
+            "observability" => {
+                // CF `[observability]` — Worker Logs gates + head
+                // sampling, enforced by the platform `vrt-tail`
+                // collector per worker. `enabled`/`logs.enabled`
+                // false => the cell renders NO collector (nothing is
+                // collected); `logs.head_sampling_rate` (or the
+                // deprecated top-level alias) keeps that fraction of
+                // INVOCATIONS whole — a dropped invocation keeps none
+                // of its records; `logs.invocation_logs` gates just
+                // the outcome record. `traces`/`persist`/`destinations`
+                // have no counterpart here and fail closed.
+                let t = value
+                    .as_object()
+                    .ok_or_else(|| invalid("observability", "must be a table"))?;
+                let mut enabled = None;
+                let mut rate_top = None;
+                let mut rate_logs = None;
+                let mut logs_enabled = None;
+                let mut invocation_logs = None;
+                for (k, v) in t {
+                    match k.as_str() {
+                        "enabled" => enabled = opt_bool(Some(v), "observability.enabled")?,
+                        "head_sampling_rate" => {
+                            rate_top = opt_rate(Some(v), "observability.head_sampling_rate")?
+                        }
+                        "logs" => {
+                            let lt = v
+                                .as_object()
+                                .ok_or_else(|| invalid("observability.logs", "must be a table"))?;
+                            for (lk, lv) in lt {
+                                match lk.as_str() {
+                                    "enabled" => {
+                                        logs_enabled =
+                                            opt_bool(Some(lv), "observability.logs.enabled")?
+                                    }
+                                    "head_sampling_rate" => {
+                                        rate_logs = opt_rate(
+                                            Some(lv),
+                                            "observability.logs.head_sampling_rate",
+                                        )?
+                                    }
+                                    "invocation_logs" => {
+                                        invocation_logs = opt_bool(
+                                            Some(lv),
+                                            "observability.logs.invocation_logs",
+                                        )?
+                                    }
+                                    _ => {
+                                        return Err(unsupported(
+                                            &format!("observability.logs.{lk}"),
+                                            None,
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                        _ => return Err(unsupported(&format!("observability.{k}"), None)),
+                    }
+                }
+                // When both the modern `logs.head_sampling_rate` and the
+                // deprecated top-level alias are present, `logs.*` wins
+                // (CF treats it as authoritative) — refusing the pair
+                // would reject a valid, unambiguous CF config. The
+                // alias is only a fallback for configs that predate the
+                // nested table.
+                let rate = rate_logs.or(rate_top).unwrap_or(1.0);
+                if !(0.0..=1.0).contains(&rate) {
+                    return Err(invalid(
+                        "observability.head_sampling_rate",
+                        "must be in [0,1]",
+                    ));
+                }
+                // PPM integer — the signed wire's canonical JSON is
+                // safe-integer-only (deterministic across Rust/TS).
+                let ppm = (rate * 1_000_000.0).round() as u64;
+                let mut o = Map::new();
+                o.insert("enabled".into(), Value::from(enabled.unwrap_or(true)));
+                o.insert(
+                    "logsEnabled".into(),
+                    Value::from(logs_enabled.unwrap_or(true)),
+                );
+                o.insert(
+                    "invocationLogs".into(),
+                    Value::from(invocation_logs.unwrap_or(true)),
+                );
+                o.insert("headSamplingRatePpm".into(), Value::from(ppm));
+                out.insert("observability".into(), Value::Object(o));
+            }
+            "unsafe" => {
+                // CF `[unsafe]` — raw-binding escape hatch
+                // (`[[unsafe.bindings]] {name, type}`): the entry is
+                // forwarded verbatim into upload metadata, so `type`
+                // may name any binding kind. `unsafe_eval` is the ONE
+                // type with no proper wrangler key that workerd runs
+                // (native `unsafeEval` capability object —
+                // eval/newFunction/newWasmModule); every other type has
+                // a first-class key
+                // in this surface or no runtime support, so it fails
+                // closed with guidance. `unsafe.capnp`/`unsafe.metadata`
+                // and friends inject raw workerd/upload structures —
+                // rejected: there is no faithful platform projection.
+                let table = value
+                    .as_object()
+                    .ok_or_else(|| unsupported("unsafe", Some("table")))?;
+                for (k, v) in table {
+                    if k != "bindings" {
+                        return Err(unsupported(
+                            &format!("unsafe.{k}"),
+                            Some("only [[unsafe.bindings]] is supported"),
+                        ));
+                    }
+                    for (i, et) in table_list(v, "unsafe.bindings")?.iter().enumerate() {
+                        for k in et.keys() {
+                            match k.as_str() {
+                                "name" | "type" => {}
+                                _ => {
+                                    return Err(unsupported(
+                                        &format!("unsafe.bindings[{i}].{k}"),
+                                        None,
+                                    ))
+                                }
+                            }
+                        }
+                        let name = req_str(
+                            et.get("name").unwrap_or(&Value::Null),
+                            &format!("unsafe.bindings[{i}].name"),
+                        )?;
+                        let ty = req_str(
+                            et.get("type").unwrap_or(&Value::Null),
+                            &format!("unsafe.bindings[{i}].type"),
+                        )?;
+                        if ty != "unsafe_eval" {
+                            return Err(unsupported(
+                                &format!("unsafe.bindings[{i}].type"),
+                                Some(&format!(
+                                    "`{ty}` has no unsafe-bindings support — use the first-class \
+                                     key for this binding type (only `unsafe_eval` is supported)"
+                                )),
+                            ));
+                        }
+                        let mut b = Map::new();
+                        b.insert("type".into(), Value::from("unsafeEval"));
+                        b.insert("name".into(), Value::from(name));
+                        bindings.push(Value::Object(b));
+                    }
                 }
             }
             "pg" => {
@@ -1250,7 +1713,55 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 for (i, e) in entries.iter().enumerate() {
                     let field = format!("{key}[{i}]");
                     let pattern = match e {
-                        Value::Object(o) => opt_str(o.get("pattern"), &format!("{field}.pattern"))?,
+                        Value::Object(o) => {
+                            // Booleans first — they decide which CF route
+                            // shape this entry is (`custom_domain: true` →
+                            // CustomDomainRoute, else zone/pattern route).
+                            for flag in ["custom_domain", "enabled", "previews_enabled"] {
+                                if let Some(v) = o.get(flag) {
+                                    if !v.is_boolean() {
+                                        return Err(invalid(
+                                            &format!("{field}.{flag}"),
+                                            "must be a boolean",
+                                        ));
+                                    }
+                                }
+                            }
+                            let is_custom = o
+                                .get("custom_domain")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let enabled =
+                                o.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                            // CF route-shape whitelist: zone refs are
+                            // accepted and ignored (VRT has no zone
+                            // registry); `enabled`/`previews_enabled` exist
+                            // only on the CustomDomainRoute shape.
+                            for k in o.keys() {
+                                match k.as_str() {
+                                    "pattern" | "custom_domain" | "zone_id" | "zone_name" => {}
+                                    "enabled" | "previews_enabled" if is_custom => {}
+                                    _ => return Err(unsupported(&format!("{field}.{k}"), None)),
+                                }
+                            }
+                            let p = opt_str(o.get("pattern"), &format!("{field}.pattern"))?
+                                .ok_or_else(|| {
+                                    invalid(&field, "must be a pattern string or { pattern }")
+                                })?;
+                            if is_custom {
+                                if enabled {
+                                    // Custom domain: `pattern` IS the
+                                    // hostname — no wildcard/suffix.
+                                    custom_domains.push(validate_custom_domain(
+                                        p,
+                                        &format!("{field}.pattern"),
+                                    )?);
+                                }
+                            } else {
+                                hostnames.push(route_to_hostname(p, &field)?);
+                            }
+                            continue;
+                        }
                         Value::String(_) => Some(e.as_str().unwrap()),
                         _ => {
                             return Err(invalid(&field, "must be a pattern string or { pattern }"))
@@ -1429,6 +1940,16 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     out.insert("tailConsumers".into(), Value::Array(out_arr));
                 }
             }
+            "rules" => {
+                out.insert("moduleRules".into(), normalize_module_rules(value)?);
+            }
+            "base_dir" => {
+                let d = req_str(value, "base_dir")?;
+                out.insert(
+                    "baseDir".into(),
+                    Value::from(validate_base_dir(d, "base_dir")?),
+                );
+            }
             "env" => {
                 return Err(invalid(
                     "env",
@@ -1459,6 +1980,21 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
         // control plane they must name ALREADY-claimed hostnames (they
         // never auto-claim, unlike the native `hostnames` field).
         out.insert("routeHostnames".into(), Value::Array(dedup));
+    }
+    if !custom_domains.is_empty() {
+        let dedup: Vec<Value> = {
+            let mut seen = std::collections::BTreeSet::new();
+            custom_domains
+                .into_iter()
+                .filter(|h| seen.insert(h.clone()))
+                .map(Value::from)
+                .collect()
+        };
+        // CF `custom_domain` routes attach the whole hostname to the
+        // worker — the control plane auto-claims them (idempotent
+        // vrtHostname claim + async verify), unlike `routeHostnames`
+        // which must name already-claimed hostnames.
+        out.insert("customDomains".into(), Value::Array(dedup));
     }
     Ok(Value::Object(out))
 }
@@ -1519,6 +2055,104 @@ fn normalize_limits(value: &Value) -> Result<Value, ProjectConfigError> {
         "subrequests": subrequests,
         "outboundConnections": DEFAULT_OUTBOUND_CONNECTIONS,
     }))
+}
+
+/// CF `[dev]` — wrangler dev-server settings, strictly validated for
+/// `vrt dev` at session start (deploy accepts and drops the table on
+/// the shared normalize path, so this runs only on the dev entry).
+/// `ip`/`port` pick the loopback ingress listen (CLI `--listen` still
+/// wins); `host` registers an extra hostname for the session and must
+/// satisfy the same hostname rule a desired-state route does, so a
+/// bad value fails here instead of at publish. Keys that declare dev
+/// behavior the standalone does not implement — `upstream_protocol`,
+/// `inspector_*`, `remote`/`experimental_remote`, `enable_containers`,
+/// `container_engine`, `generate_types` — fail closed; `local_protocol`
+/// is a no-op only when `http` (the sole mode vrt dev serves).
+pub(crate) fn parse_dev_table(
+    value: &Value,
+) -> Result<crate::worker_pkg::DevToml, ProjectConfigError> {
+    let table = value
+        .as_object()
+        .ok_or_else(|| invalid("dev", "must be a table"))?;
+    let mut out = crate::worker_pkg::DevToml::default();
+    for (k, v) in table {
+        match k.as_str() {
+            "ip" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid("dev.ip", "must be a string"))?;
+                // `localhost` — CF's default — resolves to IPv4
+                // loopback (DevPorts::alloc enforces loopback for
+                // `--listen` too; a public bind is refused either way).
+                let ip: std::net::IpAddr = if s == "localhost" {
+                    std::net::IpAddr::from([127, 0, 0, 1])
+                } else {
+                    s.parse()
+                        .map_err(|_| invalid("dev.ip", "must be an IP address or 'localhost'"))?
+                };
+                if !ip.is_loopback() {
+                    return Err(invalid("dev.ip", "vrt dev binds loopback only"));
+                }
+                out.ip = Some(ip.to_string());
+            }
+            "port" => {
+                let n = v
+                    .as_u64()
+                    .ok_or_else(|| invalid("dev.port", "must be an integer"))?;
+                if !(1..=65535).contains(&n) {
+                    return Err(invalid("dev.port", "must be within 1..=65535"));
+                }
+                out.port = Some(n as u16);
+            }
+            "host" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid("dev.host", "must be a string"))?;
+                if !snapshot_protocol::compute_desired::valid_hostname(s) {
+                    return Err(invalid(
+                        "dev.host",
+                        "must be a lowercase hostname with at least two labels",
+                    ));
+                }
+                out.host = Some(s.to_string());
+            }
+            "local_protocol" => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| invalid("dev.local_protocol", "must be a string"))?;
+                if s != "http" {
+                    return Err(unsupported(
+                        "dev.local_protocol",
+                        Some("vrt dev serves http only"),
+                    ));
+                }
+            }
+            other => return Err(unsupported(&format!("dev.{other}"), None)),
+        }
+    }
+    Ok(out)
+}
+
+/// Read the env-resolved `[dev]` table of a wrangler project for
+/// `vrt dev` — strict validation, applied only on the dev entry so a
+/// deploy never rejects session-only config it would drop anyway.
+/// `None` when the project has no `[dev]` (or ships `vrt.toml`, which
+/// carries `dev` inside `WorkerToml` instead).
+pub(crate) fn load_dev_table_for_env(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+) -> Result<Option<crate::worker_pkg::DevToml>, LocalError> {
+    if worker_dir.join("vrt.toml").exists() {
+        return Ok(None);
+    }
+    let (_config, resolved, _shadowed) =
+        load_wrangler_project_config(worker_dir, None, env_name)
+            .map_err(|e| LocalError::Worker(Box::leak(e.to_string().into_boxed_str())))?;
+    resolved
+        .get("dev")
+        .map(parse_dev_table)
+        .transpose()
+        .map_err(|e| LocalError::WorkerOwned(e.to_string()))
 }
 
 /// T31c: normalize `run_worker_first` — Wrangler semantics:
@@ -1643,6 +2277,19 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("quotas") {
         wire.insert("quotas".into(), v.clone());
     }
+    // `[dev]` — dev-server settings, verbatim (consumed by `vrt dev`,
+    // never by the desired-state path).
+    if let Some(v) = obj.get("dev") {
+        wire.insert("dev".into(), v.clone());
+    }
+    // `rules`/`base_dir` — module-typing rules + the rule-eval root,
+    // consumed by `build_pack_json` (already shape-proven above).
+    if let Some(v) = obj.get("moduleRules") {
+        wire.insert("moduleRules".into(), v.clone());
+    }
+    if let Some(v) = obj.get("baseDir") {
+        wire.insert("baseDir".into(), v.clone());
+    }
     if let Some(Value::Object(vars)) = obj.get("vars") {
         let mut out_vars = Map::new();
         for (k, v) in vars {
@@ -1685,7 +2332,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         // hostnames and native hostnames both become wire `hostnames`
         // (deduped, order-preserving).
         let mut merged: Vec<Value> = Vec::new();
-        for key in ["hostnames", "routeHostnames"] {
+        for key in ["hostnames", "routeHostnames", "customDomains"] {
             if let Some(Value::Array(list)) = obj.get(key) {
                 for v in list {
                     if !merged.contains(v) {
@@ -1715,6 +2362,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("queueConsumers") {
         wire.insert("queueConsumers".into(), v.clone());
     }
+    if let Some(v) = obj.get("streamingTailConsumers") {
+        wire.insert("streamingTailConsumers".into(), v.clone());
+    }
     if let Some(v) = obj.get("durableObjectBindings") {
         wire.insert("durableObjectBindings".into(), v.clone());
     }
@@ -1726,6 +2376,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     }
     if let Some(v) = obj.get("tailConsumers") {
         wire.insert("tailConsumers".into(), v.clone());
+    }
+    if let Some(v) = obj.get("observability") {
+        wire.insert("observability".into(), v.clone());
     }
 
     // W1-r1: STRUCTURAL anti-drop — every normalized top-level key
@@ -1742,13 +2395,19 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "assets",
         "hostnames",
         "routeHostnames",
+        "customDomains",
         "crons",
         "queueConsumers",
+        "observability",
+        "streamingTailConsumers",
         "durableObjectBindings",
         "durableObjectMigrations",
         "workflows",
         "tailConsumers",
         "quotas",
+        "dev",
+        "moduleRules",
+        "baseDir",
         "bindings",
     ];
     // Normalized-internal keys that legitimately do not carry to the
@@ -1775,6 +2434,8 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut hyperdrive = Map::new();
         let mut ratelimit = Map::new();
         let mut worker_loaders = Vec::new();
+        let mut unsafe_evals = Vec::new();
+        let mut flagship = Map::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -1875,6 +2536,13 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                 "workerLoader" => {
                     worker_loaders.push(Value::from(name));
                 }
+                "unsafeEval" => {
+                    unsafe_evals.push(Value::from(name));
+                }
+                "flagship" => {
+                    let app_id = b.get("appId").and_then(|i| i.as_str()).unwrap_or(name);
+                    flagship.insert(name.into(), Value::from(app_id));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -1919,6 +2587,12 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !worker_loaders.is_empty() {
             bind.insert("workerLoaders".into(), Value::Array(worker_loaders));
+        }
+        if !unsafe_evals.is_empty() {
+            bind.insert("unsafeEvals".into(), Value::Array(unsafe_evals));
+        }
+        if !flagship.is_empty() {
+            bind.insert("flagship".into(), Value::Object(flagship));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));
@@ -1972,8 +2646,7 @@ mod tests {
 
     fn vectors_path() -> PathBuf {
         // vrt-local → workers-runtime → server → repo root
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../shared/vrt-project-config-vectors.json")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shared/vrt-project-config-vectors.json")
     }
 
     #[test]
@@ -2162,6 +2835,213 @@ mod tests {
         assert_eq!(bind.kv.get("K").map(|s| s.as_str()), Some("K"));
     }
 
+    fn wrangler_meta(toml: &str) -> Result<WorkerToml, LocalError> {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("wrangler.toml"), toml).unwrap();
+        load_worker_meta(dir.path()).map(|(m, _)| m)
+    }
+
+    #[test]
+    fn custom_domain_routes_into_hostnames() {
+        // `{pattern, custom_domain = true}` — CF CustomDomainRoute: the
+        // pattern IS the hostname (uppercase folds to lowercase; zone
+        // refs are accepted and ignored, matching CF's anyOf shapes).
+        let meta = wrangler_meta(
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             routes=[{pattern=\"API.Example.com\",custom_domain=true},\n\
+             {pattern=\"api.example.com/*\",zone_name=\"example.com\"}]\n",
+        )
+        .unwrap();
+        // Both land in standalone `hostnames` (wire merge dedupes).
+        assert_eq!(meta.hostnames, vec!["api.example.com"]);
+
+        // Multiple custom domains dedup to first-occurrence order (same
+        // as `routeHostnames`).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.toml"),
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             routes=[{pattern=\"b.example.com\",custom_domain=true},\n\
+             {pattern=\"a.example.com\",custom_domain=true},\n\
+             {pattern=\"b.example.com\",custom_domain=true}]\n",
+        )
+        .unwrap();
+        let (cfg, _, _) = load_wrangler_project_config(dir.path(), None, None).unwrap();
+        assert_eq!(
+            cfg["customDomains"],
+            serde_json::json!(["b.example.com", "a.example.com"])
+        );
+        // Singular `route` form carries the same entry shape.
+        let meta = wrangler_meta(
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             route={pattern=\"one.example.com\",custom_domain=true}\n",
+        )
+        .unwrap();
+        assert_eq!(meta.hostnames, vec!["one.example.com"]);
+    }
+
+    #[test]
+    fn custom_domain_disabled_and_false_are_not_claimed() {
+        // `enabled = false` → not served, not claimed; `custom_domain
+        // = false` on a zone route stays a plain pattern route.
+        let meta = wrangler_meta(
+            "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n\
+             routes=[{pattern=\"off.example.com\",custom_domain=true,enabled=false},\n\
+             {pattern=\"on.example.com/*\",zone_id=\"z1\",custom_domain=false}]\n",
+        )
+        .unwrap();
+        assert_eq!(meta.hostnames, vec!["on.example.com"]);
+    }
+
+    #[test]
+    fn custom_domain_fail_closed() {
+        let bad = [
+            // wildcard custom domains are out of the claim model's scope
+            (
+                "routes=[{pattern=\"*.example.com\",custom_domain=true}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // a path/port is not a bare hostname
+            (
+                "routes=[{pattern=\"a.example.com/v1\",custom_domain=true}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            (
+                "routes=[{pattern=\"a.example.com:443\",custom_domain=true}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // single label is not a routable FQDN claim
+            (
+                "routes=[{pattern=\"localhost\",custom_domain=true}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // non-boolean custom_domain
+            (
+                "routes=[{pattern=\"a.example.com\",custom_domain=\"yes\"}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // `enabled` only exists on the custom-domain shape
+            (
+                "routes=[{pattern=\"a.example.com/*\",enabled=false}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // unknown keys fail closed (CF additionalProperties:false)
+            (
+                "routes=[{pattern=\"a.example.com\",custom_domain=true,ttl=60}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+        ];
+        for (routes, code) in bad {
+            let err = wrangler_meta(&format!(
+                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{routes}\n"
+            ))
+            .expect_err(&format!("{routes} must fail"));
+            assert!(
+                format!("{err:?}").contains(code),
+                "{routes} → {err:?}, want {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_rules_and_base_dir_normalize() {
+        // `{type, globs, fallthrough?}` — CF Rule shape; `base_dir`
+        // carries verbatim as the pack-time rule-eval root.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.toml"),
+            "name=\"w\"\nmain=\"src/index.mjs\"\ncompatibility_date=\"2025-01-01\"\n\
+             base_dir=\"src\"\n\
+             rules=[{type=\"Text\",globs=[\"**/*.md\"],fallthrough=true},\n\
+             {type=\"Data\",globs=[\"**/*.bin\"]}]\n",
+        )
+        .unwrap();
+        let (cfg, _, _) = load_wrangler_project_config(dir.path(), None, None).unwrap();
+        assert_eq!(cfg["baseDir"], serde_json::json!("src"));
+        assert_eq!(
+            cfg["moduleRules"],
+            serde_json::json!([
+                {"type": "Text", "globs": ["**/*.md"], "fallthrough": true},
+                {"type": "Data", "globs": ["**/*.bin"]},
+            ])
+        );
+        // The pack-time meta carries them through the wire shape.
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.base_dir.as_deref(), Some("src"));
+        assert_eq!(meta.module_rules.len(), 2);
+        assert_eq!(meta.module_rules[0].ty, "Text");
+        assert_eq!(meta.module_rules[0].fallthrough, Some(true));
+    }
+
+    #[test]
+    fn module_rules_fail_closed() {
+        let bad = [
+            // unknown type (CF enum)
+            (
+                "rules=[{type=\"Text2\",globs=[\"a\"]}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // Python types are schema-valid but runtime-less here
+            (
+                "rules=[{type=\"PythonModule\",globs=[\"**/*.py\"]}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // missing globs
+            ("rules=[{type=\"Text\"}]", "VRT_CONFIG_INVALID"),
+            // non-array globs / non-string entries
+            (
+                "rules=[{type=\"Text\",globs=\"*.txt\"}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            ("rules=[{type=\"Text\",globs=[42]}]", "VRT_CONFIG_INVALID"),
+            // unknown key — CF additionalProperties:false
+            (
+                "rules=[{type=\"Text\",globs=[\"a\"],x=1}]",
+                "VRT_CONFIG_UNSUPPORTED_FIELD",
+            ),
+            // non-boolean fallthrough
+            (
+                "rules=[{type=\"Text\",globs=[\"a\"],fallthrough=\"yes\"}]",
+                "VRT_CONFIG_INVALID",
+            ),
+            // not an array
+            ("rules={type=\"Text\"}", "VRT_CONFIG_INVALID"),
+        ];
+        for (rules, code) in bad {
+            let err = wrangler_meta(&format!(
+                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{rules}\n"
+            ))
+            .expect_err(&format!("{rules} must fail"));
+            assert!(
+                format!("{err:?}").contains(code),
+                "{rules} → {err:?}, want {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn base_dir_fail_closed() {
+        for (dir_value, code) in [
+            // escapes the project
+            ("base_dir=\"../x\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"/abs\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"a\\\\b\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"a/../b\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"./x\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=\"x/\"", "VRT_CONFIG_INVALID"),
+            ("base_dir=42", "VRT_CONFIG_INVALID"),
+        ] {
+            let err = wrangler_meta(&format!(
+                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{dir_value}\n"
+            ))
+            .expect_err(&format!("{dir_value} must fail"));
+            assert!(
+                format!("{err:?}").contains(code),
+                "{dir_value} → {err:?}, want {code}"
+            );
+        }
+    }
+
     #[test]
     fn hyperdrive_and_ratelimits_project_into_standalone_shape() {
         let dir = tempfile::tempdir().unwrap();
@@ -2265,7 +3145,10 @@ mod tests {
             "[service]\nA = \"t\"\nB = { service = \"t\", entrypoint = \"Greeter\" }\nC = { service = \"t\", props = { a = 1, nested = { b = true } } }\nD = { service = \"t\", entrypoint = \"Api\", props = { region = \"eu\" } }\n",
         )
         .unwrap();
-        assert_eq!(b.service.get("A"), Some(&ServiceTargetToml::Worker("t".into())));
+        assert_eq!(
+            b.service.get("A"),
+            Some(&ServiceTargetToml::Worker("t".into()))
+        );
         assert_eq!(b.service.get("B").unwrap().entrypoint(), Some("Greeter"));
         let c = b.service.get("C").unwrap();
         assert_eq!(c.entrypoint(), None);
@@ -2345,9 +3228,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("wrangler.toml"),
-            format!(
-                "name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{extra}"
-            ),
+            format!("name=\"w\"\nmain=\"m.js\"\ncompatibility_date=\"2025-01-01\"\n{extra}"),
         )
         .unwrap();
         dir
@@ -2368,7 +3249,10 @@ mod tests {
         // Unknown field under the array table.
         let dir = wrangler_loader_body("[[worker_loaders]]\nbinding=\"L\"\nid=\"x\"\n");
         let err = load_worker_meta(dir.path()).expect_err("unknown key must fail");
-        assert!(format!("{err:?}").contains("worker_loaders[0].id"), "{err:?}");
+        assert!(
+            format!("{err:?}").contains("worker_loaders[0].id"),
+            "{err:?}"
+        );
         // Missing binding.
         let dir = wrangler_loader_body("[[worker_loaders]]\n");
         assert!(load_worker_meta(dir.path()).is_err());
@@ -2377,6 +3261,191 @@ mod tests {
         assert!(load_worker_meta(dir.path()).is_err());
         // Not an array of tables.
         let dir = wrangler_loader_body("worker_loaders=\"L\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn unsafe_eval_bindings_into_pack_shape() {
+        let dir = wrangler_loader_body(
+            "[unsafe]\n[[unsafe.bindings]]\nname=\"UNSAFE_EVAL\"\ntype=\"unsafe_eval\"\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(
+            meta.bindings.unwrap().unsafe_evals,
+            vec!["UNSAFE_EVAL".to_string()]
+        );
+    }
+
+    #[test]
+    fn unsafe_eval_bindings_fail_closed() {
+        // A raw binding type other than unsafe_eval is refused — every
+        // other kind either has a first-class key or no runtime support.
+        let dir =
+            wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\nname=\"Q\"\ntype=\"queue\"\n");
+        let err = load_worker_meta(dir.path()).expect_err("queue type must fail");
+        assert!(
+            format!("{err:?}").contains("unsafe.bindings[0].type"),
+            "{err:?}"
+        );
+        // Other `[unsafe]` keys (capnp/metadata raw injection) refused.
+        let dir = wrangler_loader_body("[unsafe]\ncapnp=\"x\"\n");
+        let err = load_worker_meta(dir.path()).expect_err("unsafe.capnp must fail");
+        assert!(format!("{err:?}").contains("unsafe.capnp"), "{err:?}");
+        // Missing name.
+        let dir = wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\ntype=\"unsafe_eval\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // Missing type.
+        let dir = wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\nname=\"E\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // Non-string name.
+        let dir =
+            wrangler_loader_body("[unsafe]\n[[unsafe.bindings]]\nname=1\ntype=\"unsafe_eval\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // `unsafe` not a table.
+        let dir = wrangler_loader_body("unsafe=\"x\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+        // `unsafe.bindings` not an array of tables.
+        let dir = wrangler_loader_body("[unsafe]\nbindings=\"x\"\n");
+        assert!(load_worker_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn streaming_tail_consumers_into_pack_shape() {
+        // CF `streaming_tail_consumers = [{service}]` — same shape as
+        // `tail_consumers`, projected to its own pack key.
+        let dir = wrangler_loader_body(
+            "streaming_tail_consumers = [{service=\"t1\"},{service=\"t2\"}]\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let services: Vec<&str> = meta
+            .streaming_tail_consumers
+            .iter()
+            .map(|c| c.service.as_str())
+            .collect();
+        assert_eq!(services, ["t1", "t2"]);
+
+        // Only `service` is accepted — unknown keys fail closed.
+        for toml in [
+            "streaming_tail_consumers = [{service=\"t1\",environment=\"prod\"}]\n",
+            "streaming_tail_consumers = [{service=\"t1\",remote=true}]\n",
+            "streaming_tail_consumers = [{namespace=\"ns\"}]\n",
+            "streaming_tail_consumers = \"svc\"\n",
+            "streaming_tail_consumers = [1]\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+    }
+
+    #[test]
+    fn observability_into_pack_shape() {
+        let dir = wrangler_loader_body(
+            "[observability]\nenabled=true\nhead_sampling_rate=0.3\n[observability.logs]\ninvocation_logs=false\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.expect("observability parsed");
+        assert!(obs.enabled);
+        assert!(obs.logs_enabled);
+        assert!(!obs.invocation_logs);
+        assert_eq!(obs.head_sampling_rate_ppm, 300_000);
+        // `logs.head_sampling_rate` is the modern slot; folded the same.
+        let dir =
+            wrangler_loader_body("[observability.logs]\nhead_sampling_rate=0.5\nenabled=false\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.unwrap();
+        assert_eq!(obs.head_sampling_rate_ppm, 500_000);
+        assert!(!obs.logs_enabled);
+    }
+
+    #[test]
+    fn observability_defaults_and_fail_closed() {
+        // An empty table folds to CF defaults: all gates on, rate 1.
+        let dir = wrangler_loader_body("[observability]\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let obs = meta.observability.unwrap();
+        assert_eq!(obs.head_sampling_rate_ppm, 1_000_000);
+        assert!(obs.enabled && obs.logs_enabled && obs.invocation_logs);
+        // Deprecated alias AND `logs.head_sampling_rate` together:
+        // CF treats `logs.*` as authoritative, so the nested value wins
+        // instead of rejecting an otherwise valid config.
+        let dir = wrangler_loader_body(
+            "[observability]\nhead_sampling_rate=0.5\n[observability.logs]\nhead_sampling_rate=0.25\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.observability.unwrap().head_sampling_rate_ppm, 250_000);
+        // A named env that only tunes sampling must not reset inherited
+        // gates to their defaults (top-level `enabled = false` is a
+        // privacy gate; losing it here is fail-open).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"w","main":"m.js","compatibility_date":"2025-01-01",
+               "observability":{"enabled":false,"logs":{"invocation_logs":false}},
+               "env":{"production":{"observability":{"head_sampling_rate":0.25}}}}"#,
+        )
+        .unwrap();
+        let (meta, _) = load_worker_meta_for_env(dir.path(), Some("production")).unwrap();
+        let obs = meta.observability.expect("env observability parsed");
+        assert!(!obs.enabled, "inherited enabled=false must survive");
+        assert!(!obs.invocation_logs, "inherited logs gate must survive");
+        assert_eq!(obs.head_sampling_rate_ppm, 250_000);
+        // Rate bounds.
+        for toml in [
+            "[observability.logs]\nhead_sampling_rate=1.5\n",
+            "[observability]\nhead_sampling_rate=-0.1\n",
+            "[observability]\nhead_sampling_rate=\"half\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+        // No counterpart in this pipeline — every one fails closed.
+        for toml in [
+            "[observability.traces]\nenabled=true\n",
+            "[observability.logs]\npersist=true\n",
+            "[observability.logs]\ndestinations=[\"x\"]\n",
+            "[observability]\ninvocation_logs=false\n",
+            "[observability]\nenabled=\"yes\"\n",
+            "observability=\"x\"\n",
+            "[observability]\nlogs=\"x\"\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+    }
+
+    #[test]
+    fn flagship_bindings_into_pack_shape() {
+        // CF `[[flagship]] {binding, app_id}` → `{type:"flagship"}`
+        // binding records + the pack-shape `flagship` map (name →
+        // appId). Multiple apps bind to one worker (CF: one worker may
+        // consume several Flagship apps).
+        let dir = wrangler_loader_body(
+            "[[flagship]]\nbinding=\"FLAGS_A\"\napp_id=\"app-a\"\n[[flagship]]\nbinding=\"FLAGS_B\"\napp_id=\"app-b\"\nremote=true\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let b = meta.bindings.unwrap();
+        assert_eq!(b.flagship.get("FLAGS_A").map(String::as_str), Some("app-a"));
+        assert_eq!(b.flagship.get("FLAGS_B").map(String::as_str), Some("app-b"));
+
+        // Fail closed: missing binding/app_id, non-string values,
+        // oversized appId, non-boolean `remote`, unknown keys.
+        for toml in [
+            "[[flagship]]\napp_id=\"app-a\"\n",
+            "[[flagship]]\nbinding=\"F\"\n",
+            "[[flagship]]\nbinding=1\napp_id=\"a\"\n",
+            "[[flagship]]\nbinding=\"F\"\napp_id=7\n",
+            "[[flagship]]\nbinding=\"F\"\napp_id=\"a\"\nremote=\"yes\"\n",
+            "[[flagship]]\nbinding=\"F\"\napp_id=\"a\"\nextra=1\n",
+            "flagship={binding=\"F\",app_id=\"a\"}\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+        // appId cap.
+        let dir = wrangler_loader_body(&format!(
+            "[[flagship]]\nbinding=\"F\"\napp_id=\"{}\"\n",
+            "a".repeat(129)
+        ));
         assert!(load_worker_meta(dir.path()).is_err());
     }
 
@@ -2428,6 +3497,105 @@ mod tests {
             .expect_err("unknown key must fail");
         assert_eq!(err.code, "VRT_CONFIG_UNSUPPORTED_FIELD");
         assert_eq!(err.field.as_deref(), Some("limits.memory_mb"));
+    }
+
+    #[test]
+    fn parse_dev_table_gates_and_fail_closed() {
+        // The wrangler `[dev]` surface vrt dev consumes: ip/port/host.
+        let full = parse_dev_table(&serde_json::json!({
+            "ip": "localhost",
+            "port": 9_000,
+            "host": "dev.example.com",
+        }))
+        .expect("ip/port/host accepted");
+        assert_eq!(full.ip.as_deref(), Some("127.0.0.1"));
+        assert_eq!(full.port, Some(9_000));
+        assert_eq!(full.host.as_deref(), Some("dev.example.com"));
+
+        // IPv6 loopback is accepted (DevPorts::alloc renders it as a
+        // bracketed SocketAddr) and canonicalizes to `::1`.
+        let v6 = parse_dev_table(&serde_json::json!({"ip": "::1"})).unwrap();
+        assert_eq!(v6.ip.as_deref(), Some("::1"));
+
+        // `local_protocol = "http"` is a no-op (the only mode).
+        parse_dev_table(&serde_json::json!({"local_protocol": "http"})).unwrap();
+
+        // Malformed values.
+        for (input, path) in [
+            (serde_json::json!(1), "dev"),
+            (serde_json::json!({"ip": 1}), "dev.ip"),
+            (serde_json::json!({"ip": "0.0.0.0"}), "dev.ip"),
+            (serde_json::json!({"ip": "example.com"}), "dev.ip"),
+            (serde_json::json!({"port": 0}), "dev.port"),
+            (serde_json::json!({"port": 70000}), "dev.port"),
+            (serde_json::json!({"port": "9000"}), "dev.port"),
+            (serde_json::json!({"host": ""}), "dev.host"),
+            (serde_json::json!({"host": "localhost"}), "dev.host"),
+            (serde_json::json!({"host": "Dev.Example.com"}), "dev.host"),
+            (serde_json::json!({"host": "*.example.com"}), "dev.host"),
+        ] {
+            let err = parse_dev_table(&input).expect_err("malformed must fail");
+            assert_eq!(err.code, "VRT_CONFIG_INVALID", "{input}: {err:?}");
+            assert_eq!(err.field.as_deref(), Some(path), "{input}: {err:?}");
+        }
+
+        // Unimplemented dev semantics fail closed.
+        for (input, path) in [
+            (
+                serde_json::json!({"local_protocol": "https"}),
+                "dev.local_protocol",
+            ),
+            (
+                serde_json::json!({"upstream_protocol": "https"}),
+                "dev.upstream_protocol",
+            ),
+            (
+                serde_json::json!({"inspector_port": 9229}),
+                "dev.inspector_port",
+            ),
+            (serde_json::json!({"remote": true}), "dev.remote"),
+            (
+                serde_json::json!({"generate_types": true}),
+                "dev.generate_types",
+            ),
+        ] {
+            let err = parse_dev_table(&input).expect_err("unsupported key must fail");
+            assert_eq!(err.code, "VRT_CONFIG_UNSUPPORTED_FIELD", "{input}: {err:?}");
+            assert_eq!(err.field.as_deref(), Some(path), "{input}: {err:?}");
+        }
+    }
+
+    /// `vrt deploy` must accept every `[dev]` key `wrangler deploy` accepts:
+    /// the shared normalize path drops the table instead of validating it,
+    /// so `ip = "0.0.0.0"`, `inspector_port` and `remote` cannot fail a
+    /// deploy. Only `vrt dev` re-validates strictly (`parse_dev_table`).
+    #[test]
+    fn deploy_projection_drops_dev_table() {
+        let dir = wrangler_loader_body(
+            "[dev]\nip = \"0.0.0.0\"\nport = 9000\nhost = \"dev.example.com\"\n\
+             inspector_port = 9229\nremote = true\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert!(
+            meta.dev.is_none(),
+            "wrangler [dev] is session-local and must not enter the pack"
+        );
+        // The dev entry re-validates the same table strictly: a public
+        // bind stays refused there even though deploy accepted it.
+        assert!(
+            load_dev_table_for_env(dir.path(), None).is_err(),
+            "vrt dev must still refuse a non-loopback bind"
+        );
+
+        // A dev-acceptable table resolves on the dev entry.
+        let loopback = wrangler_loader_body(
+            "[dev]\nip = \"localhost\"\nport = 9000\nhost = \"dev.example.com\"\n",
+        );
+        let dev = load_dev_table_for_env(loopback.path(), None)
+            .expect("dev entry resolves the table")
+            .expect("table present");
+        assert_eq!(dev.port, Some(9_000));
+        assert_eq!(dev.host.as_deref(), Some("dev.example.com"));
     }
 
     /// The normalized `limits` block must survive the anti-drop projection

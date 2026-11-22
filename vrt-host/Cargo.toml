@@ -15,6 +15,7 @@ dev-stub = []
 
 [dependencies]
 arc-swap = "1"
+arrow = "59"
 async-trait = "0.1"
 axum = "0.8"
 bytes = "1"
@@ -27,6 +28,8 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+maxminddb = "0.33"
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

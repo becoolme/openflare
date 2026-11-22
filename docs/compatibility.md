@@ -31,6 +31,8 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | WebSockets | Partial | [bindings/websockets.md](bindings/websockets.md), [ingress-websocket.md](ingress-websocket.md) |
 | Vars / secrets | Partial | [bindings/vars-and-secrets.md](bindings/vars-and-secrets.md) |
 | Tail Workers | Partial | [bindings/tail-workers.md](bindings/tail-workers.md) |
+| Flagship (`[[flagship]]` feature flags) | Partial | [wrangler-config.md](wrangler-config.md), [bindings/flagship.md](bindings/flagship.md) |
+| Observability (`[observability]` Worker Logs gates + head sampling) | Partial | [wrangler-config.md](wrangler-config.md) |
 | Workers AI, Vectorize, AI Search, Analytics Engine, Pipelines, e-mail, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
 
 ## Known platform differences
@@ -55,16 +57,23 @@ These are not tied to one binding.
 - **No edge network.** One `vrt-host` is one ingress — no Cloudflare
   global anycast, no edge cache tier for `cacheTtl`, no Smart Placement
   (`placement` is ignored).
-- **`request.cf` is a whitelist, synthesized from the verified Cloudflare
-  chain.** Inbound `cf-*` headers are stripped and re-injected only when
-  the request arrived through the trusted proxy → Cloudflare edge. Today:
-  `country`, `colo`, `httpProtocol`, plus the visitor-location set
-  `city`, `continent`, `region`, `regionCode`, `metroCode`,
-  `postalCode`, `timezone`, `latitude`, `longitude`, `isEUCountry`
-  (the location fields require the zone's **Add visitor location
-  headers** managed transform). `asn`, `asOrganization`, `botManagement`
-  and the `tls*` fields have no header source on this ingress and stay
-  absent rather than being guessed.
+- **`request.cf` is a whitelist, synthesized from two sources.**
+  Inbound `cf-*` headers are stripped and re-injected only when the
+  request arrived through the trusted proxy → Cloudflare edge;
+  verified upstream values always win. On top of that, the `[geoip]`
+  module (default on) resolves the client IP the typed `clientIp`
+  policy derived — or the TCP peer itself when no trusted proxy is
+  configured — against a local MMDB and fills any field upstream did
+  not provide. Emitted today: `country`, `colo`, `httpProtocol`,
+  `asn` (JSON number), `asOrganization`, plus the visitor-location
+  set `city`, `continent`, `region`, `regionCode`, `metroCode`,
+  `postalCode`, `timezone`, `latitude`, `longitude`, `isEUCountry`.
+  `colo` has no local source (it names the edge in front, not the
+  client) and stays upstream-only; `botManagement` and the `tls*`
+  fields stay absent rather than being guessed. The MMDB is the
+  merged `NetworkCats/Merged-IP-Data` release — see `[geoip]` in
+  `examples/*-vrt-host.toml` for mirror/disable options and the
+  attribution note.
 
 ## Known limitations
 
@@ -109,13 +118,21 @@ These are not tied to one binding.
   `tails` designators alongside the platform log collector. The
   consumer must be a different, already-deployed Worker of the same
   tenant, delivery is best effort (events may be dropped and must not
-  be used for billing/audit), and streaming tail consumers
-  (`streamingTails`) are not supported. `TailItem.scriptName` is null
+  be used for billing/audit). `streaming_tail_consumers` renders
+  streaming `tailStream()` consumers as workerd `streamingTails`
+  designators. `TailItem.scriptName` is null
   in standalone workerd (there is no per-script name). See
   [`docs/bindings/tail-workers.md`](bindings/tail-workers.md).
+- **Analytics Engine** (`[[analytics_engine_datasets]]`): native
+  `writeDataPoint()` ingests into a per-tenant spool that flushes to
+  canonical Parquet under `<work>/ae/out/`. Full-fidelity storage (no
+  sampling/`_sample_interval`); query via DuckDB or ClickHouse
+  `s3(...,'Parquet')` — see [Analytics Engine](bindings/analytics-engine.md).
 - **No D1 migrations runner** — `migrations_dir` is an unsupported key.
-- **Routes**: only plain hostnames and `<fqdn>/*` patterns; no zone
-  management, no `custom_domain`.
+- **Routes**: plain hostnames and `<fqdn>/*` patterns, plus CF
+  `custom_domain` entries (`{ pattern = "host", custom_domain = true }` —
+  the bare hostname attaches to the worker; `enabled = false` disables).
+  Wildcard custom domains and zone management are not carried.
 
 ## Unsupported bindings
 
@@ -124,11 +141,14 @@ Any unrecognized wrangler key fails the deploy with
 [`docs/wrangler-config.md`](wrangler-config.md) for the full table.
 Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 (`ai`), Vectorize (`vectorize`), AI Search (`ai_search`,
-`ai_search_namespaces`), Analytics Engine (`analytics_engine_datasets`),
-Secrets Store (`secrets_store_secrets`), Pipelines, dispatch namespaces
+`ai_search_namespaces`), Secrets Store
+(`secrets_store_secrets`), Pipelines, dispatch namespaces
 (`dispatch_namespaces`), `send_email`, `mtls_certificates`, `browser`,
-`containers`, `unsafe`, raw
+`containers`, raw
 `wasm_modules`/`text_blobs`/`data_blobs`/`version_metadata` upload keys.
+`[unsafe]` is partially supported: `[[unsafe.bindings]]` entries with
+`type = "unsafe_eval"` bind workerd's `unsafeEval` capability; other
+`type` values and other `unsafe.*` keys fail closed.
 
 ## Error taxonomy
 
@@ -145,9 +165,16 @@ Runtime failures visible at ingress carry platform codes documented in
 ## Changelog
 
 - 2026-11-21: Tail Workers (`tail_consumers`) are supported as native
-  workerd `tails` designators; user consumers coexist with the platform
-  log collector. Delivery is best effort, consumers must be different
-  same-tenant deployed Workers, and streaming tails remain unsupported.
+  workerd `tails` designators; `streaming_tail_consumers` render as
+  `streamingTails` designators delivering `tailStream()` events. User
+  consumers coexist with the platform log collector. Delivery is best
+  effort, consumers must be different same-tenant deployed Workers, and
+  a worker can consume one event channel only.
+- 2026-11-20: Analytics Engine (`[[analytics_engine_datasets]]` → native
+  `analyticsEngine` bindings) ingests `writeDataPoint()` events to a
+  per-tenant socket, spools JSONL, and flushes to canonical Parquet
+  (`ae/out/<seg>/<dataset>/dt=<date>/part-*.parquet`). Query via
+  DuckDB/ClickHouse; no sampling or hosted SQL API yet.
 
 - 2026-11-20: Worker loaders (`[[worker_loaders]]` → native `WorkerLoader`
   bindings, `get`/`load`, named cache, dynamic entrypoints and DO facets)

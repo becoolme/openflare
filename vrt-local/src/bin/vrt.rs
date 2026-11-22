@@ -1139,6 +1139,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             secrets,
             name: overrides.name.clone(),
             meta: g.meta.clone(),
+            flagship_apps: g.flagship_apps.clone(),
         };
         let wire = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
         let (status, text) = http_post_json(url, "/v1/deploy/upload", &token, &wire)?;

@@ -112,6 +112,7 @@ fn upload_body(dir: &Path) -> vrt_local::worker_pkg::DeployUpload {
         vars: BTreeMap::from([("EXTRA".to_string(), "yes".to_string())]),
         secrets: BTreeMap::from([("api-key-ref".to_string(), "s3cr3t-value".to_string())]),
         name: None,
+        flagship_apps: g.flagship_apps.clone(),
     }
 }
 
@@ -352,8 +353,10 @@ fn tampered_upload_rejected() {
         serde_json::from_value(serde_json::to_value(&good).unwrap()).unwrap();
     bad.secrets
         .insert("ok-ref".to_string(), "V4LUE-N0T-1N-ERR0RS".to_string());
+    // `.xyz` has no extension fallback and matches no module rule —
+    // unlike `.bin`, which the implicit `Data: **/*.bin` rule claims.
     bad.modules
-        .insert("broken.bin".to_string(), "AA==".to_string());
+        .insert("broken.xyz".to_string(), "AA==".to_string());
     let err = local.deploy_upload(&bad).unwrap_err().to_string();
     assert!(!err.contains("V4LUE-N0T-1N-ERR0RS"), "secret leaked: {err}");
 

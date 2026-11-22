@@ -79,6 +79,15 @@ pub const MAX_WORKER_NAME_LEN: usize = 63;
 pub const MAX_BINDING_NAME_LEN: usize = 64;
 /// Maximum compact-JSON size of a service binding's `props` object.
 pub const MAX_SERVICE_PROPS_BYTES: usize = 8 * 1024;
+
+/// Flagship apps one tenant may publish — CF allows many apps per
+/// account; 64 bounds the signed payload while leaving headroom.
+pub const MAX_FLAGSHIP_APPS_PER_TENANT: usize = 64;
+
+/// Serialized `{"flags":{...}}` module config per app — larger than a
+/// `json` binding since flag sets include targeting rules, still
+/// bounded so a signed snapshot stays small.
+pub const MAX_FLAGSHIP_CONFIG_BYTES: usize = 64 * 1024;
 /// Maximum route hostname length (DNS).
 pub const MAX_HOSTNAME_LEN: usize = 253;
 /// Maximum compatibility-flag token length.
@@ -156,6 +165,31 @@ pub struct TenantDesired {
 
     /// Workers assigned to this tenant on this cell.
     pub workers: Vec<WorkerDesired>,
+
+    /// Cloudflare Flagship apps owned by this tenant — the flag
+    /// definitions (data plane) behind `{"type":"flagship"}` bindings.
+    /// Flag edits mint a new `compute.desired` revision and propagate
+    /// without a worker redeploy, matching Flagship's ≤30s global
+    /// propagation. Skipped when empty so snapshots stay
+    /// byte-identical; old cells reject the field via
+    /// `deny_unknown_fields` (fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flagship_apps: Vec<FlagshipAppDesired>,
+}
+
+/// One Flagship app — the `app_id` a `flagship` binding resolves to.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FlagshipAppDesired {
+    /// Platform-assigned app identifier (the wrangler `app_id`).
+    pub app_id: String,
+    /// Serialized `{"appId","accountTag","flags":{...}}` module config,
+    /// canonical JSON text — emitted verbatim as the `wrapped`
+    /// binding's `config` innerBinding, same precedent as
+    /// `JsonBinding.value`. Text (not a nested struct) keeps variant
+    /// values free of the canonical-wire safe-integer constraint:
+    /// `number` variants may be fractional.
+    pub config: String,
 }
 
 /// RV-R53: one signed deletion tombstone. Scope:
@@ -247,8 +281,52 @@ pub struct WorkerDesired {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail_consumers: Vec<TailConsumerDesired>,
 
+    /// Observability (`[observability]`) — Worker Logs gates +
+    /// head sampling applied by the platform `vrt-tail` collector.
+    /// Skipped when absent so snapshots without the table stay
+    /// byte-identical (old cells reject the field via
+    /// `deny_unknown_fields` — fail closed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<ObservabilityDesired>,
+    /// Streaming Tail Workers (`streaming_tail_consumers`) — the same
+    /// same-tenant resolution rule as `tail_consumers` but rendered to
+    /// workerd `streamingTails` designators: the consumer receives
+    /// TailStream events via `tailStream()` rather than batched
+    /// `tail()` calls. Skipped when empty so snapshots stay
+    /// byte-identical (old cells reject the field via
+    /// `deny_unknown_fields` — fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub streaming_tail_consumers: Vec<TailConsumerDesired>,
+
     /// Per-isolate/per-request resource limits enforced by the runtime.
     pub quotas: WorkerQuotas,
+}
+
+/// `[observability]` — CF Worker Logs collection gates and head
+/// sampling. All fields are EFFECTIVE values (wrangler-side defaults
+/// and the deprecated top-level `head_sampling_rate` alias are folded
+/// at parse). `traces`/`persist`/`destinations` have no counterpart
+/// and are rejected upstream.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObservabilityDesired {
+    /// Master gate (`observability.enabled`, default true).
+    pub enabled: bool,
+    /// Logs sub-gate (`observability.logs.enabled`, default true).
+    /// `enabled && logsEnabled == false` => no collection at all —
+    /// the cell emits no `vrt-tail` collector for the worker.
+    pub logs_enabled: bool,
+    /// Head sampling rate in parts-per-million [0,1_000_000]
+    /// (`logs.headSamplingRate`, with the deprecated top-level alias
+    /// folded in): fraction of INVOCATIONS whose records are kept,
+    /// decided per-invocation — a dropped invocation keeps none of
+    /// its log/exception/outcome records. Integer ppm because the
+    /// signed wire's canonical JSON carries safe integers only.
+    pub head_sampling_rate_ppm: u32,
+    /// `observability.logs.invocation_logs` (default true) — false
+    /// drops only the `outcome` (invocation) record; console and
+    /// exception records still collect.
+    pub invocation_logs: bool,
 }
 
 /// An immutable, content-addressed worker version.
@@ -310,6 +388,41 @@ pub enum BindingDesired {
     /// Points at no provider resource; the tenant supplies code at
     /// runtime. Rendered as workerd `workerLoader` (experimental).
     WorkerLoader(WorkerLoaderBinding),
+    /// `{"type":"analyticsEngine"}` — Analytics Engine dataset
+    /// (`env.<name>` is a `AnalyticsEngineDataset` with
+    /// `writeDataPoint()`). Rendered as workerd `analyticsEngine`
+    /// (experimental) targeting the tenant's AE ingest socket; the
+    /// emitted service designator name IS the dataset name — workerd
+    /// derives the event's `dataset` field from it.
+    AnalyticsEngine(AnalyticsEngineBinding),
+    /// `{"type":"unsafeEval"}` — CF `[[unsafe.bindings]]
+    /// {type="unsafe_eval"}`: workerd's native `unsafeEval` binding —
+    /// `env.<name>` is the `UnsafeEval` object (`.eval`/`.newFunction`/
+    /// `.newWasmModule`) the worker can call; the global `eval()`/`new
+    /// Function()` stay blocked in request handlers. It is the one raw
+    /// binding type with no proper wrangler key that workerd runs;
+    /// every other `unsafe.bindings` entry fails closed at parse.
+    UnsafeEval(UnsafeEvalBinding),
+    /// `{"type":"flagship"}` — Cloudflare Flagship feature-flag
+    /// binding: `env.<name>` is the async evaluation API
+    /// (`get`/`get*Value`/`get*Details`). `app_id` resolves to an app
+    /// in the owning tenant's `flagshipApps`; flag content rides the
+    /// tenant section so edits propagate without a redeploy. Rendered
+    /// as a `wrapped` binding over the `cloudflare-internal:flagship`
+    /// module.
+    Flagship(FlagshipBinding),
+}
+
+/// `{"type":"flagship"}` — see [`BindingDesired::Flagship`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FlagshipBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// The Flagship app this binding evaluates — must name an entry of
+    /// the tenant's `flagshipApps` (checked in
+    /// `ComputeDesired::validate`; needs tenant scope).
+    pub app_id: String,
 }
 
 /// `{"type":"var"}` — see [`BindingDesired::Var`].
@@ -496,7 +609,9 @@ pub const RESERVED_ENTRYPOINT_PREFIXES: [&str; 2] = ["Vrt", "vrt"];
 pub fn valid_service_entrypoint(ep: &str) -> bool {
     valid_binding_name(ep)
         && ep != "default"
-        && !RESERVED_ENTRYPOINT_PREFIXES.iter().any(|p| ep.starts_with(p))
+        && !RESERVED_ENTRYPOINT_PREFIXES
+            .iter()
+            .any(|p| ep.starts_with(p))
 }
 
 /// `{"type":"d1"}` — server-assigned database identity + writer epoch.
@@ -578,6 +693,31 @@ pub struct DoBindingDesired {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerLoaderBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+}
+
+/// `{"type":"analyticsEngine"}` — an Analytics Engine dataset binding.
+/// `dataset` becomes both the workerd service-designator name (the
+/// event's `dataset` field) and the per-tenant spool/parquet
+/// partition, so it is charset-bound at validation
+/// (`[A-Za-z0-9_]{1,256}`) — safe as a capnp service name, an
+/// `--external-addr` token, and a filesystem path segment.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AnalyticsEngineBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// Dataset name — wrangler `dataset`, defaults to the binding name
+    /// at project-config parse (mirrors CF).
+    pub dataset: String,
+}
+
+/// `{"type":"unsafeEval"}` — see [`BindingDesired::UnsafeEval`].
+/// Carries no resource reference; the binding name is the only field.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UnsafeEvalBinding {
     /// Binding name (`env.<name>`), JS identifier.
     pub name: String,
 }
@@ -966,6 +1106,24 @@ pub enum DesiredError {
     #[error("tail consumer target is invalid")]
     TailConsumer,
 
+    /// `observability.headSamplingRate` is outside [0,1] (NaN
+    /// included — a NaN rate can never sample correctly, so it fails
+    /// closed rather than degrading to an arbitrary gate).
+    #[error("observability headSamplingRate outside [0,1]")]
+    ObservabilityBounds,
+
+    /// A `flagship` binding names an app not in the tenant's
+    /// `flagshipApps` — the binding would evaluate flags belonging to
+    /// nobody or another tenant, so the spec never ships (fail
+    /// closed). Same rule as `ServiceTarget`.
+    #[error("flagship binding's appId is not in the same tenant")]
+    FlagshipApp,
+
+    /// A `flagshipApps[].config` payload is malformed — the flag model
+    /// is proven at the wire so a bad config cannot reach an isolate.
+    #[error("flagship app config is malformed: {0}")]
+    FlagshipConfig(&'static str),
+
     /// A cron expression is not a valid 5-field schedule.
     #[error("invalid cron expression")]
     CronExpression,
@@ -1012,6 +1170,9 @@ impl DesiredError {
             Self::DoClass => "DESIRED_DO_CLASS_UNDECLARED",
             Self::WorkflowTarget => "DESIRED_WORKFLOW_TARGET_SCOPE",
             Self::TailConsumer => "DESIRED_TAIL_CONSUMER_SCOPE",
+            Self::ObservabilityBounds => "DESIRED_OBSERVABILITY_BOUNDS",
+            Self::FlagshipApp => "DESIRED_FLAGSHIP_APP_SCOPE",
+            Self::FlagshipConfig(_) => "DESIRED_FLAGSHIP_CONFIG",
         }
     }
 }
@@ -1145,16 +1306,54 @@ impl ComputeDesired {
                 worker.quotas.validate()?;
             }
 
+            // Flagship apps: ids unique per tenant, and every app's
+            // serialized flag config must carry a well-formed flag
+            // model — a malformed config would surface inside the
+            // isolate only at eval time, so the wire proves shape.
+            if tenant.flagship_apps.len() > MAX_FLAGSHIP_APPS_PER_TENANT {
+                return Err(DesiredError::Capacity("flagshipApps"));
+            }
+            let mut flagship_app_ids = HashSet::new();
+            for app in &tenant.flagship_apps {
+                if !valid_identifier(&app.app_id, MAX_IDENTIFIER_LEN) {
+                    return Err(DesiredError::Identifier("flagshipApps.appId"));
+                }
+                if !flagship_app_ids.insert(&app.app_id) {
+                    return Err(DesiredError::Duplicate("flagshipApps.appId"));
+                }
+                validate_flagship_config(&app.config)?;
+            }
+
             // Service bindings may only target workers of the same tenant.
             for worker in &tenant.workers {
+                // Flagship bindings resolve to an app owned by the same
+                // tenant — cross-tenant or dangling app references fail
+                // closed (a binding must never evaluate another
+                // tenant's flag set).
+                for binding in &worker.bindings {
+                    if let BindingDesired::Flagship(f) = binding {
+                        if !flagship_app_ids.contains(&f.app_id) {
+                            return Err(DesiredError::FlagshipApp);
+                        }
+                    }
+                }
                 // Tail consumers: a same-tenant, DIFFERENT worker; unique
                 // per producer. Workerd refuses a `tails` designator with
                 // no service, so a dangling declaration must never ship.
-                if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+                // Both lists share one target set: no self-reference, no
+                // duplicate, and the same worker cannot be delivered on
+                // two channels (tail() + tailStream() would both fire).
+                if worker.tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
+                    || worker.streaming_tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER
+                {
                     return Err(DesiredError::Capacity("tailConsumers"));
                 }
                 let mut tail_targets = HashSet::new();
-                for tail in &worker.tail_consumers {
+                for tail in worker
+                    .tail_consumers
+                    .iter()
+                    .chain(&worker.streaming_tail_consumers)
+                {
                     if !valid_identifier(&tail.worker_id, MAX_IDENTIFIER_LEN) {
                         return Err(DesiredError::Identifier("tailConsumers.workerId"));
                     }
@@ -1165,6 +1364,11 @@ impl ComputeDesired {
                     }
                     if !tail_targets.insert(&tail.worker_id) {
                         return Err(DesiredError::Duplicate("tailConsumers.workerId"));
+                    }
+                }
+                if let Some(obs) = &worker.observability {
+                    if obs.head_sampling_rate_ppm > 1_000_000 {
+                        return Err(DesiredError::ObservabilityBounds);
                     }
                 }
                 for binding in &worker.bindings {
@@ -1296,11 +1500,7 @@ impl ComputeDesired {
             if d.revision == 0 || d.revision > MAX_SAFE_INTEGER {
                 return Err(DesiredError::InvalidRevision);
             }
-            if !seen_deletions.insert((
-                &d.tenant_id,
-                &d.worker_id,
-                &d.class_key,
-            )) {
+            if !seen_deletions.insert((&d.tenant_id, &d.worker_id, &d.class_key)) {
                 return Err(DesiredError::Duplicate("deletions"));
             }
         }
@@ -1397,8 +1597,9 @@ impl WorkerDesired {
                     let h = &hd.synthetic_host;
                     if !(h.len() <= 253
                         && h.ends_with(".hyperdrive.vrt.internal")
-                        && h.chars().all(|c| c.is_ascii_lowercase()
-                            || c.is_ascii_digit() || c == '-' || c == '.'))
+                        && h.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.'
+                        }))
                     {
                         return Err(DesiredError::Identifier("bindings.syntheticHost"));
                     }
@@ -1498,6 +1699,33 @@ impl WorkerDesired {
                 // (validated as a binding name at the match head) is
                 // the only field.
                 BindingDesired::WorkerLoader(_) => {}
+                BindingDesired::AnalyticsEngine(ae) => {
+                    // `dataset` is emitted as a workerd service name
+                    // AND used as a spool/parquet path segment —
+                    // `[A-Za-z0-9_]{1,256}` keeps both uses safe
+                    // (no `=` for --external-addr, no `/` for paths).
+                    if ae.dataset.is_empty()
+                        || ae.dataset.len() > 256
+                        || !ae
+                            .dataset
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    {
+                        return Err(DesiredError::Identifier("bindings.dataset"));
+                    }
+                }
+                // UnsafeEval carries no resource reference — `name`
+                // (validated as a binding name at the match head) is
+                // the only field.
+                BindingDesired::UnsafeEval(_) => {}
+                BindingDesired::Flagship(f) => {
+                    // `app_id` is server-minted; resolution against the
+                    // tenant's flagshipApps happens in
+                    // ComputeDesired::validate (needs tenant scope).
+                    if !valid_identifier(&f.app_id, MAX_IDENTIFIER_LEN) {
+                        return Err(DesiredError::Identifier("bindings.appId"));
+                    }
+                }
             }
         }
         Ok(())
@@ -1668,6 +1896,9 @@ impl BindingDesired {
             Self::Queue(b) => &b.name,
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
+            Self::AnalyticsEngine(b) => &b.name,
+            Self::UnsafeEval(b) => &b.name,
+            Self::Flagship(b) => &b.name,
         }
     }
 
@@ -1688,7 +1919,9 @@ impl BindingDesired {
             | Self::Service(_)
             | Self::DurableObject(_)
             | Self::Ratelimit(_)
-            | Self::WorkerLoader(_) => None,
+            | Self::WorkerLoader(_)
+            | Self::AnalyticsEngine(_)
+            | Self::UnsafeEval(_) | Self::Flagship(_) => None,
         }
     }
 }
@@ -1766,7 +1999,7 @@ fn valid_bucket_name(value: &str) -> bool {
 }
 
 /// Lowercase FQDN hostname, no wildcards, at least two labels.
-fn valid_hostname(value: &str) -> bool {
+pub fn valid_hostname(value: &str) -> bool {
     if value.is_empty() || value.len() > MAX_HOSTNAME_LEN {
         return false;
     }
@@ -1962,6 +2195,281 @@ fn cron_atom_value(
                 i as u32 + min
             }
         })
+}
+
+// ---- Flagship flag-model bounds (the eval engine's contract) ----
+const MAX_FLAGSHIP_FLAGS: usize = 128;
+const MAX_FLAGSHIP_VARIANTS: usize = 16;
+const MAX_FLAGSHIP_RULES: usize = 32;
+const MAX_FLAGSHIP_FLAG_KEY_LEN: usize = 64;
+const MAX_FLAGSHIP_VARIANT_NAME_LEN: usize = 64;
+const MAX_FLAGSHIP_ATTRIBUTE_LEN: usize = 255;
+/// CF: dot-separated paths traverse at most five segments; logical
+/// condition groups nest at most five levels.
+const MAX_FLAGSHIP_SEGMENTS: usize = 5;
+const MAX_FLAGSHIP_COND_DEPTH: usize = 5;
+const FLAGSHIP_FLAG_TYPES: [&str; 4] = ["boolean", "string", "number", "json"];
+const FLAGSHIP_OPERATORS: [&str; 13] = [
+    "equals",
+    "not_equals",
+    "greater_than",
+    "less_than",
+    "greater_than_or_equals",
+    "less_than_or_equals",
+    "contains",
+    "starts_with",
+    "ends_with",
+    "in",
+    "not_in",
+    "has",
+    "not_has",
+];
+
+fn valid_flagship_flag_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_FLAGSHIP_FLAG_KEY_LEN
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn valid_flagship_attribute(attribute: &str) -> bool {
+    !attribute.is_empty()
+        && attribute.len() <= MAX_FLAGSHIP_ATTRIBUTE_LEN
+        && attribute.split('.').count() <= MAX_FLAGSHIP_SEGMENTS
+        && attribute.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.'
+        })
+}
+
+/// One condition node — a `{attribute, operator, value?}` leaf or an
+/// `{all|any: [nodes]}` group. Unknown keys make the node malformed
+/// (fail closed — a silently ignored key could invert intent).
+fn validate_flagship_condition_node(
+    node: &serde_json::Value,
+    depth: usize,
+) -> Result<(), DesiredError> {
+    if depth > MAX_FLAGSHIP_COND_DEPTH {
+        return Err(DesiredError::FlagshipConfig("conditions.depth"));
+    }
+    let obj = node
+        .as_object()
+        .ok_or(DesiredError::FlagshipConfig("condition"))?;
+    if let (Some(all), None) = (obj.get("all"), obj.get("any")) {
+        let list = all
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .ok_or(DesiredError::FlagshipConfig("conditions.all"))?;
+        for n in list {
+            validate_flagship_condition_node(n, depth + 1)?;
+        }
+        if obj.keys().any(|k| k != "all") {
+            return Err(DesiredError::FlagshipConfig("conditions.keys"));
+        }
+        return Ok(());
+    }
+    if let (None, Some(any)) = (obj.get("all"), obj.get("any")) {
+        let list = any
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .ok_or(DesiredError::FlagshipConfig("conditions.any"))?;
+        for n in list {
+            validate_flagship_condition_node(n, depth + 1)?;
+        }
+        if obj.keys().any(|k| k != "any") {
+            return Err(DesiredError::FlagshipConfig("conditions.keys"));
+        }
+        return Ok(());
+    }
+    // Leaf condition.
+    if let (None, None) = (obj.get("all"), obj.get("any")) {
+        let attribute = obj
+            .get("attribute")
+            .and_then(|a| a.as_str())
+            .ok_or(DesiredError::FlagshipConfig("condition.attribute"))?;
+        if !valid_flagship_attribute(attribute) {
+            return Err(DesiredError::FlagshipConfig("condition.attribute"));
+        }
+        let operator = obj
+            .get("operator")
+            .and_then(|o| o.as_str())
+            .ok_or(DesiredError::FlagshipConfig("condition.operator"))?;
+        if !FLAGSHIP_OPERATORS.contains(&operator) {
+            return Err(DesiredError::FlagshipConfig("condition.operator"));
+        }
+        if obj
+            .keys()
+            .any(|k| k != "attribute" && k != "operator" && k != "value")
+        {
+            return Err(DesiredError::FlagshipConfig("conditions.keys"));
+        }
+        return Ok(());
+    }
+    Err(DesiredError::FlagshipConfig("conditions.keys"))
+}
+
+fn validate_flagship_rule(
+    rule: &serde_json::Value,
+    variants: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), DesiredError> {
+    let obj = rule
+        .as_object()
+        .ok_or(DesiredError::FlagshipConfig("rule"))?;
+    let serve = obj
+        .get("serve_variation")
+        .and_then(|s| s.as_str())
+        .ok_or(DesiredError::FlagshipConfig("rule.serveVariation"))?;
+    if !variants.contains_key(serve) {
+        return Err(DesiredError::FlagshipConfig("rule.serveVariation"));
+    }
+    if let Some(rollout) = obj.get("rollout") {
+        let r = rollout
+            .as_object()
+            .ok_or(DesiredError::FlagshipConfig("rollout"))?;
+        let pct = r
+            .get("percentage")
+            .and_then(|p| p.as_f64())
+            .ok_or(DesiredError::FlagshipConfig("rollout.percentage"))?;
+        if !(0.0..=100.0).contains(&pct) {
+            return Err(DesiredError::FlagshipConfig("rollout.percentage"));
+        }
+        if let Some(attr) = r.get("attribute") {
+            if !attr
+                .as_str()
+                .is_some_and(valid_flagship_attribute)
+            {
+                return Err(DesiredError::FlagshipConfig("rollout.attribute"));
+            }
+        }
+        if r.keys().any(|k| k != "percentage" && k != "attribute") {
+            return Err(DesiredError::FlagshipConfig("rollout.keys"));
+        }
+    }
+    if let Some(conditions) = obj.get("conditions") {
+        match conditions {
+            serde_json::Value::Array(list) => {
+                if list.is_empty() {
+                    return Err(DesiredError::FlagshipConfig("conditions"));
+                }
+                for node in list {
+                    validate_flagship_condition_node(node, 1)?;
+                }
+            }
+            serde_json::Value::Object(_) => {
+                validate_flagship_condition_node(conditions, 1)?;
+            }
+            _ => return Err(DesiredError::FlagshipConfig("conditions")),
+        }
+    }
+    if obj
+        .keys()
+        .any(|k| k != "serve_variation" && k != "rollout" && k != "conditions")
+    {
+        return Err(DesiredError::FlagshipConfig("rule.keys"));
+    }
+    Ok(())
+}
+
+fn flagship_variant_value_ok(flag_type: &str, value: &serde_json::Value) -> bool {
+    match flag_type {
+        "boolean" => value.is_boolean(),
+        "string" => value.is_string(),
+        "number" => value.is_number(),
+        // `json` variants accept any JSON value.
+        _ => true,
+    }
+}
+
+/// `flagshipApps[].config` — prove the serialized flag model at the
+/// signed-wire boundary. The control plane validates the same model at
+/// write time; this pass keeps a malformed config from ever reaching
+/// an isolate's eval engine (fail closed).
+pub fn validate_flagship_config(config: &str) -> Result<(), DesiredError> {
+    if config.len() > MAX_FLAGSHIP_CONFIG_BYTES {
+        return Err(DesiredError::FlagshipConfig("configBytes"));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(config).map_err(|_| DesiredError::FlagshipConfig("configJson"))?;
+    let obj = value
+        .as_object()
+        .ok_or(DesiredError::FlagshipConfig("config"))?;
+    if let Some(tag) = obj.get("accountTag") {
+        if !tag
+            .as_str()
+            .is_some_and(|s| !s.is_empty() && s.len() <= MAX_IDENTIFIER_LEN)
+        {
+            return Err(DesiredError::FlagshipConfig("accountTag"));
+        }
+    }
+    let flags = obj
+        .get("flags")
+        .and_then(|f| f.as_object())
+        .ok_or(DesiredError::FlagshipConfig("flags"))?;
+    if flags.len() > MAX_FLAGSHIP_FLAGS {
+        return Err(DesiredError::FlagshipConfig("flags"));
+    }
+    for (key, flag) in flags {
+        if !valid_flagship_flag_key(key) {
+            return Err(DesiredError::FlagshipConfig("flagKey"));
+        }
+        let f = flag
+            .as_object()
+            .ok_or(DesiredError::FlagshipConfig("flag"))?;
+        let flag_type = f
+            .get("type")
+            .and_then(|t| t.as_str())
+            .ok_or(DesiredError::FlagshipConfig("flag.type"))?;
+        if !FLAGSHIP_FLAG_TYPES.contains(&flag_type) {
+            return Err(DesiredError::FlagshipConfig("flag.type"));
+        }
+        if !f.get("enabled").is_some_and(|e| e.is_boolean()) {
+            return Err(DesiredError::FlagshipConfig("flag.enabled"));
+        }
+        let variants = f
+            .get("variants")
+            .and_then(|v| v.as_object())
+            .filter(|v| !v.is_empty() && v.len() <= MAX_FLAGSHIP_VARIANTS)
+            .ok_or(DesiredError::FlagshipConfig("flag.variants"))?;
+        for (vname, vval) in variants {
+            if vname.is_empty() || vname.len() > MAX_FLAGSHIP_VARIANT_NAME_LEN {
+                return Err(DesiredError::FlagshipConfig("flag.variantName"));
+            }
+            if !flagship_variant_value_ok(flag_type, vval) {
+                return Err(DesiredError::FlagshipConfig("flag.variantType"));
+            }
+        }
+        let default_variant = f
+            .get("defaultVariant")
+            .and_then(|d| d.as_str())
+            .ok_or(DesiredError::FlagshipConfig("flag.defaultVariant"))?;
+        if !variants.contains_key(default_variant) {
+            return Err(DesiredError::FlagshipConfig("flag.defaultVariant"));
+        }
+        if let Some(rules) = f.get("rules") {
+            let list = rules
+                .as_array()
+                .filter(|r| r.len() <= MAX_FLAGSHIP_RULES)
+                .ok_or(DesiredError::FlagshipConfig("flag.rules"))?;
+            for rule in list {
+                validate_flagship_rule(rule, variants)?;
+            }
+        }
+        if f.keys().any(|k| {
+            k != "enabled" && k != "type" && k != "variants" && k != "defaultVariant" && k != "rules"
+        }) {
+            return Err(DesiredError::FlagshipConfig("flag.keys"));
+        }
+    }
+    // Top level allows only the documented module config keys —
+    // `appId` is implied by the wrapper but tolerated when present
+    // (the renderer re-asserts it from the `app_id` field).
+    if obj
+        .keys()
+        .any(|k| k != "flags" && k != "appId" && k != "accountTag")
+    {
+        return Err(DesiredError::FlagshipConfig("config.keys"));
+    }
+    Ok(())
 }
 
 fn is_lower_hex(value: &str, bytes: usize) -> bool {
@@ -2329,7 +2837,9 @@ mod tests {
             ),
             (
                 "service-entrypoint-empty",
-                Box::new(|v| v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("")),
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("")
+                }),
                 "DESIRED_INVALID_IDENTIFIER",
             ),
             (
@@ -2338,6 +2848,44 @@ mod tests {
                     v["tenants"][0]["workers"][0]["bindings"][5]["entrypoint"] = json!("default")
                 }),
                 "DESIRED_INVALID_IDENTIFIER",
+            ),
+            // `[observability]` — the rate is the only bound-checked
+            // field (booleans carry no range semantics).
+            (
+                "observability-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["observability"] = json!({
+                        "enabled": true,
+                        "logsEnabled": true,
+                        "invocationLogs": false,
+                        "headSamplingRatePpm": 250000
+                    })
+                }),
+                "",
+            ),
+            (
+                "observability-rate-high",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["observability"] = json!({
+                        "enabled": true,
+                        "logsEnabled": true,
+                        "invocationLogs": true,
+                        "headSamplingRatePpm": 1500000
+                    })
+                }),
+                "DESIRED_OBSERVABILITY_BOUNDS",
+            ),
+            (
+                "observability-rate-negative",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["observability"] = json!({
+                        "enabled": true,
+                        "logsEnabled": true,
+                        "invocationLogs": true,
+                        "headSamplingRatePpm": 1000001
+                    })
+                }),
+                "DESIRED_OBSERVABILITY_BOUNDS",
             ),
             (
                 "service-entrypoint-reserved-probe",
@@ -2361,6 +2909,43 @@ mod tests {
                         json!("E".repeat(MAX_BINDING_NAME_LEN + 1))
                 }),
                 "DESIRED_INVALID_IDENTIFIER",
+            ),
+            // `streamingTailConsumers` — identical same-tenant and
+            // uniqueness rules as `tail_consumers` (one shared target
+            // set, so the same worker cannot appear on both channels).
+            (
+                "streaming-tail-ok",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}])
+                }),
+                "",
+            ),
+            (
+                "streaming-tail-missing-target",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-nope"}])
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "streaming-tail-self-reference",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-alpha-1"}])
+                }),
+                "DESIRED_TAIL_CONSUMER_SCOPE",
+            ),
+            (
+                "tail-same-consumer-on-both-channels",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["tailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}]);
+                    v["tenants"][0]["workers"][0]["streamingTailConsumers"] =
+                        json!([{"workerId": "w-alpha-2"}]);
+                }),
+                "DESIRED_DUPLICATE",
             ),
             (
                 "bad-assets-digest",
@@ -2596,7 +3181,8 @@ mod tests {
 
     #[test]
     fn ratelimit_binding_validation_fails_closed() {
-        let ok = json!({"type":"ratelimit","name":"RL","namespaceId":"1001","limit":40,"period":60});
+        let ok =
+            json!({"type":"ratelimit","name":"RL","namespaceId":"1001","limit":40,"period":60});
         let mut v = valid_payload();
         bind_rl(&mut v, ok.clone());
         assert_eq!(desired(&v).unwrap().validate(), Ok(()));
@@ -2637,7 +3223,9 @@ mod tests {
         // Per-worker count cap.
         let mut v = valid_payload();
         for i in 0..=MAX_RATELIMIT_BINDINGS_PER_WORKER {
-            bind_rl(&mut v, json!({"type":"ratelimit","name":format!("RL{i}"),"namespaceId":"1","limit":1,"period":10}),
+            bind_rl(
+                &mut v,
+                json!({"type":"ratelimit","name":format!("RL{i}"),"namespaceId":"1","limit":1,"period":10}),
             );
         }
         assert_eq!(
@@ -2936,7 +3524,9 @@ mod tests {
     fn service_entrypoint_wire_shape() {
         let legacy = serde_json::json!({"type": "service", "name": "AUTH", "workerId": "w-2"});
         let b: BindingDesired = serde_json::from_value(legacy.clone()).unwrap();
-        let BindingDesired::Service(s) = &b else { panic!() };
+        let BindingDesired::Service(s) = &b else {
+            panic!()
+        };
         assert_eq!(s.entrypoint, None);
         // Absent stays absent: legacy snapshots keep their canonical bytes.
         assert_eq!(serde_json::to_value(&b).unwrap(), legacy);
@@ -2945,7 +3535,9 @@ mod tests {
             {"type": "service", "name": "AUTH", "workerId": "w-2", "entrypoint": "Greeter"}
         );
         let b: BindingDesired = serde_json::from_value(named.clone()).unwrap();
-        let BindingDesired::Service(s) = &b else { panic!() };
+        let BindingDesired::Service(s) = &b else {
+            panic!()
+        };
         assert_eq!(s.entrypoint.as_deref(), Some("Greeter"));
         assert_eq!(serde_json::to_value(&b).unwrap(), named);
 
@@ -3018,10 +3610,21 @@ mod tests {
         for ok in ["Greeter", "_x", "$y", "Admin2", "VRT"] {
             assert!(valid_service_entrypoint(ok), "{ok}");
         }
-        for bad in ["", "default", "1A", "a-b", "a.b", "VrtWaituntilProbe", "vrtX", "Vrt"] {
+        for bad in [
+            "",
+            "default",
+            "1A",
+            "a-b",
+            "a.b",
+            "VrtWaituntilProbe",
+            "vrtX",
+            "Vrt",
+        ] {
             assert!(!valid_service_entrypoint(bad), "{bad}");
         }
-        assert!(!valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN + 1)));
+        assert!(!valid_service_entrypoint(
+            &"E".repeat(MAX_BINDING_NAME_LEN + 1)
+        ));
         assert!(valid_service_entrypoint(&"E".repeat(MAX_BINDING_NAME_LEN)));
     }
 
@@ -3144,7 +3747,116 @@ mod tests {
             desired(&dup).unwrap().validate(),
             Err(DesiredError::Duplicate("bindingName"))
         );
-        let ok = payload_with_binding(serde_json::json!({"type": "workerLoader", "name": "LOADER"}));
+        let ok =
+            payload_with_binding(serde_json::json!({"type": "workerLoader", "name": "LOADER"}));
         assert!(desired(&ok).unwrap().validate().is_ok());
+    }
+
+    #[test]
+    fn unsafe_eval_wire_shape_and_validation() {
+        // `{"type":"unsafeEval","name":...}` is the signed desired
+        // snapshot shape emitted by the control plane (CF
+        // `[[unsafe.bindings]] type="unsafe_eval"`).
+        let doc = serde_json::json!({"type": "unsafeEval", "name": "UNSAFE_EVAL"});
+        let b: BindingDesired = serde_json::from_value(doc.clone()).unwrap();
+        let BindingDesired::UnsafeEval(u) = &b else {
+            panic!()
+        };
+        assert_eq!(u.name, "UNSAFE_EVAL");
+        assert_eq!(serde_json::to_value(&b).unwrap(), doc);
+
+        // deny_unknown_fields: extra keys must not be silently
+        // accepted — raw binding entries carry only a name.
+        let with_extra = serde_json::json!({"type": "unsafeEval", "name": "E", "level": "full"});
+        assert!(serde_json::from_value::<BindingDesired>(with_extra).is_err());
+
+        // The binding name flows through the shared binding-name
+        // checks: JS identifier required, duplicates rejected.
+        for (name, err) in [
+            ("1bad", DesiredError::BindingName),
+            ("has-dash", DesiredError::BindingName),
+        ] {
+            let p = payload_with_binding(serde_json::json!({"type": "unsafeEval", "name": name}));
+            assert_eq!(desired(&p).unwrap().validate(), Err(err));
+        }
+        let dup = {
+            let mut p = valid_payload();
+            let workers = p["tenants"][0]["workers"].as_array_mut().unwrap();
+            workers[0]["bindings"] = serde_json::json!([
+                {"type": "unsafeEval", "name": "E"},
+                {"type": "unsafeEval", "name": "E"},
+            ]);
+            p
+        };
+        assert_eq!(
+            desired(&dup).unwrap().validate(),
+            Err(DesiredError::Duplicate("bindingName"))
+        );
+        let ok =
+            payload_with_binding(serde_json::json!({"type": "unsafeEval", "name": "UNSAFE_EVAL"}));
+        assert!(desired(&ok).unwrap().validate().is_ok());
+    }
+
+    #[test]
+    fn flagship_wire_shape_and_validation() {
+        // `{"type":"flagship","appId":...}` — the version-scoped binding
+        // declaration (CF `[[flagship]]`); flag content is tenant-level
+        // `flagshipApps` data, never carried on the binding.
+        let doc = serde_json::json!({"type": "flagship", "name": "FLAGS", "appId": "app-01"});
+        let b: BindingDesired = serde_json::from_value(doc.clone()).unwrap();
+        let BindingDesired::Flagship(f) = &b else {
+            panic!()
+        };
+        assert_eq!(f.name, "FLAGS");
+        assert_eq!(f.app_id, "app-01");
+        assert_eq!(serde_json::to_value(&b).unwrap(), doc);
+        // deny_unknown_fields on the binding AND tenant app entries.
+        let with_extra =
+            serde_json::json!({"type": "flagship", "name": "F", "appId": "a", "remote": true});
+        assert!(serde_json::from_value::<BindingDesired>(with_extra).is_err());
+
+        let app = serde_json::json!({
+            "appId": "app-01",
+            "config": "{\"appId\":\"app-01\",\"flags\":{\"f\":{\"enabled\":true,\"type\":\"boolean\",\"variants\":{\"on\":true,\"off\":false},\"defaultVariant\":\"off\"}}}"
+        });
+        let mut p = payload_with_binding(doc);
+        p["tenants"][0]["flagshipApps"] = serde_json::json!([app.clone()]);
+        assert!(desired(&p).unwrap().validate().is_ok());
+
+        // A binding whose appId is absent from the tenant's
+        // flagshipApps fails closed — the render would otherwise
+        // silently evaluate defaults.
+        let missing = {
+            let mut p = payload_with_binding(
+                serde_json::json!({"type": "flagship", "name": "F", "appId": "app-02"}),
+            );
+            p["tenants"][0]["flagshipApps"] = serde_json::json!([app.clone()]);
+            p
+        };
+        assert_eq!(
+            desired(&missing).unwrap().validate(),
+            Err(DesiredError::FlagshipApp)
+        );
+
+        // Duplicate appIds and malformed configs fail closed.
+        let dup_apps = {
+            let mut p = valid_payload();
+            p["tenants"][0]["flagshipApps"] = serde_json::json!([app.clone(), app.clone()]);
+            p
+        };
+        assert_eq!(
+            desired(&dup_apps).unwrap().validate(),
+            Err(DesiredError::Duplicate("flagshipApps.appId"))
+        );
+        for cfg in ["not-json", "{}", "{\"flags\":[]}"] {
+            let bad = {
+                let mut a = app.clone();
+                a["config"] = serde_json::json!(cfg);
+                let mut p = valid_payload();
+                p["tenants"][0]["flagshipApps"] = serde_json::json!([a]);
+                p
+            };
+            assert!(desired(&bad).unwrap().validate().is_err(), "{cfg}");
+        }
     }
 }

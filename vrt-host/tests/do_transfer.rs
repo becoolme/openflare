@@ -490,6 +490,99 @@ impl ObjectStore for SnapBlockStore {
     }
 }
 
+/// Test-only read gate for the sibling-failure ordering. While
+/// `outage` is set, snapshot GETs for ONE class (`sibling_key`) stay
+/// blocked until the test has observed the OTHER class's lease land in
+/// the placement record, then fail like a transient restore outage.
+///
+/// Why this exists: `do_switch_pipeline::run` is fail-fast — the first
+/// class to fail sets an abort flag, and siblings that have not yet
+/// passed the acquire gate return `Aborted("acquire")` WITHOUT taking
+/// a lease. A test that simply blocks every snapshot read races that
+/// abort against the victim's acquire: on a loaded runner the sibling
+/// can fail first, the victim is skipped, and its record never leaves
+/// the dead-marker epoch. Gating the sibling's read on the victim's
+/// acquire makes the scenario (sibling fails, victim's lease gets
+/// released) deterministic instead of scheduler-dependent.
+struct SiblingRestoreGate {
+    inner: Arc<dyn ObjectStore>,
+    /// Class key whose `/snap-` GETs simulate the outage.
+    sibling_key: String,
+    /// `true` while the simulated sibling outage is active.
+    outage: Arc<AtomicBool>,
+    /// Flipped by the test once the victim lease is observed; wakes
+    /// the blocked sibling GET so the pipeline can fail it.
+    victim_seen: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    /// Upper bound on the gate wait — a wedged victim fails the
+    /// scenario with a timeout instead of hanging the pipeline thread.
+    wait: Duration,
+}
+
+impl SiblingRestoreGate {
+    fn block(&self, k: &str) -> bool {
+        self.outage.load(AtomicOrdering::SeqCst)
+            && k.contains("/snap-")
+            && k.contains(&self.sibling_key)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for SiblingRestoreGate {
+    async fn get(
+        &self,
+        k: &str,
+    ) -> Result<Option<vrt_objstore::StoredObject>, vrt_objstore::StoreError> {
+        if self.block(k) {
+            let (lock, cv) = &*self.victim_seen;
+            let deadline = std::time::Instant::now() + self.wait;
+            let mut seen = lock.lock().unwrap();
+            while !*seen {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (guard, _) = cv.wait_timeout(seen, deadline - now).unwrap();
+                seen = guard;
+            }
+            return Err(vrt_objstore::StoreError::unavailable(
+                false,
+                "sibling restore blocked by test",
+            ));
+        }
+        self.inner.get(k).await
+    }
+    async fn head(
+        &self,
+        k: &str,
+    ) -> Result<Option<vrt_objstore::ObjectMeta>, vrt_objstore::StoreError> {
+        self.inner.head(k).await
+    }
+    async fn put_if_none_match(
+        &self,
+        k: &str,
+        b: &[u8],
+    ) -> Result<String, vrt_objstore::StoreError> {
+        self.inner.put_if_none_match(k, b).await
+    }
+    async fn put_if_match(
+        &self,
+        k: &str,
+        e: &str,
+        b: &[u8],
+    ) -> Result<String, vrt_objstore::StoreError> {
+        self.inner.put_if_match(k, e, b).await
+    }
+    async fn put(&self, k: &str, b: &[u8]) -> Result<String, vrt_objstore::StoreError> {
+        self.inner.put(k, b).await
+    }
+    async fn list(&self, p: &str) -> Result<vrt_objstore::ListPage, vrt_objstore::StoreError> {
+        self.inner.list(p).await
+    }
+    async fn delete(&self, k: &str) -> Result<(), vrt_objstore::StoreError> {
+        self.inner.delete(k).await
+    }
+}
+
 /// P0-1: a write landing AFTER slot close but BEFORE process exit
 /// must appear in the Final snapshot the target restores. The stub
 /// writer ignores SIGTERM so the drain window is deterministic
@@ -1628,14 +1721,26 @@ async fn sibling_fail_closed_recovers_transfer_class() {
     let key_b = key64(b'b'); // the transferred class
     seed_class_dir(&tenant_dir_a, "w1", &key_b);
 
-    let block_get = Arc::new(AtomicBool::new(false));
+    // The sibling's snapshot reads are GATED, not blanket-blocked: the
+    // failure is ordered after the victim class has acquired, so the
+    // test always exercises "sibling failure releases the victim
+    // lease" instead of racing the pipeline's fail-fast abort against
+    // the victim's acquire (see SiblingRestoreGate).
     let off = Arc::new(AtomicBool::new(false));
-    let store: Arc<dyn ObjectStore> = Arc::new(SnapBlockStore {
-        inner: MemoryStore::new(),
-        block: off.clone(),
-        block_all: off.clone(),
-        block_get: block_get.clone(),
-        block_wal: off.clone(),
+    let outage = Arc::new(AtomicBool::new(false));
+    let victim_seen = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let store: Arc<dyn ObjectStore> = Arc::new(SiblingRestoreGate {
+        inner: Arc::new(SnapBlockStore {
+            inner: MemoryStore::new(),
+            block: off.clone(),
+            block_all: off.clone(),
+            block_get: off.clone(),
+            block_wal: off.clone(),
+        }),
+        sibling_key: key_a.clone(),
+        outage: outage.clone(),
+        victim_seen: victim_seen.clone(),
+        wait: Duration::from_secs(10),
     });
     let plc_a = Arc::new(ManifestDoPlacement::new(
         store.clone(),
@@ -1726,14 +1831,20 @@ async fn sibling_fail_closed_recovers_transfer_class() {
         .unwrap();
     plc_a.fence(&scope_a, PlacementEpoch(1)).unwrap(); // dead@1
 
-    // Target worker w2 runs BOTH classes (a first — its blocked
-    // restore is the sibling failure that releases b's lease too).
-    block_get.store(true, AtomicOrdering::SeqCst);
+    // Target worker w2 runs BOTH classes. Class a's restore read is
+    // the sibling failure; it stays blocked until b (the victim) has
+    // acquired, so the failure can never preempt b's acquire.
+    outage.store(true, AtomicOrdering::SeqCst);
     let tenant_dir_b = fx.dir.path().join("do-b").join("t1");
     let mut spec_b = fx.stub_spec("t1", &["w2"], &[]);
     let mut worker_classes: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    worker_classes.insert("w2".to_string(), vec![key_a.clone(), key_b.clone()]);
+    // Victim first: the transfer class b acquires/restores and then
+    // becomes the pure victim when class a's restore read fails. Order
+    // matters for determinism — the pipeline is fail-fast, so b must be
+    // in flight (or, with a single-worker pool, already done) before a
+    // can abort it.
+    worker_classes.insert("w2".to_string(), vec![key_b.clone(), key_a.clone()]);
     let mut transfer_sources: std::collections::BTreeMap<(String, String), String> =
         std::collections::BTreeMap::new();
     transfer_sources.insert(("w2".to_string(), key_b.clone()), "w1".to_string());
@@ -1745,29 +1856,85 @@ async fn sibling_fail_closed_recovers_transfer_class() {
     let runtime_b = TenantRuntime::new("t1");
     let handle_b =
         vrt_host::supervisor::spawn_supervisor(runtime_b.clone(), spec_b, deps_b, test_params());
-    // Same cycle wait as above: a completed acquire/fail/release round
-    // is what bumps the victim lease past the dead-marker epoch — a bare
-    // sleep leaves it to scheduler luck on a loaded runner.
-    let cycle_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Bounded poll for one full acquire → sibling-fail → release
+    // cycle on the VICTIM class. The gate above makes the ordering
+    // deterministic (sibling failure cannot fire before the victim
+    // acquires), so this only waits for the pipeline to run — no
+    // wall-clock sleep. The timeline is the failure diagnostic: epoch,
+    // holder, writer_epoch, lease expiry and committed snapshot per
+    // observed transition.
+    let cycle_started = std::time::Instant::now();
+    let cycle_deadline = cycle_started + Duration::from_secs(10);
+    let mut timeline: Vec<String> = Vec::new();
+    let mut last_seen: Option<(u64, bool, u64)> = None;
+    let mut saw_victim_held = false;
     loop {
         let rec = plc_a.record(&scope_b).unwrap();
-        if rec
-            .as_ref()
-            .is_some_and(|r| r.epoch >= 2 && r.holder.is_empty())
-        {
-            break;
+        if let Some(r) = &rec {
+            let held = !r.holder.is_empty();
+            let snap = r
+                .snapshot
+                .as_ref()
+                .map(|s| {
+                    format!(
+                        "epoch={} seq={} files={} bytes={} kind={:?} at_ms={}",
+                        s.epoch, s.seq, s.files, s.bytes, s.kind, s.at_ms
+                    )
+                })
+                .unwrap_or_else(|| "none".into());
+            let seen = (r.epoch, held, r.writer_epoch);
+            if last_seen != Some(seen) {
+                last_seen = Some(seen);
+                timeline.push(format!(
+                    "+{:>5}ms epoch={} holder={:?} writer_epoch={} expires_at_ms={} snapshot={snap}",
+                    cycle_started.elapsed().as_millis(),
+                    r.epoch,
+                    r.holder,
+                    r.writer_epoch,
+                    r.expires_at_ms,
+                ));
+            }
+            if r.epoch >= 2 {
+                // Victim acquired (or already cycled) — let the
+                // blocked sibling read fail now, then wait for the
+                // release it triggers.
+                let (lock, cv) = &*victim_seen;
+                let mut seen = lock.lock().unwrap();
+                if !*seen {
+                    *seen = true;
+                    cv.notify_all();
+                }
+                drop(seen);
+                saw_victim_held |= held;
+                if !held {
+                    break;
+                }
+            }
         }
         assert!(
             std::time::Instant::now() < cycle_deadline,
-            "blocked sibling attempt never completed an acquire/release cycle: {rec:?}"
+            "blocked sibling attempt never completed an acquire/release cycle \
+             (state={:?}, last_error={:?}, record={rec:?})\ntimeline:\n{}",
+            runtime_b.state(),
+            runtime_b.last_error(),
+            timeline.join("\n"),
         );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    assert!(
+        saw_victim_held,
+        "the transfer class must HOLD a lease before the sibling failure \
+         releases it — the pipeline aborted it instead \
+         (state={:?}, last_error={:?})\ntimeline:\n{}",
+        runtime_b.state(),
+        runtime_b.last_error(),
+        timeline.join("\n"),
+    );
     assert_ne!(runtime_b.state(), TenantState::Ready);
 
     // Sibling's outage clears → retry acquires both at later epochs;
     // a restores its periodic, b passes the gate via writer_epoch.
-    block_get.store(false, AtomicOrdering::SeqCst);
+    outage.store(false, AtomicOrdering::SeqCst);
     wait_state(&runtime_b, TenantState::Ready, Duration::from_secs(20)).await;
     assert!(tenant_dir_b
         .join("w2")

@@ -111,6 +111,8 @@ pub fn worker(
         durable_object_classes: vec![],
         workflows: vec![],
         tail_consumers: vec![],
+        observability: None,
+        streaming_tail_consumers: vec![],
         quotas: quotas(),
     }
 }
@@ -129,6 +131,7 @@ pub fn tenant(tenant_id: &str, workers: Vec<WorkerDesired>) -> TenantDesired {
     TenantDesired {
         tenant_id: tenant_id.to_string(),
         workers,
+        flagship_apps: Vec::new(),
     }
 }
 
