@@ -134,6 +134,14 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         return Err("missing command".into());
     };
     match cmd {
+        "--version" | "-V" | "version" => {
+            // `OF_RELEASE_TAG` is stamped at release-build time by
+            // .github/workflows/release.yml; source builds fall back
+            // to the crate version.
+            let tag = option_env!("OF_RELEASE_TAG").unwrap_or(env!("CARGO_PKG_VERSION"));
+            println!("of {tag}");
+            Ok(())
+        }
         "init" => cmd_init(&args[1..]),
         "serve" => cmd_serve(&args[1..]).await,
         "dev" => cmd_dev(&args[1..]).await,

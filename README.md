@@ -112,6 +112,26 @@ limits) are documented in [`docs/compatibility.md`](docs/compatibility.md).
 | `deploy/` | Dockerfiles and the standalone Docker Compose stack (Kubernetes manifests live in `openflare-control`) |
 | `examples/` | example workers: hello, KV + assets, D1, R2, queues, cron, Durable Objects, workflows, wrangler projects |
 
+## Install the `of` CLI
+
+Prebuilt binaries for linux-x64/arm64 and macOS x64/arm64 are on the
+[releases page](https://github.com/becoolme/openflare/releases)
+(`of-v*` tags; per-binary sha256 in `manifest.json`):
+
+```sh
+curl -fLO https://github.com/becoolme/openflare/releases/latest/download/of-macos-arm64
+shasum -a256 of-macos-arm64   # compare against manifest.json
+install -m0755 of-macos-arm64 /usr/local/bin/of
+of --version
+```
+
+Or build from source (Rust stable):
+
+```sh
+cargo build --release -p vrt-local --bin of
+install -m0755 target/release/of /usr/local/bin/of
+```
+
 ## Quick start (Docker, standalone)
 
 workerd is never downloaded by the image build. You supply a pinned binary
