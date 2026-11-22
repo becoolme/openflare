@@ -8,6 +8,7 @@
     "d1CellOps": true,
     "email": true,
     "flagship": true,
+    "images": true,
     "k2": true,
     "observability": true,
     "queue": true,

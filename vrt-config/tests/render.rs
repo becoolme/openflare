@@ -384,11 +384,11 @@ fn render_produces_expected_structure() {
     let denied = out
         .matches("globalOutbound = (name = \"vrt-no-network\", entrypoint = \"DenyAll\")")
         .count();
-    // 9 facades (kv/r2/assets/pg/d1/queue/k2/ratelimit/email) + facade-cron-w-alpha-1
+    // 10 facades (kv/r2/assets/pg/d1/queue/k2/ratelimit/email/images) + facade-cron-w-alpha-1
     // (CR1: the cron dispatcher is also deny-routed — it reaches the
     // tenant worker only through the TARGET service binding, never
     // the network) + vrt-no-network itself.
-    assert_eq!(denied, 11, "all non-egress system workers are deny-routed");
+    assert_eq!(denied, 12, "all non-egress system workers are deny-routed");
     // No worker emits any other globalOutbound spelling.
     assert_eq!(
         out.matches("globalOutbound =").count(),
@@ -1324,6 +1324,40 @@ fn worker_loader_binding_renders_native_loader() {
     // The only LOADER occurrence is the binding line itself — a loader
     // wires no service, socket, or facade reference.
     assert_eq!(out.matches("\"LOADER\"").count(), 1, "{out}");
+}
+
+/// `images` renders a `wrapped` binding over the upstream Miniflare
+/// module name `cloudflare-internal:images-api`, whose inner `fetcher`
+/// reaches the facade-images system worker — the transform engine is
+/// vendored WASM in-worker, so no provider socket is wired.
+#[test]
+fn images_binding_renders_wrapped_images_api() {
+    let mut tenant = tenant();
+    tenant.workers[0].bindings = serde_json::from_value(serde_json::json!([
+        {"type": "images", "name": "IMAGES"}
+    ]))
+    .unwrap();
+    let bs = bundles();
+    let out = render_tenant_config(&input(&tenant, &bs, &runtime_params()))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains(
+            "(name = \"IMAGES\", wrapped = (moduleName = \"cloudflare-internal:images-api\""
+        ),
+        "images must render the wrapped images-api module:\n{out}"
+    );
+    assert!(
+        out.contains("service = (name = \"facade-images\""),
+        "inner fetcher must reach facade-images:\n{out}"
+    );
+    // IMG1: the ingress `/cdn-cgi/image/` transform endpoint renders as
+    // a loopback socket pointing at the same facade service.
+    let wid = &tenant.workers[0].worker_id;
+    assert!(
+        out.contains(&format!("{wid}-images.sock\"")),
+        "images facade socket must render for cdn-cgi:\n{out}"
+    );
 }
 
 // ---- per-worker quotas (`limits`) ----

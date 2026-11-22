@@ -48,6 +48,7 @@ pub mod assignment;
 pub mod backoff;
 pub mod bundle_http;
 pub mod cache;
+pub mod cdn_cgi;
 pub mod config;
 pub mod control;
 pub mod cron_trigger;

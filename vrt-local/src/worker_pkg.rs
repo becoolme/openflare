@@ -225,6 +225,10 @@ pub(crate) struct BindingsToml {
     /// each renders as workerd's native `unsafeEval` capability.
     #[serde(default)]
     pub(crate) unsafe_evals: Vec<String>,
+    /// CF `[images]` — binding names only; transforms run in-worker on
+    /// the vendored WASM engine via facade-images (no resource ref).
+    #[serde(default)]
+    pub(crate) images: Vec<String>,
     /// CF `[[flagship]]` — `binding name -> app_id` (the app record
     /// lives tenant-side: standalone resolves it in `flagship.json`,
     /// the platform in the Flagship app store).
@@ -1196,6 +1200,11 @@ pub fn assemble(
                     allowed_sender_addresses: restriction.allowed_sender_addresses.clone(),
                     permissions: read_write.clone(),
                 },
+            ));
+        }
+        for name in &b.images {
+            bindings.push(BindingDesired::Images(
+                snapshot_protocol::compute_desired::ImagesBinding { name: name.clone() },
             ));
         }
         for (binding, db) in &b.pg {
@@ -2219,6 +2228,9 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
         }
         for name in b.send_email.keys() {
             bindings.push(format!("send_email:{name}"));
+        }
+        for name in &b.images {
+            bindings.push(format!("images:{name}"));
         }
         for name in b.pg.keys() {
             bindings.push(format!("pg:{name}"));

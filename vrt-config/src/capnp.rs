@@ -153,6 +153,10 @@ pub struct FacadeRefs {
     /// `k2` bindings → wrapped `cloudflare-internal:k2` whose inner
     /// `fetcher` service is this facade (K2 produce wire: POST /send).
     pub k2: ServiceEndpoint,
+    /// `images` bindings → wrapped `cloudflare-internal:images-api`
+    /// whose inner `fetcher` service is this facade — transforms run
+    /// inside facade-images on the vendored WASM engine.
+    pub images: ServiceEndpoint,
     /// `ratelimit` bindings -> plain service binding to this facade's
     /// `RateLimiter` entrypoint (MIG-16; no binding-backend).
     pub ratelimit: ServiceEndpoint,
@@ -169,6 +173,17 @@ pub struct SystemModuleRef {
     pub name: String,
     /// sha256 of the module bytes, lowercase hex (64 chars).
     pub digest: String,
+}
+
+/// The capnp `Worker.Module` union member a system module emits: `.wasm`
+/// names embed as `wasm` (workerd hands the importer a `WebAssembly.Module`),
+/// everything else as `esModule`.
+pub fn system_module_capnp_field(name: &str) -> &'static str {
+    if name.ends_with(".wasm") {
+        "wasm"
+    } else {
+        "esModule"
+    }
 }
 
 /// A system worker placeholder: a named worker whose modules are
@@ -1136,6 +1151,25 @@ fn emit_worker_sockets(out: &mut String, worker: &WorkerDesired, input: &TenantR
             capnp_text(&cron_facade_service_name(&worker.worker_id)),
         ));
     }
+    // IMG1: `<id>-images.sock` — the ingress intercepts `/cdn-cgi/image/`
+    // on this worker's hostnames and POSTs multipart transform requests
+    // here. Loopback unix only; present iff the worker declares an
+    // `images` binding (capability-gated like every other facade).
+    if worker
+        .bindings
+        .iter()
+        .any(|b| matches!(b, snapshot_protocol::compute_desired::BindingDesired::Images(_)))
+    {
+        out.push_str(&format!(
+            "    (name = {}, address = {}, http = (), service = {}),\n",
+            capnp_text(&format!("sock-images-{}", worker.worker_id)),
+            capnp_text(&format!(
+                "unix:{}/{}-images.sock",
+                input.params.socket_dir, worker.worker_id
+            )),
+            capnp_text(&input.params.facades.images.service),
+        ));
+    }
 }
 
 /// Emit the per-worker `do-storage-<workerId>` DiskDirectory service
@@ -1629,6 +1663,9 @@ fn emit_binding(
         BindingDesired::SendEmail(e) => {
             emit_email_binding(out, e, worker, input)?;
         }
+        BindingDesired::Images(img) => {
+            emit_images_binding(out, img, worker, input)?;
+        }
         BindingDesired::Ratelimit(r) => {
             emit_ratelimit_binding(out, r, worker, input)?;
         }
@@ -2079,6 +2116,31 @@ fn emit_email_binding(
     Ok(())
 }
 
+/// `images` — `wrapped` binding over `cloudflare-internal:images-api`
+/// (the upstream Miniflare module name); the inner `fetcher` points at
+/// the facade-images system worker, which runs the vendored WASM
+/// engine in-worker — no provider hop, no signed props needed (the
+/// facade holds no secrets and transforms only its input bytes).
+fn emit_images_binding(
+    out: &mut String,
+    img: &snapshot_protocol::compute_desired::ImagesBinding,
+    _worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+) -> Result<(), ConfigError> {
+    let facade = &input.params.facades.images;
+    out.push_str(&format!(
+        "        (name = {}, wrapped = (moduleName = {}, innerBindings = [
+            (name = \"fetcher\", service = (name = {}, entrypoint = {}))
+        ])),
+",
+        capnp_text(&img.name),
+        capnp_text("cloudflare-internal:images-api"),
+        capnp_text(&facade.service),
+        capnp_text(&facade.entrypoint),
+    ));
+    Ok(())
+}
+
 /// Emit one system (facade/egress) worker placeholder.
 fn emit_system_worker(
     out: &mut String,
@@ -2122,8 +2184,9 @@ fn emit_system_worker(
             },
         });
         out.push_str(&format!(
-            "        (name = {}, esModule = embed {}),\n",
+            "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
+            system_module_capnp_field(&module.name),
             capnp_text(&path),
         ));
     }
@@ -2142,6 +2205,15 @@ fn emit_system_worker(
             "(name = {}, text = {})",
             capnp_text(EGRESS_POLICY_BINDING),
             capnp_text(&egress_policy_json(input)?),
+        ));
+        // IMG2: `cf.image` fetch options transform through the shared
+        // facade-images worker — wired unconditionally because cf.image
+        // is a fetch option, not a declared binding (a tenant that never
+        // declares `images` must not get a silently untransformed image).
+        bindings.push(format!(
+            "(name = \"VRT_IMAGES\", service = (name = {}, entrypoint = {}))",
+            capnp_text(&params.facades.images.service),
+            capnp_text(&params.facades.images.entrypoint),
         ));
     }
     if system.service_name == params.egress.service
@@ -3292,8 +3364,9 @@ fn emit_router_worker(
             },
         });
         out.push_str(&format!(
-            "        (name = {}, esModule = embed {}),\n",
+            "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
+            system_module_capnp_field(&module.name),
             capnp_text(&path),
         ));
     }
@@ -3400,8 +3473,9 @@ fn emit_qconsumer_worker(
             },
         });
         out.push_str(&format!(
-            "        (name = {}, esModule = embed {}),\n",
+            "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
+            system_module_capnp_field(&module.name),
             capnp_text(&path),
         ));
     }

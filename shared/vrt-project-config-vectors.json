@@ -1783,6 +1783,94 @@
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "send_email[0].extra"
    }
+  },
+  {
+   "name": "images binding",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[images]\nbinding = \"IMAGES\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "name": "IMAGES",
+       "type": "images"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "images remote accepted and ignored",
+   "files": {
+    "wrangler.json": "{ \"name\": \"svc\", \"main\": \"src/index.ts\", \"compatibility_date\": \"2025-01-01\", \"images\": { \"binding\": \"IMG\", \"remote\": true } }\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.json",
+    "config": {
+     "bindings": [
+      {
+       "name": "IMG",
+       "type": "images"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "images unknown sub-key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[images]\nbinding = \"IMAGES\"\nquality = 80\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "images.quality"
+   }
+  },
+  {
+   "name": "images missing binding rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[images]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "images.binding"
+   }
+  },
+  {
+   "name": "images remote non-boolean rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[images]\nbinding = \"IMG\"\nremote = \"yes\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "images.remote"
+   }
+  },
+  {
+   "name": "images non-table rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\nimages = \"IMG\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "images"
+   }
   }
  ]
 }

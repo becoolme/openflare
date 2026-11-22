@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use vrt_host::artifact::{sha256_hex, ArtifactError, BundleCache, BundleSource};
 use vrt_host::system_seed::{seed_system_modules, SeedError};
 
-const SERVICES: [&str; 11] = [
+const SERVICES: [&str; 12] = [
     "facade-kv",
     "facade-r2",
     "facade-assets",
@@ -19,6 +19,7 @@ const SERVICES: [&str; 11] = [
     "facade-ratelimit",
     "facade-k2",
     "facade-email",
+    "facade-images",
     "vrt-egress",
     "vrt-no-network",
 ];

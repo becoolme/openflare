@@ -1276,6 +1276,35 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     bindings.push(Value::Object(b));
                 }
             }
+            "images" => {
+                // CF `[images] {binding}` — the Images binding
+                // (`env.<binding>.info()`/`.input().transform().output()`);
+                // transforms run inside the facade-images worker on the
+                // vendored WASM engine. `remote` is a CF local-dev knob
+                // accepted and ignored (k2/flagship/AE precedent).
+                let t = value
+                    .as_object()
+                    .ok_or_else(|| invalid("images", "must be a table"))?;
+                for k in t.keys() {
+                    match k.as_str() {
+                        "binding" | "remote" => {}
+                        _ => return Err(unsupported(&format!("images.{k}"), None)),
+                    }
+                }
+                let binding = req_str(
+                    t.get("binding").unwrap_or(&Value::Null),
+                    "images.binding",
+                )?;
+                if let Some(v) = t.get("remote") {
+                    if !v.is_boolean() {
+                        return Err(invalid("images.remote", "must be a boolean"));
+                    }
+                }
+                let mut b = Map::new();
+                b.insert("type".into(), Value::from("images"));
+                b.insert("name".into(), Value::from(binding));
+                bindings.push(Value::Object(b));
+            }
             "streaming_tail_consumers" => {
                 // CF `streaming_tail_consumers = [{service = "..."}]` —
                 // same-table shape as `tail_consumers` (worker-level,
@@ -2594,6 +2623,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut ratelimit = Map::new();
         let mut worker_loaders = Vec::new();
         let mut unsafe_evals = Vec::new();
+        let mut images = Vec::new();
         let mut flagship = Map::new();
         let mut k2 = Map::new();
         let mut send_email = Map::new();
@@ -2727,6 +2757,11 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     }
                     send_email.insert(name.into(), Value::Object(r));
                 }
+                "images" => {
+                    // `[images] {binding}` — name list only (like
+                    // workerLoaders): no resource reference.
+                    images.push(Value::from(name));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -2771,6 +2806,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !worker_loaders.is_empty() {
             bind.insert("workerLoaders".into(), Value::Array(worker_loaders));
+        }
+        if !images.is_empty() {
+            bind.insert("images".into(), Value::Array(images));
         }
         if !unsafe_evals.is_empty() {
             bind.insert("unsafeEvals".into(), Value::Array(unsafe_evals));

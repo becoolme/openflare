@@ -20,3 +20,20 @@ export function resolve(specifier, context, next) {
   }
   return next(specifier, context);
 }
+
+// `.wasm` specifiers → a module whose default export is the compiled
+// `WebAssembly.Module`, mirroring workerd's `wasm = embed` semantics.
+// (The hook thread can't share objects with the app realm, so the
+// synthesized module reads the bytes itself.)
+import { fileURLToPath } from "node:url";
+export function load(url, context, next) {
+  if (url.endsWith(".wasm")) {
+    return {
+      format: "module",
+      shortCircuit: true,
+      source: `import { readFileSync } from "node:fs";
+export default new WebAssembly.Module(readFileSync(${JSON.stringify(fileURLToPath(url))}));`,
+    };
+  }
+  return next(url, context);
+}

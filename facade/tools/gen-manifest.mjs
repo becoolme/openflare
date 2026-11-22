@@ -64,6 +64,9 @@ const WORKERS = [
   // (produce-only: POST /send → provider → vrt-sql K2Backend).
   { serviceName: "facade-k2", entrypoint: "K2Facade", entry: "facade-k2.ts", needsBindingBackend: true },
   { serviceName: "facade-email", entrypoint: "EmailFacade", entry: "facade-email.ts", needsBindingBackend: true },
+  // CF Images binding — inner `fetcher` of `cloudflare-internal:images-api`.
+  // Pure in-worker transforms (vendored WASM engine); no binding-backend.
+  { serviceName: "facade-images", entrypoint: "ImagesFacade", entry: "facade-images.ts", needsBindingBackend: false },
   // MIG-16: in-process Rate Limiting binding — pure RPC entrypoint, no
   // binding-backend (state is local to the workerd process).
   { serviceName: "facade-ratelimit", entrypoint: "RateLimiter", entry: "facade-ratelimit.ts", needsBindingBackend: false },
@@ -175,6 +178,15 @@ function resolveSpecifier(spec, fromFile, container, tries) {
   if (inside.startsWith("..") || inside === "" || inside.includes(`..${sep}`)) {
     fail(fromFile, `specifier ${JSON.stringify(spec)} escapes the module root`);
   }
+  // `.wasm` resolves to the literal file only — workerd imports it as a
+  // `WebAssembly.Module` (`wasm = embed` in capnp), never scanned or
+  // transpiled.
+  if (spec.endsWith(".wasm")) {
+    if (!existsSync(candidate)) {
+      fail(fromFile, `wasm specifier ${JSON.stringify(spec)} does not resolve inside the module graph`);
+    }
+    return { file: candidate };
+  }
   for (const t of tries(candidate)) {
     if (existsSync(t) && MODULE_EXTS.some((e) => t.endsWith(e))) {
       if (t.endsWith(".d.ts")) {
@@ -224,6 +236,9 @@ function walk(entryFile, container, tries) {
     const file = queue.shift();
     if (files.has(file)) continue;
     files.add(file);
+    // Wasm modules are leaves: bytes are embedded verbatim and carry no
+    // import graph of their own.
+    if (file.endsWith(".wasm")) continue;
     const source = readFileSync(file, "utf8");
     for (const spec of importsOf(file, source)) {
       const resolved = resolveSpecifier(spec, file, container, tries);
@@ -260,17 +275,27 @@ function build() {
     for (const file of files) {
       const rel = relative(ROOT, file).split(sep).join("/");
       const name = moduleName(rel);
-      const source = readFileSync(file, "utf8");
-      const published = publish(source, file);
       const distAbs = resolve(DIST_DIR, name);
-      emitted.set(distAbs, published);
-      modules.push({
+      const entry = {
         name,
         dist: relative(ROOT, distAbs).split(sep).join("/"),
         source: rel,
-        sourceSha256: sha256Hex(source),
-        sha256: sha256Hex(published),
-      });
+      };
+      if (file.endsWith(".wasm")) {
+        // Raw bytes — no transpile; `wasm = embed` in the rendered capnp.
+        const bytes = readFileSync(file);
+        emitted.set(distAbs, bytes);
+        entry.sourceSha256 = sha256Hex(bytes);
+        entry.sha256 = sha256Hex(bytes);
+        entry.type = "wasm";
+      } else {
+        const source = readFileSync(file, "utf8");
+        const published = publish(source, file);
+        emitted.set(distAbs, published);
+        entry.sourceSha256 = sha256Hex(source);
+        entry.sha256 = sha256Hex(published);
+      }
+      modules.push(entry);
     }
     modules.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     if (new Set(modules.map((m) => m.name)).size !== modules.length) {
@@ -298,6 +323,8 @@ function build() {
       if (published === undefined) {
         fail(file, "dist graph references a module outside the emitted set");
       }
+      // Wasm leaves hold bytes, not an import graph.
+      if (file.endsWith(".wasm")) continue;
       for (const spec of importsOf(file, published)) {
         const candidate = resolve(dirname(file), spec);
         if (spec.startsWith("./") || spec.startsWith("../")) {
@@ -362,8 +389,9 @@ if (process.argv.includes("--check")) {
   if (current !== manifest) drift.push("manifest.json differs from regenerated output");
   const expected = new Set(emitted.keys());
   for (const [file, bytes] of emitted) {
-    const onDisk = existsSync(file) ? readFileSync(file, "utf8") : null;
-    if (onDisk !== bytes) {
+    const onDisk = existsSync(file) ? readFileSync(file) : null;
+    const want = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+    if (onDisk === null || !onDisk.equals(want)) {
       drift.push(`${relative(FACADE_DIR, file)} differs (or is missing)`);
     }
   }

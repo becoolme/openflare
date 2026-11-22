@@ -73,6 +73,7 @@ fn parses_generated_manifest_into_system_workers() {
         "facade-ratelimit",
         "facade-k2",
         "facade-email",
+        "facade-images",
         "vrt-egress",
         "vrt-no-network",
     ] {
@@ -89,13 +90,14 @@ fn parses_generated_manifest_into_system_workers() {
             worker.service_name.starts_with("facade-")
                 && worker.service_name != "facade-router"
                 && worker.service_name != "facade-qconsumer"
-                && worker.service_name != "facade-ratelimit",
+                && worker.service_name != "facade-ratelimit"
+                && worker.service_name != "facade-images",
             "{} binding-backend flag",
             worker.service_name
         );
         assert!(worker.modules.iter().any(|m| m.name == worker.main_module));
         for module in &worker.modules {
-            assert!(module.name.ends_with(".js"));
+            assert!(module.name.ends_with(".js") || module.name.ends_with(".wasm"));
             assert_eq!(module.digest.len(), 64);
         }
     }
@@ -189,6 +191,7 @@ fn minimal() -> serde_json::Value {
         "facade-ratelimit",
         "facade-k2",
         "facade-email",
+        "facade-images",
         "vrt-egress",
         "vrt-no-network",
     ] {

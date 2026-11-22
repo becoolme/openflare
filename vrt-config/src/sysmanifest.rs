@@ -25,7 +25,7 @@ use crate::manifest::valid_module_name;
 pub const FACADE_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Service names whose endpoints fill [`FacadeRefs`].
-const REQUIRED_FACADES: [&str; 9] = [
+const REQUIRED_FACADES: [&str; 10] = [
     "facade-kv",
     "facade-r2",
     "facade-assets",
@@ -35,6 +35,7 @@ const REQUIRED_FACADES: [&str; 9] = [
     "facade-k2",
     "facade-ratelimit",
     "facade-email",
+    "facade-images",
 ];
 
 /// Service name of the T6 egress worker — required since T6: it is the
@@ -84,6 +85,10 @@ struct WireModule {
     source_sha256: String,
     /// sha256 of the dist bytes — what `sys/<digest>` embeds.
     sha256: String,
+    /// Module kind — only `"wasm"` is meaningful (raw bytes embedded as a
+    /// `WebAssembly.Module`); absent means `esModule`.
+    #[serde(default, rename = "type")]
+    module_type: Option<String>,
 }
 
 /// Parsed facade manifest: the four product endpoints plus the egress
@@ -167,6 +172,15 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
             if !valid_module_name(&module.dist) {
                 return Err(ConfigError::Identifier("workers.modules.dist"));
             }
+            // `type: "wasm"` is the only meaningful kind marker and must
+            // match the `.wasm` suffix the renderer keys on — anything else
+            // would silently emit the wrong capnp module union member.
+            let is_wasm_name = module.name.ends_with(".wasm");
+            match module.module_type.as_deref() {
+                None if !is_wasm_name => {}
+                Some("wasm") if is_wasm_name => {}
+                _ => return Err(ConfigError::Identifier("workers.modules.type")),
+            }
             modules.push(SystemModuleRef {
                 name: module.name.clone(),
                 digest: module.sha256.clone(),
@@ -203,6 +217,7 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         k2: endpoint(REQUIRED_FACADES[6], "facades.required")?,
         ratelimit: endpoint(REQUIRED_FACADES[7], "facades.required")?,
         email: endpoint(REQUIRED_FACADES[8], "facades.required")?,
+        images: endpoint(REQUIRED_FACADES[9], "facades.required")?,
     };
     let egress = endpoint(EGRESS_SERVICE, "egress.required")?;
     let deny_outbound = endpoint(DENY_OUTBOUND_SERVICE, "denyOutbound.required")?;

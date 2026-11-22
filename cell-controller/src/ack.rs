@@ -214,6 +214,15 @@ pub struct AckCapabilities {
     /// Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub email: bool,
+    /// `{"type":"images"}` bindings render a `wrapped` binding over
+    /// `cloudflare-internal:images-api` routed through `facade-images`
+    /// — a cell predating either fails the snapshot parse
+    /// (`deny_unknown_fields` on the binding variant) or the whole
+    /// config load (missing system worker), so the control plane only
+    /// admits Images bindings onto cells that claim it. Omitted while
+    /// false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub images: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized
