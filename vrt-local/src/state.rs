@@ -235,7 +235,6 @@ impl LocalState {
                     .ok_or("versions")?;
                 record.versions.remove(pos);
             }
-            record.versions.push(Self::version_record(pkg, version_id.clone()));
             record
                 .versions
                 .push(Self::version_record(pkg, version_id.clone()));
