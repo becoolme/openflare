@@ -66,6 +66,7 @@ pub mod geoip;
 pub mod hibernate;
 pub mod ingress;
 pub mod initial_snapshot;
+pub mod introspect;
 pub mod launch;
 pub mod logs;
 pub mod metrics;

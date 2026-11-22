@@ -1025,6 +1025,67 @@ impl RusqliteEngine {
         }
     }
 
+    /// Read-only size/shape snapshot for the control-plane stats report.
+    /// Uses the engine-internal authorizer bypass (pragma_* functions are
+    /// rejected for tenant SQL) and never changes data.
+    pub fn stats_sync(&self) -> Result<DbStats, EngineError> {
+        if self.dropped.load(Ordering::SeqCst) {
+            return Err(EngineError::Dropped);
+        }
+        if self.fenced.load(Ordering::SeqCst) {
+            return Err(EngineError::Fenced(self.lease_epoch()));
+        }
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.internal.set(true);
+        let out = (|| -> rusqlite::Result<DbStats> {
+            let page_count: i64 =
+                inner
+                    .conn
+                    .query_row("SELECT page_count FROM pragma_page_count()", [], |r| {
+                        r.get(0)
+                    })?;
+            let page_size: i64 =
+                inner
+                    .conn
+                    .query_row("SELECT page_size FROM pragma_page_size()", [], |r| {
+                        r.get(0)
+                    })?;
+            let user_version: i64 = inner
+                .conn
+                .query_row("SELECT user_version FROM pragma_user_version()", [], |r| {
+                    r.get(0)
+                })?;
+            let tables: Vec<String> = {
+                let mut stmt = inner.conn.prepare(
+                    "select name from sqlite_master
+                      where type='table'
+                        and name not like 'sqlite_%'
+                        and name not like '\\_vrt\\_%' escape '\\'
+                      order by name",
+                )?;
+                let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+                rows.filter_map(|r| r.ok()).collect()
+            };
+            let index_count: i64 = inner.conn.query_row(
+                "select count(*) from sqlite_master
+                  where type='index' and name not like 'sqlite_%'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok(DbStats {
+                database_bytes: page_count.saturating_mul(page_size),
+                page_count,
+                page_size,
+                table_count: tables.len() as i64,
+                tables,
+                index_count,
+                user_version,
+            })
+        })();
+        inner.internal.set(false);
+        out.map_err(EngineError::Sqlite)
+    }
+
     /// size_after: pragma_*() functions are rejected by the authorizer; go through the internal bypass.
     fn size_after(conn: &Connection, internal: &security::InternalFlag) -> i64 {
         internal.set(true);
@@ -1833,6 +1894,19 @@ impl Drop for OpenGuard<'_> {
         self.slot
             .publish(Err(SharedOpenErr::Unavailable("database open aborted")));
     }
+}
+
+/// Read-only size/shape snapshot of one D1 database (control-plane stats).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DbStats {
+    pub database_bytes: i64,
+    pub page_count: i64,
+    pub page_size: i64,
+    pub table_count: i64,
+    pub tables: Vec<String>,
+    pub index_count: i64,
+    pub user_version: i64,
 }
 
 /// T36: read-only diagnostic entry (JSON camelCase -- the outward shape of `/internal/dbs`).

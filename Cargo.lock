@@ -419,6 +419,7 @@ dependencies = [
  "vrt-metrics",
  "vrt-provider",
  "vrt-securefs",
+ "vrt-sql",
 ]
 
 [[package]]

@@ -1474,3 +1474,68 @@ async fn release_rejects_stale_lease() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn wire_internal_stats_reports_d1_shape_and_queue_metrics() {
+    let tmp = TempDir::new().unwrap();
+    let app = wire::app(AppState::new(tmp.path().join("dbs"), [9u8; 32]));
+    let db = "01jqqm3b4y6zq8f0v2w5x7k9ae";
+    let q = "q".repeat(26);
+
+    for sql in ["CREATE TABLE t(a TEXT)", "INSERT INTO t VALUES('x')"] {
+        let (code, body) = oneshot(
+            app.clone(),
+            "POST",
+            &format!("/dbs/{db}/execute"),
+            serde_json::json!({"sql": sql}),
+        )
+        .await;
+        assert_eq!(code, 200, "{body}");
+    }
+
+    let (code, _) = oneshot(
+        app.clone(),
+        "POST",
+        &format!("/queues/{q}/send"),
+        serde_json::json!({"messages":[
+            {"id":"m1","body":hex::encode(b"hi"),"contentType":"text","delaySecs":0}
+        ]}),
+    )
+    .await;
+    assert_eq!(code, 200);
+
+    let (code, body) = oneshot(
+        app.clone(),
+        "POST",
+        "/internal/stats",
+        serde_json::json!({"d1":[db, "not-a-db"], "queues":[q, "short"]}),
+    )
+    .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["success"].as_bool(), Some(true));
+
+    let dbs = body["databases"].as_array().unwrap();
+    assert_eq!(dbs.len(), 2);
+    assert_eq!(dbs[0]["databaseId"].as_str(), Some(db));
+    assert_eq!(dbs[0]["stats"]["tableCount"].as_i64(), Some(1), "{body}");
+    assert_eq!(dbs[0]["stats"]["tables"][0].as_str(), Some("t"));
+    assert!(
+        dbs[0]["stats"]["databaseBytes"].as_i64().unwrap() > 0,
+        "{body}"
+    );
+    assert_eq!(
+        dbs[1]["error"]["code"].as_str(),
+        Some("VRT_INVALID_REQUEST"),
+        "{body}"
+    );
+
+    let queues = body["queues"].as_array().unwrap();
+    assert_eq!(queues.len(), 2);
+    assert_eq!(queues[0]["queueId"].as_str(), Some(q.as_str()));
+    assert_eq!(queues[0]["metrics"]["backlogCount"].as_i64(), Some(1));
+    assert_eq!(
+        queues[1]["error"]["code"].as_str(),
+        Some("VRT_INVALID_REQUEST"),
+        "{body}"
+    );
+}

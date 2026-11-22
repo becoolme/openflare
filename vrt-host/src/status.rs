@@ -379,6 +379,9 @@ pub fn control_router(
         .merge(crate::cron_trigger::router_with_hold(registry.clone(), hold))
         .merge(crate::queue_dispatch::router_with_hold(registry.clone(), hold))
         .merge(crate::wfops::router_with_hold(registry.clone(), hold))
+        // Control-plane stats report: read-only instance listing for the
+        // declared class dirs (workflow + DO instance indexes).
+        .merge(crate::introspect::router(registry.clone()))
         // B12: `GET /metrics` shares the control listener (standalone
         // / `vrt serve`); k8s additionally gets a dedicated
         // `metricsListen` port in vrt-host.rs.

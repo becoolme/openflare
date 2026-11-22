@@ -979,6 +979,165 @@ async fn drop_impl(
     }
 }
 
+/// Bounded stats request from the cell controller (periodic report).
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StatsRequest {
+    #[serde(default)]
+    d1: Vec<String>,
+    #[serde(default)]
+    queues: Vec<String>,
+}
+
+const STATS_MAX_IDS: usize = 500;
+
+/// `POST /internal/stats` -- read-only size/shape for the D1 databases and
+/// queue metrics the control plane asked about. Same ServiceAuth model and
+/// body cap as the D1 endpoints. Per-resource failures are typed inside the
+/// response; one broken database never hides the rest.
+async fn stats_handler(State(state): State<AppState>, request: axum::extract::Request) -> Response {
+    let started = Instant::now();
+    let label = "stats";
+    let fail = |outcome: &'static str, status: StatusCode, body: serde_json::Value| {
+        crate::metrics::query(label, outcome, started.elapsed().as_secs_f64());
+        Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let _permit = match state.permits.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return fail(
+                "rate_limited",
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"success": false, "error": "vrt-sql overloaded"}),
+            )
+        }
+    };
+    if let Some(cl) = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if cl > state.body_max {
+            return fail(
+                "protocol_error",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"success": false, "error": "request body too large"}),
+            );
+        }
+    }
+    let method = request.method().clone();
+    let path_query = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| request.uri().path().to_string());
+    let headers = request.headers().clone();
+    let body = match axum::body::to_bytes(request.into_body(), state.body_max).await {
+        Ok(b) => b,
+        Err(_) => {
+            return fail(
+                "protocol_error",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"success": false, "error": "request body too large"}),
+            )
+        }
+    };
+    if let Some(auth) = &state.auth {
+        if !auth.verify(&headers, &method, &path_query, &body) {
+            return fail(
+                "unauthorized",
+                StatusCode::UNAUTHORIZED,
+                json!({"success": false, "error": "unauthorized"}),
+            );
+        }
+    }
+    let req: StatsRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => {
+            return fail(
+                "protocol_error",
+                StatusCode::BAD_REQUEST,
+                json!({"success": false, "error": "invalid stats request"}),
+            )
+        }
+    };
+    if req.d1.len() > STATS_MAX_IDS || req.queues.len() > STATS_MAX_IDS {
+        return fail(
+            "protocol_error",
+            StatusCode::BAD_REQUEST,
+            json!({"success": false, "error": "too many ids"}),
+        );
+    }
+    let mut databases = Vec::with_capacity(req.d1.len());
+    if !req.d1.is_empty() {
+        let registry = state.registry.clone();
+        let ids = req.d1.clone();
+        let joined = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::with_capacity(ids.len());
+            for id in ids {
+                if crate::paths::validate_database_id(&id).is_err() {
+                    out.push(json!({"databaseId": id, "error": {"code": "VRT_INVALID_REQUEST"}}));
+                    continue;
+                }
+                match registry.get(crate::paths::ResourceKind::D1, &id) {
+                    Ok(engine) => match engine.stats_sync() {
+                        Ok(s) => out.push(json!({"databaseId": id, "stats": s})),
+                        Err(e) => out.push(json!({"databaseId": id, "error": error_body(&e)})),
+                    },
+                    Err(e) => out.push(json!({"databaseId": id, "error": error_body(&e)})),
+                }
+            }
+            out
+        })
+        .await;
+        match joined {
+            Ok(v) => databases = v,
+            Err(_) => {
+                return fail(
+                    "error",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"success": false, "error": "stats task failed"}),
+                )
+            }
+        }
+    }
+    let mut queues = Vec::with_capacity(req.queues.len());
+    let backend = crate::queue::SqliteQueueBackend::new(state.registry.clone());
+    for id in req.queues {
+        let queue = match crate::queue::QueueId::parse(&id) {
+            Ok(q) => q,
+            Err(e) => {
+                queues.push(json!({
+                    "queueId": id,
+                    "error": {"code": "VRT_INVALID_REQUEST", "error": e.to_string()},
+                }));
+                continue;
+            }
+        };
+        match backend.metrics(&queue, now_ms()).await {
+            Ok(m) => queues.push(json!({"queueId": id, "metrics": m})),
+            Err(e) => queues.push(json!({
+                "queueId": id,
+                "error": {"code": e.code(), "error": e.to_string()},
+            })),
+        }
+    }
+    crate::metrics::query(label, "ok", started.elapsed().as_secs_f64());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(
+            json!({"success": true, "databases": databases, "queues": queues}).to_string(),
+        ))
+        .unwrap()
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/dbs/{id}/query", post(query_handler))
@@ -999,6 +1158,7 @@ pub fn app(state: AppState) -> Router {
             axum::routing::get(queue_metrics_handler),
         )
         .route("/internal/dbs", axum::routing::get(diag_handler))
+        .route("/internal/stats", post(stats_handler))
         .route("/healthz", axum::routing::get(healthz))
         .route("/readyz", axum::routing::get(healthz))
         .with_state(state)

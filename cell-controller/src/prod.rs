@@ -102,6 +102,41 @@ pub struct ProdConfig {
     /// non-default quota (409, fail closed).
     #[serde(default)]
     pub quotas: bool,
+    /// Periodic cell report (pod metrics + D1/queue stats + Workflow/DO
+    /// instance listings). Absent → enabled with defaults when pods or
+    /// `[d1sql]` are configured; `enabled = false` opts out.
+    #[serde(default)]
+    pub report: Option<ReportToml>,
+}
+
+/// `[report]` — periodic runtime → control-plane collection cadence.
+/// `deny_unknown_fields` keeps a typo from silently disabling it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportToml {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_report_interval")]
+    pub interval_secs: u64,
+    #[serde(default = "default_report_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_report_interval() -> u64 {
+    30
+}
+fn default_report_timeout() -> u64 {
+    10
+}
+
+impl Default for ReportToml {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: default_report_interval(),
+            timeout_secs: default_report_timeout(),
+        }
+    }
 }
 
 /// T37b: `[queue_dispatch]` — optional tuning over
@@ -233,6 +268,14 @@ pub fn load_config(path: &str) -> Result<ProdConfig, String> {
         }
         if !lease.api_url.starts_with("https://") {
             return Err("cron_lease api_url must be https".into());
+        }
+    }
+    if let Some(report) = &config.report {
+        if !(5..=3600).contains(&report.interval_secs) {
+            return Err("report.interval_secs must be 5..=3600".into());
+        }
+        if !(1..=60).contains(&report.timeout_secs) {
+            return Err("report.timeout_secs must be 1..=60".into());
         }
     }
     Ok(config)

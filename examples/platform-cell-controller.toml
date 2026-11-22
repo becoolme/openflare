@@ -46,6 +46,14 @@ cidr = { cidr = "203.0.113.10/32", port = { protocol = "tcp", port = 443 } }
 keyId = "bf29c9743adb0a97f43ae4bc"
 publicKey = "MCowBQYDK2VwAyEAO4cbNjsO7FQzisOvZshKKMa67lIim3ikig7RdntOAZM="
 
+# Periodic cell report: pod metrics + D1/queue stats + Workflow/DO instance
+# listings pushed to /api/internal/clusters/<cell>/vrt/metrics. Enabled by
+# default when pods or [d1sql] exist; set enabled = false to opt out.
+[report]
+enabled = true
+interval_secs = 30       # 5..=3600
+timeout_secs = 10        # 1..=60 per network call
+
 # One delivery directory per pod + readyz probe (T14/B1 FileEnvelopePodChannel)
 [[pods]]
 id = "pod-0"
