@@ -4144,6 +4144,7 @@ console.log("after the payload");
             bindings: Vec::new(),
             hostnames: Vec::new(),
             vars: BTreeMap::new(),
+            tag: None,
         };
         let pkg = crate::worker_pkg::pack(&fixture, &overrides, "tenant").unwrap();
         assert_eq!(pkg.name, "cf-config-fixture");
