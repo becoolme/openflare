@@ -123,7 +123,7 @@ const USER_MODULE: &str = r#"export default {
           missing,
         });
       }
-      if (url.pathname === "/secrets") {
+      if (p === "/secrets") {
         const value = await env.SECRET.get();
         let missing = "no-error";
         try {
