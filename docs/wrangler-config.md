@@ -78,6 +78,7 @@ environment blocks.
 | `assets` | supported — see [Static assets](bindings/static-assets.md); `directory`, `binding`, `html_handling`, `not_found_handling`, `run_worker_first` | `project_cfg.rs:1235` |
 | `workflows` | supported — see [Workflows](bindings/workflows.md); `name`, `binding`, `class_name`, `script_name`, `limits.steps` | `project_cfg.rs:1269` |
 | `tail_consumers` | supported — see [Tail Workers](bindings/tail-workers.md); `service` table or legacy string entries; distinct same-tenant already-deployed consumers, deduped, max 16; empty list valid | `project_cfg.rs:1352` |
+| `streaming_tail_consumers` | supported — Streaming Tail Workers; per-entry key `service` only; same same-tenant resolution as `tail_consumers`, rendered as workerd `streamingTails` designators so the consumer's `tailStream()` receives the event stream; one channel per consumer | `project_cfg.rs` `streaming_tail_consumers` |
 | `limits` | supported — see [Per-worker quotas](quotas.md); `cpu_ms` (1..300000) and `subrequests` (0..10000); other keys rejected | `project_cfg.rs:1393` |
 | `dev` | supported (dev-only) — `ip` (loopback only; `localhost` normalizes to `127.0.0.1`, `::1` binds as `[::1]:port`), `port` (1..65535), `host` (extra route hostname registered for the session via `DeployOverrides.hostnames`; must satisfy the route hostname rule), `local_protocol = "http"` no-op. The deploy-facing projection accepts and drops the table, so dev-only keys never fail `vrt deploy`; `vrt dev` validates strictly at session start (`parse_dev_table`) where `inspector_*`, `upstream_protocol`, `remote`/`experimental_remote`, `enable_containers`, `container_engine`, `generate_types` are rejected | `project_cfg.rs` `parse_dev_table`, `dev.rs` `DevPorts::alloc` |
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
@@ -146,6 +147,10 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 - 2026-11-21: `tail_consumers` is accepted (table or legacy string
   entries, deduped, max 16) and carried to the signed snapshot as
   resolved same-tenant worker ids; empty lists are ignored.
+- 2026-11-21: `streaming_tail_consumers` is accepted (same shape and
+  same-tenant rule, rendered as `streamingTails`); both tail lists share
+  self-reference, dedupe and 16-cap validation, and a worker on both
+  channels is refused rather than double-delivered.
 - 2026-11-21 (r2): `[dev]` handling corrected against review — the
   shared normalize path now accepts-and-drops the table (mirroring the
   TS ignore list), so config `wrangler deploy` accepts (`ip =

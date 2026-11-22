@@ -93,6 +93,12 @@ pub struct WorkerToml {
     #[serde(default)]
     pub(crate) observability:
         Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// `streamingTailConsumers` — same `{service}`-by-name shape as
+    /// `tailConsumers`, but the consumer receives TailStream events
+    /// via `tailStream()` instead of batched `tail()` calls (CF
+    /// `streaming_tail_consumers`; workerd `streamingTails`).
+    #[serde(default)]
+    pub(crate) streaming_tail_consumers: Vec<TailConsumerToml>,
     /// P3c-1: `durableObjectBindings` -- DO namespace bindings
     /// (same shape after normalizing wrangler `durable_objects.bindings[]`).
     #[serde(default)]
@@ -499,6 +505,9 @@ pub struct PackedWorker {
     /// `[observability]` — version-scoped like `tail_consumers`:
     /// rollback restores the earlier collection gates.
     pub observability: Option<snapshot_protocol::compute_desired::ObservabilityDesired>,
+    /// Desired streaming tail consumers — same resolution rule as
+    /// `tail_consumers`, rendered to `streamingTails` instead of `tails`.
+    pub streaming_tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
     /// P3c-1: DO class declarations -- the result of evaluating migrations, `uniqueKey`
     /// already derived by HMAC with the deploy key, rename lineage resolved.
     pub durable_object_classes: Vec<DoClassDesired>,
@@ -1163,6 +1172,35 @@ pub fn assemble(
         });
     }
 
+    // `tailConsumers` / `streamingTailConsumers` — same name→id rule
+    // as `[bindings.service]`: the consumer is a sibling worker of
+    // THIS tenant/project, and an unresolvable name fails closed
+    // (never a dangling trace target). Both lists share one resolver
+    // so the self-target, dedupe and cap invariants cannot drift.
+    let tail_consumers =
+        resolve_tail_consumers(&meta.tail_consumers, &name, "tail_consumers", resolve_worker)?;
+    let streaming_tail_consumers = resolve_tail_consumers(
+        &meta.streaming_tail_consumers,
+        &name,
+        "streaming_tail_consumers",
+        resolve_worker,
+    )?;
+    // One consumer cannot appear on both channels: workerd would call
+    // its `tail()` AND `tailStream()` for the same event, doubling
+    // delivery with no way for the consumer to tell the copies apart.
+    // The signed-desired validator enforces the same rule on delivered
+    // snapshots; this is the fail-early config error.
+    if let Some(dup) = tail_consumers.iter().find(|c| {
+        streaming_tail_consumers
+            .iter()
+            .any(|s| s.worker_id == c.worker_id)
+    }) {
+        return Err(LocalError::WorkerOwned(format!(
+            "worker {} cannot be both a tail consumer and a streaming tail consumer",
+            dup.worker_id
+        )));
+    }
+
     // Deterministic worker-id material: hash the worker name so a
     // re-deployed directory keeps its identity without stored state.
     // (DO uniqueKey derivation needs it too -- hoisted before assets.)
@@ -1357,39 +1395,6 @@ pub fn assemble(
         }
     }
 
-    // Tail Workers (`tail_consumers`): resolve each service name inside
-    // this tenant. A miss (never deployed / typo) fails the deploy now —
-    // a dangling workerd `tails` designator would fail the whole config
-    // load at generation start, and a silently dropped consumer would
-    // lose events. Self-reference is rejected: CF documents tail
-    // consumers as watching OTHER Workers, and a self-tail has no
-    // documented recursion bound. Duplicates collapse to the first
-    // occurrence (order is preserved for deterministic rendering).
-    let mut tail_consumers = Vec::new();
-    {
-        use snapshot_protocol::compute_desired::{
-            TailConsumerDesired, MAX_TAIL_CONSUMERS_PER_WORKER,
-        };
-        let mut seen = std::collections::BTreeSet::new();
-        for consumer in &meta.tail_consumers {
-            if consumer.service == name {
-                return Err(LocalError::Worker(
-                    "tail_consumers service must be another worker",
-                ));
-            }
-            let target = resolve_worker(&consumer.service)
-                .ok_or(LocalError::Worker("tail_consumers service target"))?;
-            if seen.insert(target.clone()) {
-                tail_consumers.push(TailConsumerDesired { worker_id: target });
-            }
-        }
-        if tail_consumers.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
-            return Err(LocalError::Worker(
-                "tail_consumers at most 16 consumers per worker",
-            ));
-        }
-    }
-
     // T21: `[assets] dir` — pack the directory into the local
     // content-addressed store (materialized by `Local::deploy`; the
     // binding references the manifest digest it produced).
@@ -1431,6 +1436,7 @@ pub fn assemble(
         crons: meta.crons,
         queue_consumers,
         observability: meta.observability,
+        streaming_tail_consumers,
         durable_object_classes,
         workflows,
         tail_consumers,
@@ -1527,6 +1533,45 @@ fn scan_dir(
         }
     }
     Ok(())
+}
+
+/// Resolve a `*Consumers[]` `{service}` list to workerIds — shared by
+/// `tail_consumers` and `streaming_tail_consumers` so the invariants
+/// cannot drift: a self-target is refused (a self `streamingTails`
+/// designator amplifies each invocation into another unboundedly, and
+/// a self `tails` edge has no documented recursion bound either),
+/// duplicates collapse on the declared name, and the resolved list
+/// stays within `MAX_TAIL_CONSUMERS_PER_WORKER` — the same bound the
+/// signed-desired validator re-checks.
+fn resolve_tail_consumers(
+    list: &[TailConsumerToml],
+    self_name: &str,
+    what: &str,
+    resolve_worker: &dyn Fn(&str) -> Option<String>,
+) -> Result<Vec<snapshot_protocol::compute_desired::TailConsumerDesired>, LocalError> {
+    use snapshot_protocol::compute_desired::MAX_TAIL_CONSUMERS_PER_WORKER;
+    let mut out = Vec::with_capacity(list.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for c in list {
+        if c.service == self_name {
+            return Err(LocalError::WorkerOwned(format!(
+                "{what} service must be another worker"
+            )));
+        }
+        if !seen.insert(c.service.clone()) {
+            continue;
+        }
+        out.push(snapshot_protocol::compute_desired::TailConsumerDesired {
+            worker_id: resolve_worker(&c.service)
+                .ok_or_else(|| LocalError::WorkerOwned(format!("{what} service target")))?,
+        });
+    }
+    if out.len() > MAX_TAIL_CONSUMERS_PER_WORKER {
+        return Err(LocalError::WorkerOwned(format!(
+            "{what} at most {MAX_TAIL_CONSUMERS_PER_WORKER} consumers per worker"
+        )));
+    }
+    Ok(out)
 }
 
 /// P3c-1: JS identifier check (class names and binding names follow the same rule --
@@ -2174,5 +2219,49 @@ mod quotas_tests {
                 other => panic!("{toml_src}: expected Worker({field}), got {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tail_consumer_tests {
+    use super::*;
+
+    fn list(names: &[&str]) -> Vec<TailConsumerToml> {
+        names
+            .iter()
+            .map(|s| TailConsumerToml {
+                service: (*s).to_string(),
+            })
+            .collect()
+    }
+
+    fn resolve(name: &str) -> Option<String> {
+        Some(format!("w-{name}"))
+    }
+
+    /// Both lists share this resolver: self-targets are refused (no
+    /// recursion bound), duplicates collapse, and the cap is enforced
+    /// on the RESOLVED list.
+    #[test]
+    fn shared_invariants_hold_for_both_lists() {
+        let got =
+            resolve_tail_consumers(&list(&["a", "a", "b"]), "producer", "tail", &resolve).unwrap();
+        assert_eq!(
+            got.iter().map(|c| c.worker_id.as_str()).collect::<Vec<_>>(),
+            vec!["w-a", "w-b"]
+        );
+
+        let err =
+            resolve_tail_consumers(&list(&["producer"]), "producer", "tail", &resolve).unwrap_err();
+        assert!(format!("{err:?}").contains("another worker"), "{err:?}");
+
+        let many: Vec<TailConsumerToml> = (0..17)
+            .map(|i| TailConsumerToml {
+                service: format!("c{i}"),
+            })
+            .collect();
+        let err =
+            resolve_tail_consumers(&many, "producer", "streaming tail", &resolve).unwrap_err();
+        assert!(format!("{err:?}").contains("16"), "{err:?}");
     }
 }

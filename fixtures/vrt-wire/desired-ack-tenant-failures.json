@@ -17,7 +17,8 @@
     "workflowsCrossWorker": true,
     "workflowsOps": true,
     "unsafeEval": true,
-    "observability": true
+    "observability": true,
+    "streamingTailConsumers": true
   },
   "envelopeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "fenceRevision": 5,

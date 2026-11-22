@@ -137,6 +137,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `[observability]` worker fields render with this
         // generation -- unconditionally on (same reasoning).
         observability: true,
+        // `streamingTailConsumers` renders with this generation --
+        // unconditionally on (same reasoning).
+        streaming_tail_consumers: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

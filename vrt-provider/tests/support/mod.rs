@@ -112,6 +112,7 @@ pub fn worker(
         workflows: vec![],
         tail_consumers: vec![],
         observability: None,
+        streaming_tail_consumers: vec![],
         quotas: quotas(),
     }
 }

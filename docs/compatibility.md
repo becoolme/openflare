@@ -117,8 +117,9 @@ These are not tied to one binding.
   `tails` designators alongside the platform log collector. The
   consumer must be a different, already-deployed Worker of the same
   tenant, delivery is best effort (events may be dropped and must not
-  be used for billing/audit), and streaming tail consumers
-  (`streamingTails`) are not supported. `TailItem.scriptName` is null
+  be used for billing/audit). `streaming_tail_consumers` renders
+  streaming `tailStream()` consumers as workerd `streamingTails`
+  designators. `TailItem.scriptName` is null
   in standalone workerd (there is no per-script name). See
   [`docs/bindings/tail-workers.md`](bindings/tail-workers.md).
 - **Analytics Engine** (`[[analytics_engine_datasets]]`): native
@@ -161,9 +162,11 @@ Runtime failures visible at ingress carry platform codes documented in
 ## Changelog
 
 - 2026-11-21: Tail Workers (`tail_consumers`) are supported as native
-  workerd `tails` designators; user consumers coexist with the platform
-  log collector. Delivery is best effort, consumers must be different
-  same-tenant deployed Workers, and streaming tails remain unsupported.
+  workerd `tails` designators; `streaming_tail_consumers` render as
+  `streamingTails` designators delivering `tailStream()` events. User
+  consumers coexist with the platform log collector. Delivery is best
+  effort, consumers must be different same-tenant deployed Workers, and
+  a worker can consume one event channel only.
 - 2026-11-20: Analytics Engine (`[[analytics_engine_datasets]]` → native
   `analyticsEngine` bindings) ingests `writeDataPoint()` events to a
   per-tenant socket, spools JSONL, and flushes to canonical Parquet

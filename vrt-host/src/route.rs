@@ -213,6 +213,7 @@ mod tests {
                     durable_object_classes: vec![],
                     workflows: vec![],
                     tail_consumers: vec![],
+                    streaming_tail_consumers: vec![],
                     quotas: snapshot_protocol::compute_desired::WorkerQuotas {
                         cpu_ms: 50,
                         memory_mb: 128,
