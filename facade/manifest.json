@@ -492,8 +492,8 @@
           "name": "facade/queue-wire.js",
           "dist": "facade/dist/facade/queue-wire.js",
           "source": "facade/queue-wire.ts",
-          "sourceSha256": "99a06be592eca20597ac4fce0f2cf8507670cc91fce3bfddb1d6cf566ac8805b",
-          "sha256": "f22d35fa0051d3576af9f56efae17d2f79e66dca674ae018ea322acbfc0e2508"
+          "sourceSha256": "e1dc4563ebbaa5d7b0ecb3a3bf2025d257ba77f1e66c2ade7be6e41822c1c502",
+          "sha256": "03e39f43d67f734985a7ac5681d6c01f5790b568fddace60c9f0f4c6c0f72290"
         },
         {
           "name": "third_party/open-compute/facade/bindings/json-body.js",
