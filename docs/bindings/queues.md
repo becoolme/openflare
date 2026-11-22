@@ -48,7 +48,7 @@ are rejected at config load.
   workerd `queue` binding into `facade-queue`, then `vrt-provider`'s
   `/internal/bindings/v1/queue/{bindingId}/{message|batch|metrics}`
   route and `vrt-sql`'s `QueueBackend` — one SQLite database per queue.
-- Consumer: the dispatcher (`vrt serve` standalone, `cell-controller`
+- Consumer: the dispatcher (`of serve` standalone, `cell-controller`
   on a cell) claims batches from `vrt-sql` inside the same transaction
   as its dispatch lease, posts to `vrt-host` `/v1/queue/dispatch`, which
   reaches `facade-qconsumer` over `sock-qconsumer-<workerId>` and calls
@@ -68,7 +68,7 @@ are rejected at config load.
 
 `vrt-sql` queue storage only. The dispatcher is `cell-controller`'s
 lease-gated dispatcher on a cell (at most one per queue per cell) or the
-standalone `vrt serve` loop (1 s cadence).
+standalone `of serve` loop (1 s cadence).
 
 ## Known differences from Cloudflare
 
@@ -121,7 +121,7 @@ standalone `vrt serve` loop (1 s cadence).
 - An unset `max_concurrency` defaults to 10 in-flight batches on this
   platform (Cloudflare documents "scale to the currently supported
   maximum" instead); the standalone dispatcher runs on a fixed 1 s tick
-  inside `vrt serve`.
+  inside `of serve`.
 
 ## Unsupported keys and error shape
 

@@ -33,8 +33,8 @@ resolved to a worker id at pack time, fail closed on a miss).
   signing key material) — never client input.
 - `vrt-host` owns DO lifecycle: placement leases and snapshots
   (`[placement]`, `[doSnapshots]` in `vrt-host.toml`), WAL machinery
-  (`vrt-host/src/do_wal.rs`), and admin endpoints `vrt do-snapshot` /
-  `vrt do-migrate`.
+  (`vrt-host/src/do_wal.rs`), and admin endpoints `of do-snapshot` /
+  `of do-migrate`.
 - Storage state is external to the bundle: a worker can be restarted,
   rescheduled or redeployed without losing object data.
 - Alarms are durable object metadata, not process state:

@@ -88,26 +88,21 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
     "build",
     "alias",
     "tsconfig",
-    "jsx_factory",
-    "jsx_fragment",
-    // `no_bundle`/`find_additional_modules`/`preserve_file_names` are
-    // wrangler bundler knobs: the VRT pack always ships the project
-    // module table unbundled (CF `no_bundle` + additional-modules
-    // semantics already), so they are accepted and ignored —
-    // `rules`/`base_dir` DO carry over (module typing + rule-eval
-    // root) and are normalized below.
-    "no_bundle",
-    "minify",
-    "keep_names",
-    "find_additional_modules",
+    // `preserve_file_names`/`upload_source_maps` are upload-detail
+    // knobs: additional modules keep their project-relative names in
+    // the wire table (deterministic, content-addressed already) and
+    // the bundler emits no sourcemaps — accepted and ignored.
     "preserve_file_names",
-    "define",
     "upload_source_maps",
     "cwd",
     "config",
     // MIG-14: wrangler `[placement]` (CF Smart Placement / region
     // hints) — dropped; the runtime has no placement semantics.
     "placement",
+    // `$schema` is the standard JSON-Schema annotation wrangler.jsonc
+    // files carry (`"$schema": "node_modules/wrangler/config-schema.json"`)
+    // — editor metadata, not config.
+    "$schema",
 ];
 /// Mirrors @wdl-dev/cli NON_INHERITABLE_ENV_KEYS — env blocks REPLACE
 /// these keys wholesale instead of merging the top-level value.
@@ -1043,6 +1038,10 @@ fn req_str<'a>(v: &'a Value, field: &str) -> Result<&'a str, ProjectConfigError>
         None => Err(invalid(field, "must be a non-empty string")),
     }
 }
+fn req_bool(v: &Value, field: &str) -> Result<bool, ProjectConfigError> {
+    v.as_bool()
+        .ok_or_else(|| invalid(field, "must be a boolean"))
+}
 fn opt_str<'a>(v: Option<&'a Value>, field: &str) -> Result<Option<&'a str>, ProjectConfigError> {
     match v {
         None | Some(Value::Null) => Ok(None),
@@ -1284,6 +1283,10 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
     let mut custom_domains: Vec<String> = Vec::new();
     let mut routes_seen = false;
     let mut route_seen = false;
+    // Wrangler bundler knobs fold into one normalized `bundle` doc —
+    // wrangler's default is bundling ON (`no_bundle` absent), so the
+    // doc is always emitted for wrangler sources.
+    let mut bundle: Map<String, Value> = Map::new();
 
     for (key, value) in obj {
         match key.as_str() {
@@ -1291,7 +1294,15 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 out.insert("name".into(), Value::from(req_str(value, "name")?));
             }
             "main" => {
-                out.insert("main".into(), Value::from(req_str(value, "main")?));
+                // Wrangler accepts `main = "./x.js"` and normalizes the
+                // leading `./`; the signed bundle forbids a `.` path
+                // segment, so fold it here rather than fail at pack.
+                let mut main = req_str(value, "main")?;
+                while let Some(rest) = main.strip_prefix("./") {
+                    main = rest;
+                }
+                let main = main.to_string();
+                out.insert("main".into(), Value::from(main));
             }
             "compatibility_date" => {
                 out.insert(
@@ -1319,7 +1330,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
             // and never part of a deployment: accepted and dropped
             // here (mirroring the TS ignore list) so a config `wrangler
             // deploy` accepts stays deployable — `ip = "0.0.0.0"` or an
-            // `inspector_port` must not fail `vrt deploy`. `vrt dev`
+            // `inspector_port` must not fail `of deploy`. `of dev`
             // re-validates it strictly at session start via
             // `parse_dev_table` on the env-resolved config.
             "dev" => {}
@@ -2805,6 +2816,68 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     out.insert("tailConsumers".into(), Value::Array(out_arr));
                 }
             }
+            // Wrangler build-step knobs → one `bundle` doc. Semantics
+            // per CF docs: `no_bundle` flips `enabled` off; the rest
+            // pass through to the rolldown step at pack time.
+            "no_bundle" => {
+                bundle.insert(
+                    "enabled".into(),
+                    Value::Bool(!req_bool(value, "no_bundle")?),
+                );
+            }
+            "find_additional_modules" => {
+                bundle.insert(
+                    "findAdditionalModules".into(),
+                    Value::Bool(req_bool(value, "find_additional_modules")?),
+                );
+            }
+            "minify" => {
+                bundle.insert("minify".into(), Value::Bool(req_bool(value, "minify")?));
+            }
+            "keep_names" => {
+                bundle.insert(
+                    "keepNames".into(),
+                    Value::Bool(req_bool(value, "keep_names")?),
+                );
+            }
+            "jsx_factory" => {
+                bundle.insert(
+                    "jsxFactory".into(),
+                    Value::from(req_str(value, "jsx_factory")?),
+                );
+            }
+            "jsx_fragment" => {
+                bundle.insert(
+                    "jsxFragment".into(),
+                    Value::from(req_str(value, "jsx_fragment")?),
+                );
+            }
+            // CF `define` — `{IDENT: "<js expression>"}` identifier
+            // replacement at bundle time. Values are code snippets
+            // (`"\"production\""`, `"42"`), never secrets.
+            "define" => {
+                let defs = value
+                    .as_object()
+                    .ok_or_else(|| invalid("define", "must be a table of name → value"))?;
+                if defs.len() > 64 {
+                    return Err(invalid("define", "must declare at most 64 entries"));
+                }
+                let mut out_defs = Map::new();
+                for (k, v) in defs {
+                    if k.is_empty()
+                        || k.len() > 256
+                        || !k.bytes().all(|b| b.is_ascii() && b != b'\0')
+                    {
+                        return Err(invalid("define", "invalid identifier"));
+                    }
+                    let s = req_str(v, &format!("define.{k}"))?;
+                    if s.len() > 8192 {
+                        return Err(invalid("define", "value too long"));
+                    }
+                    out_defs.insert(k.clone(), Value::from(s));
+                }
+                bundle.insert("define".into(), Value::Object(out_defs));
+            }
             "rules" => {
                 out.insert("moduleRules".into(), normalize_module_rules(value)?);
             }
@@ -2860,6 +2933,14 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
         // vrtHostname claim + async verify), unlike `routeHostnames`
         // which must name already-claimed hostnames.
         out.insert("customDomains".into(), Value::Array(dedup));
+    }
+    // `bundle` materializes only when the config declares a bundler
+    // knob (`no_bundle`, `minify`, …) — the normalized doc then stays
+    // field-for-field identical to the TypeScript normalizer. The
+    // bundle-by-default decision lives with the meta SOURCE at pack:
+    // wrangler → on, vrt.toml → off (`no_bundle` flips it explicitly).
+    if !bundle.is_empty() {
+        out.insert("bundle".into(), Value::Object(bundle));
     }
     Ok(Value::Object(out))
 }
@@ -2923,7 +3004,7 @@ fn normalize_limits(value: &Value) -> Result<Value, ProjectConfigError> {
 }
 
 /// CF `[dev]` — wrangler dev-server settings, strictly validated for
-/// `vrt dev` at session start (deploy accepts and drops the table on
+/// `of dev` at session start (deploy accepts and drops the table on
 /// the shared normalize path, so this runs only on the dev entry).
 /// `ip`/`port` pick the loopback ingress listen (CLI `--listen` still
 /// wins); `host` registers an extra hostname for the session and must
@@ -2932,7 +3013,7 @@ fn normalize_limits(value: &Value) -> Result<Value, ProjectConfigError> {
 /// behavior the standalone does not implement — `upstream_protocol`,
 /// `inspector_*`, `remote`/`experimental_remote`, `enable_containers`,
 /// `container_engine`, `generate_types` — fail closed; `local_protocol`
-/// is a no-op only when `http` (the sole mode vrt dev serves).
+/// is a no-op only when `http` (the sole mode of dev serves).
 pub(crate) fn parse_dev_table(
     value: &Value,
 ) -> Result<crate::worker_pkg::DevToml, ProjectConfigError> {
@@ -2956,7 +3037,7 @@ pub(crate) fn parse_dev_table(
                         .map_err(|_| invalid("dev.ip", "must be an IP address or 'localhost'"))?
                 };
                 if !ip.is_loopback() {
-                    return Err(invalid("dev.ip", "vrt dev binds loopback only"));
+                    return Err(invalid("dev.ip", "of dev binds loopback only"));
                 }
                 out.ip = Some(ip.to_string());
             }
@@ -2988,7 +3069,7 @@ pub(crate) fn parse_dev_table(
                 if s != "http" {
                     return Err(unsupported(
                         "dev.local_protocol",
-                        Some("vrt dev serves http only"),
+                        Some("of dev serves http only"),
                     ));
                 }
             }
@@ -2999,7 +3080,7 @@ pub(crate) fn parse_dev_table(
 }
 
 /// Read the env-resolved `[dev]` table of a wrangler project for
-/// `vrt dev` — strict validation, applied only on the dev entry so a
+/// `of dev` — strict validation, applied only on the dev entry so a
 /// deploy never rejects session-only config it would drop anyway.
 /// `None` when the project has no `[dev]` (or ships `vrt.toml`, which
 /// carries `dev` inside `WorkerToml` instead).
@@ -3150,10 +3231,14 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("quotas") {
         wire.insert("quotas".into(), v.clone());
     }
-    // `[dev]` — dev-server settings, verbatim (consumed by `vrt dev`,
+    // `[dev]` — dev-server settings, verbatim (consumed by `of dev`,
     // never by the desired-state path).
     if let Some(v) = obj.get("dev") {
         wire.insert("dev".into(), v.clone());
+    }
+    // `bundle` — bundler knobs, consumed by `gather_bundled` at pack.
+    if let Some(v) = obj.get("bundle") {
+        wire.insert("bundle".into(), v.clone());
     }
     // `rules`/`base_dir` — module-typing rules + the rule-eval root,
     // consumed by `build_pack_json` (already shape-proven above).
@@ -3281,6 +3366,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "dev",
         "moduleRules",
         "baseDir",
+        "bundle",
         "bindings",
     ];
     // Normalized-internal keys that legitimately do not carry to the
@@ -3493,7 +3579,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
                         &format!("bindings.{name}"),
-                        Some("secrets are declared via [secrets] in vrt.toml or `vrt secret put`"),
+                        Some("secrets are declared via [secrets] in vrt.toml or `of secret put`"),
                     ));
                 }
                 // W1-r1: a binding type that survives normalize but has
@@ -4200,6 +4286,18 @@ console.log("after the payload");
             meta.vars.get("ONLY_STAGING").map(String::as_str),
             Some("yes")
         );
+    }
+
+    #[test]
+    fn wrangler_main_leading_dot_slash_normalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"w","main":"./sub/m.js","compatibility_date":"2025-01-01"}"#,
+        )
+        .unwrap();
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.main_module, "sub/m.js");
     }
 
     #[test]
@@ -5041,7 +5139,7 @@ console.log("after the payload");
 
     #[test]
     fn parse_dev_table_gates_and_fail_closed() {
-        // The wrangler `[dev]` surface vrt dev consumes: ip/port/host.
+        // The wrangler `[dev]` surface of dev consumes: ip/port/host.
         let full = parse_dev_table(&serde_json::json!({
             "ip": "localhost",
             "port": 9_000,
@@ -5105,10 +5203,10 @@ console.log("after the payload");
         }
     }
 
-    /// `vrt deploy` must accept every `[dev]` key `wrangler deploy` accepts:
+    /// `of deploy` must accept every `[dev]` key `wrangler deploy` accepts:
     /// the shared normalize path drops the table instead of validating it,
     /// so `ip = "0.0.0.0"`, `inspector_port` and `remote` cannot fail a
-    /// deploy. Only `vrt dev` re-validates strictly (`parse_dev_table`).
+    /// deploy. Only `of dev` re-validates strictly (`parse_dev_table`).
     #[test]
     fn deploy_projection_drops_dev_table() {
         let dir = wrangler_loader_body(
@@ -5124,7 +5222,7 @@ console.log("after the payload");
         // bind stays refused there even though deploy accepted it.
         assert!(
             load_dev_table_for_env(dir.path(), None).is_err(),
-            "vrt dev must still refuse a non-loopback bind"
+            "of dev must still refuse a non-loopback bind"
         );
 
         // A dev-acceptable table resolves on the dev entry.

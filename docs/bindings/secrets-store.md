@@ -41,7 +41,7 @@ tenant's secret map — the same `params.secrets` namespace `[secrets]`
 bindings use. Provision it out of band:
 
 ```sh
-vrt secret put secrets-store:default:api-key
+of secret put secrets-store:default:api-key
 ```
 
 An unprovisioned ref does not render a half-wired binding: the worker
@@ -98,7 +98,7 @@ deny-all — it cannot leave the tenant's generation.
 ## Backends
 
 No adapter — the value is process-env material resolved by the
-platform's secret map (`[secrets]`/`vrt secret put` out-of-band
+platform's secret map (`[secrets]`/`of secret put` out-of-band
 provisioning), not a remote store. Account-level Secrets Store sync
 is out of scope.
 

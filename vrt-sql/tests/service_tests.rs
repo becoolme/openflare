@@ -117,7 +117,7 @@ fn db_labels_bounded() {
 }
 
 /// T36b/P0-A: the published vrt-sql example config must pass ServiceConfig
-/// validation -- placeholder substitution is the same as `vrt init` rendering, preventing T36's required
+/// validation -- placeholder substitution is the same as `of init` rendering, preventing T36's required
 /// `[persistence]` from turning examples/fixtures into start-and-crash (d1_smoke once hit this).
 #[test]
 fn shipped_vrt_sql_example_config_validates() {

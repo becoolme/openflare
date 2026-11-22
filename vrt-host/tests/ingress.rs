@@ -1702,7 +1702,7 @@ async fn ws_per_tenant_cap_rejects_with_503_and_frees_on_close() {
     ig.stop().await;
 }
 
-/// `vrt dev` only: `ingress.devCatchAll` routes ANY unmatched Host to
+/// `of dev` only: `ingress.devCatchAll` routes ANY unmatched Host to
 /// the desired doc's single worker. Production strictness holds in
 /// both directions — flag off → `unknown_host`, flag on with >1
 /// worker → still `unknown_host` (never a guess between workers).

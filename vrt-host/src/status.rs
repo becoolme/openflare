@@ -383,7 +383,7 @@ pub fn control_router(
         // declared class dirs (workflow + DO instance indexes).
         .merge(crate::introspect::router(registry.clone()))
         // B12: `GET /metrics` shares the control listener (standalone
-        // / `vrt serve`); k8s additionally gets a dedicated
+        // / `of serve`); k8s additionally gets a dedicated
         // `metricsListen` port in vrt-host.rs.
         .merge(crate::metrics::router(registry))
         .route(
@@ -410,7 +410,7 @@ pub fn assignment_reason(e: AssignmentError) -> String {
     e.code().to_string()
 }
 
-// ---- T25/M2: on-disk host status for `vrt status` (standalone) ----
+// ---- T25/M2: on-disk host status for `of status` (standalone) ----
 
 /// One tenant's live state as serialized into `host-status.json`.
 /// Fields are diagnostic only — names/digests/reasons, never secrets
@@ -452,7 +452,7 @@ pub struct HostStatusFile {
     /// MIG-10: CA trust-store probe result (egress TLS capability).
     pub egress_trust_store_ok: bool,
     /// Per-worker quotas: this host renders the workerd `limits` block
-    /// (`render.quotas`). `vrt status` merges this so an operator can
+    /// (`render.quotas`). `of status` merges this so an operator can
     /// tell "declared but unenforced" from "enforced" without reading
     /// the host config.
     pub quotas_enforced: bool,
@@ -491,7 +491,7 @@ pub fn status_file_view(
 }
 
 /// Atomically write `<work_dir>/host-status.json` (0600) — the same
-/// file `vrt status --root <root>` reads at `<root>/work/host-status.json`.
+/// file `of status --root <root>` reads at `<root>/work/host-status.json`.
 /// Write failures are logged, never fatal (diagnostics must not kill
 /// the host).
 pub fn write_status_file(

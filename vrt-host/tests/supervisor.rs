@@ -1050,7 +1050,7 @@ async fn crash_retry_gets_fresh_work_dir() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_tenant_converges_as_explicit_empty_state() {
-    // B8/L9: `vrt init` now publishes a SIGNED EMPTY envelope so the
+    // B8/L9: `of init` now publishes a SIGNED EMPTY envelope so the
     // stack can go healthy before the first deploy. Converge must
     // apply it as "expected empty", never as an assemble error, and
     // never spawn a workerd for it.

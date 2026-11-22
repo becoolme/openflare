@@ -1,4 +1,4 @@
-//! A2: remote `vrt deploy` — client gather → upload wire body →
+//! A2: remote `of deploy` — client gather → upload wire body →
 //! server-side revalidation + signed publish. The TCP listener is
 //! exercised over real loopback HTTP; the unix socket is untouched.
 

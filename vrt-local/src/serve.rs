@@ -1,4 +1,4 @@
-//! `vrt serve` — standalone control-plane orchestration (T17).
+//! `of serve` — standalone control-plane orchestration (T17).
 //!
 //! One process owns three duties:
 //! 1. the management API on `mgmt/vrt.sock` (see [`crate::mgmt`]);
@@ -30,7 +30,7 @@ const MAX_CHILD_RESTARTS: u32 = 5;
 /// Restart backoff ceiling.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-/// `vrt serve` options.
+/// `of serve` options.
 #[derive(Clone, Debug)]
 pub struct ServeOptions {
     /// Supervise vrt-host/vrt-provider children (bare-metal mode).
@@ -40,13 +40,13 @@ pub struct ServeOptions {
     pub vrt_host_bin: Option<PathBuf>,
     /// vrt-provider binary (PATH lookup when None).
     pub vrt_provider_bin: Option<PathBuf>,
-    /// vrt-sql binary (`vrt dev` / bare-metal). When set,
+    /// vrt-sql binary (`of dev` / bare-metal). When set,
     /// `config/vrt-sql.toml` must exist and vrt-sql is supervised as
     /// a third child; when unset the child set is unchanged.
     pub vrt_sql_bin: Option<PathBuf>,
     /// Extra args passed to each child after `--config`.
     pub extra_args: Vec<String>,
-    /// External stop channel (`vrt dev`, tests): a `true` send ends
+    /// External stop channel (`of dev`, tests): a `true` send ends
     /// serve exactly like SIGINT. `None` in production serve.
     pub stop: Option<tokio::sync::watch::Receiver<bool>>,
     /// A2: optional TCP management listener (`--mgmt-tcp-listen`).
@@ -55,7 +55,7 @@ pub struct ServeOptions {
 }
 
 /// A2: the optional TCP management listener — for remote
-/// `vrt deploy --url`. Deliberately flag-only (never a config-file
+/// `of deploy --url`. Deliberately flag-only (never a config-file
 /// default): an operator must opt in per process, bind defaults to
 /// loopback, auth uses a SEPARATE 0600 token file from the unix
 /// socket's `mgmt/token`, bodies are capped, and sources are
@@ -185,7 +185,7 @@ pub async fn run(root: &Path, opts: &ServeOptions) -> Result<(), LocalError> {
             Err(e) => Err(LocalError::Io(std::io::Error::other(format!("mgmt tcp panicked: {e}")))),
         },
         _ = shutdown_signal() => Ok(()),
-        // External stop (`vrt dev`, tests) — same effect as SIGINT.
+        // External stop (`of dev`, tests) — same effect as SIGINT.
         _ = async {
             match ext_stop.as_mut() {
                 Some(rx) => { let _ = rx.changed().await; }
@@ -319,7 +319,7 @@ fn supervise_setup(root: &Path, opts: &ServeOptions) -> Result<Vec<Child>, Local
         ("vrt-host", &opts.vrt_host_bin, "vrt-host.toml"),
         ("vrt-provider", &opts.vrt_provider_bin, "vrt-provider.toml"),
     ];
-    // `vrt dev` / bare-metal adds vrt-sql — opt-in so the compose and
+    // `of dev` / bare-metal adds vrt-sql — opt-in so the compose and
     // bare-metal child sets stay exactly as before when unset.
     if opts.vrt_sql_bin.is_some() {
         specs.push(("vrt-sql", &opts.vrt_sql_bin, "vrt-sql.toml"));
@@ -403,7 +403,7 @@ const CHILD_TERM_GRACE: Duration = Duration::from_secs(5);
 async fn kill_children(children: &mut [Child]) {
     // Graceful first: SIGTERM lets each service drain and stop its
     // own children (vrt-host → workerd); SIGKILL only on timeout so
-    // `vrt dev` Ctrl+C never orphans a runtime.
+    // `of dev` Ctrl+C never orphans a runtime.
     for c in children.iter_mut() {
         if let Some(pid) = c.proc.id() {
 // SAFETY: the pid comes from a Child this process spawned; SIGTERM has no further preconditions.
@@ -428,7 +428,7 @@ async fn kill_children(children: &mut [Child]) {
 /// `CronRunner`. A missing `controlListen` in `vrt-host.toml` means
 /// the host cannot receive triggers — cron is disabled (logged once,
 /// status file updated, then the task PENDS forever: a disabled
-/// capability must never tear down `vrt serve`). Only a panic inside
+/// capability must never tear down `of serve`). Only a panic inside
 /// the runner is fatal, and that surfaces through the JoinHandle.
 fn cron_status_path(root: &Path) -> std::path::PathBuf {
     crate::layout::state_dir(root).join("cron-status.json")
@@ -590,7 +590,7 @@ async fn cron_loop(root: &Path) {
 /// Standalone queue dispatcher (T37b): 1s tick over the local signed
 /// envelope — identical `QueueDispatcher` semantics to the platform
 /// cell. Disabled-but-pending when `controlListen` or `[vrtSql]` is
-/// absent (a disabled capability never tears down `vrt serve`).
+/// absent (a disabled capability never tears down `of serve`).
 async fn queue_dispatch_loop(root: &Path) {
     let Some(control) = host_control_base(root) else {
         tracing::error!("queue dispatch disabled: vrt-host.toml has no controlListen");
@@ -803,7 +803,7 @@ async fn queue_dispatch_loop(root: &Path) {
 }
 
 /// `[vrtSql] addr`/`authSecretFile` out of `config/vrt-provider.toml`.
-/// T37b-r4: `vrt queue-metrics` (CLI diagnostics) shares the same read path
+/// T37b-r4: `of queue-metrics` (CLI diagnostics) shares the same read path
 /// with the dispatcher/cron.
 pub fn provider_sql(root: &Path) -> Option<(String, std::path::PathBuf)> {
     let text =
@@ -816,7 +816,7 @@ pub fn provider_sql(root: &Path) -> Option<(String, std::path::PathBuf)> {
 }
 
 /// B12: fetch `/metrics` from the host control listener and return a
-/// small allowlisted summary for `vrt status`. Unreachable host →
+/// small allowlisted summary for `of status`. Unreachable host →
 /// `reachable:false` (never blocks status on a downed host).
 pub fn metrics_summary(root: &Path) -> Option<serde_json::Value> {
     let base = host_control_base(root)?;

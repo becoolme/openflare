@@ -36,7 +36,7 @@ Nothing to provision — the platform supplies the values at render:
 - `id` — the active version's `versionId` (`vrt_<sha256:28>`,
   content-addressed over the version record: identical re-deploys
   keep the same id).
-- `tag` — the deploy's `--tag` (`vrt deploy --tag v1`); `""` when
+- `tag` — the deploy's `--tag` (`of deploy --tag v1`); `""` when
   untagged, matching `wrangler versions upload` without `--tag`.
 - `timestamp` — ISO 8601 creation instant of the version record
   (deduped re-deploys report the FIRST upload's timestamp).
@@ -94,7 +94,7 @@ Only `binding` is accepted:
 ```
 
 `tag`/`timestamp` are deploy facts, not config — set the tag via
-`vrt deploy --tag`.
+`of deploy --tag`.
 
 ## Examples and tests
 
@@ -114,4 +114,4 @@ Only `binding` is accepted:
   `vrt_<sha256:28>` is content-derived — format differs, semantics
   (immutable version identifier) match.
 - CF tag sources: `wrangler versions upload --tag` / `--tag` on
-  deploy; VRT: `vrt deploy --tag`.
+  deploy; VRT: `of deploy --tag`.

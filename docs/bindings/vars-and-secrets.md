@@ -27,7 +27,7 @@ LOG_LEVEL = "info"
 
 [secrets]
 GREETING_SECRET = "greeting-secret"   # secretRef; value via:
-# printf 'my-secret' | vrt secret put --root <root> greeting-secret
+# printf 'my-secret' | of secret put --root <root> greeting-secret
 ```
 
 ## Where it runs
@@ -46,7 +46,7 @@ GREETING_SECRET = "greeting-secret"   # secretRef; value via:
 ## Backends
 
 Secret values live in `secrets/secrets.json` (mode `0600`,
-`vrt-local/src/layout.rs`), managed by `vrt secret put|ls|rm`. `put`
+`vrt-local/src/layout.rs`), managed by `of secret put|ls|rm`. `put`
 reads the value from stdin only — never argv.
 
 ## Known differences from Cloudflare
@@ -57,7 +57,7 @@ reads the value from stdin only — never argv.
   `42` — read with `JSON.parse` or coercion
   (`vrt-local/src/project_cfg.rs` standalone var conversion).
 - There is no `wrangler secret` CLI and no secret value in the wrangler
-  file — only `secretRef` names plus `vrt secret put`.
+  file — only `secretRef` names plus `of secret put`.
 - `keep_vars` is accepted at top level but ignored (deploys always carry
   their own `vars`).
 - `.dev.vars` is not read.
@@ -77,4 +77,4 @@ reads the value from stdin only — never argv.
 - `examples/standalone-wrangler` — `vars` in `wrangler.jsonc`.
 - `vrt-local/src/project_cfg.rs` — wrangler `vars` normalization.
 - `vrt-local/src/worker_pkg.rs` — `var:`/`secret:` ref derivation.
-- `vrt-local/src/bin/vrt.rs` — `vrt secret put|ls|rm` implementation.
+- `vrt-local/src/bin/of.rs` — `of secret put|ls|rm` implementation.

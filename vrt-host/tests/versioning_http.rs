@@ -649,6 +649,7 @@ fn upload_body(dir: &Path) -> vrt_local::worker_pkg::DeployUpload {
         vars: Default::default(),
         secrets: Default::default(),
         name: None,
+        tag: None,
         preview: false,
         flagship_apps: g.flagship_apps.clone(),
     }

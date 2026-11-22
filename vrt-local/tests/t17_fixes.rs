@@ -368,7 +368,7 @@ fn init_rejects_stub_mode_with_real_workerd() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let exe = env!("CARGO_BIN_EXE_vrt");
+    let exe = env!("CARGO_BIN_EXE_of");
     let out = std::process::Command::new(exe)
         .args(["init", "--root"])
         .arg(&root)
@@ -383,8 +383,8 @@ fn init_rejects_stub_mode_with_real_workerd() {
 
 #[test]
 fn init_rejects_missing_workerd_explicit_and_default() {
-    let exe = env!("CARGO_BIN_EXE_vrt");
-    // T34f: spawns real `vrt init` — deep CARGO_TARGET_TMPDIR roots
+    let exe = env!("CARGO_BIN_EXE_of");
+    // T34f: spawns real `of init` — deep CARGO_TARGET_TMPDIR roots
     // now fail the socket-path budget before reaching the workerd
     // check; a short root keeps the assertion about `--workerd`.
     let root_guard = match vrt_securefs::ShortRoot::new("vrt17k") {
@@ -425,8 +425,8 @@ fn init_rejects_missing_workerd_explicit_and_default() {
 
 #[test]
 fn init_reconfigure_rejects_on_drift_and_rewrites() {
-    let exe = env!("CARGO_BIN_EXE_vrt");
-    // T34e/T34f: `vrt init` refuses roots whose derived unix socket
+    let exe = env!("CARGO_BIN_EXE_of");
+    // T34e/T34f: `of init` refuses roots whose derived unix socket
     // path exceeds the AF_UNIX budget — this test spawns the real
     // binary, so its root must FIT the budget: the shared helper
     // gives /tmp/<p>-<pid>-<seq> (~30B; macOS temp_dir alone is ~50B

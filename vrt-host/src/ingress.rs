@@ -607,7 +607,7 @@ pub struct IngressState {
     /// `level=platform` records. Set once after construction; unset =
     /// log collection disabled (zero overhead).
     logs: std::sync::OnceLock<Arc<crate::logs::LogHub>>,
-    /// `vrt dev` only: when set, an unknown Host falls back to the
+    /// `of dev` only: when set, an unknown Host falls back to the
     /// route table's single-worker catch-all target. Production
     /// configs never set it — `RouteTable::lookup` stays exact-match.
     dev_catch_all: Arc<AtomicBool>,
@@ -651,7 +651,7 @@ impl IngressState {
     }
 
     /// Attach the dev-mode catch-all switch (once; default off).
-    /// `vrt dev` sets it after construction, like `set_log_hub`.
+    /// `of dev` sets it after construction, like `set_log_hub`.
     pub fn set_dev_catch_all(&self, on: bool) {
         self.dev_catch_all
             .store(on, std::sync::atomic::Ordering::Relaxed);

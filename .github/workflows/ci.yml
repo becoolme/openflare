@@ -40,6 +40,11 @@ jobs:
           set -euo pipefail
           scripts/fetch-workerd.sh --capnp-only --out "$RUNNER_TEMP/workerd"
           echo "WORKERD_CAPNP=$RUNNER_TEMP/workerd/workerd.capnp" >> "$GITHUB_ENV"
+      # of-bundler is its own cargo workspace (rolldown's serde_json
+      # feature flags must not unify with the main graph). bundle_sync
+      # resolves it from of-bundler/target/debug/ at test time.
+      - name: Build of-bundler helper
+        run: cargo build --locked --manifest-path of-bundler/Cargo.toml
       # Tests that need a real workerd binary (VRT_WORKERD_BIN) skip here.
       # No debuginfo: tests do not need it and it keeps the linker small.
       - name: cargo test
@@ -163,6 +168,11 @@ jobs:
           .ci/workerd/workerd --version
       - name: Verify generated compatibility flags against pinned workerd
         run: python3 vrt-config/compat/gen_compat_flags.py --check --check-workerd .ci/workerd/workerd
+      # Bundle-enabled deploys shell out to the of-bundler helper; it is
+      # a separate cargo workspace (rolldown serde_json isolation) so it
+      # needs its own build — the manifest-dir fallback resolves it.
+      - name: Build of-bundler helper
+        run: cargo build --locked --manifest-path of-bundler/Cargo.toml
       # d1_smoke locates target/debug/vrt-sql itself — build bins once.
       - name: cargo build --bins
         env:

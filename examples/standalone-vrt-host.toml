@@ -2,7 +2,7 @@
 # Same shape as celld: single instance, single trusted owner. No cell-controller/
 # assignment -- the desired envelope is signed locally by vrt-local and written to disk directly;
 # bundles use a local directory source (objects/<digest>, consistent with the vrt-local write side).
-# __VRT_ROOT__ = the root directory of `vrt init` (e.g. ~/.vrt). Key names are camelCase.
+# __VRT_ROOT__ = the root directory of `of init` (e.g. ~/.vrt). Key names are camelCase.
 cellId = "__VRT_CELL__"
 workerdBinary = "__WORKERD__"
 workDir = "__VRT_ROOT__/work"
@@ -23,7 +23,7 @@ dir = "__VRT_ROOT__/objects"
 [desired]
 path = "__VRT_ROOT__/desired/envelope.json"              # written atomically by vrt-local deploy
 trustedKeys = [
-  { keyId = "__VRT_KEY_ID__", publicKey = "__VRT_PUBKEY__" },  # rendered by vrt init
+  { keyId = "__VRT_KEY_ID__", publicKey = "__VRT_PUBKEY__" },  # rendered by of init
 ]
 reloadMs = 1000
 graceVersions = 1
@@ -33,7 +33,7 @@ mode = "capnp"
 facadeManifest = "__VRT_ROOT__/facade/manifest.json"
 # T25/L13: points at the provider's per-tenant listener sockets --
 # the provider binds <listenerDir>/<enc(tenant)>.sock, and both sides share
-# the vrt_securefs::socket_path derivation (rendered by vrt init).
+# the vrt_securefs::socket_path derivation (rendered by of init).
 bindingBackendSocket = "__VRT_BACKEND_SOCK__"
 systemCompatDate = "2024-09-25"
 systemCompatFlags = []
@@ -51,7 +51,7 @@ varsFile = "__VRT_ROOT__/vars/vars.json"                  # maintained by vrt-lo
 
 
 # T21: ASSETS materialization -- content-addressed storage shared with the provider; standalone
-# is pre-written by `vrt deploy` (no baseUrl -> missing means fail closed).
+# is pre-written by `of deploy` (no baseUrl -> missing means fail closed).
 [assets]
 dir = "__VRT_ROOT__/provider/data/assets"
 

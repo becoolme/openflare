@@ -1,6 +1,6 @@
 //! The standalone compose quick start (dev/CI) keeps the SQLite db and
 //! the fs persistence root on ONE Docker device, which vrt-sql's
-//! fail-closed durability guard rejects. `vrt init` therefore needs an
+//! fail-closed durability guard rejects. `of init` therefore needs an
 //! explicit dev-only opt-in; the default render must stay armed.
 
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ fn fake_workerd(root: &Path) -> PathBuf {
 }
 
 fn init(root: &Path, fake: &Path, extra: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_vrt"))
+    std::process::Command::new(env!("CARGO_BIN_EXE_of"))
         .args(["init", "--root"])
         .arg(root)
         .args(["--cell", "local", "--tenant", "local", "--workerd"])

@@ -3,7 +3,7 @@
 #
 # Proves the base compose path end-to-end with a REAL workerd:
 #   up --wait → init → deploy hello + kv-assets → Host-header curls
-#   (200/body), assets ETag/304 + SPA fallback, vrt status, restart
+#   (200/body), assets ETag/304 + SPA fallback, of status, restart
 #   recovery. Any failure dumps every service's logs; the project is
 #   always torn down (down -v) — the next run starts clean.
 #
@@ -64,28 +64,28 @@ cleanup() {
     # cell-controller registry — the service logs alone can't show
     # claim/lease/delivery state, so pull them off the mgmt socket.
     echo "--- vrt queue dispatcher metrics ---" >&2
-    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt vrt metrics --root /data \
+    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt of metrics --root /data \
       | grep -E "vrt_queue_delivered_total|vrt_queue_consumer_errors_total|vrt_queue_dispatcher_lease|vrt_queue_dispatcher_epoch|vrt_queue_settle_blocked_total" \
       >&2 || echo "(dispatcher metrics unavailable)" >&2
     # T37b-r2: generation state is the first thing an operator checks —
     # switch-failed/launch detail must be in the failure dump.
-    echo "--- vrt status (tenant generations) ---" >&2
-    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt vrt status --root /data >&2 \
-      || echo "(vrt status unavailable)" >&2
+    echo "--- of status (tenant generations) ---" >&2
+    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt of status --root /data >&2 \
+      || echo "(of status unavailable)" >&2
     # T37b-r4: queue backlog — send-ok-but-no-delivery splits into
     # visible (never claimed) / inFlight (claimed, unsettled) /
     # dead (dropped after retries). Signed GET via the provider's
     # [vrtSql] channel — no extra tooling in the image.
     echo "--- queue backlog (e2e-queue) ---" >&2
     ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt \
-      vrt queue-metrics --root /data --queue-name e2e-queue >&2 \
+      of queue-metrics --root /data --queue-name e2e-queue >&2 \
       || echo "(queue metrics unavailable)" >&2
     # T37b-r3: in-container probes run the image's own `vrt` binary —
     # the runtime images ship no curl (do NOT add it for diagnostics).
     echo "--- vrt-host control / provider listener probes ---" >&2
-    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt-host vrt probe --url http://127.0.0.1:9091/healthz >&2 \
+    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt-host of probe --url http://127.0.0.1:9091/healthz >&2 \
       || echo "(vrt-host control probe failed)" >&2
-    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt-provider vrt probe --dir-sockets /data/provider/listeners >&2 \
+    ${TIMEOUT[@]+"${TIMEOUT[@]}"} "${DC[@]}" exec -T vrt-provider of probe --dir-sockets /data/provider/listeners >&2 \
       || echo "(provider listener probe failed)" >&2
   fi
   "${DC[@]}" down -v >/dev/null 2>&1 || true
@@ -119,49 +119,49 @@ EXAMPLES="$(cd "$HERE/../../examples" && pwd)"
 # the first render resolves (render fails closed on missing secrets).
 step "seed greeting-secret"
 printf 'e2e-greeting-secret' | "${DC[@]}" exec -T vrt \
-  vrt secret put --root /data greeting-secret >/dev/null
+  of secret put --root /data greeting-secret >/dev/null
 
 step "deploy standalone-hello"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-hello
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-hello
 
 step "deploy standalone-kv-assets"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-kv-assets
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-kv-assets
 
 step "deploy standalone-wrangler"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-wrangler
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-wrangler
 
 step "deploy standalone-d1"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-d1
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-d1
 
 step "deploy standalone-queue (producer+consumer)"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-queue
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-queue
 
 step "deploy standalone-do"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-do
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-do
 
 step "deploy standalone-workflow"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-workflow
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-workflow
 
 step "deploy standalone-r2"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-r2
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-r2
 
 step "deploy standalone-cache (C1)"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-cache
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-cache
 
 step "deploy standalone-cron (CR1)"
-"${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-cron
+"${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-cron
 
 # W4-r2 (append-only): the last deploy lands a generation switch; the
 # first assertions must target the FINAL generation, not whatever was
 # serving mid-switch. `/readyz` is the authoritative check — it reports
 # ready only when EVERY assigned worker has state Ready AND
 # servingDigest == expectedDigest (open endpoint). Poll via the
-# image's own `vrt probe` (the image ships no curl/jq); on timeout
-# dump `vrt status` so the stuck generation is visible.
+# image's own `of probe` (the image ships no curl/jq); on timeout
+# dump `of status` so the stuck generation is visible.
 step "wait servingDigest == expectedDigest (post-deploy)"
 converged=0
 for _ in $(seq 1 60); do
-  if "${DC[@]}" exec -T vrt-host vrt probe --url http://127.0.0.1:9091/readyz >/dev/null 2>&1; then
+  if "${DC[@]}" exec -T vrt-host of probe --url http://127.0.0.1:9091/readyz >/dev/null 2>&1; then
     converged=1
     break
   fi
@@ -169,7 +169,7 @@ for _ in $(seq 1 60); do
 done
 if [ "$converged" != "1" ]; then
   echo "host never converged to servingDigest == expectedDigest" >&2
-  "${DC[@]}" exec -T vrt vrt status --root /data >&2 || true
+  "${DC[@]}" exec -T vrt of status --root /data >&2 || true
   FAILED=1
   exit 1
 fi
@@ -318,26 +318,26 @@ done
 
 step "assert DO snapshot+restore (P3c-2)"
 # P3c-2-r2: workerId + uniqueKey come from typed read-only CLI
-# queries — never grep `vrt status` JSON positionally. serde_json
+# queries — never grep `of status` JSON positionally. serde_json
 # serializes WorkerStatus keys ALPHABETICALLY, so `versions` sits
 # between `name` and `workerId`; the old `"name":"X","workerId":"Y"`
 # grep could never match, and `set -e` killed the step silently.
 # Every $(…) below is `|| true`-guarded + shape-checked so a failure
 # names itself instead of dying on an assignment.
-wid="$("${DC[@]}" exec -T vrt vrt worker-id --root /data do-demo || true)"
+wid="$("${DC[@]}" exec -T vrt of worker-id --root /data do-demo || true)"
 echo "$wid" | grep -qE '^w_[0-9a-f]+$' \
-  || { echo "vrt worker-id do-demo returned no workerId: '$wid'" >&2; FAILED=1; exit 1; }
+  || { echo "of worker-id do-demo returned no workerId: '$wid'" >&2; FAILED=1; exit 1; }
 # uniqueKey is server-minted (HMAC) — resolve the declared class name
 # ("Counter" in examples/standalone-do/wrangler.toml) via the CLI's
 # state lookup; never ls the on-disk dir or grep JSON.
-ukey="$("${DC[@]}" exec -T vrt vrt do-key --root /data "$wid" Counter || true)"
+ukey="$("${DC[@]}" exec -T vrt of do-key --root /data "$wid" Counter || true)"
 echo "$ukey" | grep -qE '^[0-9a-f]{64}$' \
-  || { echo "vrt do-key $wid Counter returned no uniqueKey: '$ukey'" >&2; FAILED=1; exit 1; }
+  || { echo "of do-key $wid Counter returned no uniqueKey: '$ukey'" >&2; FAILED=1; exit 1; }
 # On-demand epoch-fenced snapshot via the standalone admin CLI → the
 # loopback control endpoint (same trust model as cron/queue). The
 # admin resolves the class dir from the desired DO view, so the
 # request carries the REAL workerId.
-"${DC[@]}" exec -T vrt vrt do-snapshot --root /data \
+"${DC[@]}" exec -T vrt of do-snapshot --root /data \
   --worker "$wid" --class "$ukey" --tenant local \
   || { echo "do-snapshot admin call failed" >&2; FAILED=1; exit 1; }
 # Wipe the local class dir (debian-slim image ships coreutils `rm`;
@@ -359,12 +359,12 @@ echo "$d4" | grep -q '"n":2' \
 step "assert Workflow (W1)"
 # Engine = DO inside tenant workerd; env.WF → wf-engine-* service.
 # Every $(…) is `|| true`-guarded + shape-checked (r2 pattern).
-wid_wf="$("${DC[@]}" exec -T vrt vrt worker-id --root /data wf-demo || true)"
+wid_wf="$("${DC[@]}" exec -T vrt of worker-id --root /data wf-demo || true)"
 echo "$wid_wf" | grep -qE '^w_[0-9a-f]+$' \
-  || { echo "vrt worker-id wf-demo returned no workerId: '$wid_wf'" >&2; FAILED=1; exit 1; }
-wf_list="$("${DC[@]}" exec -T vrt vrt workflows --root /data wf-demo || true)"
+  || { echo "of worker-id wf-demo returned no workerId: '$wid_wf'" >&2; FAILED=1; exit 1; }
+wf_list="$("${DC[@]}" exec -T vrt of workflows --root /data wf-demo || true)"
 echo "$wf_list" | grep -q '"name": "order-flow"' \
-  || { echo "vrt workflows wf-demo missing order-flow: '$wf_list'" >&2; FAILED=1; exit 1; }
+  || { echo "of workflows wf-demo missing order-flow: '$wf_list'" >&2; FAILED=1; exit 1; }
 cid="$(curl -sS --max-time 5 -H "Host: wf.vrt.local" "$BASE_URL/create" || true)"
 inst="$(echo "$cid" | grep -o '"id":"[^"]*"' | cut -d'"' -f4 || true)"
 [ -n "$inst" ] \
@@ -402,23 +402,23 @@ echo "$wf_re" | grep -q '"status":"complete"' \
 
 step "assert workflow instance ops via /v1/wfops (W3)"
 # The platform ops channel: vrt-host /v1/wfops → sock-wfops-<id>
-# unix socket → facade-wfops-<id> → engine WorkflowBinding. `vrt wfop`
+# unix socket → facade-wfops-<id> → engine WorkflowBinding. `of wfop`
 # resolves the worker + declaration uniqueKey from LOCAL state and
 # derives the facade token — the same contract the control-plane
 # cell-op executor drives, so this asserts the trusted channel
 # end-to-end (a tenant cannot reach this socket or mint the token).
 w3i="e2e-w3-1"
-o="$("${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+o="$("${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op create --instance "$w3i" || true)"
 echo "$o" | grep -q "\"instanceId\":\"$w3i\"" \
   || { echo "wfop create returned no instanceId: '$o'" >&2; FAILED=1; exit 1; }
 # pause lands on queued-or-running; poll paused either way.
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op action --instance "$w3i" --action pause >/dev/null \
   || { echo "wfop pause failed" >&2; FAILED=1; exit 1; }
 st=""
 for i in $(seq 1 20); do
-  g="$("${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+  g="$("${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
     --workflow order-flow --op get --instance "$w3i" || true)"
   st="$(echo "$g" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || true)"
   [ "$st" = "paused" ] && break
@@ -428,13 +428,13 @@ for i in $(seq 1 20); do
 done
 [ "$st" = "paused" ] \
   || { echo "instance never paused; last: '$st'" >&2; FAILED=1; exit 1; }
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op action --instance "$w3i" --action resume >/dev/null \
   || { echo "wfop resume failed" >&2; FAILED=1; exit 1; }
 # resume → runs to completion (the 2s sleep inside the run).
 w3_done=""
 for i in $(seq 1 40); do
-  g="$("${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+  g="$("${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
     --workflow order-flow --op get --instance "$w3i" || true)"
   st="$(echo "$g" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || true)"
   [ "$st" = "complete" ] && { w3_done="$g"; break; }
@@ -447,15 +447,15 @@ echo "$w3_done" | grep -q '"output":"a-b-done"' \
 # terminate a fresh instance → terminated; get after terminate
 # still resolves through the same channel.
 w3t="e2e-w3-2"
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op create --instance "$w3t" >/dev/null \
   || { echo "wfop create (terminate target) failed" >&2; FAILED=1; exit 1; }
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op action --instance "$w3t" --action terminate >/dev/null \
   || { echo "wfop terminate failed" >&2; FAILED=1; exit 1; }
 st=""
 for i in $(seq 1 20); do
-  g="$("${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+  g="$("${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
     --workflow order-flow --op get --instance "$w3t" || true)"
   st="$(echo "$g" | grep -o '"status":"[^"]*"' | cut -d'"' -f4 || true)"
   [ "$st" = "terminated" ] && break
@@ -465,10 +465,10 @@ done
   || { echo "instance never terminated; last: '$st'" >&2; FAILED=1; exit 1; }
 # Negatives: undeclared workflow fails closed at local resolution;
 # an invalid action verb is rejected before any dispatch.
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow no-such-wf --op get --instance x >/dev/null 2>&1 \
   && { echo "wfop on undeclared workflow must fail" >&2; FAILED=1; exit 1; }
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op action --instance "$w3t" --action explode >/dev/null 2>&1 \
   && { echo "wfop with invalid action must fail" >&2; FAILED=1; exit 1; }
 
@@ -482,19 +482,19 @@ done
 # file itself is reclaimed later by the host at a verified no-actor
 # safe point, never while a resident actor could hold it.
 w3e="e2e-w3-3"
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op create --instance "$w3e" >/dev/null \
   || { echo "wfop create (event target) failed" >&2; FAILED=1; exit 1; }
-ev="$("${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+ev="$("${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op sendEvent --instance "$w3e" \
   --event-type approve --payload '{"v":1}' || true)"
 echo "$ev" | grep -q '"status":"delivered"' \
   || { echo "wfop sendEvent did not deliver: '$ev'" >&2; FAILED=1; exit 1; }
-dl="$("${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+dl="$("${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op delete --instance "$w3e" || true)"
 echo "$dl" | grep -q '"status":"deleted"' \
   || { echo "wfop delete did not confirm storage removal: '$dl'" >&2; FAILED=1; exit 1; }
-"${DC[@]}" exec -T vrt vrt wfop --root /data --worker "$wid_wf" \
+"${DC[@]}" exec -T vrt of wfop --root /data --worker "$wid_wf" \
   --workflow order-flow --op get --instance "$w3e" >/dev/null 2>&1 \
   && { echo "wfop get on deleted instance must fail" >&2; FAILED=1; exit 1; }
 
@@ -505,15 +505,15 @@ step "assert bad workflow class rejected at deploy (W7)"
 # the pack-time deploy gate must reject it instead. Deploy MUST fail
 # with a clear error and publish nothing.
 "${DC[@]}" cp "$EXAMPLES/standalone-workflow-bad-class" vrt:/tmp/examples/ || true
-badout="$("${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/examples/standalone-workflow-bad-class 2>&1 || true)"
+badout="$("${DC[@]}" exec -T vrt of deploy --root /data /tmp/examples/standalone-workflow-bad-class 2>&1 || true)"
 echo "$badout" | grep -qiE 'WorkflowEntrypoint|workflow class'   || { echo "bad-class deploy was not rejected with a class error: '$badout'" >&2; FAILED=1; exit 1; }
-"${DC[@]}" exec -T vrt vrt worker-id --root /data wf-bad-class >/dev/null 2>&1   && { echo "bad-class deploy published a worker" >&2; FAILED=1; exit 1; }
+"${DC[@]}" exec -T vrt of worker-id --root /data wf-bad-class >/dev/null 2>&1   && { echo "bad-class deploy published a worker" >&2; FAILED=1; exit 1; }
 # wf-demo keeps serving — a rejected sibling deploy cannot poison it.
 ok="$(curl -sS --max-time 5 -H "Host: wf.vrt.local" "$BASE_URL/ping" || true)"
 echo "$ok" | grep -qiE 'ok|pong|status'   || { echo "wf-demo stopped serving after bad-class deploy reject: '$ok'" >&2; FAILED=1; exit 1; }
 
 step "assert bad deploy rejected, old keeps serving (W1-r2)"
-# A config workerd cannot load must fail `vrt deploy` BEFORE publish
+# A config workerd cannot load must fail `of deploy` BEFORE publish
 # — explicit error, no versionId, and the tenant keeps serving the
 # last good version (the miniflare:zod outage took every worker down).
 "${DC[@]}" exec -T vrt sh -c 'mkdir -p /tmp/badw && printf \
@@ -521,7 +521,7 @@ step "assert bad deploy rejected, old keeps serving (W1-r2)"
   > /tmp/badw/vrt.toml && printf \
   "import \"nonexistent:mod\";\nexport default { async fetch() { return new Response(\"x\"); } };\n" \
   > /tmp/badw/main.js'
-bad_out="$("${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/badw 2>&1 || true)"
+bad_out="$("${DC[@]}" exec -T vrt of deploy --root /data /tmp/badw 2>&1 || true)"
 echo "$bad_out" | grep -q "nonexistent:mod" \
   || { echo "bad deploy must name the load failure: '$bad_out'" >&2; FAILED=1; exit 1; }
 case "$bad_out" in *versionId*) echo "bad deploy must not return a versionId: '$bad_out'" >&2; FAILED=1; exit 1;; esac
@@ -539,7 +539,7 @@ step "assert transferred_classes rejected on standalone (DO1)"
   > /tmp/xferw/wrangler.toml && printf \
   "export default { async fetch() { return new Response(\"x\"); } };\n" \
   > /tmp/xferw/main.js'
-xfer_out="$("${DC[@]}" exec -T vrt vrt deploy --root /data /tmp/xferw 2>&1 || true)"
+xfer_out="$("${DC[@]}" exec -T vrt of deploy --root /data /tmp/xferw 2>&1 || true)"
 echo "$xfer_out" | grep -q "transferred_classes" \
   || { echo "transferred_classes deploy must name the rejected field: '$xfer_out'" >&2; FAILED=1; exit 1; }
 case "$xfer_out" in *versionId*) echo "transferred_classes deploy must not return a versionId: '$xfer_out'" >&2; FAILED=1; exit 1;; esac
@@ -618,9 +618,9 @@ ccron="${clastv%@*}"; cms="${clastv##*@}"
 printf '%s' "$cms" | grep -qE '^[0-9]+$'          || { echo "scheduledTime not integer ms: '$clast'" >&2; FAILED=1; exit 1; }
 [ "$cms" -gt 0 ] && [ $(( cms % 60000 )) -eq 0 ]  || { echo "scheduledTime not minute-aligned: '$clast'" >&2; FAILED=1; exit 1; }
 
-# 4. vrt status — the operator's view must be coherent.
-step "vrt status"
-"${DC[@]}" exec -T vrt vrt status --root /data
+# 4. of status — the operator's view must be coherent.
+step "of status"
+"${DC[@]}" exec -T vrt of status --root /data
 
 # 5. Restart the whole stack — services must recover (envelope,
 #    objects, listeners, sockets all persisted under /data).

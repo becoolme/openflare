@@ -27,8 +27,8 @@
 //!                        addressed, non-secret; dir 0700 gates access)
 //! secrets/secrets.json   {tenantId:{ref:value}} render secrets (0600)
 //! vars/vars.json         {varRef:value} render vars (0600)
-//! config/                `vrt init` generated host/provider configs
-//! mgmt/                  `vrt serve` unix socket + token (T17)
+//! config/                `of init` generated host/provider configs
+//! mgmt/                  `of serve` unix socket + token (T17)
 //! ```
 //!
 //! Write order per mutating op (crash-safe): artifacts → state →
@@ -36,10 +36,14 @@
 //! published revision (envelope unwritten) or an orphan artifact —
 //! never a half-state desired document.
 
+mod bundle;
+mod bundle_spec;
+pub mod check;
 mod desired;
 pub mod dev;
 pub mod devvars;
 pub mod doctor;
+pub(crate) mod glob;
 pub mod keys;
 pub mod layout;
 mod lock;
@@ -150,7 +154,7 @@ pub struct DeployResult {
     pub revision: u64,
 }
 
-/// Read-only status view (`vrt status` backing call).
+/// Read-only status view (`of status` backing call).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalStatus {
@@ -252,7 +256,7 @@ pub struct PromoteResult {
 }
 
 /// Envelope lifetime — the protocol maximum (24 h). `renew` (or any
-/// mutating op) must run before expiry; `vrt serve` (T17) renews on a
+/// mutating op) must run before expiry; `of serve` (T17) renews on a
 /// timer. Kept in sync with `envelope::MAX_TTL` — a compile-time
 /// assertion lives in the crate tests.
 const ENVELOPE_TTL: chrono::Duration = chrono::Duration::seconds(24 * 3600);
@@ -301,7 +305,7 @@ impl VrtLocal {
             keys::write_mgmt_token(&staging)?;
             // T25/L8: provider cursor secret — random file (0600),
             // never env plaintext. Generated at init so the provider
-            // config produced by `vrt init` is self-contained.
+            // config produced by `of init` is self-contained.
             keys::write_cursor_secret(&staging)?;
             keys::write_sql_secrets(&staging)?;
             let mut st = state::LocalState::new(&params.cell_id, &params.tenant_id);
@@ -433,7 +437,7 @@ impl VrtLocal {
         self.commit_packaged(pkg, &key, mode)
     }
 
-    /// Deploy a remote-upload body (`vrt deploy --url`): the client
+    /// Deploy a remote-upload body (`of deploy --url`): the client
     /// gathered meta + module bytes + assets; everything trust-bearing
     /// happens here — secrets land in the tenant store, service
     /// targets resolve against live state, DO/workflow unique keys
@@ -997,7 +1001,7 @@ impl VrtLocal {
         Ok(())
     }
 
-    /// Re-sign the current state (envelope TTL refresh — `vrt serve`
+    /// Re-sign the current state (envelope TTL refresh — `of serve`
     /// calls this periodically; mutating ops already re-sign).
     pub fn renew(&self) -> Result<u64, LocalError> {
         let _lock = lock::StateLock::acquire(&self.root)?;
@@ -1048,7 +1052,7 @@ impl VrtLocal {
 
     /// Resolve a worker by display name OR stable `workerId` — the
     /// same convention `versions`/`rollback`/the DO admin commands
-    /// use. Typed state lookup: NEVER parse `vrt status` JSON output
+    /// use. Typed state lookup: NEVER parse `of status` JSON output
     /// positionally (its keys serialize alphabetically, so `name`
     /// and `workerId` are NOT adjacent — P3c-2-r2).
     pub fn resolve_worker_id(&self, q: &str) -> Result<String, LocalError> {
@@ -1085,7 +1089,7 @@ impl VrtLocal {
     }
 
     /// Active version's declared workflows (W1) — typed lookup for
-    /// the read-only `vrt workflows` surface; never parsed from
+    /// the read-only `of workflows` surface; never parsed from
     /// status JSON.
     pub fn workflows(
         &self,

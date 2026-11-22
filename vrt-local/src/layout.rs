@@ -62,7 +62,7 @@ pub fn vars_file(root: &Path) -> PathBuf {
 pub fn facade_manifest_path(root: &Path) -> PathBuf {
     root.join("facade/manifest.json")
 }
-/// Host-side work/cache dirs created by `vrt init` (vrt-local does not
+/// Host-side work/cache dirs created by `of init` (vrt-local does not
 /// touch their contents).
 pub fn host_work_dir(root: &Path) -> PathBuf {
     root.join("work")
@@ -114,7 +114,7 @@ fn is_our_residue(root: &Path) -> bool {
 /// present, or foreign files) is never touched.
 /// T34e: standalone socket-path preflight — the provider listener and
 /// workerd service sockets bind unix paths under `root`; if even the
-/// *known* longest path exceeds the AF_UNIX budget, `vrt init` fails
+/// *known* longest path exceeds the AF_UNIX budget, `of init` fails
 /// HERE with a clear message instead of letting `vrt-provider` die at
 /// bind time with a bare ENAMETOOLONG (the T34d dead end).
 pub fn check_socket_path_budget(root: &Path, tenant_id: &str) -> Result<(), LocalError> {

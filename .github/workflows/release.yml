@@ -1,0 +1,120 @@
+name: Release of CLI
+
+# `of-v*` tag push builds and publishes the `of` binary for
+# linux-x64/arm64 + macOS x64/arm64. Manual dispatch with `release_tag`
+# does the same on an arbitrary commit.
+on:
+  push:
+    tags: ["of-v*"]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish (e.g. of-v0.1.0); created on the dispatched ref"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners per arch — no cross toolchain. macOS x64
+          # cross-compiles on the arm64 runner (same SDK; extra cargo
+          # target only).
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, name: linux-x64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, name: linux-arm64 }
+          - { os: macos-latest, target: aarch64-apple-darwin, name: macos-arm64, extra_target: x86_64-apple-darwin, extra_name: macos-x64 }
+    runs-on: ${{ matrix.os }}
+    env:
+      OF_RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}${{ matrix.extra_target && format(', {0}', matrix.extra_target) || '' }}
+      - uses: Swatinem/rust-cache@v2
+
+      # of-bundler is a separate cargo workspace — rolldown's dep tree
+      # enables serde_json preserve_order/arbitrary_precision, and
+      # feature unification must not leak that into the shipped `of`.
+      # Release binaries embed the helper (build.rs OF_EMBED_BUNDLER);
+      # at run time it materializes to a hashed cache file, so the
+      # single `of` download stays self-contained.
+      - name: Build of
+        run: |
+          cargo build --release --locked --manifest-path of-bundler/Cargo.toml --target ${{ matrix.target }}
+          mkdir -p dist
+          OF_EMBED_BUNDLER="of-bundler/target/${{ matrix.target }}/release/of-bundler" \
+            cargo build --release --locked -p vrt-local --bin of --target ${{ matrix.target }}
+          cp "target/${{ matrix.target }}/release/of" "dist/of-${{ matrix.name }}"
+          if [ -n "${{ matrix.extra_target || '' }}" ]; then
+            cargo build --release --locked --manifest-path of-bundler/Cargo.toml --target ${{ matrix.extra_target }}
+            OF_EMBED_BUNDLER="of-bundler/target/${{ matrix.extra_target }}/release/of-bundler" \
+              cargo build --release --locked -p vrt-local --bin of --target ${{ matrix.extra_target }}
+            cp "target/${{ matrix.extra_target }}/release/of" "dist/of-${{ matrix.extra_name }}"
+          fi
+
+      - name: Checksums
+        run: |
+          cd dist
+          for f in of-*; do
+            shasum -a 256 "$f" > "$f.sha256"
+          done
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # gh resolves the repo via .git — without checkout every gh
+      # call fails "not a git repository".
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write manifest
+        run: |
+          tag="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}"
+          {
+            printf '{\n'
+            printf '  "tag": "%s",\n' "$tag"
+            printf '  "commit": "%s",\n' "$GITHUB_SHA"
+            printf '  "binaries": {\n'
+            first=1
+            for f in dist/*.sha256; do
+              asset="$(basename "$f" .sha256)"
+              sha="$(cut -d' ' -f1 "$f")"
+              [ "$first" -eq 0 ] && printf ',\n'
+              first=0
+              printf '    "%s": "%s"' "$asset" "$sha"
+            done
+            printf '\n  }\n}\n'
+          } > dist/manifest.json
+          cat dist/manifest.json
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}"
+          # Dispatch without an existing tag: create it on the
+          # dispatched ref via the API (no checkout needed here).
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA"
+          fi
+          gh release create "$tag" dist/* \
+            --title "$tag" \
+            --notes "of CLI build from ${GITHUB_SHA}. Per-binary sha256 in manifest.json."

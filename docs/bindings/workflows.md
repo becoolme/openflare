@@ -30,8 +30,8 @@ class_name = "OrderFlow"
   poll) before resolving; a timeout throws a typed
   `instance.create_unconfirmed` error instead of handing out phantom ids
   (`vrt-config/system-workers/workflows/wrapped-binding.vrt.worker.js`).
-- `vrt workflows` lists declared workflows; `vrt wfop` exposes engine
-  operations; `vrt do-snapshot` / `vrt do-migrate` cover the engine's
+- `of workflows` lists declared workflows; `of wfop` exposes engine
+  operations; `of do-snapshot` / `of do-migrate` cover the engine's
   storage like any DO class.
 
 ## Backends

@@ -1,5 +1,5 @@
 //! `.dev.vars` / `--secrets-file` parser — dotenv subset shared by
-//! `vrt dev` and `vrt deploy --secrets-file`.
+//! `of dev` and `of deploy --secrets-file`.
 //!
 //! Grammar: `KEY=VALUE` lines, `#` comments and blank lines skipped,
 //! optional `export ` prefix, value optionally single/double quoted
