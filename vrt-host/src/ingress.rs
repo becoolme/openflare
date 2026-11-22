@@ -1096,7 +1096,25 @@ async fn proxy_inner(
     let mut metric = crate::metrics::RequestMetric::begin(&target.worker_id);
     let logs = state.logs.get().cloned();
     match handle_routed(state, peer, req, host.as_str(), &target, &mut metric).await {
-        Ok(r) => Ok(r),
+        Ok(mut r) => {
+            // PREVIEW: a preview response is ALWAYS labelled, so a client
+            // (or the app itself) can never mistake preview output for
+            // production. Worker-supplied `x-vrt-*` headers were scrubbed
+            // upstream, so these values are host-authored.
+            if let Some(version) = &target.preview {
+                if let Ok(value) = HeaderValue::from_str(version) {
+                    r.headers_mut().insert(
+                        axum::http::HeaderName::from_static("x-vrt-preview-version"),
+                        value,
+                    );
+                }
+                r.headers_mut().insert(
+                    axum::http::HeaderName::from_static("x-vrt-preview"),
+                    HeaderValue::from_static("1"),
+                );
+            }
+            Ok(r)
+        }
         Err(e) => {
             metric.finish(None, e.metric_reason());
             // Platform-authored record (never tenant text); the hub
@@ -1902,6 +1920,22 @@ fn scrubbed_headers(
         "x-vrt-worker-id",
         HeaderValue::from_str(&target.worker_id).unwrap_or(HeaderValue::from_static("invalid")),
     );
+    // PREVIEW: tell the code it is running as a preview. Only this host
+    // writes these (inbound `x-vrt-*` was stripped above), so a worker
+    // cannot forge preview status on a production route, and a preview
+    // can branch its own side effects without parsing its Host header.
+    if let Some(version) = &target.preview {
+        if let Ok(value) = HeaderValue::from_str(version) {
+            out.insert(
+                axum::http::HeaderName::from_static("x-vrt-preview-version"),
+                value,
+            );
+        }
+        out.insert(
+            axum::http::HeaderName::from_static("x-vrt-preview"),
+            HeaderValue::from_static("1"),
+        );
+    }
     out.insert(
         "x-forwarded-host",
         HeaderValue::from_str(host).unwrap_or(HeaderValue::from_static("invalid")),
@@ -2423,6 +2457,7 @@ mod cf_blob_tests {
             worker_id: "w".into(),
             assets_first: false,
             images: false,
+            preview: None,
         };
         let inbound = cf_inbound(&[
             ("cf-ipcountry", "JP"),
@@ -2631,6 +2666,7 @@ mod ws_tests {
             worker_id: "w".into(),
             assets_first: false,
             images: false,
+            preview: None,
         };
         scrubbed_headers(
             inbound,
@@ -2825,6 +2861,7 @@ mod ws_tests {
             worker_id: "w".into(),
             assets_first: false,
             images: false,
+            preview: None,
         };
         scrubbed_headers(
             inbound,

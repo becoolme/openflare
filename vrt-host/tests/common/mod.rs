@@ -420,6 +420,7 @@ pub fn worker(worker_id: &str, hostname: &str, digest: &str) -> WorkerDesired {
         workflows: vec![],
         tail_consumers: vec![],
         streaming_tail_consumers: vec![],
+        preview: None,
         quotas: WorkerQuotas {
             cpu_ms: 50,
             memory_mb: 128,

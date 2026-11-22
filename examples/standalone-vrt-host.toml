@@ -136,3 +136,16 @@ maxBodyBytes = 1048576
 # MIG-7: standalone is reached directly over plaintext — the
 # `fixed-http` default is correct here (client headers are always
 # stripped; nothing promotes the scheme).
+
+# Versioned preview URLs (`of deploy --preview`). OFF by default: with
+# no `domain`, every preview hostname is a 404 and production routing is
+# byte-identical. When set, the host derives
+# `<versionId>--<workerName>.<domain>` for each preview version (and for
+# each worker's active version) from the verified snapshot — the suffix
+# is never read from a snapshot or a request. Responses carry
+# `x-vrt-preview: 1` + `x-vrt-preview-version`. Previews never receive
+# tenant secrets; KV/R2/D1/queue bindings stay shared with production.
+# `vrt-local` reads this same file to report `previewUrl` in
+# `of deploy --preview` / `of versions list`.
+[preview]
+# domain = "preview.example.com"

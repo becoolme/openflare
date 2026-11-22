@@ -596,6 +596,9 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         assignment_file: config.desired.assignment_file.as_deref(),
         pod_id: config.desired.pod_id.as_deref(),
         status: status.clone(),
+        // PREVIEW: host-owned suffix; never from the snapshot. Absent =
+        // preview URLs are disabled (every preview host 404s).
+        preview_domain: config.preview.domain(),
     };
     // T34f2/R1: startup-only orphan sweep — at this point the process
     // provably owns NO children, so a verified workerd whose owning
@@ -784,6 +787,9 @@ struct ConvergeCtx<'a> {
     assignment_file: Option<&'a std::path::Path>,
     pod_id: Option<&'a str>,
     status: vrt_host::status::HostStatus,
+    /// `[preview] domain` (normalized). `None` = preview serving off:
+    /// no preview hostname resolves at all.
+    preview_domain: Option<String>,
 }
 
 /// Reload-visible convergence: verified snapshot → supervisor specs +
@@ -869,7 +875,10 @@ fn converge_once(
                     "converged"
                 );
             }
-            ingress_state.set_routes(RouteTable::from_desired(&effective));
+            ingress_state.set_routes(RouteTable::from_desired_with_preview_domain(
+                &effective,
+                ctx.preview_domain.as_deref(),
+            ));
         }
         Err(e) => {
             tracing::warn!(error = %e, "no usable snapshot; keeping previous routes");

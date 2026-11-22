@@ -49,4 +49,7 @@ of queue-metrics --root <dir> (--queue-id <26 chars> | --queue-name <name> [--te
 ```
 
 Version lifecycle details (`deploy --preview`, `promote`, `versions
-list`, and the current MVP limits) are in [deploy versions](versioning.md).
+list`, preview URLs, and the current MVP limits) are in
+[deploy versions](versioning.md). A preview deploy's JSON output (and
+`/v1/deploy`, `/v1/versions`) carries `previewUrl` — `null` unless the
+host configures `[preview] domain` in `root/config/vrt-host.toml`.

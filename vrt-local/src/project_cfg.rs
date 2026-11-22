@@ -198,9 +198,25 @@ pub fn load_worker_meta(worker_dir: &Path) -> Result<(WorkerToml, MetaSource), L
 /// evaluation `mode` for `cloudflare.config.*` (that format has no env
 /// blocks — the mode is its environment selector). `vrt.toml` has no
 /// environment blocks and rejects an explicit selection.
+///
+/// This is the production (non-preview) entry point: it never sets
+/// `isPreview`, so a config's preview branch can only be reached through
+/// [`load_worker_meta_for_env_preview`] with `is_preview = true`.
 pub fn load_worker_meta_for_env(
     worker_dir: &Path,
     env_name: Option<&str>,
+) -> Result<(WorkerToml, MetaSource), LocalError> {
+    load_worker_meta_for_env_preview(worker_dir, env_name, false)
+}
+
+/// [`load_worker_meta_for_env`] plus the `isPreview` branch: only a
+/// `cloudflare.config.*` evaluation can observe it (`--preview` on the
+/// loader child). Wrangler files and `vrt.toml` have no preview branch,
+/// so they ignore the flag.
+pub fn load_worker_meta_for_env_preview(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+    is_preview: bool,
 ) -> Result<(WorkerToml, MetaSource), LocalError> {
     let vrt_path = worker_dir.join("vrt.toml");
     if vrt_path.exists() {
@@ -240,8 +256,9 @@ pub fn load_worker_meta_for_env(
         .copied()
         .find(|c| worker_dir.join(c).exists())
     {
-        let (config, _resolved, _shadowed) = load_cf_project_config(worker_dir, cf, env_name)
-            .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
+        let (config, _resolved, _shadowed) =
+            load_cf_project_config(worker_dir, cf, env_name, is_preview)
+                .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
         let meta = wrangler_config_to_worker_toml(&config)
             .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
         return Ok((meta, MetaSource::CfConfig(cf.to_string())));
@@ -485,11 +502,15 @@ fn cf_helper_failure(stderr: &[u8]) -> (Option<String>, String) {
 }
 
 /// Run the Node helper for `config_file` inside `project_dir` and return
-/// the raw (wrangler-shaped) config object.
+/// the raw (wrangler-shaped) config object. `is_preview` maps onto the
+/// helper's `--preview` flag (the `isPreview` argument Cloudflare's own
+/// loader hands to `defineConfig`); it is only ever `true` for
+/// `of deploy --preview`.
 fn run_cf_config_loader(
     project_dir: &Path,
     config_file: &str,
     env_name: Option<&str>,
+    is_preview: bool,
 ) -> Result<Value, ProjectConfigError> {
     use std::process::{Command, Stdio};
 
@@ -508,6 +529,12 @@ fn run_cf_config_loader(
     cmd.arg(&script).arg(&config_path);
     if let Some(name) = env_name {
         cmd.arg("--mode").arg(name);
+    }
+    if is_preview {
+        // `defineConfig(({ isPreview }) => …)` — the production deploy
+        // never passes this, so its branch can never be selected by
+        // accident (the helper's flag is additive, not a default).
+        cmd.arg("--preview");
     }
     cmd.current_dir(project_dir)
         .stdin(Stdio::null())
@@ -549,7 +576,7 @@ fn run_cf_config_loader(
     // Readers drain both pipes concurrently (a full stderr pipe would
     // otherwise block the child) and report over a channel: results are
     // awaited with a bound, so a config that leaks an inherited pipe cannot
-    // hang `vrt deploy`.
+    // hang `of deploy`.
     let (out_tx, out_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = out_tx.send(read_capped(stdout_pipe, CF_CONFIG_MAX_STDOUT_BYTES));
@@ -729,11 +756,15 @@ fn rebase_cf_main(
 /// Evaluate a `cloudflare.config.*` and run it through the shared wrangler
 /// normalization. `env_name` is passed to the loader as `--mode`; the
 /// format has no `[env.*]` blocks, so env resolution runs in pass-through
-/// mode. Returns (normalized config, resolved raw object, shadowed files).
+/// mode. `is_preview` is passed as `--preview`, so
+/// `defineConfig(({ isPreview }) => …)` takes its preview branch ONLY for
+/// `of deploy --preview`. Returns (normalized config, resolved raw
+/// object, shadowed files).
 pub fn load_cf_project_config(
     project_dir: &Path,
     config_file: &str,
     env_name: Option<&str>,
+    is_preview: bool,
 ) -> Result<(Value, Value, Vec<String>), ProjectConfigError> {
     if !CLOUDFLARE_CONFIG_CANDIDATES.contains(&config_file) {
         return Err(invalid_code(
@@ -752,7 +783,7 @@ pub fn load_cf_project_config(
             &format!("config file not found in project: {config_file}"),
         ));
     }
-    let mut raw = run_cf_config_loader(project_dir, config_file, env_name)?;
+    let mut raw = run_cf_config_loader(project_dir, config_file, env_name, is_preview)?;
     rebase_cf_main(&mut raw, project_dir, config_file)?;
     let resolved = resolve_env(&raw, None, config_file)?;
     let config = normalize_wrangler_config(&resolved, config_file)?;
@@ -3092,7 +3123,7 @@ pub(crate) fn load_dev_table_for_env(
         return Ok(None);
     }
     // `cloudflare.config.*` has no `[dev]` table (the `cf` format keeps dev
-    // settings elsewhere); there is nothing to parse for `vrt dev`.
+    // settings elsewhere); there is nothing to parse for `of dev`.
     if CLOUDFLARE_CONFIG_CANDIDATES
         .iter()
         .any(|c| worker_dir.join(c).exists())
@@ -3949,6 +3980,42 @@ process.stdout.write(JSON.stringify({
     }
 
     #[test]
+    fn cf_config_loader_passes_preview_only_for_preview_deploys() {
+        if !require_node("cf_config_loader_passes_preview_only_for_preview_deploys") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        // The REAL helper maps `--preview` onto `loadAndParseConfig`'s
+        // `isPreview`; this stub proves vrt's argv contract for it.
+        let body = r#"
+const args = process.argv.slice(2);
+const preview = args.includes("--preview");
+process.stdout.write(JSON.stringify({
+  raw: {name: "w", main: "m.js", compatibility_date: "2025-01-01",
+        vars: {IS_PREVIEW: preview ? "yes" : "no"}},
+  dependencies: [],
+}));
+"#;
+        let (dir, _guard) = cf_stub_project(body);
+        // A production deploy never sets isPreview …
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.vars.get("IS_PREVIEW").map(String::as_str), Some("no"));
+        // … and `--preview` is the ONLY way the branch is reached.
+        let (meta, _) = load_worker_meta_for_env_preview(dir.path(), None, true).unwrap();
+        assert_eq!(
+            meta.vars.get("IS_PREVIEW").map(String::as_str),
+            Some("yes")
+        );
+        // Leading `--mode` ordering is unchanged (both flags may coexist).
+        let (meta, _) =
+            load_worker_meta_for_env_preview(dir.path(), Some("staging"), true).unwrap();
+        assert_eq!(
+            meta.vars.get("IS_PREVIEW").map(String::as_str),
+            Some("yes")
+        );
+    }
+
+    #[test]
     fn cf_config_cf_worker_entrypoint_is_rebased() {
         if !require_node("cf_config_cf_worker_entrypoint_is_rebased") {
             return;
@@ -4222,6 +4289,35 @@ console.log("after the payload");
         let (meta, _) = load_worker_meta(&fixture).unwrap();
         assert!(!meta.vars.contains_key("STAGE"));
 
+        // isPreview: the ordinary path takes the production branch …
+        assert_eq!(
+            meta.vars.get("PREVIEW").map(String::as_str),
+            Some("production")
+        );
+        // … and only `--preview` takes the preview branch.
+        let (preview_meta, _) = load_worker_meta_for_env_preview(&fixture, None, true).unwrap();
+        assert_eq!(
+            preview_meta.vars.get("PREVIEW").map(String::as_str),
+            Some("preview")
+        );
+
+        // The whole pipeline packs each way: a preview deploy packs the
+        // preview branch, a normal deploy packs production.
+        let preview_overrides = crate::worker_pkg::DeployOverrides {
+            is_preview: true,
+            ..Default::default()
+        };
+        let preview_pkg =
+            crate::worker_pkg::pack(&fixture, &preview_overrides, "tenant").unwrap();
+        assert!(
+            preview_pkg.var_values.values().any(|v| v == "preview"),
+            "isPreview must reach the packed bundle"
+        );
+        assert!(
+            !preview_pkg.var_values.values().any(|v| v == "production"),
+            "a preview deploy must not also pack the production branch"
+        );
+
         // And the whole pipeline packs: the fixture's entrypoint is a plain
         // `.js` module, so the cf-config worker is deployable as-is.
         let overrides = crate::worker_pkg::DeployOverrides {
@@ -4231,6 +4327,7 @@ console.log("after the payload");
             hostnames: Vec::new(),
             vars: BTreeMap::new(),
             tag: None,
+            is_preview: false,
         };
         let pkg = crate::worker_pkg::pack(&fixture, &overrides, "tenant").unwrap();
         assert_eq!(pkg.name, "cf-config-fixture");
@@ -4696,6 +4793,7 @@ console.log("after the payload");
                 hostnames: vec![],
                 vars: BTreeMap::new(),
                 tag: None,
+                is_preview: false,
             };
             pack_with_resolver(dir.path(), &overrides, "tenant", &|_| Some("w-target".into()))
         };

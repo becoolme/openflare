@@ -10,10 +10,11 @@
 //!
 //! Version identity is observed three ways so a 200 can never stand in
 //! for a state change: `/v1/versions` (lifecycle), the signed desired
-//! document (what the host converges), and the ingress response
-//! (`x-stub-env-*` reflects the ACTIVE version's version-scoped var
-//! bindings, so it flips exactly when a different version serves). The
-//! bundle bytes for the active version are decoded from `objects/`
+//! document (what the host converges), and the ingress response —
+//! `x-stub-worker` names the instance that served the request (the stub
+//! runs one process per tenant, so `x-stub-env-*` markers are unioned
+//! across that tenant's instances and cannot distinguish them), while
+//! the bundle bytes for the active version are decoded from `objects/`
 //! through the same `DirBundleSource` the host assembles from, which is
 //! where the actual code that would run is asserted (the stub does not
 //! execute JS — a real-workerd assertion lives in the `VRT_WORKERD_BIN`
@@ -399,6 +400,15 @@ impl Stack {
     }
 }
 
+/// Instance socket that served an ingress response (`x-stub-worker:
+/// sock-<instanceId>`).
+fn served_by(headers: &[(String, String)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k == "x-stub-worker")
+        .map(|(_, v)| v.clone())
+}
+
 /// Env-marker value from an ingress response (`present` / `absent`).
 fn marker(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
@@ -440,6 +450,8 @@ async fn preview_keeps_traffic_on_the_active_version() {
         Some("present"),
         "v1's version-scoped var must be live"
     );
+    let v1_instance = served_by(&headers);
+    assert!(v1_instance.is_some(), "the stub must name its instance");
     assert_eq!(
         bundle_module(
             &env.root,
@@ -492,10 +504,16 @@ async fn preview_keeps_traffic_on_the_active_version() {
         marker(&headers, "VRT_VAR_ONLY_V1").as_deref(),
         Some("present")
     );
+    // The stub's env is per PROCESS and every instance of a tenant shares
+    // one process, so `VRT_VAR_ONLY_V2` being visible here does not mean
+    // v2 serves. Production traffic must land on the very same instance
+    // socket as before the preview; preview-instance isolation is
+    // asserted by that identity here and by `preview_url_e2e`'s
+    // route/counter checks.
     assert_eq!(
-        marker(&headers, "VRT_VAR_ONLY_V2").as_deref(),
-        Some("absent"),
-        "v2 was previewed, not activated"
+        served_by(&headers),
+        v1_instance,
+        "preview must not move production traffic off v1's instance"
     );
     assert_eq!(
         desired_active(&env.root, "edge-api").as_deref(),
@@ -629,7 +647,7 @@ async fn promote_switches_traffic_and_replays_idempotently() {
 // 3. preview + secret values is refused before anything is written
 // ---------------------------------------------------------------------
 
-/// A remote-upload wire body (`vrt deploy --url`) for `dir`.
+/// A remote-upload wire body (`of deploy --url`) for `dir`.
 fn upload_body(dir: &Path) -> vrt_local::worker_pkg::DeployUpload {
     use base64::Engine;
     let g = vrt_local::worker_pkg::gather_dir(dir).unwrap();

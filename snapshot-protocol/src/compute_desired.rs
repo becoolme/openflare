@@ -50,6 +50,12 @@ const MAX_WORKFLOWS_PER_WORKER: usize = 32;
 /// config has no explicit cap; this bounds the signed document and the
 /// rendered `tails` list without approaching workerd's service limits.
 pub const MAX_TAIL_CONSUMERS_PER_WORKER: usize = 16;
+/// PREVIEW: preview instances one production worker may carry in one
+/// snapshot. Each instance is a rendered worker of the same tenant, so
+/// the cap bounds the rendered config (and the workerd process's socket
+/// and memory footprint). Older preview versions stay stored and
+/// promotable — they are just no longer routable until re-previewed.
+pub const MAX_PREVIEWS_PER_WORKER: usize = 4;
 /// CF `limits.steps` bound — wrangler accepts positive ints; we cap
 /// conservatively (engine default is effectively unbounded).
 const MAX_WORKFLOW_STEPS: u32 = 100_000;
@@ -300,6 +306,40 @@ pub struct WorkerDesired {
 
     /// Per-isolate/per-request resource limits enforced by the runtime.
     pub quotas: WorkerQuotas,
+
+    /// Versioned preview instance: present iff this worker entry IS a
+    /// preview of another worker of the same tenant, and names the
+    /// production worker it previews. A preview instance is rendered as
+    /// a normal worker (its own sockets, bindings and version pin) but:
+    ///
+    /// - it never owns a `routes` entry — the host derives its public
+    ///   hostname from `previewDomain` (`<versionId>--<name>.<domain>`),
+    ///   so a preview can never shadow or move production traffic;
+    /// - it carries no `crons`/`queueConsumers`/`workflows`/`tailConsumers`
+    ///   (single-consumer and engine relations stay production-scoped) and
+    ///   declares no `durableObjectClasses` (no version-isolated DO
+    ///   storage yet);
+    /// - it carries no `secret` bindings — tenant secrets are not
+    ///   version-scoped, so a preview never receives them.
+    ///
+    /// Skipped when absent so snapshots without previews stay
+    /// byte-identical; `deny_unknown_fields` makes older cells reject a
+    /// snapshot carrying it (fail closed, never silently serve a preview
+    /// as production).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewDesired>,
+}
+
+/// PREVIEW: identity of the production worker a preview instance
+/// previews. See [`WorkerDesired::preview`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewDesired {
+    /// Production worker id (same tenant, non-preview entry).
+    pub worker_id: String,
+    /// Version id being previewed; equals the instance's
+    /// [`VersionDesired::version_id`].
+    pub version_id: String,
 }
 
 /// `[observability]` — CF Worker Logs collection gates and head
@@ -1300,6 +1340,34 @@ pub enum DesiredError {
     /// same-key data (refused, fail closed).
     #[error("deletion tombstone scope is malformed")]
     DeletionScope,
+
+    /// PREVIEW: a preview instance's `preview.workerId` names a worker
+    /// outside this tenant, itself, or another preview instance (a
+    /// chain of previews has no production lineage to derive a host
+    /// from).
+    #[error("preview target is not a production worker of this tenant")]
+    PreviewTarget,
+
+    /// PREVIEW: `preview.versionId` disagrees with the instance's
+    /// `activeVersion.versionId` — the host would label a route with a
+    /// version it is not serving.
+    #[error("preview version does not match the served version")]
+    PreviewVersion,
+
+    /// PREVIEW: a preview instance declared `routes`.
+    #[error("preview instance must not declare routes")]
+    PreviewRoutes,
+
+    /// PREVIEW: a preview instance declared a production-side effect
+    /// (crons, queue consumers, workflows, tail consumers).
+    #[error("preview instance must not declare side effects")]
+    PreviewSideEffects,
+
+    /// PREVIEW: a preview instance declared a tenant secret binding —
+    /// secrets are not version-scoped, so a preview must never receive
+    /// the serving version's secret values.
+    #[error("preview instance must not bind secrets")]
+    PreviewSecretBinding,
 }
 
 impl DesiredError {
@@ -1330,6 +1398,11 @@ impl DesiredError {
             Self::ObservabilityBounds => "DESIRED_OBSERVABILITY_BOUNDS",
             Self::FlagshipApp => "DESIRED_FLAGSHIP_APP_SCOPE",
             Self::FlagshipConfig(_) => "DESIRED_FLAGSHIP_CONFIG",
+            Self::PreviewTarget => "DESIRED_PREVIEW_TARGET",
+            Self::PreviewVersion => "DESIRED_PREVIEW_VERSION",
+            Self::PreviewRoutes => "DESIRED_PREVIEW_ROUTES",
+            Self::PreviewSideEffects => "DESIRED_PREVIEW_SIDE_EFFECTS",
+            Self::PreviewSecretBinding => "DESIRED_PREVIEW_SECRET_BINDING",
         }
     }
 }
@@ -1461,6 +1534,58 @@ impl ComputeDesired {
                 worker.validate_routes(&mut hostnames)?;
                 worker.validate_crons()?;
                 worker.quotas.validate()?;
+            }
+
+            // PREVIEW: preview instances ride in the same worker list (so
+            // the renderer/supervisor/provider see a complete tenant), but
+            // they may never look like production: no routes (the host
+            // derives the preview hostname), no production-side effects,
+            // no tenant secrets, and a real production lineage.
+            let mut previews_per_worker: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for worker in &tenant.workers {
+                let Some(preview) = &worker.preview else {
+                    continue;
+                };
+                let target = tenant
+                    .workers
+                    .iter()
+                    .find(|w| w.worker_id == preview.worker_id)
+                    .filter(|w| w.worker_id != worker.worker_id && w.preview.is_none());
+                if !valid_identifier(&preview.worker_id, MAX_IDENTIFIER_LEN) || target.is_none() {
+                    return Err(DesiredError::PreviewTarget);
+                }
+                if !valid_identifier(&preview.version_id, MAX_IDENTIFIER_LEN)
+                    || preview.version_id != worker.active_version.version_id
+                {
+                    return Err(DesiredError::PreviewVersion);
+                }
+                if !worker.routes.is_empty() {
+                    return Err(DesiredError::PreviewRoutes);
+                }
+                if !worker.crons.is_empty()
+                    || !worker.queue_consumers.is_empty()
+                    || !worker.workflows.is_empty()
+                    || !worker.tail_consumers.is_empty()
+                    || !worker.streaming_tail_consumers.is_empty()
+                    || !worker.durable_object_classes.is_empty()
+                {
+                    return Err(DesiredError::PreviewSideEffects);
+                }
+                if worker
+                    .bindings
+                    .iter()
+                    .any(|b| matches!(b, BindingDesired::Secret(_)))
+                {
+                    return Err(DesiredError::PreviewSecretBinding);
+                }
+                let count = previews_per_worker
+                    .entry(preview.worker_id.as_str())
+                    .or_default();
+                *count += 1;
+                if *count > MAX_PREVIEWS_PER_WORKER {
+                    return Err(DesiredError::Capacity("previews"));
+                }
             }
 
             // Flagship apps: ids unique per tenant, and every app's
@@ -4134,5 +4259,176 @@ mod tests {
             };
             assert!(desired(&bad).unwrap().validate().is_err(), "{cfg}");
         }
+    }
+
+    /// PREVIEW: one production worker + one preview instance in the same
+    /// tenant. The preview instance must be a *valid* worker entry — its
+    /// own id/socket/version pin — but may never carry routes, side
+    /// effects or secrets.
+    fn preview_payload() -> serde_json::Value {
+        let mut p = valid_payload();
+        p["tenants"][0]["workers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "workerId": "w-alpha-1.pv01234567",
+                "name": "api-pv01234567",
+                "activeVersion": {
+                    "versionId": "v-2026-11-09-preview",
+                    "artifactDigest": "e".repeat(64),
+                    "compatibilityDate": "2026-11-01",
+                    "compatibilityFlags": []
+                },
+                "bindings": [],
+                "routes": [],
+                "crons": [],
+                "quotas": {"cpuMs": 50, "memoryMb": 128, "subrequests": 100, "outboundConnections": 16},
+                "preview": {"workerId": "w-alpha-1", "versionId": "v-2026-11-09-preview"}
+            }));
+        p
+    }
+
+    #[test]
+    fn preview_instance_validates_and_round_trips() {
+        let parsed = desired(&preview_payload()).expect("decode");
+        parsed.validate().expect("valid preview payload");
+        // The marker is a typed field, not a naming convention.
+        let preview = parsed.tenants[0]
+            .workers
+            .iter()
+            .find(|w| w.preview.is_some())
+            .unwrap();
+        assert_eq!(
+            preview.preview.as_ref().unwrap().worker_id.as_str(),
+            "w-alpha-1"
+        );
+        // Absent markers stay absent on the wire (no snapshot churn).
+        let plain = serde_json::to_value(&parsed).unwrap();
+        assert!(plain["tenants"][0]["workers"][0].get("preview").is_none());
+        assert_eq!(
+            plain["tenants"][0]["workers"][2]["preview"]["workerId"],
+            json!("w-alpha-1")
+        );
+        // Round-trip: the signed wire shape decodes back identically.
+        assert_eq!(desired(&plain).unwrap(), parsed);
+    }
+
+    #[test]
+    fn preview_instance_misuse_fails_closed() {
+        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>, &'static str)> = vec![
+            (
+                "no-routes",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["routes"] =
+                        json!([{"hostname": "sneaky.example.com"}])
+                }),
+                "DESIRED_PREVIEW_ROUTES",
+            ),
+            (
+                "no-crons",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["crons"] =
+                        json!([{"scheduleId": "c", "expression": "*/5 * * * *"}])
+                }),
+                "DESIRED_PREVIEW_SIDE_EFFECTS",
+            ),
+            (
+                "no-queues",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["queueConsumers"] = json!([{
+                        "queueId": "q".repeat(26),
+                        "queueName": "jobs",
+                        "deadLetterQueueId": null,
+                        "maxBatchSize": 10,
+                        "maxBatchTimeoutSecs": 5,
+                        "maxRetries": 3,
+                        "retryDelaySecs": 0,
+                        "maxConcurrency": 10
+                    }])
+                }),
+                "DESIRED_PREVIEW_SIDE_EFFECTS",
+            ),
+            (
+                "no-durable-objects",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["durableObjectClasses"] = json!([{
+                        "className": "Counter",
+                        "uniqueKey": "c".repeat(64),
+                        "enableSql": true
+                    }])
+                }),
+                "DESIRED_PREVIEW_SIDE_EFFECTS",
+            ),
+            (
+                "no-secrets",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["bindings"] = json!([
+                        {"type": "secret", "name": "API_TOKEN", "secretRef": "sec:x:tok"}
+                    ])
+                }),
+                "DESIRED_PREVIEW_SECRET_BINDING",
+            ),
+            (
+                "version-mismatch",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["preview"]["versionId"] =
+                        json!("v-other")
+                }),
+                "DESIRED_PREVIEW_VERSION",
+            ),
+            (
+                "unknown-target",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["preview"]["workerId"] = json!("w-missing")
+                }),
+                "DESIRED_PREVIEW_TARGET",
+            ),
+            (
+                "self-target",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][2]["preview"]["workerId"] =
+                        json!("w-alpha-1.pv01234567")
+                }),
+                "DESIRED_PREVIEW_TARGET",
+            ),
+            (
+                "preview-chain",
+                Box::new(|v| {
+                    // The only other worker is the preview instance itself.
+                    v["tenants"][0]["workers"][0]["preview"] = json!({
+                        "workerId": "w-alpha-1.pv01234567",
+                        "versionId": v["tenants"][0]["workers"][0]["activeVersion"]["versionId"]
+                    });
+                }),
+                "DESIRED_PREVIEW_TARGET",
+            ),
+        ];
+        for (id, mutate, expected) in cases {
+            let mut value = preview_payload();
+            mutate(&mut value);
+            let err = desired(&value)
+                .unwrap_or_else(|e| panic!("{id}: decode failed: {e}"))
+                .validate()
+                .expect_err(id);
+            assert_eq!(err.code(), expected, "{id}");
+        }
+
+        // Capacity: a fifth preview of one worker is refused.
+        let mut many = preview_payload();
+        let mut workers = many["tenants"][0]["workers"].as_array().unwrap().clone();
+        let base = workers[2].clone();
+        for i in 0..MAX_PREVIEWS_PER_WORKER {
+            let mut w = base.clone();
+            w["workerId"] = json!(format!("w-alpha-1.pv{i:08}"));
+            w["name"] = json!(format!("api-pv{i:08}"));
+            w["activeVersion"]["versionId"] = json!(format!("v-preview-{i}"));
+            w["preview"]["versionId"] = json!(format!("v-preview-{i}"));
+            workers.push(w);
+        }
+        many["tenants"][0]["workers"] = json!(workers);
+        assert_eq!(
+            desired(&many).unwrap().validate(),
+            Err(DesiredError::Capacity("previews"))
+        );
     }
 }

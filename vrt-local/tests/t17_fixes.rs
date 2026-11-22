@@ -207,6 +207,7 @@ fn failed_validation_persists_nothing() {
         hostnames: vec!["invalid_hostname!".to_string()],
         vars: Default::default(),
         tag: None,
+        is_preview: false,
     };
     let err = local.deploy(&w2, &bad);
     assert!(err.is_err(), "invalid desired must fail");

@@ -161,8 +161,7 @@ fn preview_stores_version_without_moving_traffic() {
 }
 
 #[test]
-fn preview_first_worker_is_absent_from_desired_until_promoted() {
-    let root = root();
+fn preview_first_worker_is_absent_from_desired_until_promoted() {    let root = root();
     let local = init(&root);
     let dir = worker_dir(&root, "fresh", "export default {fresh: true}\n");
 
@@ -372,4 +371,139 @@ fn concurrent_promotes_never_produce_two_active_versions() {
     let active_id = st["workers"]["race"]["activeVersionId"].as_str().unwrap();
     assert_eq!(active_statuses[0]["versionId"], active_id);
     assert_eq!(desired_active(&root, "race").as_deref(), Some(active_id));
+}
+
+// ── PREVIEW URLs ─────────────────────────────────────────────────────
+
+/// `previewUrl` is derived from the HOST config, never guessed: with no
+/// `[preview] domain` the API reports null, and only `--preview` (or an
+/// active version) ever gets one.
+#[test]
+fn preview_url_reflects_the_host_preview_domain() {
+    let root = root();
+    let local = init(&root);
+    let v1 = worker_dir(&root, "urls", "export default {v: 1}\n");
+    let r1 = local.deploy(&v1, &DeployOverrides::default()).unwrap();
+    // A production deploy never carries a preview URL.
+    assert_eq!(r1.preview_url, None);
+
+    let v2 = worker_dir(&root, "urls", "export default {v: 2}\n");
+    // No host config at all → preview is off.
+    let no_domain = local
+        .deploy_preview(&v2, &DeployOverrides::default())
+        .unwrap();
+    assert_eq!(no_domain.preview_url, None);
+    assert_eq!(
+        local
+            .versions("urls")
+            .unwrap()
+            .versions
+            .iter()
+            .find(|v| v.version_id == no_domain.version_id)
+            .unwrap()
+            .preview_url,
+        None
+    );
+
+    // Configure the SAME knob vrt-host routes on.
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::write(
+        root.join("config/vrt-host.toml"),
+        "cellId = \"local\"\n\n[preview]\ndomain = \"Preview.Example.COM\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        vrt_local::preview::preview_domain(&root).as_deref(),
+        Some("preview.example.com"),
+        "case is normalized"
+    );
+
+    let v3 = worker_dir(&root, "urls", "export default {v: 3}\n");
+    let p3 = local
+        .deploy_preview(&v3, &DeployOverrides::default())
+        .unwrap();
+    let want = format!("https://{}--urls.preview.example.com/", p3.version_id);
+    assert_eq!(p3.preview_url.as_deref(), Some(want.as_str()));
+
+    // Active versions keep a preview URL (the host serves them), archived
+    // versions lose it.
+    local.promote("urls", &p3.version_id).unwrap();
+    let list = local.versions("urls").unwrap();
+    let row = |id: &str| {
+        list.versions
+            .iter()
+            .find(|v| v.version_id == id)
+            .unwrap_or_else(|| panic!("version {id} missing"))
+    };
+    assert_eq!(row(&p3.version_id).status, VersionStatus::Active);
+    assert!(row(&p3.version_id).preview_url.is_some());
+    // The earlier preview stays a preview (promote only moves the active
+    // pointer), so it is routable now that a domain exists.
+    assert_eq!(row(&no_domain.version_id).status, VersionStatus::Preview);
+    assert!(row(&no_domain.version_id).preview_url.is_some());
+    // The version that was ACTIVE and got replaced loses its URL: it is
+    // archived, and the host has no route for it.
+    assert_eq!(row(&r1.version_id).status, VersionStatus::Archived);
+    assert_eq!(row(&r1.version_id).preview_url, None);
+}
+
+/// Durable objects and workflows are not version-isolated yet: a preview
+/// that declares them would share/duplicate production state, so the
+/// preview is refused BEFORE anything is persisted.
+#[test]
+fn preview_refuses_durable_objects_and_workflows() {
+    let root = root();
+    let local = init(&root);
+    let base = worker_dir(&root, "guarded", "export default {}\n");
+    local.deploy(&base, &DeployOverrides::default()).unwrap();
+    let rev_before = local.status().unwrap().revision;
+
+    // Durable object declaration.
+    let do_dir = root.join("worker-do");
+    std::fs::create_dir_all(&do_dir).unwrap();
+    std::fs::write(
+        do_dir.join("vrt.toml"),
+        "name = \"guarded\"\nmainModule = \"main.js\"\n\
+         compatibilityDate = \"2024-09-25\"\n\n\
+         [[durableObjectBindings]]\nname = \"COUNTER\"\nclassName = \"Counter\"\n\n\
+         [[durableObjectMigrations]]\ntag = \"v1\"\nnewSqliteClasses = [\"Counter\"]\n",
+    )
+    .unwrap();
+    std::fs::write(do_dir.join("main.js"), "export class Counter {}\n").unwrap();
+    let err = local
+        .deploy_preview(&do_dir, &DeployOverrides::default())
+        .expect_err("DO preview must fail closed");
+    assert!(
+        err.to_string().contains("durableObjects"),
+        "unexpected error: {err}"
+    );
+
+    // Workflow declaration.
+    let wf_dir = root.join("worker-wf");
+    std::fs::create_dir_all(&wf_dir).unwrap();
+    std::fs::write(
+        wf_dir.join("vrt.toml"),
+        "name = \"guarded\"\nmainModule = \"main.js\"\n\
+         compatibilityDate = \"2024-09-25\"\n\n\
+         [[workflows]]\nname = \"order\"\nbinding = \"ORDER\"\nclassName = \"OrderWorkflow\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        wf_dir.join("main.js"),
+        "import { WorkflowEntrypoint } from \"cloudflare:workers\";\n         export class OrderWorkflow extends WorkflowEntrypoint {}\n         export default {}\n",
+    )
+    .unwrap();
+    let err = local
+        .deploy_preview(&wf_dir, &DeployOverrides::default())
+        .expect_err("workflow preview must fail closed");
+    assert!(
+        err.to_string().contains("workflows"),
+        "unexpected error: {err}"
+    );
+
+    // Nothing was persisted and the active pointer never moved.
+    let st = local.status().unwrap();
+    assert_eq!(st.revision, rev_before, "a refused preview writes nothing");
+    assert_eq!(st.workers[0].versions.len(), 1);
+    assert!(st.workers[0].active_version_id.is_some());
 }

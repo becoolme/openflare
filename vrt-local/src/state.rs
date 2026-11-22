@@ -176,6 +176,100 @@ pub struct VersionRecord {
     pub quotas: WorkerQuotas,
 }
 
+/// Version metadata fields (`tag`, `created_at`) ride the wire only when
+/// the version declares the `versionMetadata` binding — pre-
+/// versionMetadata cells use `deny_unknown_fields` and would reject the
+/// whole snapshot, so they must never see the fields otherwise.
+fn version_metadata_fields(version: &VersionRecord) -> (String, String) {
+    let has_version_metadata = version
+        .bindings
+        .iter()
+        .any(|b| matches!(b, BindingDesired::VersionMetadata(_)));
+    if !has_version_metadata {
+        return (String::new(), String::new());
+    }
+    (
+        version.tag.clone(),
+        chrono::DateTime::from_timestamp_millis(version.created_at_unix_ms as i64)
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .unwrap_or_default(),
+    )
+}
+
+/// PREVIEW: stable instance id for `<worker_id>` serving
+/// `<version_id>`. Deterministic (a re-converge of the same desired
+/// state must not churn sockets) and SHORT: the id ends up in a
+/// `<gen>/sock/<id>.sock` path, and `sun_path` is 104 bytes.
+pub fn preview_instance_id(worker_id: &str, version_id: &str) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(version_id.as_bytes()));
+    format!("{worker_id}.pv{}", &digest[..8])
+}
+
+/// PREVIEW: worker display name for an instance — unique per tenant,
+/// a valid lowercase DNS label (no `--`), and derived from the
+/// production name so logs/status stay readable.
+pub fn preview_instance_name(name: &str, version_id: &str) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(version_id.as_bytes()));
+    let suffix = format!("-pv{}", &digest[..8]);
+    let keep = snapshot_protocol::compute_desired::MAX_WORKER_NAME_LEN
+        .saturating_sub(suffix.len())
+        .max(1);
+    let mut base: String = name.chars().take(keep).collect();
+    while base.ends_with('-') {
+        base.pop();
+    }
+    format!("{base}{suffix}")
+}
+
+/// PREVIEW: project one stored preview version into the worker
+/// instance the host renders and routes. Everything that would let a
+/// preview act as the production version is dropped here (and the
+/// protocol validator rejects a snapshot that reintroduces it):
+///
+/// - no routes (the preview hostname is host-derived),
+/// - no crons / queue consumers / workflows / tail consumers,
+/// - no secret bindings (tenant secrets are not version-scoped),
+/// - no durable-object classes (previews may not share or fork DO
+///   storage; a version declaring DOs is refused at preview time).
+fn preview_worker_desired(
+    worker: &WorkerRecord,
+    name: &str,
+    version: &VersionRecord,
+) -> WorkerDesired {
+    let (tag, created_at) = version_metadata_fields(version);
+    WorkerDesired {
+        worker_id: preview_instance_id(&worker.worker_id, &version.version_id),
+        name: preview_instance_name(name, &version.version_id),
+        active_version: VersionDesired {
+            version_id: version.version_id.clone(),
+            artifact_digest: version.artifact_digest.clone(),
+            compatibility_date: version.compatibility_date.clone(),
+            compatibility_flags: version.compatibility_flags.clone(),
+            tag,
+            created_at,
+        },
+        bindings: version
+            .bindings
+            .iter()
+            .filter(|b| !matches!(b, BindingDesired::Secret(_)))
+            .cloned()
+            .collect(),
+        routes: Vec::new(),
+        crons: Vec::new(),
+        queue_consumers: Vec::new(),
+        durable_object_classes: Vec::new(),
+        workflows: Vec::new(),
+        tail_consumers: Vec::new(),
+        streaming_tail_consumers: Vec::new(),
+        observability: version.observability.clone(),
+        quotas: version.quotas.clone(),
+        preview: Some(snapshot_protocol::compute_desired::PreviewDesired {
+            worker_id: worker.worker_id.clone(),
+            version_id: version.version_id.clone(),
+        }),
+    }
+}
+
 impl LocalState {
     pub fn new(cell_id: &str, tenant_id: &str) -> Self {
         Self {
@@ -514,24 +608,7 @@ impl LocalState {
                 .iter()
                 .find(|v| &v.version_id == active_id)
                 .ok_or(LocalError::State("activeVersion"))?;
-            // Version metadata fields ride the wire only when the
-            // version declares the binding — `deny_unknown_fields`
-            // makes pre-versionMetadata cells reject the whole
-            // snapshot, so they must never see the fields otherwise.
-            let has_version_metadata = active
-                .bindings
-                .iter()
-                .any(|b| matches!(b, BindingDesired::VersionMetadata(_)));
-            let (tag, created_at) = if has_version_metadata {
-                (
-                    active.tag.clone(),
-                    chrono::DateTime::from_timestamp_millis(active.created_at_unix_ms as i64)
-                        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-                        .unwrap_or_default(),
-                )
-            } else {
-                (String::new(), String::new())
-            };
+            let (tag, created_at) = version_metadata_fields(active);
             workers.push(WorkerDesired {
                 worker_id: w.worker_id.clone(),
                 name: name.clone(),
@@ -559,7 +636,33 @@ impl LocalState {
                 workflows: active.workflows.clone(),
                 tail_consumers: active.tail_consumers.clone(),
                 quotas: active.quotas.clone(),
+                preview: None,
             });
+            // PREVIEW: every still-previewable version becomes an extra
+            // worker instance of this tenant (same process, own socket,
+            // own version pin). The host turns each instance into
+            // `<versionId>--<name>.<previewDomain>` and never touches
+            // `activeVersionId`, so preview traffic can neither move nor
+            // impersonate production. Newest first and capped: the cap
+            // bounds the rendered config, not the stored history — an
+            // older preview stays stored/promotable, it is just not
+            // served over HTTP until re-previewed.
+            let mut previewable: Vec<&VersionRecord> = w
+                .versions
+                .iter()
+                .filter(|v| v.status == VersionStatus::Preview)
+                .collect();
+            previewable.sort_by(|a, b| {
+                b.created_at_unix_ms
+                    .cmp(&a.created_at_unix_ms)
+                    .then_with(|| b.version_id.cmp(&a.version_id))
+            });
+            for version in previewable
+                .into_iter()
+                .take(snapshot_protocol::compute_desired::MAX_PREVIEWS_PER_WORKER)
+            {
+                workers.push(preview_worker_desired(w, name, version));
+            }
         }
         Ok(ComputeDesired {
             schema_version: snapshot_protocol::compute_desired::SCHEMA_VERSION,
@@ -818,6 +921,172 @@ mod tests {
             only_preview.to_desired().unwrap().tenants[0].workers.len(),
             0
         );
+    }
+
+    /// PREVIEW: a preview version is projected as a separate worker
+    /// instance — own socket/version pin, production active pointer
+    /// untouched, and none of the production-only surface.
+    #[test]
+    fn preview_versions_project_as_isolated_instances() {
+        let mut st = LocalState::new("local", "local");
+        st.revision = 1;
+        let mut active = pkg();
+        active.hostnames = vec!["api.example.com".into()];
+        active.crons = vec![snapshot_protocol::compute_desired::CronDesired {
+            schedule_id: "c1".into(),
+            expression: "*/5 * * * *".into(),
+        }];
+        active.bindings = vec![BindingDesired::Secret(
+            snapshot_protocol::compute_desired::SecretBinding {
+                name: "API_TOKEN".into(),
+                secret_ref: "sec:tok".into(),
+            },
+        )];
+        let active_id = LocalState::version_id(&active);
+        st.apply_deploy(&active, 1).unwrap();
+        // Same behavior but a different version identity.
+        let mut preview = pkg();
+        preview.hostnames = active.hostnames.clone();
+        preview.crons = active.crons.clone();
+        preview.bindings = active.bindings.clone();
+        preview.compatibility_flags = vec!["nodejs_compat".into()];
+        let preview_id = LocalState::version_id(&preview);
+        st.apply_preview(&preview, 2).unwrap();
+
+        let desired = st.to_desired().unwrap();
+        let workers = &desired.tenants[0].workers;
+        assert_eq!(workers.len(), 2, "active + one preview instance");
+
+        let prod = workers.iter().find(|w| w.preview.is_none()).unwrap();
+        assert_eq!(prod.active_version.version_id, active_id);
+        assert_eq!(prod.routes[0].hostname, "api.example.com");
+        assert_eq!(prod.crons.len(), 1);
+        assert_eq!(prod.bindings.len(), 1);
+
+        let pv = workers.iter().find(|w| w.preview.is_some()).unwrap();
+        let marker = pv.preview.as_ref().unwrap();
+        assert_eq!(marker.worker_id, prod.worker_id);
+        assert_eq!(marker.version_id, preview_id);
+        assert_eq!(pv.active_version.version_id, preview_id);
+        // Own identity (its own socket) — never the production worker id.
+        assert_eq!(
+            pv.worker_id,
+            preview_instance_id(&prod.worker_id, &preview_id)
+        );
+        assert_ne!(pv.worker_id, prod.worker_id);
+        assert_ne!(pv.name, prod.name);
+        // No route (the host derives the preview hostname), no crons,
+        // no secret bindings.
+        assert!(pv.routes.is_empty());
+        assert!(pv.crons.is_empty());
+        assert!(pv.bindings.is_empty());
+        assert!(pv.durable_object_classes.is_empty());
+        // The signed document must validate (protocol invariants).
+        desired.validate().unwrap();
+    }
+
+    /// REBASE MERGE (#74 version metadata + #82 preview instances): a
+    /// preview instance carries the SAME `versionMetadata` projection as
+    /// production — `tag`/`created_at` are set when the version declares
+    /// the binding, and stay empty otherwise (pre-versionMetadata cells
+    /// reject the fields outright).
+    #[test]
+    fn preview_instance_projects_version_metadata_only_when_declared() {
+        use snapshot_protocol::compute_desired::{VersionMetadataBinding, VersionDesired};
+
+        let mut st = LocalState::new("local", "local");
+        st.revision = 1;
+        st.apply_deploy(&pkg(), 1).unwrap();
+
+        let mut untagged = pkg();
+        untagged.compatibility_flags = vec!["untagged".into()];
+        let untagged_id = LocalState::version_id(&untagged);
+        st.apply_preview(&untagged, 2).unwrap();
+
+        let mut tagged = pkg();
+        tagged.compatibility_flags = vec!["tagged".into()];
+        tagged.tag = "release-7".into();
+        tagged.bindings = vec![BindingDesired::VersionMetadata(VersionMetadataBinding {
+            name: "CF_VERSION_METADATA".into(),
+        })];
+        let tagged_id = LocalState::version_id(&tagged);
+        st.apply_preview(&tagged, 1_700_000_000_000).unwrap();
+
+        let desired = st.to_desired().unwrap();
+        desired.validate().unwrap();
+        let preview = |id: &str| -> &VersionDesired {
+            &desired.tenants[0]
+                .workers
+                .iter()
+                .find(|w| w.active_version.version_id == id)
+                .unwrap()
+                .active_version
+        };
+        assert_eq!(preview(&untagged_id).tag, "");
+        assert_eq!(preview(&untagged_id).created_at, "");
+        assert_eq!(preview(&tagged_id).tag, "release-7");
+        assert_eq!(
+            preview(&tagged_id).created_at,
+            "2023-11-14T22:13:20.000Z",
+            "the preview instance reports its own creation time"
+        );
+    }
+
+    #[test]
+    fn preview_instances_are_capped_newest_first() {
+        let cap = snapshot_protocol::compute_desired::MAX_PREVIEWS_PER_WORKER;
+        let mut st = LocalState::new("local", "local");
+        st.revision = 1;
+        st.apply_deploy(&pkg(), 1).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..(cap + 2) {
+            let mut p = pkg();
+            p.compatibility_flags = vec![format!("flag{i}")];
+            ids.push(LocalState::version_id(&p));
+            st.apply_preview(&p, 10 + i as u64).unwrap();
+        }
+        let desired = st.to_desired().unwrap();
+        desired.validate().unwrap();
+        let projected: std::collections::BTreeSet<String> = desired.tenants[0]
+            .workers
+            .iter()
+            .filter(|w| w.preview.is_some())
+            .map(|w| w.active_version.version_id.clone())
+            .collect();
+        assert_eq!(projected.len(), cap);
+        // Exactly the NEWEST `cap` versions are projected; the older ones
+        // stay stored and promotable, they are only not served.
+        let newest: std::collections::BTreeSet<String> =
+            ids.iter().rev().take(cap).cloned().collect();
+        assert_eq!(projected, newest);
+    }
+
+    /// A promoted version stops being a preview instance: the production
+    /// worker serves it, and the derived active-version preview host still
+    /// resolves (route-table side).
+    #[test]
+    fn promoted_version_leaves_the_preview_instance_set() {
+        let mut st = LocalState::new("local", "local");
+        st.revision = 1;
+        st.apply_deploy(&pkg(), 1).unwrap();
+        let mut p = pkg();
+        p.compatibility_flags = vec!["nodejs_compat".into()];
+        let preview_id = LocalState::version_id(&p);
+        st.apply_preview(&p, 2).unwrap();
+        assert_eq!(
+            st.to_desired().unwrap().tenants[0]
+                .workers
+                .iter()
+                .filter(|w| w.preview.is_some())
+                .count(),
+            1
+        );
+        st.promote("svc", &preview_id).unwrap();
+        let desired = st.to_desired().unwrap();
+        let workers = &desired.tenants[0].workers;
+        assert_eq!(workers.len(), 1);
+        assert!(workers[0].preview.is_none());
+        assert_eq!(workers[0].active_version.version_id, preview_id);
     }
 
     #[test]

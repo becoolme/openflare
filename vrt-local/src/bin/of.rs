@@ -1142,16 +1142,17 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
     use vrt_local::worker_pkg::{DeployOverrides, DeployUpload, UploadAssets};
     let pos = positional(args);
     let dir = pos.first().ok_or("worker_dir required")?.clone();
+    let preview = args.iter().any(|a| a == "--preview");
     let overrides = DeployOverrides {
         name: arg(args, "--name").map(String::from),
         env_name: arg(args, "--env").map(String::from),
         vars: collect_vars(args)?,
         tag: arg(args, "--tag").map(String::from),
+        is_preview: preview,
         ..Default::default()
     };
     let secrets = collect_secrets(args)?;
     let dry_run = args.iter().any(|a| a == "--dry-run");
-    let preview = args.iter().any(|a| a == "--preview");
     if preview && !secrets.is_empty() {
         // Secret values are tenant-level, not versioned: applying them
         // during a preview would change the currently serving version.
@@ -1169,9 +1170,10 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             arg(args, "--token-file").ok_or("--url requires --token-file <path> (0600, 64-hex)")?;
         let token = vrt_local::keys::load_token_file(Path::new(token_path))
             .map_err(|e| format!("token file: {e}"))?;
-        let g = vrt_local::worker_pkg::gather_dir_for_env(
+        let g = vrt_local::worker_pkg::gather_dir_for_env_preview(
             Path::new(&dir),
             overrides.env_name.as_deref(),
+            preview,
         )
         .map_err(|e| e.to_string())?;
         if dry_run {
@@ -1228,9 +1230,10 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
     let root = root_of(args)?;
     let g = if dry_run {
         Some(
-            vrt_local::worker_pkg::gather_dir_for_env(
+            vrt_local::worker_pkg::gather_dir_for_env_preview(
                 Path::new(&dir),
                 overrides.env_name.as_deref(),
+                preview,
             )
             .map_err(|e| e.to_string())?,
         )
@@ -1255,7 +1258,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             l.deploy(Path::new(&dir), &overrides)
         };
         deployed.map(|r| {
-            serde_json::json!({"versionId": r.version_id, "artifactDigest": r.artifact_digest, "revision": r.revision})
+            serde_json::json!({"versionId": r.version_id, "artifactDigest": r.artifact_digest, "revision": r.revision, "previewUrl": r.preview_url})
         })
     })?;
     println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());

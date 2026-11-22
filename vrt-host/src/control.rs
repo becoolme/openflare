@@ -133,13 +133,16 @@ fn parse_line(line: &[u8]) -> Result<ListenEvent, ControlError> {
     }
     // Worker ids are `<teamId>:<workerName>` on the control plane, and the
     // socket name is `sock-<workerId>` — allow the separator and a bound that
-    // covers two maximum-length identifiers plus the prefix.
+    // covers two maximum-length identifiers plus the prefix. `.` is allowed
+    // because a PREVIEW instance id is `<workerId>.pv<digest>`
+    // (`vrt-local::preview_instance_id`); socket names come from our own
+    // rendered config, never from request input.
     if msg.socket.is_empty()
         || msg.socket.len() > 256
         || !msg
             .socket
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':')
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b':' || b == b'.')
     {
         return Err(ControlError::Malformed);
     }
@@ -193,6 +196,22 @@ mod tests {
             .push(line("sock-team-1:edge", "tcp:127.0.0.1:1").as_bytes())
             .unwrap();
         assert_eq!(events[0].socket, "sock-team-1:edge");
+    }
+
+    #[test]
+    fn accepts_preview_instance_socket_names() {
+        // PREVIEW: `<workerId>.pv<digest>` — the dot is part of the
+        // rendered socket name, and workerd reports the name it bound.
+        let mut p = JsonLineControlParser::new();
+        let events = p
+            .push(line("sock-w_0123.pvdeadbeef", "tcp:127.0.0.1:1").as_bytes())
+            .unwrap();
+        assert_eq!(events[0].socket, "sock-w_0123.pvdeadbeef");
+        // Still fail closed on anything else (`$`, spaces, …).
+        let mut p = JsonLineControlParser::new();
+        assert!(p
+            .push(line("sock-w_0123.pv$deadbeef", "tcp:127.0.0.1:1").as_bytes())
+            .is_err());
     }
 
     #[test]

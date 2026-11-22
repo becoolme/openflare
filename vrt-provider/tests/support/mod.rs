@@ -142,6 +142,7 @@ pub fn worker(
         tail_consumers: vec![],
         observability: None,
         streaming_tail_consumers: vec![],
+        preview: None,
         quotas: quotas(),
     }
 }
