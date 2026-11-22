@@ -123,7 +123,7 @@ const USER_MODULE: &str = r#"export default {
           missing,
         });
       }
-      if (url.pathname === "/secrets") {
+      if (p === "/secrets") {
         const value = await env.SECRET.get();
         let missing = "no-error";
         try {
@@ -133,7 +133,7 @@ const USER_MODULE: &str = r#"export default {
         }
         return Response.json({ value, missing });
       }
-      if (url.pathname === "/versionmeta") {
+      if (p === "/versionmeta") {
         const m = env.CF_VERSION_METADATA;
         return Response.json({ id: m.id, tag: m.tag, timestamp: m.timestamp });
       }
