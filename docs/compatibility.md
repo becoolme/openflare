@@ -33,7 +33,10 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | Tail Workers | Partial | [bindings/tail-workers.md](bindings/tail-workers.md) |
 | Flagship (`[[flagship]]` feature flags) | Partial | [wrangler-config.md](wrangler-config.md), [bindings/flagship.md](bindings/flagship.md) |
 | Observability (`[observability]` Worker Logs gates + head sampling) | Partial | [wrangler-config.md](wrangler-config.md) |
-| Workers AI, Vectorize, AI Search, Analytics Engine, Pipelines, e-mail, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
+| Vectorize | Partial | [bindings/vectorize.md](bindings/vectorize.md) |
+| Analytics Engine | Partial | [bindings/analytics-engine.md](bindings/analytics-engine.md) |
+| E-mail (`send_email`) | Partial | [wrangler-config.md](wrangler-config.md) — binding page pending |
+| Workers AI, AI Search, Pipelines, mTLS, Secrets Store, Workers for Platforms/dispatch, Containers | Unsupported | [wrangler-config.md](wrangler-config.md) |
 
 ## Known platform differences
 
