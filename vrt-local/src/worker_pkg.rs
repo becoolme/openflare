@@ -2357,6 +2357,10 @@ pub struct DeployUpload {
     /// Worker name override (`vrt.toml` name otherwise).
     #[serde(default)]
     pub name: Option<String>,
+    /// `true` for `deploy --preview`: store the immutable version
+    /// without changing the worker's active version.
+    #[serde(default)]
+    pub preview: bool,
     /// Flagship app definitions gathered client-side
     /// (`flagship.json`) — re-validated server-side with the same
     /// wire-boundary flag-model proof before state application.

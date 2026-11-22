@@ -144,13 +144,21 @@ compose="docker compose -f deploy/standalone/docker-compose.yml exec vrt"
 $compose vrt status --root /data
 $compose vrt deploy --root /data <dir>
 $compose vrt deploy --root /data --env staging <dir>
+$compose vrt deploy --root /data --preview <dir>
+$compose vrt promote --root /data <worker> <version_id>
 $compose vrt rollback --root /data <worker> <version_id>
 $compose vrt hostnames add --root /data <worker> <host>
 printf 's3cret' | $compose vrt secret put --root /data <ref>
-$compose vrt versions --root /data <worker>
+$compose vrt versions list --root /data <worker>
 $compose vrt logs --root /data <worker> --follow --since 10m --level error
 $compose vrt doctor --root /data          # add --json or --strict
 ```
+
+`deploy --preview` stores an immutable version without moving traffic;
+`promote` switches the worker's active version through the same signed
+desired revision path as `rollback`. See
+[deploy versions](../../docs/versioning.md) for lifecycle, concurrency
+and current limits.
 
 `vrt logs` is a read-only tail of the host log hub (console.log,
 exceptions, platform codes; secrets are already redacted at ingest).

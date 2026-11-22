@@ -14,6 +14,8 @@ vrt init --root <dir> --cell <id> --tenant <id> [--mode capnp|stub]
          [--facade-dist <dir>] [--workerd <path>] [--ingress-listen <addr>]
 vrt serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
 vrt deploy --root <dir> <worker_dir>
+vrt deploy --preview --root <dir> <worker_dir>
+vrt promote --root <dir> [--worker <name|workerId>] <version_id>
 vrt rollback --root <dir> <worker> <version_id>
 vrt hostnames add --root <dir> <worker> <hostname>
 vrt hostnames rm  --root <dir> <worker> <hostname>
@@ -23,6 +25,7 @@ vrt secret rm  --root <dir> <secret_ref>
 vrt secret ls  --root <dir>
 vrt status  --root <dir>
 vrt versions --root <dir> <worker>
+vrt versions list --root <dir> <worker>
 vrt renew   --root <dir>
 vrt key     --root <dir>                        (print trusted public key)
 vrt health  --root <dir>                        (mgmt /healthz → exit code)
@@ -43,3 +46,6 @@ Two root-level ops are implemented but not in the usage banner:
 vrt metrics       --root <dir>                    (Prometheus text off the mgmt socket)
 vrt queue-metrics --root <dir> (--queue-id <26 chars> | --queue-name <name> [--tenant <id>])
 ```
+
+Version lifecycle details (`deploy --preview`, `promote`, `versions
+list`, and the current MVP limits) are in [deploy versions](versioning.md).

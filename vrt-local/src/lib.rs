@@ -54,6 +54,7 @@ pub use project_cfg::{
 pub use worker_pkg::WorkerToml;
 pub mod serve;
 mod state;
+pub use state::VersionStatus;
 pub mod templates;
 mod wf_scan;
 pub mod worker_pkg;
@@ -199,11 +200,70 @@ pub struct InitReport {
     pub trusted_key: TrustedKey,
 }
 
+/// One version row for `versions list` / `/v1/versions`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionInfo {
+    /// Immutable content id (`vrt_<digest-prefix>`).
+    pub version_id: String,
+    /// `preview`, `active` or `archived`.
+    pub status: state::VersionStatus,
+    /// True exactly when this version is the worker's active pointer.
+    pub active: bool,
+    /// Creation time (unix ms); `0` for records written before the
+    /// versioning MVP.
+    pub created_at_unix_ms: u64,
+    /// Creator when the caller supplied one (standalone: `None`).
+    pub created_by: Option<String>,
+    /// Content-addressed bundle digest (`objects/<digest>`).
+    pub artifact_digest: String,
+    /// Behavior/config hash (`cfg_<digest-prefix>`).
+    pub config_hash: String,
+}
+
+/// Detailed version list for one worker.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerVersions {
+    /// Worker display name.
+    pub worker: String,
+    /// Stable worker id.
+    pub worker_id: String,
+    /// Active version id, if the worker has ever been deployed.
+    pub active_version_id: Option<String>,
+    /// Oldest first, matching stored history order.
+    pub versions: Vec<VersionInfo>,
+}
+
+/// Outcome of promoting one version.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromoteResult {
+    /// Resolved worker display name.
+    pub worker: String,
+    /// Promoted version id.
+    pub version_id: String,
+    /// State revision after the operation (or the already-current
+    /// revision for an idempotent replay).
+    pub revision: u64,
+    /// `false` when the version was already active and the desired
+    /// document was already current.
+    pub changed: bool,
+}
+
 /// Envelope lifetime — the protocol maximum (24 h). `renew` (or any
 /// mutating op) must run before expiry; `vrt serve` (T17) renews on a
 /// timer. Kept in sync with `envelope::MAX_TTL` — a compile-time
 /// assertion lives in the crate tests.
 const ENVELOPE_TTL: chrono::Duration = chrono::Duration::seconds(24 * 3600);
+
+/// Deploy tail behavior: normal deploy moves traffic immediately;
+/// preview only stores the version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeployMode {
+    Activate,
+    Preview,
+}
 
 impl VrtLocal {
     /// Create a fresh standalone root: secure layout, Ed25519 signing
@@ -312,6 +372,27 @@ impl VrtLocal {
         worker_dir: &Path,
         overrides: &worker_pkg::DeployOverrides,
     ) -> Result<DeployResult, LocalError> {
+        self.deploy_with_mode(worker_dir, overrides, DeployMode::Activate)
+    }
+
+    /// Build and store an immutable version WITHOUT moving traffic.
+    /// The returned `versionId` is the id `vrt promote` accepts. The
+    /// state/envelope write still fails closed: no id is returned
+    /// unless the version record was persisted.
+    pub fn deploy_preview(
+        &self,
+        worker_dir: &Path,
+        overrides: &worker_pkg::DeployOverrides,
+    ) -> Result<DeployResult, LocalError> {
+        self.deploy_with_mode(worker_dir, overrides, DeployMode::Preview)
+    }
+
+    fn deploy_with_mode(
+        &self,
+        worker_dir: &Path,
+        overrides: &worker_pkg::DeployOverrides,
+        mode: DeployMode,
+    ) -> Result<DeployResult, LocalError> {
         let _lock = lock::StateLock::acquire(&self.root)?;
         let key = keys::load_signing_key(&self.root)?;
         let st_probe = state::read(&self.root)?;
@@ -349,7 +430,7 @@ impl VrtLocal {
             &|target| st_probe.workers.get(target).map(|w| w.worker_id.clone()),
             Some(&do_ctx),
         )?;
-        self.commit_packaged(pkg, &key)
+        self.commit_packaged(pkg, &key, mode)
     }
 
     /// Deploy a remote-upload body (`vrt deploy --url`): the client
@@ -362,6 +443,27 @@ impl VrtLocal {
         &self,
         upload: &worker_pkg::DeployUpload,
     ) -> Result<DeployResult, LocalError> {
+        let mode = if upload.preview {
+            DeployMode::Preview
+        } else {
+            DeployMode::Activate
+        };
+        self.deploy_upload_with_mode(upload, mode)
+    }
+
+    fn deploy_upload_with_mode(
+        &self,
+        upload: &worker_pkg::DeployUpload,
+        mode: DeployMode,
+    ) -> Result<DeployResult, LocalError> {
+        // Secret values are tenant-level today (there is no versioned
+        // secret store). Applying them on preview would silently change
+        // the version that is currently serving, so preview refuses
+        // them and stays traffic-neutral. The bundle still references
+        // existing secret refs normally.
+        if mode == DeployMode::Preview && !upload.secrets.is_empty() {
+            return Err(LocalError::Worker("previewSecrets"));
+        }
         let _lock = lock::StateLock::acquire(&self.root)?;
         let key = keys::load_signing_key(&self.root)?;
         // Secrets first — same ordering rule as `put_secret`: inputs
@@ -417,7 +519,7 @@ impl VrtLocal {
             &|target| st_probe.workers.get(target).map(|w| w.worker_id.clone()),
             Some(&do_ctx),
         )?;
-        self.commit_packaged(pkg, &key)
+        self.commit_packaged(pkg, &key, mode)
     }
 
     /// The shared deploy tail — state revision, asset materialization,
@@ -428,7 +530,9 @@ impl VrtLocal {
         &self,
         pkg: worker_pkg::PackedWorker,
         key: &snapshot_protocol::SigningKey,
+        mode: DeployMode,
     ) -> Result<DeployResult, LocalError> {
+        let preview = mode == DeployMode::Preview;
         let mut st = state::read(&self.root)?;
         st.revision = st
             .revision
@@ -472,8 +576,9 @@ impl VrtLocal {
         // with no definitions keeps the empty config `assemble`
         // synthesized. Apps are never removed by a deploy that does
         // not name them (the store is tenant-level, like CF's local
-        // flag store: updates land per app).
-        if !pkg.flagship_apps.is_empty() {
+        // flag store: updates land per app). Preview skips this: the
+        // flag store is live tenant state, not version-scoped.
+        if !preview && !pkg.flagship_apps.is_empty() {
             for app in pkg.flagship_apps.iter() {
                 match st.flagship_apps.iter_mut().find(|a| a.app_id == app.app_id) {
                     Some(existing) => *existing = app.clone(),
@@ -482,16 +587,32 @@ impl VrtLocal {
             }
             st.flagship_apps.sort_by(|a, b| a.app_id.cmp(&b.app_id));
         }
-        let (version_id, digest) = st.apply_deploy(&pkg).map_err(LocalError::Worker)?;
+        let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let (version_id, digest) = if preview {
+            st.apply_preview(&pkg, now_unix_ms)
+        } else {
+            st.apply_deploy(&pkg, now_unix_ms)
+        }
+        .map_err(LocalError::Worker)?;
         // F3: NOTHING is persisted before the desired doc validates —
-        // a rejected state must leave every file byte-identical.
+        // a rejected state must leave every file byte-identical. A
+        // preview-only worker is skipped by `to_desired`, so this stays
+        // valid even when the preview never served.
         Self::validate_desired(&st)?;
         // W1-r2/P0-2: prove the post-deploy config actually LOADS in
         // workerd before anything is published — a config that cannot
         // load fails the deploy here (explicit error, old version
         // untouched), instead of taking the whole tenant down at the
-        // next apply. Skips on stub/non-standalone roots.
-        preflight::deploy_preflight(&self.root, &st, Some((&pkg.digest, &pkg.stored_document)))?;
+        // next apply. Skips on stub/non-standalone roots. A preview
+        // does not change the rendered config; promote runs the same
+        // check before it moves the active pointer.
+        if !preview {
+            preflight::deploy_preflight(
+                &self.root,
+                &st,
+                Some((&pkg.digest, &pkg.stored_document)),
+            )?;
+        }
         // 1. artifact(s) first — orphan objects are harmless.
         let object_path = layout::objects_dir(&self.root).join(&pkg.digest);
         vrt_securefs::atomic_write(&object_path, &pkg.stored_document, 0o644)?;
@@ -506,12 +627,15 @@ impl VrtLocal {
         // F4: GC objects no version references (evicted bundles and
         // stale uploads); system modules survive via `system_objects`.
         // Still under the writer lock; a failed delete leaves an
-        // orphan (harmless), never a broken reference.
-        self.gc_objects(&st);
+        // orphan (harmless), never a broken reference. Preview never
+        // evicts versions, so it has nothing to collect.
+        if !preview {
+            self.gc_objects(&st);
+        }
         oplog::append(
             &self.root,
             &oplog::entry(
-                "deploy",
+                if preview { "deploy-preview" } else { "deploy" },
                 serde_json::json!({
                     "worker": pkg.name, "versionId": version_id, "digest": digest,
                     "revision": st.revision,
@@ -554,6 +678,184 @@ impl VrtLocal {
             ),
         )?;
         Ok(st.revision)
+    }
+
+    /// Promote one already-stored version to be the worker's active
+    /// version. This is the same atomic signed-desired pointer switch
+    /// `rollback` uses; vrt-host applies it through the existing
+    /// generation swap path.
+    ///
+    /// Idempotent: promoting the current active version returns the
+    /// current revision without publishing a new revision. If a prior
+    /// promote persisted the state but crashed before the envelope
+    /// write, the replay repairs the envelope instead of reporting a
+    /// false success.
+    pub fn promote(&self, worker: &str, version_id: &str) -> Result<u64, LocalError> {
+        Ok(self
+            .promote_version_with(Some(worker), version_id)?
+            .revision)
+    }
+
+    /// Promote by version id, optionally with the owning worker as a
+    /// hint. Without a hint the id must resolve to exactly one worker
+    /// (version ids are content-derived and may coincide across
+    /// workers that ship identical bundles); an ambiguous id fails
+    /// closed and asks for the worker explicitly.
+    pub fn promote_version(
+        &self,
+        version_id: &str,
+        worker: Option<&str>,
+    ) -> Result<PromoteResult, LocalError> {
+        self.promote_version_with(worker, version_id)
+    }
+
+    fn promote_version_with(
+        &self,
+        worker_hint: Option<&str>,
+        version_id: &str,
+    ) -> Result<PromoteResult, LocalError> {
+        let _lock = lock::StateLock::acquire(&self.root)?;
+        let key = keys::load_signing_key(&self.root)?;
+        let mut st = state::read(&self.root)?;
+        let worker = Self::resolve_version_owner(&st, worker_hint, version_id)?;
+        let version = st
+            .version(&worker, version_id)
+            .ok_or(LocalError::NotFound("version"))?;
+        // A version only exists while its content-addressed bundle is
+        // present. A deleted object (legacy GC or operator action) must
+        // fail promote closed rather than publish a desired document
+        // the host cannot assemble.
+        if !layout::objects_dir(&self.root)
+            .join(&version.artifact_digest)
+            .is_file()
+        {
+            return Err(LocalError::NotFound("artifact"));
+        }
+        let already_active = st
+            .workers
+            .get(&worker)
+            .and_then(|w| w.active_version_id.as_deref())
+            == Some(version_id);
+        if already_active {
+            if desired::read_envelope_revision(&self.root) == Some(st.revision) {
+                return Ok(PromoteResult {
+                    worker,
+                    version_id: version_id.to_string(),
+                    revision: st.revision,
+                    changed: false,
+                });
+            }
+            // Crash-window repair: state is already switched but the
+            // signed envelope is stale. Re-run the same validation as
+            // a normal promote and republish at the current revision.
+            Self::validate_desired(&st)?;
+            preflight::deploy_preflight(&self.root, &st, None)?;
+            self.publish(&st, &key)?;
+            oplog::append(
+                &self.root,
+                &oplog::entry(
+                    "promote-repair",
+                    serde_json::json!({
+                        "worker": worker, "versionId": version_id,
+                        "revision": st.revision,
+                    }),
+                ),
+            )?;
+            return Ok(PromoteResult {
+                worker,
+                version_id: version_id.to_string(),
+                revision: st.revision,
+                changed: false,
+            });
+        }
+        st.revision = st
+            .revision
+            .checked_add(1)
+            .ok_or(LocalError::State("revision"))?;
+        let changed = st.promote(&worker, version_id)?;
+        debug_assert!(changed, "active pointer comparison above");
+        Self::validate_desired(&st)?;
+        // The promoted bundle must load before traffic moves; failure
+        // leaves both state and the old envelope untouched.
+        preflight::deploy_preflight(&self.root, &st, None)?;
+        state::write_vars(&self.root, &st.vars_union())?;
+        state::write(&self.root, &st)?;
+        self.publish(&st, &key)?;
+        oplog::append(
+            &self.root,
+            &oplog::entry(
+                "promote",
+                serde_json::json!({
+                    "worker": worker, "versionId": version_id,
+                    "revision": st.revision,
+                }),
+            ),
+        )?;
+        Ok(PromoteResult {
+            worker,
+            version_id: version_id.to_string(),
+            revision: st.revision,
+            changed: true,
+        })
+    }
+
+    fn resolve_version_owner(
+        st: &state::LocalState,
+        worker_hint: Option<&str>,
+        version_id: &str,
+    ) -> Result<String, LocalError> {
+        if let Some(hint) = worker_hint {
+            let (name, record) = st
+                .workers
+                .iter()
+                .find(|(n, w)| n.as_str() == hint || w.worker_id == hint)
+                .ok_or(LocalError::NotFound("worker"))?;
+            if !record.versions.iter().any(|v| v.version_id == version_id) {
+                return Err(LocalError::NotFound("version"));
+            }
+            return Ok(name.clone());
+        }
+        let owners: Vec<String> = st
+            .workers
+            .iter()
+            .filter(|(_, w)| w.versions.iter().any(|v| v.version_id == version_id))
+            .map(|(n, _)| n.clone())
+            .collect();
+        match owners.as_slice() {
+            [] => Err(LocalError::NotFound("version")),
+            [owner] => Ok(owner.clone()),
+            _ => Err(LocalError::State("ambiguousVersion")),
+        }
+    }
+
+    /// Detailed version list for one worker (`vrt versions list`).
+    pub fn versions(&self, worker: &str) -> Result<WorkerVersions, LocalError> {
+        let st = state::read(&self.root)?;
+        let (name, record) = st
+            .workers
+            .iter()
+            .find(|(n, w)| n.as_str() == worker || w.worker_id == worker)
+            .ok_or(LocalError::NotFound("worker"))?;
+        let active = record.active_version_id.as_deref();
+        let versions = record
+            .versions
+            .iter()
+            .map(|v| VersionInfo {
+                version_id: v.version_id.clone(),
+                status: v.status,
+                active: active == Some(v.version_id.as_str()),
+                created_at_unix_ms: v.created_at_unix_ms,
+                created_by: v.created_by.clone(),
+                artifact_digest: v.artifact_digest.clone(),
+                config_hash: v.config_hash.clone(),
+            })
+            .collect();
+        Ok(WorkerVersions {
+            worker: name.clone(),
+            worker_id: record.worker_id.clone(),
+            active_version_id: record.active_version_id.clone(),
+            versions,
+        })
     }
 
     /// Add a public hostname to a worker (globally unique enforced by
