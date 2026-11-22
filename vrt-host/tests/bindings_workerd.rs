@@ -334,6 +334,16 @@ fn strip_field(text: &str, name: &str) -> String {
         }
         assert!(end > 0, "unbalanced parens after {name}");
         rest = &after[end..];
+        // Removing a field must also remove one separator or the capnp
+        // list gains an empty item: eat the following ',' when there is
+        // a next field; when the removed field was last (next non-ws
+        // closes the parent), eat the preceding ',' instead.
+        let tail = rest.trim_start();
+        if let Some(t) = tail.strip_prefix(',') {
+            rest = t;
+        } else if out.trim_end().ends_with(',') {
+            out.truncate(out.trim_end().len() - 1);
+        }
     }
     out.push_str(rest);
     out

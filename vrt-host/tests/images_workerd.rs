@@ -376,6 +376,18 @@ fn render_and_write(dir: &Path, port: u16) -> PathBuf {
         "expected unix socket addr in render:\n{text}"
     );
     text = text.replace(&unix_addr, &format!("127.0.0.1:{port}"));
+    // The `/cdn-cgi/` loopback socket (`<workerId>-images.sock`) is
+    // rendered as a relative unix addr nothing dials in this test —
+    // retarget every remaining `unix:sock/*` service addr onto
+    // loopback TCP so the pinned binary can bind it.
+    while let Some(pos) = text.find("unix:sock/") {
+        let end = text[pos..]
+            .find('"')
+            .map(|i| pos + i)
+            .expect("unix addr is quoted");
+        let addr = text[pos..end].to_string();
+        text = text.replace(&addr, &format!("127.0.0.1:{}", free_port()));
+    }
     // The fork's `limits` worker field landed after the oldest binary
     // we smoke against — strip it so an unpinned local workerd still
     // exercises the images path (limits are not under test here).
@@ -435,9 +447,15 @@ fn strip_field(text: &str, name: &str) -> String {
         }
         let i = end.unwrap_or_else(|| panic!("unbalanced parens after {needle}"));
         rest = &after[i + 1..];
-        // Swallow the trailing `,` field separator if present.
-        if let Some(r) = rest.strip_prefix(',') {
-            rest = r;
+        // Removing a field must also remove one separator or the capnp
+        // list gains an empty item: eat the following ',' when there is
+        // a next field (whitespace may intervene); when the removed
+        // field was last, eat the preceding ',' instead.
+        let tail = rest.trim_start();
+        if let Some(t) = tail.strip_prefix(',') {
+            rest = t;
+        } else if out.trim_end().ends_with(',') {
+            out.truncate(out.trim_end().len() - 1);
         }
     }
     out.push_str(rest);
