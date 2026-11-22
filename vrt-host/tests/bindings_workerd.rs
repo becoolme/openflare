@@ -1,0 +1,433 @@
+//! Real-workerd wrapped-binding smoke matrix: `vectorize`, `send_email`
+//! and `k2` in one tenant worker.
+//!
+//! What unit tests cannot prove and this does:
+//! - the rendered `wrapped` bindings load under the pinned binary:
+//!   `cloudflare-internal:vectorize-api` (upstream shim, unmodified)
+//!   plus the fork's `cloudflare-internal:send-email` /
+//!   `cloudflare-internal:k2` modules;
+//! - the shims' fetch calls reach facade-vectorize / facade-email /
+//!   facade-k2 through the inner `fetcher` service binding, and each
+//!   facade forwards to `BINDING_BACKEND` under the signed-props
+//!   `bindingId` (`{workerId}~{name}`) at the provider path
+//!   `/internal/bindings/v1/<product>/<bindingId>/<leaf>`;
+//! - the typed envelopes round-trip: vectorize `{code,error}` throws
+//!   `OP_ERROR (code = N)`, send_email `{success,error}` throws an
+//!   Error carrying `.code`, k2 `{success:false,error}` resolves
+//!   without throwing — exactly the upstream-contracted classes.
+//!
+//! The `binding-backend` external is replaced by a stub worker that
+//! speaks the provider envelope; provider internals are covered by the
+//! vrt-provider suite, not this file.
+//!
+//! Gated on `VRT_WORKERD_BIN` — absent → explicit skip with a printed
+//! reason, never silently green:
+//!   VRT_WORKERD_BIN=/path/to/workerd cargo test -p vrt-host \
+//!     --test bindings_workerd -- --include-ignored
+
+mod common;
+
+use std::path::{Path, PathBuf};
+
+use common::hyperdrive::*;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use snapshot_protocol::compute_desired::TenantDesired;
+use vrt_config::{
+    render_tenant_config, DeployManifest, EmbedKind, TenantRenderInput, VersionBundle,
+};
+
+/// Tenant worker exercising all three provider-backed wrapped
+/// bindings. Every route returns JSON the test asserts on; the
+/// vectorize route additionally echoes the provider path the backend
+/// observed (`matches[0].id` smuggles it back through the typed
+/// envelope), proving the facade's `bindingId` routing end to end.
+const USER_MODULE: &str = r#"export default {
+  async fetch(req, env) {
+    const p = new URL(req.url).pathname;
+    try {
+      if (p === "/vectorize") {
+        const ins = await env.VEC.insert([
+          { id: "a", values: [1, 0, 0, 0], metadata: { t: "x" }, namespace: "n1" },
+        ]);
+        const q = await env.VEC.query([1, 0, 0, 0], { topK: 1 });
+        const info = await env.VEC.describe();
+        const got = await env.VEC.getByIds(["a"]);
+        let del = "no-error";
+        try {
+          await env.VEC.deleteByIds(["a"]);
+        } catch (e) {
+          del = "err:" + e.message;
+        }
+        return Response.json({
+          mutationId: ins.mutationId,
+          count: q.count,
+          seen: q.matches[0].id,
+          dims: info.dimensions,
+          vectorCount: info.vectorCount,
+          gotId: got[0].id,
+          del,
+        });
+      }
+      if (p === "/email") {
+        const ok = await env.EMAIL.send({
+          from: "hello@example.com", to: "user@example.com",
+          subject: "hi", text: "hello",
+        });
+        let denied = "no-error";
+        try {
+          await env.EMAIL.send({
+            from: "hello@example.com", to: "user@example.com",
+            subject: "hi", text: "hello",
+            headers: { "x-mock": "denied" },
+          });
+        } catch (e) {
+          denied = "err:" + e.code + ":" + String(e.message).slice(0, 40);
+        }
+        return Response.json({ messageId: ok.messageId, denied });
+      }
+      if (p === "/k2") {
+        const ok = await env.K2.send([{ content: "hello" }]);
+        const fail = await env.K2.send([
+          { content: "x", headers: { "x-mock": "fail" } },
+        ]);
+        return Response.json({
+          ok: ok.success,
+          failCode: fail.error && fail.error.code,
+          retryable: fail.error && fail.error.retryable,
+        });
+      }
+      return new Response("ok");
+    } catch (e) {
+      return new Response("unexpected:" + String((e && e.stack) || e), { status: 500 });
+    }
+  },
+};
+"#;
+
+/// Stub `binding-backend` worker speaking the provider envelope for
+/// the three products. The vectorize `query`/`insert` replies smuggle
+/// the observed path back so the test can assert the facade's
+/// `{bindingId}` routing — `matches[0].id` is provider data the shim
+/// passes through untouched.
+const BACKEND_STUB: &str = r#"export default {
+  async fetch(request) {
+    const url = new URL(request.url);
+    const p = url.pathname;
+    const leaf = p.split("/").filter(Boolean).pop() ?? "";
+    if (p.startsWith("/internal/bindings/v1/vectorize/")) {
+      if (leaf === "info") {
+        return Response.json({
+          vectorCount: 1, dimensions: 4,
+          processedUpToDatetime: 1700000000000,
+          processedUpToMutation: "m-1",
+        });
+      }
+      if (leaf === "query") {
+        return Response.json({ count: 1, matches: [
+          { id: "seen:" + p, score: 0.99, namespace: "n1" }] });
+      }
+      if (leaf === "insert" || leaf === "upsert") {
+        return Response.json({ mutationId: "m-1" });
+      }
+      if (leaf === "getByIds") {
+        return Response.json([{ id: "a", values: [1, 0, 0, 0], metadata: { t: "x" } }]);
+      }
+      if (leaf === "deleteByIds") {
+        return Response.json({ code: 3101, error: "denied" }, { status: 403 });
+      }
+      return Response.json({ code: 3000, error: "bad leaf" }, { status: 404 });
+    }
+    if (p.startsWith("/internal/bindings/v1/email/")) {
+      const body = await request.json().catch(() => null);
+      const marker = body && body.headers && body.headers["x-mock"];
+      if (marker === "denied") {
+        return Response.json(
+          { success: false, error: { code: "E_SENDER_NOT_VERIFIED",
+              message: "sender not allowed", retryable: false } },
+          { status: 403 });
+      }
+      return Response.json({ success: true, messageId: "msg-smoke-1" });
+    }
+    if (p.startsWith("/internal/bindings/v1/k2/")) {
+      const body = await request.json().catch(() => null);
+      const marker = body && body.records && body.records[0]
+        && body.records[0].headers && body.records[0].headers["x-mock"];
+      if (marker === "fail") {
+        return Response.json(
+          { success: false, error: { code: "SLOTS_FULL",
+              message: "no lease", retryable: true } });
+      }
+      return Response.json({ success: true });
+    }
+    return Response.json({ error: "bad route" }, { status: 404 });
+  }
+}
+"#;
+
+/// Render the tenant capnp into `dir`, materialize every embed, retarget
+/// the worker socket onto `port` and replace the `binding-backend`
+/// external with the provider-protocol stub worker.
+fn render_and_write(dir: &Path, port: u16) -> PathBuf {
+    let worker_id = "wsmoke";
+    let bundle = VersionBundle::build(
+        DeployManifest::from_pack(&json!({
+            "mainModule": "index.js",
+            "modules": { "index.js": USER_MODULE },
+            "compatibilityDate": "2026-09-08",
+            "compatibilityFlags": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let tenant: TenantDesired = serde_json::from_value(json!({
+        "tenantId": "team-smoke",
+        "workers": [{
+            "workerId": worker_id,
+            "name": "smoke",
+            "activeVersion": {
+                "versionId": "v-smoke-1",
+                "artifactDigest": bundle.digest(),
+                "compatibilityDate": "2026-09-08",
+                "compatibilityFlags": []
+            },
+            "bindings": [
+                {"type": "vectorize", "name": "VEC",
+                 "indexId": "abcdefghijklmnopqrstuvwxyz",
+                 "indexName": "smoke-index", "dimensions": 4,
+                 "metric": "cosine",
+                 "permissions": {"read": true, "write": true}},
+                {"type": "sendEmail", "name": "EMAIL",
+                 "permissions": {"read": false, "write": true}},
+                {"type": "k2", "name": "K2",
+                 "streamId": "0123456789abcdef0123456789abcdef",
+                 "permissions": {"read": false, "write": true}}
+            ],
+            "routes": [{"hostname": "smoke--team-smoke.vibeploy.app"}],
+            "crons": [],
+            "quotas": {"cpuMs": 50, "memoryMb": 128,
+                       "subrequests": 100, "outboundConnections": 16}
+        }]
+    }))
+    .unwrap();
+    let params = smoke_params();
+    let input = TenantRenderInput {
+        tenant: &tenant,
+        revision: 1,
+        bundles: &[bundle],
+        params: &params,
+    };
+    let out = render_tenant_config(&input).unwrap();
+
+    // Structural assertions on the REAL emitted text — every wrapped
+    // shim module name and the vectorize v2 inner bindings.
+    for needle in [
+        "moduleName = \"cloudflare-internal:vectorize-api\"",
+        "moduleName = \"cloudflare-internal:send-email\"",
+        "moduleName = \"cloudflare-internal:k2\"",
+        "(name = \"indexId\", text = \"abcdefghijklmnopqrstuvwxyz\")",
+        "(name = \"indexVersion\", text = \"v2\")",
+    ] {
+        assert!(out.text.contains(needle), "render must contain {needle}:\n{}", out.text);
+    }
+
+    let manifest_raw = std::fs::read_to_string(facade_root().join("manifest.json")).unwrap();
+    let manifest_doc: serde_json::Value = serde_json::from_str(&manifest_raw).unwrap();
+    for embed in &out.embeds {
+        let dst = dir.join(&embed.path);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        match &embed.kind {
+            EmbedKind::SystemModule {
+                service_name,
+                module_name,
+            } => {
+                let modules = manifest_doc["workers"][service_name]["modules"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{service_name} missing from manifest"));
+                let m = modules
+                    .iter()
+                    .find(|m| m["name"].as_str().unwrap() == module_name)
+                    .unwrap_or_else(|| panic!("{service_name}/{module_name} not in manifest"));
+                let src = facade_root()
+                    .join("..")
+                    .join(m["dist"].as_str().unwrap());
+                let bytes =
+                    std::fs::read(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+                let got = format!("{:x}", Sha256::digest(&bytes));
+                assert_eq!(
+                    got, embed.digest,
+                    "embed {service_name}/{module_name} digest drift — \
+                     regenerate facade/dist"
+                );
+                std::fs::write(&dst, bytes).unwrap();
+            }
+            EmbedKind::BundleModule {
+                worker_id: w,
+                module_name,
+            } => {
+                assert_eq!(w, worker_id);
+                assert_eq!(module_name, "index.js");
+                std::fs::write(&dst, USER_MODULE).unwrap();
+            }
+            EmbedKind::VendoredModule { name } => {
+                let bytes = vrt_config::workflows::vendored_bytes(name)
+                    .unwrap_or_else(|| panic!("vendored module {name}"));
+                std::fs::write(&dst, bytes).unwrap();
+            }
+        }
+    }
+
+    let mut text = out.text.clone();
+    let unix_addr = format!("unix:sock/{worker_id}.sock");
+    assert!(
+        text.contains(&unix_addr),
+        "expected unix socket addr in render:\n{text}"
+    );
+    text = text.replace(&unix_addr, &format!("127.0.0.1:{port}"));
+    // `limits` is not under test; strip so an unpinned local workerd
+    // still exercises the binding paths (CI's pinned binary parses it).
+    text = strip_field(&text, "limits");
+    let external = "(name = \"binding-backend\", external = (http = ()))";
+    assert!(
+        text.contains(external),
+        "expected binding-backend external in render:\n{text}"
+    );
+    text = text.replace(
+        external,
+        "(name = \"binding-backend\", worker = (\n            \
+           modules = [(name = \"backend.js\", \
+           esModule = embed \"backend-stub.js\")],\n            \
+           compatibilityDate = \"2026-09-08\",\n            \
+           globalOutbound = (name = \"vrt-no-network\", \
+           entrypoint = \"DenyAll\"),\n        ))",
+    );
+    std::fs::write(dir.join("backend-stub.js"), BACKEND_STUB).unwrap();
+
+    let path = dir.join("cfg.capnp");
+    std::fs::write(&path, text).unwrap();
+    path
+}
+
+/// Remove `name = (…)` capnp field spans (balanced parens) from the
+/// rendered text — drops fields an unpinned local binary cannot parse.
+fn strip_field(text: &str, name: &str) -> String {
+    let needle = format!("{name} = (");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find(&needle) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + needle.len()..];
+        let mut depth = 1usize;
+        let mut end = 0usize;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(end > 0, "unbalanced parens after {name}");
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `env.VEC` round-trips through the upstream vectorize-api shim:
+/// insert/describe/getByIds return typed envelopes and `deleteByIds`
+/// throws `VECTOR_DELETE_ERROR (code = 3101)` — the shim's contracted
+/// non-200 `{code,error}` surface. `seen` echoes the provider path the
+/// facade computed, proving `bindingId` routing end to end.
+#[test]
+#[ignore = "needs VRT_WORKERD_BIN"]
+fn vectorize_binding_traverses_shim_end_to_end() {
+    let Some(bin) = workerd_bin() else {
+        eprintln!("SKIP: VRT_WORKERD_BIN unset — real workerd required");
+        return;
+    };
+    let Some(dir) = smoke_root("vrt-bindings-smoke") else {
+        return;
+    };
+    let port = free_port();
+    let cfg = render_and_write(&dir, port);
+    let proc = spawn(&bin, &cfg, &dir);
+    assert!(wait_ready(port), "workerd did not start:\n{}", log_text(&proc));
+
+    let v = http_json(port, "/vectorize");
+    assert_eq!(v["mutationId"], "m-1", "insert: {v}");
+    assert_eq!(v["count"], 1, "query count: {v}");
+    assert_eq!(
+        v["seen"],
+        "seen:/internal/bindings/v1/vectorize/wsmoke~VEC/query",
+        "facade must route under the signed bindingId: {v}"
+    );
+    assert_eq!(v["dims"], 4, "describe dimensions: {v}");
+    assert_eq!(v["vectorCount"], 1, "describe vectorCount: {v}");
+    assert_eq!(v["gotId"], "a", "getByIds: {v}");
+    assert!(
+        v["del"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("VECTOR_DELETE_ERROR (code = 3101)"),
+        "deleteByIds must surface the typed code: {v}"
+    );
+}
+
+/// `env.EMAIL` resolves `{messageId}` on success and throws an Error
+/// carrying `.code` (never a TypeError) on the typed failure envelope —
+/// the send-email shim's contracted surface.
+#[test]
+#[ignore = "needs VRT_WORKERD_BIN"]
+fn send_email_binding_traverses_shim_end_to_end() {
+    let Some(bin) = workerd_bin() else {
+        eprintln!("SKIP: VRT_WORKERD_BIN unset — real workerd required");
+        return;
+    };
+    let Some(dir) = smoke_root("vrt-bindings-smoke") else {
+        return;
+    };
+    let port = free_port();
+    let cfg = render_and_write(&dir, port);
+    let proc = spawn(&bin, &cfg, &dir);
+    assert!(wait_ready(port), "workerd did not start:\n{}", log_text(&proc));
+
+    let v = http_json(port, "/email");
+    assert_eq!(v["messageId"], "msg-smoke-1", "send: {v}");
+    assert!(
+        v["denied"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("err:E_SENDER_NOT_VERIFIED"),
+        "denied send must surface the typed code: {v}"
+    );
+}
+
+/// `env.K2.send` resolves `{success:true}` on commit and the
+/// non-throwing `{success:false,error:{code,retryable}}` on the typed
+/// failure envelope — the k2 shim's contracted surface.
+#[test]
+#[ignore = "needs VRT_WORKERD_BIN"]
+fn k2_binding_traverses_shim_end_to_end() {
+    let Some(bin) = workerd_bin() else {
+        eprintln!("SKIP: VRT_WORKERD_BIN unset — real workerd required");
+        return;
+    };
+    let Some(dir) = smoke_root("vrt-bindings-smoke") else {
+        return;
+    };
+    let port = free_port();
+    let cfg = render_and_write(&dir, port);
+    let proc = spawn(&bin, &cfg, &dir);
+    assert!(wait_ready(port), "workerd did not start:\n{}", log_text(&proc));
+
+    let v = http_json(port, "/k2");
+    assert_eq!(v["ok"], true, "send commit: {v}");
+    assert_eq!(v["failCode"], "SLOTS_FULL", "typed failure code: {v}");
+    assert_eq!(v["retryable"], true, "typed failure retryable: {v}");
+}
