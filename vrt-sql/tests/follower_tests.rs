@@ -63,7 +63,14 @@ fn writer(
         queue_root_for(&root),
         vrt_sql::paths::ResourceKind::Queue,
     ));
-    EngineRegistry::new(root).with_persisters(PersisterPair { d1, queue })
+    let k2 = Arc::new(Persister::new(
+        d1.store().clone(),
+        d1.config().clone(),
+        d1.clock().clone(),
+        vrt_sql::paths::k2_root_for(&root),
+        vrt_sql::paths::ResourceKind::K2,
+    ));
+    EngineRegistry::new(root).with_persisters(PersisterPair { d1, queue, k2 })
 }
 
 fn follower(store: Arc<dyn ObjectStore>, clock: Arc<TestClock>, root: PathBuf) -> Follower {
