@@ -233,6 +233,7 @@ async fn rig_with_opts(
         queue_dispatch: None,
         storage_purge: None,
         quotas: true,
+        report: None,
     };
     let channel: Arc<dyn PodChannel> = cell_controller::prod::pod_channel(&config).unwrap();
     let snap = publish("cell-1", 1, workers);
@@ -500,6 +501,7 @@ async fn probe_failure_never_acks_applied() {
         queue_dispatch: None,
         storage_purge: None,
         quotas: true,
+        report: None,
     };
     let channel = cell_controller::prod::pod_channel(&config).unwrap();
     let snap = publish("cell-1", 1, &[worker("w1")]);
