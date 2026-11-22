@@ -47,13 +47,16 @@ pub mod logtail;
 pub mod mgmt;
 mod oplog;
 mod preflight;
+pub mod preview;
 mod project_cfg;
 pub use project_cfg::{
-    load_worker_meta, load_worker_meta_for_env, MetaSource, WRANGLER_CANDIDATES,
+    load_worker_meta, load_worker_meta_for_env, load_worker_meta_for_env_preview, MetaSource,
+    WRANGLER_CANDIDATES,
 };
 pub use worker_pkg::WorkerToml;
 pub mod serve;
 mod state;
+pub use state::preview_instance_id;
 pub use state::VersionStatus;
 pub mod templates;
 mod wf_scan;
@@ -136,6 +139,12 @@ pub enum LocalError {
     /// Operation targets a tenant other than the local one.
     #[error("wrong tenant")]
     WrongTenant,
+    /// PREVIEW: this version cannot be served as a preview (e.g. it
+    /// declares durable-object classes or workflows, which are not
+    /// version-isolated yet). Fail closed instead of publishing a
+    /// preview that would silently behave like production.
+    #[error("preview: {0}")]
+    Preview(&'static str),
 }
 
 /// Outcome of `deploy`.
@@ -148,6 +157,11 @@ pub struct DeployResult {
     pub artifact_digest: String,
     /// Published envelope revision.
     pub revision: u64,
+    /// PREVIEW: URL serving this version while it is a preview (or the
+    /// active version). `None` for a normal deploy — and for a preview
+    /// when the host has no `[preview] domain` configured (nothing can
+    /// route it yet). Display-only; the host derives routing itself.
+    pub preview_url: Option<String>,
 }
 
 /// Read-only status view (`vrt status` backing call).
@@ -219,6 +233,10 @@ pub struct VersionInfo {
     pub artifact_digest: String,
     /// Behavior/config hash (`cfg_<digest-prefix>`).
     pub config_hash: String,
+    /// PREVIEW: URL this version is reachable at while it is a preview
+    /// or the active version. `None` for archived versions and for any
+    /// version when no preview domain is configured.
+    pub preview_url: Option<String>,
 }
 
 /// Detailed version list for one worker.
@@ -396,6 +414,14 @@ impl VrtLocal {
         let _lock = lock::StateLock::acquire(&self.root)?;
         let key = keys::load_signing_key(&self.root)?;
         let st_probe = state::read(&self.root)?;
+        // `isPreview` is derived from the deploy MODE, never trusted from
+        // the caller: a production deploy can only ever evaluate a
+        // `cloudflare.config.*` with `isPreview = false`, and a preview
+        // deploy always evaluates with `true`.
+        let overrides = &worker_pkg::DeployOverrides {
+            is_preview: mode == DeployMode::Preview,
+            ..overrides.clone()
+        };
         // P3c-1: the HMAC pepper for DO uniqueKey = signing seed (deploy
         // key); the rename lineage source = the class set of the worker's currently
         // active version (empty on first deploy -- `renamed_classes`/`deleted_
@@ -403,9 +429,12 @@ impl VrtLocal {
         // is first resolved through the same meta load path (consistent with the decision inside pack).
         let do_ctx = {
             let pepper = keys::load_signing_seed(&self.root)?;
-            let (meta, _src) = crate::project_cfg::load_worker_meta_for_env(
+            // Same preview branch as the pack below — a name that only
+            // exists in the preview branch must resolve consistently.
+            let (meta, _src) = crate::project_cfg::load_worker_meta_for_env_preview(
                 worker_dir,
                 overrides.env_name.as_deref(),
+                overrides.is_preview,
             )?;
             let name = overrides.name.clone().unwrap_or(meta.name);
             let prior = st_probe
@@ -534,6 +563,17 @@ impl VrtLocal {
         mode: DeployMode,
     ) -> Result<DeployResult, LocalError> {
         let preview = mode == DeployMode::Preview;
+        // PREVIEW: durable-object classes and workflows are NOT
+        // version-isolated yet — a preview instance declaring them would
+        // either share production DO storage or trigger the serialized
+        // DO switch pipeline for production traffic. Refuse the preview
+        // instead of publishing one that silently behaves like prod.
+        if preview && !pkg.durable_object_classes.is_empty() {
+            return Err(LocalError::Preview("durableObjects"));
+        }
+        if preview && !pkg.workflows.is_empty() {
+            return Err(LocalError::Preview("workflows"));
+        }
         let mut st = state::read(&self.root)?;
         st.revision = st
             .revision
@@ -604,16 +644,19 @@ impl VrtLocal {
         // workerd before anything is published — a config that cannot
         // load fails the deploy here (explicit error, old version
         // untouched), instead of taking the whole tenant down at the
-        // next apply. Skips on stub/non-standalone roots. A preview
-        // does not change the rendered config; promote runs the same
-        // check before it moves the active pointer.
-        if !preview {
-            preflight::deploy_preflight(
-                &self.root,
-                &st,
-                Some((&pkg.digest, &pkg.stored_document)),
-            )?;
-        }
+        // next apply. Skips on stub/non-standalone roots.
+        //
+        // PREVIEW: the preview instance IS part of the rendered tenant
+        // config, so this check runs for a preview too — a broken
+        // preview bundle is rejected at deploy time instead of being
+        // published as a desired document the host cannot load (which
+        // would latch the tenant's switch as failed and block the next
+        // production deploy).
+        preflight::deploy_preflight(
+            &self.root,
+            &st,
+            Some((&pkg.digest, &pkg.stored_document)),
+        )?;
         // 1. artifact(s) first — orphan objects are harmless.
         let object_path = layout::objects_dir(&self.root).join(&pkg.digest);
         vrt_securefs::atomic_write(&object_path, &pkg.stored_document, 0o644)?;
@@ -633,6 +676,13 @@ impl VrtLocal {
         if !preview {
             self.gc_objects(&st);
         }
+        // PREVIEW URL (display): resolved from the host config while the
+        // name is still owned here — the oplog entry below consumes it.
+        let preview_url = if preview {
+            preview::url_for(&self.root, &version_id, &pkg.name)
+        } else {
+            None
+        };
         oplog::append(
             &self.root,
             &oplog::entry(
@@ -644,6 +694,7 @@ impl VrtLocal {
             ),
         )?;
         Ok(DeployResult {
+            preview_url,
             version_id,
             artifact_digest: digest,
             revision: st.revision,
@@ -838,6 +889,7 @@ impl VrtLocal {
             .find(|(n, w)| n.as_str() == worker || w.worker_id == worker)
             .ok_or(LocalError::NotFound("worker"))?;
         let active = record.active_version_id.as_deref();
+        let domain = preview::preview_domain(&self.root);
         let versions = record
             .versions
             .iter()
@@ -849,6 +901,16 @@ impl VrtLocal {
                 created_by: v.created_by.clone(),
                 artifact_digest: v.artifact_digest.clone(),
                 config_hash: v.config_hash.clone(),
+                // Same rule as routing: a version is reachable over a
+                // preview URL while it is a preview or the active version.
+                // Archived versions (and every version when no domain is
+                // configured) report null rather than a URL that 404s.
+                preview_url: match (&domain, v.status) {
+                    (Some(d), VersionStatus::Preview | VersionStatus::Active) => {
+                        preview::preview_url(d, &v.version_id, name)
+                    }
+                    _ => None,
+                },
             })
             .collect();
         Ok(WorkerVersions {

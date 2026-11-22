@@ -139,6 +139,7 @@ mod tests {
             tail_consumers: Vec::new(),
             observability: None,
             streaming_tail_consumers: Vec::new(),
+            preview: None,
             quotas: WorkerQuotas::platform_default(),
         }
     }

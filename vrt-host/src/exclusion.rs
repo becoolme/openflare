@@ -258,6 +258,7 @@ mod tests {
             workflows: Vec::new(),
             tail_consumers: Vec::new(),
             streaming_tail_consumers: Vec::new(),
+            preview: None,
             quotas: WorkerQuotas {
                 cpu_ms: 10,
                 memory_mb: 32,

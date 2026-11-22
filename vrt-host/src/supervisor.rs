@@ -12430,6 +12430,7 @@ sleep 10
             workflows: vec![],
             tail_consumers: vec![],
             streaming_tail_consumers: vec![],
+            preview: None,
             quotas: WorkerQuotas {
                 cpu_ms: 50,
                 memory_mb: 128,

@@ -129,6 +129,13 @@ pub fn adopt(
 /// Narrow the verified snapshot to this pod's assignment — every
 /// tenant keeps only its assigned workers; unassigned tenants drop
 /// out entirely (they drain via the normal remove path).
+///
+/// PREVIEW: a preview instance follows the assignment of the
+/// production worker it previews — the controller assigns the
+/// production worker, and the preview must not require a second
+/// assignment entry (its instance id is derived and may change with
+/// every preview). An unassigned production worker still keeps its
+/// preview out, and previews never pull in a tenant on their own.
 pub fn filter_to_assignment(desired: &ComputeDesired, a: &PodAssignment) -> ComputeDesired {
     let wanted: BTreeSet<(&str, &str)> = a
         .workers
@@ -142,7 +149,12 @@ pub fn filter_to_assignment(desired: &ComputeDesired, a: &PodAssignment) -> Comp
             let workers: Vec<_> = t
                 .workers
                 .iter()
-                .filter(|w| wanted.contains(&(t.tenant_id.as_str(), w.worker_id.as_str())))
+                .filter(|w| {
+                    wanted.contains(&(t.tenant_id.as_str(), w.worker_id.as_str()))
+                        || w.preview.as_ref().is_some_and(|p| {
+                            wanted.contains(&(t.tenant_id.as_str(), p.worker_id.as_str()))
+                        })
+                })
                 .cloned()
                 .collect();
             (!workers.is_empty()).then(|| TenantDesired {
@@ -155,4 +167,116 @@ pub fn filter_to_assignment(desired: &ComputeDesired, a: &PodAssignment) -> Comp
     let mut filtered = desired.clone();
     filtered.tenants = tenants;
     filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use snapshot_protocol::compute_desired::{
+        PreviewDesired, TenantDesired, VersionDesired, WorkerDesired, WorkerQuotas,
+    };
+
+    fn worker(id: &str, preview: Option<PreviewDesired>) -> WorkerDesired {
+        WorkerDesired {
+            worker_id: id.into(),
+            name: id.replace('.', "-"),
+            active_version: VersionDesired {
+                version_id: format!("v-{id}"),
+                artifact_digest: "a".repeat(64),
+                compatibility_date: "2024-01-01".into(),
+                compatibility_flags: vec![],
+                tag: String::new(),
+                created_at: String::new(),
+            },
+            bindings: vec![],
+            routes: vec![],
+            crons: vec![],
+            queue_consumers: vec![],
+            durable_object_classes: vec![],
+            workflows: vec![],
+            tail_consumers: vec![],
+            streaming_tail_consumers: vec![],
+            observability: None,
+            quotas: WorkerQuotas::platform_default(),
+            preview,
+        }
+    }
+
+    fn desired() -> ComputeDesired {
+        ComputeDesired {
+            schema_version: 1,
+            cell_id: "cell".into(),
+            revision: 2,
+            tenants: vec![
+                TenantDesired {
+                    tenant_id: "t1".into(),
+                    workers: vec![
+                        worker("w1", None),
+                        worker(
+                            "w1.pv00000000",
+                            Some(PreviewDesired {
+                                worker_id: "w1".into(),
+                                version_id: "v-w1.pv00000000".into(),
+                            }),
+                        ),
+                    ],
+                    flagship_apps: vec![],
+                },
+                TenantDesired {
+                    tenant_id: "t2".into(),
+                    workers: vec![worker("w2", None)],
+                    flagship_apps: vec![],
+                },
+            ],
+            deletions: vec![],
+        }
+    }
+
+    fn assignment(pairs: &[(&str, &str)]) -> PodAssignment {
+        PodAssignment {
+            pod_id: "pod-0".into(),
+            revision: 2,
+            payload_digest: "d".into(),
+            envelope_digest: String::new(),
+            generated_at: String::new(),
+            workers: pairs
+                .iter()
+                .map(|(t, w)| AssignedWorker {
+                    tenant_id: (*t).into(),
+                    worker_id: (*w).into(),
+                })
+                .collect(),
+        }
+    }
+
+    /// PREVIEW: a preview instance follows its producer's assignment and
+    /// never pulls a tenant into a pod on its own.
+    #[test]
+    fn preview_instances_inherit_the_producer_assignment() {
+        let filtered = filter_to_assignment(&desired(), &assignment(&[("t1", "w1")]));
+        assert_eq!(filtered.tenants.len(), 1, "t2 is not assigned");
+        let ids: Vec<&str> = filtered.tenants[0]
+            .workers
+            .iter()
+            .map(|w| w.worker_id.as_str())
+            .collect();
+        assert_eq!(ids, ["w1", "w1.pv00000000"]);
+
+        // Assigning ONLY the preview id does not admit the producer (and
+        // the preview cannot drag an unassigned tenant into the pod).
+        let only_preview =
+            filter_to_assignment(&desired(), &assignment(&[("t1", "w1.pv00000000")]));
+        let ids: Vec<&str> = only_preview.tenants[0]
+            .workers
+            .iter()
+            .map(|w| w.worker_id.as_str())
+            .collect();
+        assert_eq!(ids, ["w1.pv00000000"]);
+        assert!(
+            filter_to_assignment(&desired(), &assignment(&[("t2", "w2.pv99999999")]))
+                .tenants
+                .is_empty(),
+            "a dangling preview id assigns nothing"
+        );
+    }
 }

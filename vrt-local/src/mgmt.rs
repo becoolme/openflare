@@ -209,6 +209,7 @@ fn fail(err: LocalError) -> Response {
         LocalError::NotFound(f) => (StatusCode::NOT_FOUND, "notFound", Some(*f)),
         LocalError::WrongTenant => (StatusCode::FORBIDDEN, "wrongTenant", None),
         LocalError::Worker(f) => (StatusCode::BAD_REQUEST, "worker", Some(*f)),
+        LocalError::Preview(f) => (StatusCode::BAD_REQUEST, "preview", Some(*f)),
         LocalError::WorkerOwned(f) => {
             return err_body(StatusCode::BAD_REQUEST, "worker", Some(f.clone()))
         }

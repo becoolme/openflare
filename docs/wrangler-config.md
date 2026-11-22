@@ -82,10 +82,36 @@ closed with the "programmatic config file" message.
 This format has no `[env.*]` blocks; the environment selector is the
 `mode` the config factory receives. `--env staging` is passed to the
 loader as `--mode staging`, so `defineConfig(({ mode }) => …)` can branch
-per environment, and env resolution runs in pass-through mode. `--preview`
-is understood by the helper (`isPreview`) but `vrt` does not pass it yet.
-`[dev]` settings do not exist in this format; `vrt dev` simply has no
+per environment, and env resolution runs in pass-through mode. `[dev]`
+settings do not exist in this format; `vrt dev` simply has no
 dev-table overrides for it.
+
+### `isPreview`
+
+`defineConfig(({ isPreview }) => …)` is supported. `vrt` passes the
+loader's `--preview` flag **only** for `vrt deploy --preview`:
+
+| command | `isPreview` |
+| --- | --- |
+| `vrt deploy <dir>` | `false` |
+| `vrt deploy --dry-run <dir>` | `false` |
+| `vrt deploy --url … <dir>` | `false` |
+| `vrt deploy --preview <dir>` | `true` |
+| `vrt deploy --url … --preview <dir>` | `true` (evaluated client-side) |
+| `vrt dev` / `vrt doctor` | `false` |
+
+The flag is derived from the deploy **mode**, never from a caller
+override, so a production deploy can only ever evaluate the production
+branch. The branch is baked into the stored version at pack time:
+`promote` later serves exactly what the preview stored, and a preview
+can never write the active pointer. `vrt.toml` and the wrangler family
+have no preview branch, so they ignore the flag.
+
+The helper maps `--preview` onto Cloudflare's own
+`loadAndParseConfig(path, { isPreview })`; `vrt` never evaluates the
+config itself. See [versioning.md](./versioning.md) for preview URLs,
+the `previewUrl` field and the security boundary (a preview never
+receives tenant secrets).
 
 ### Entrypoints
 

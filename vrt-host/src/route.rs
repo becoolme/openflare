@@ -23,6 +23,12 @@ pub struct RouteTarget {
     /// per-worker `facade-images` socket). Without the binding the path
     /// falls through to tenant code untouched.
     pub images: bool,
+    /// PREVIEW: version id this route serves AS A PREVIEW (either a
+    /// preview instance or the active version reached through a preview
+    /// hostname). `None` for production hostnames. The ingress stamps
+    /// `x-vrt-preview-version` on every such response so a preview can
+    /// never be mistaken for production traffic.
+    pub preview: Option<String>,
 }
 
 /// Immutable host→target map. Swapped atomically (`ArcSwap`) on each
@@ -42,9 +48,16 @@ pub const MAX_HOST_LEN: usize = 253;
 
 /// Normalize a `Host` header value into a lookup key:
 /// lowercase, strip any port suffix or IPv6 brackets, reject empty,
-/// over-length, or non-DNS characters (`[a-z0-9.-]`; underscores, spaces,
-/// `@`, `/` … are not hostnames). Returns `None` on any malformed input —
+/// over-length, or non-DNS characters (`[a-z0-9.-]`; spaces, `@`, `/` …
+/// are not hostnames). Returns `None` on any malformed input —
 /// fail closed.
+///
+/// `_` is accepted here for exactly one reason: preview hostnames are
+/// `<versionId>--<worker>.<previewDomain>` and version ids carry a
+/// `vrt_` prefix. Production hostnames are validated by
+/// `compute_desired::valid_hostname` (which never allows `_`), so
+/// accepting `_` can only ever match a preview route — it cannot widen
+/// or shadow production routing.
 pub fn normalize_host(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw.len() > MAX_HOST_LEN + 64 {
@@ -62,16 +75,12 @@ pub fn normalize_host(raw: &str) -> Option<String> {
     if host.is_empty() || host.len() > MAX_HOST_LEN {
         return None;
     }
-    if !host
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
-    {
+    let allowed =
+        |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'_';
+    if !host.bytes().all(allowed) {
         // Lowercase first, then re-check.
         let lower = host.to_ascii_lowercase();
-        if !lower
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
-        {
+        if !lower.bytes().all(allowed) {
             return None;
         }
         return finish_host(lower);
@@ -88,8 +97,33 @@ fn finish_host(host: String) -> Option<String> {
 }
 
 impl RouteTable {
-    /// Build from a verified snapshot.
+    /// Build from a verified snapshot, production hostnames only.
+    ///
+    /// Preview hostnames stay unroutable here: the preview domain is host
+    /// configuration, so a caller that does not know it must not invent
+    /// one. `vrt-host` uses [`Self::from_desired_with_preview_domain`].
     pub fn from_desired(desired: &ComputeDesired) -> Self {
+        Self::from_desired_with_preview_domain(desired, None)
+    }
+
+    /// Build from a verified snapshot plus the host's `[preview] domain`.
+    ///
+    /// Production routing is byte-identical whether or not a preview
+    /// domain is configured; with `preview_domain = None` no preview
+    /// hostname resolves at all (every `<…>.preview` request is a 404 —
+    /// the feature is off by default).
+    ///
+    /// When configured, each preview instance and each worker's ACTIVE
+    /// version earns one derived hostname:
+    /// `<versionId>--<productionWorkerName>.<previewDomain>`. The host is
+    /// never taken from the snapshot, so a signed snapshot can neither
+    /// invent a preview domain nor shadow a production hostname: derived
+    /// entries never overwrite an existing route, and production
+    /// hostnames cannot contain the `_` that every version id carries.
+    pub fn from_desired_with_preview_domain(
+        desired: &ComputeDesired,
+        preview_domain: Option<&str>,
+    ) -> Self {
         let mut map = HashMap::new();
         // Single-worker desired docs get a catch-all candidate; the
         // ingress decides (via devCatchAll) whether to honor it.
@@ -98,41 +132,77 @@ impl RouteTable {
         for tenant in &desired.tenants {
             for worker in &tenant.workers {
                 worker_count += 1;
-                let assets_first = worker.bindings.iter().any(|b| match b {
-                    snapshot_protocol::compute_desired::BindingDesired::Assets(a) => {
-                        a.assets_first_enabled()
-                    }
-                    _ => false,
-                });
-                let images = worker.bindings.iter().any(|b| {
-                    matches!(
-                        b,
-                        snapshot_protocol::compute_desired::BindingDesired::Images(_)
-                    )
-                });
-                only_target = Some(RouteTarget {
-                    tenant_id: tenant.tenant_id.clone(),
-                    worker_id: worker.worker_id.clone(),
-                    assets_first,
-                    images,
-                });
+                let target = Self::target_for(tenant, worker);
+                only_target = Some(target.clone());
                 for route in &worker.routes {
                     // Snapshot validation guarantees global uniqueness;
                     // a duplicate still fails closed (first wins, never
                     // overwrites — the snapshot itself is trusted).
                     map.entry(route.hostname.to_ascii_lowercase())
-                        .or_insert(RouteTarget {
-                            tenant_id: tenant.tenant_id.clone(),
-                            worker_id: worker.worker_id.clone(),
-                            assets_first,
-                            images,
-                        });
+                        .or_insert_with(|| target.clone());
+                }
+            }
+        }
+        if let Some(domain) = preview_domain.filter(|d| !d.is_empty()) {
+            for tenant in &desired.tenants {
+                for worker in &tenant.workers {
+                    let version_id = match &worker.preview {
+                        Some(preview) => &preview.version_id,
+                        None => &worker.active_version.version_id,
+                    };
+                    // A preview instance is named after the PRODUCTION
+                    // worker it previews (`preview.workerId`); the
+                    // active version is named after its own worker.
+                    let name = match &worker.preview {
+                        Some(preview) => tenant
+                            .workers
+                            .iter()
+                            .find(|w| w.worker_id == preview.worker_id)
+                            .map(|w| w.name.as_str())
+                            .unwrap_or(worker.name.as_str()),
+                        None => worker.name.as_str(),
+                    };
+                    let host = format!("{}--{}.{}", version_id, name, domain).to_ascii_lowercase();
+                    if map.contains_key(&host) {
+                        // Never overwrite a production hostname (or an
+                        // earlier preview) with a derived one.
+                        continue;
+                    }
+                    let mut target = Self::target_for(tenant, worker);
+                    target.preview = Some(version_id.clone());
+                    map.insert(host, target);
                 }
             }
         }
         Self {
             map: Arc::new(map),
             catch_all: (worker_count == 1).then_some(only_target).flatten(),
+        }
+    }
+
+    /// Route target for one desired worker entry.
+    fn target_for(
+        tenant: &snapshot_protocol::compute_desired::TenantDesired,
+        worker: &snapshot_protocol::compute_desired::WorkerDesired,
+    ) -> RouteTarget {
+        let assets_first = worker.bindings.iter().any(|b| match b {
+            snapshot_protocol::compute_desired::BindingDesired::Assets(a) => {
+                a.assets_first_enabled()
+            }
+            _ => false,
+        });
+        let images = worker.bindings.iter().any(|b| {
+            matches!(
+                b,
+                snapshot_protocol::compute_desired::BindingDesired::Images(_)
+            )
+        });
+        RouteTarget {
+            tenant_id: tenant.tenant_id.clone(),
+            worker_id: worker.worker_id.clone(),
+            assets_first,
+            images,
+            preview: None,
         }
     }
 
@@ -178,6 +248,17 @@ mod tests {
             Some("app.example.com".into())
         );
         assert_eq!(normalize_host("a.b.c"), Some("a.b.c".into()));
+        // PREVIEW: version ids carry a `vrt_` prefix, so a preview Host
+        // needs `_`. Production hostnames can never contain it (the
+        // snapshot validator refuses), so this cannot widen routing.
+        assert_eq!(
+            normalize_host("vrt_abc123--edge-api.preview.example.com:443"),
+            Some("vrt_abc123--edge-api.preview.example.com".into())
+        );
+        assert_eq!(
+            normalize_host("VRT_ABC123--Edge-API.Preview.Example.COM"),
+            Some("vrt_abc123--edge-api.preview.example.com".into())
+        );
         // Invalid charset / shape → reject.
         for bad in [
             "",
@@ -185,7 +266,6 @@ mod tests {
             "app..example.com",
             ".app.com",
             "app.com.",
-            "app_example.com",
             "app example.com",
             "app/example.com",
             "user@app.com",
@@ -197,6 +277,233 @@ mod tests {
         ] {
             assert_eq!(normalize_host(bad), None, "{bad:?}");
         }
+    }
+
+    fn preview_desired() -> ComputeDesired {
+        use snapshot_protocol::compute_desired::{
+            BindingDesired, PreviewDesired, RouteDesired, TenantDesired, VersionDesired,
+            WorkerDesired, WorkerQuotas,
+        };
+        let version = |id: &str| VersionDesired {
+            version_id: id.into(),
+            artifact_digest: "d".repeat(64),
+            compatibility_date: "2024-01-01".into(),
+            compatibility_flags: vec![],
+            tag: String::new(),
+            created_at: String::new(),
+        };
+        let quotas = WorkerQuotas {
+            cpu_ms: 50,
+            memory_mb: 128,
+            subrequests: 0,
+            outbound_connections: 0,
+        };
+        ComputeDesired {
+            schema_version: 1,
+            cell_id: "cell".into(),
+            revision: 3,
+            tenants: vec![TenantDesired {
+                tenant_id: "t1".into(),
+                workers: vec![
+                    WorkerDesired {
+                        worker_id: "w1".into(),
+                        name: "edge-api".into(),
+                        active_version: version("vrt_active"),
+                        bindings: vec![],
+                        routes: vec![RouteDesired {
+                            hostname: "api.example.com".into(),
+                        }],
+                        crons: vec![],
+                        queue_consumers: vec![],
+                        durable_object_classes: vec![],
+                        workflows: vec![],
+                        tail_consumers: vec![],
+                        streaming_tail_consumers: vec![],
+                        observability: None,
+                        quotas: quotas.clone(),
+                        preview: None,
+                    },
+                    WorkerDesired {
+                        worker_id: "w1.pv01234567".into(),
+                        name: "edge-api-pv01234567".into(),
+                        active_version: version("vrt_preview"),
+                        bindings: vec![],
+                        routes: vec![],
+                        crons: vec![],
+                        queue_consumers: vec![],
+                        durable_object_classes: vec![],
+                        workflows: vec![],
+                        tail_consumers: vec![],
+                        streaming_tail_consumers: vec![],
+                        observability: None,
+                        quotas: quotas.clone(),
+                        preview: Some(PreviewDesired {
+                            worker_id: "w1".into(),
+                            version_id: "vrt_preview".into(),
+                        }),
+                    },
+                    WorkerDesired {
+                        worker_id: "w2".into(),
+                        name: "assets".into(),
+                        active_version: version("vrt_active2"),
+                        bindings: vec![BindingDesired::Images(
+                            snapshot_protocol::compute_desired::ImagesBinding {
+                                name: "IMAGES".into(),
+                            },
+                        )],
+                        routes: vec![RouteDesired {
+                            hostname: "img.example.com".into(),
+                        }],
+                        crons: vec![],
+                        queue_consumers: vec![],
+                        durable_object_classes: vec![],
+                        workflows: vec![],
+                        tail_consumers: vec![],
+                        streaming_tail_consumers: vec![],
+                        observability: None,
+                        quotas,
+                        preview: None,
+                    },
+                ],
+                flagship_apps: vec![],
+            }],
+            deletions: vec![],
+        }
+    }
+
+    #[test]
+    fn preview_routes_are_off_without_a_configured_domain() {
+        let desired = preview_desired();
+        let table = RouteTable::from_desired(&desired);
+        // Production routing is unchanged.
+        assert_eq!(table.lookup("api.example.com").unwrap().worker_id, "w1");
+        assert!(table.lookup("api.example.com").unwrap().preview.is_none());
+        // No preview domain → the preview hostname is unknown (404).
+        assert!(table
+            .lookup("vrt_preview--edge-api.preview.example.com")
+            .is_none());
+        assert!(table
+            .lookup("vrt_active--edge-api.preview.example.com")
+            .is_none());
+    }
+
+    #[test]
+    fn preview_routes_select_the_version_without_touching_production() {
+        let desired = preview_desired();
+        let table =
+            RouteTable::from_desired_with_preview_domain(&desired, Some("preview.example.com"));
+        // Preview instance: routed to ITS OWN instance, labelled with the
+        // version, while production still points at the active version.
+        let pv = table
+            .lookup("vrt_preview--edge-api.preview.example.com")
+            .expect("preview route");
+        assert_eq!(pv.worker_id, "w1.pv01234567");
+        assert_eq!(pv.preview.as_deref(), Some("vrt_preview"));
+        let prod = table.lookup("api.example.com").expect("prod route");
+        assert_eq!(prod.worker_id, "w1");
+        assert!(prod.preview.is_none());
+        // The ACTIVE version is reachable through its preview hostname and
+        // is served by the production instance.
+        let active = table
+            .lookup("vrt_active--edge-api.preview.example.com")
+            .expect("active preview route");
+        assert_eq!(active.worker_id, "w1");
+        assert_eq!(active.preview.as_deref(), Some("vrt_active"));
+        // A version that is neither preview nor active has no route.
+        assert!(table
+            .lookup("vrt_archived--edge-api.preview.example.com")
+            .is_none());
+        // Preview hosts are case-insensitive and never the production host.
+        assert!(table
+            .lookup("vrt_preview--edge-api.preview.example.com")
+            .is_some());
+        assert_ne!(
+            pv.worker_id,
+            table.lookup("api.example.com").unwrap().worker_id
+        );
+        // Other workers keep their own preview plumbing.
+        assert_eq!(
+            table
+                .lookup("vrt_active2--assets.preview.example.com")
+                .unwrap()
+                .images,
+            true
+        );
+    }
+
+    #[test]
+    fn derived_preview_route_never_overwrites_a_production_hostname() {
+        use snapshot_protocol::compute_desired::{
+            PreviewDesired, RouteDesired, TenantDesired, VersionDesired, WorkerDesired,
+            WorkerQuotas,
+        };
+        let version = |id: &str| VersionDesired {
+            version_id: id.into(),
+            artifact_digest: "d".repeat(64),
+            compatibility_date: "2024-01-01".into(),
+            compatibility_flags: vec![],
+            tag: String::new(),
+            created_at: String::new(),
+        };
+        // A worker whose production hostname is EXACTLY what the derived
+        // preview host would be. First-wins keeps production semantics.
+        let desired = ComputeDesired {
+            schema_version: 1,
+            cell_id: "cell".into(),
+            revision: 1,
+            tenants: vec![TenantDesired {
+                tenant_id: "t1".into(),
+                workers: vec![
+                    WorkerDesired {
+                        worker_id: "w1".into(),
+                        name: "edge-api".into(),
+                        active_version: version("vrt_preview"),
+                        bindings: vec![],
+                        routes: vec![RouteDesired {
+                            hostname: "vrt_preview--edge-api.preview.example.com".into(),
+                        }],
+                        crons: vec![],
+                        queue_consumers: vec![],
+                        durable_object_classes: vec![],
+                        workflows: vec![],
+                        tail_consumers: vec![],
+                        streaming_tail_consumers: vec![],
+                        observability: None,
+                        quotas: WorkerQuotas::platform_default(),
+                        preview: None,
+                    },
+                    WorkerDesired {
+                        worker_id: "w1.pv01234567".into(),
+                        name: "edge-api-pv01234567".into(),
+                        active_version: version("vrt_preview2"),
+                        bindings: vec![],
+                        routes: vec![],
+                        crons: vec![],
+                        queue_consumers: vec![],
+                        durable_object_classes: vec![],
+                        workflows: vec![],
+                        tail_consumers: vec![],
+                        streaming_tail_consumers: vec![],
+                        observability: None,
+                        quotas: WorkerQuotas::platform_default(),
+                        preview: Some(PreviewDesired {
+                            worker_id: "w1".into(),
+                            version_id: "vrt_preview".into(),
+                        }),
+                    },
+                ],
+                flagship_apps: vec![],
+            }],
+            deletions: vec![],
+        };
+        let table =
+            RouteTable::from_desired_with_preview_domain(&desired, Some("preview.example.com"));
+        // The production route wins and is NOT relabelled as a preview.
+        let prod = table
+            .lookup("vrt_preview--edge-api.preview.example.com")
+            .unwrap();
+        assert_eq!(prod.worker_id, "w1");
+        assert!(prod.preview.is_none());
     }
 
     #[test]
@@ -224,11 +531,12 @@ mod tests {
                     }],
                     crons: vec![],
                     queue_consumers: vec![],
-                                        observability: None,
+                    observability: None,
                     durable_object_classes: vec![],
                     workflows: vec![],
                     tail_consumers: vec![],
                     streaming_tail_consumers: vec![],
+                    preview: None,
                     quotas: snapshot_protocol::compute_desired::WorkerQuotas {
                         cpu_ms: 50,
                         memory_mb: 128,
@@ -239,7 +547,7 @@ mod tests {
                 flagship_apps: vec![],
             }],
             deletions: vec![],
-};
+        };
         let table = RouteTable::from_desired(&desired);
         assert_eq!(table.lookup("app.example.com").unwrap().tenant_id, "t1");
         assert!(table.lookup("x.app.example.com").is_none());

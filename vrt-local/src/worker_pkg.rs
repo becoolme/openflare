@@ -572,6 +572,12 @@ pub struct DeployOverrides {
     /// user label, surfaced via the `versionMetadata` binding's `tag`.
     /// `None`/empty = untagged (CF default).
     pub tag: Option<String>,
+    /// `vrt deploy --preview`: evaluates a `cloudflare.config.*` with
+    /// `isPreview = true` (the helper's `--preview` flag). A production
+    /// deploy always leaves this `false`, so a config's preview branch is
+    /// unreachable from a normal deploy. Ignored by `vrt.toml`/wrangler
+    /// files, which have no preview branch.
+    pub is_preview: bool,
 }
 
 /// Fully packed worker ready for state application.
@@ -921,7 +927,11 @@ fn pack_inner(
     do_ctx: Option<&DoPackCtx<'_>>,
 ) -> Result<PackedWorker, LocalError> {
     assemble(
-        gather_dir_for_env(worker_dir, overrides.env_name.as_deref())?,
+        gather_dir_for_env_preview(
+            worker_dir,
+            overrides.env_name.as_deref(),
+            overrides.is_preview,
+        )?,
         overrides,
         tenant_id,
         resolve_worker,
@@ -968,9 +978,21 @@ pub fn gather_dir_for_env(
     worker_dir: &Path,
     env_name: Option<&str>,
 ) -> Result<Gathered, LocalError> {
+    gather_dir_for_env_preview(worker_dir, env_name, false)
+}
+
+/// [`gather_dir_for_env`] plus the `isPreview` branch. Only a
+/// `cloudflare.config.*` evaluation observes `is_preview`; `vrt.toml` and
+/// wrangler files ignore it.
+pub fn gather_dir_for_env_preview(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+    is_preview: bool,
+) -> Result<Gathered, LocalError> {
     // T31/C4: `vrt.toml` keeps precedence; otherwise the wrangler family
     // (json > jsonc > toml) normalizes into the same meta shape.
-    let (meta, _meta_source) = crate::project_cfg::load_worker_meta_for_env(worker_dir, env_name)?;
+    let (meta, _meta_source) =
+        crate::project_cfg::load_worker_meta_for_env_preview(worker_dir, env_name, is_preview)?;
     let mut files = BTreeMap::new();
     let mut skipped = Vec::new();
     let mut total: u64 = 0;

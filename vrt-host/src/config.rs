@@ -134,6 +134,75 @@ pub struct HostConfig {
     /// `<workDir>/ae/`.
     #[serde(default = "AnalyticsEngineConfig::enabled_default")]
     pub analytics_engine: AnalyticsEngineConfig,
+    /// `[preview]` — versioned preview URLs
+    /// (`<versionId>--<workerName>.<domain>`). Default OFF: with no
+    /// domain configured no preview hostname resolves at all (every
+    /// `<…>` request is a 404), and production routing is unchanged.
+    #[serde(default)]
+    pub preview: PreviewConfig,
+}
+
+/// `[preview]` — how this host exposes versioned preview deployments.
+///
+/// The host derives every preview hostname itself from the signed
+/// snapshot's preview instances, so the domain is the ONLY knob: it is
+/// never read from a snapshot, a worker config or a request.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PreviewConfig {
+    /// Public suffix for preview hostnames — a DNS name such as
+    /// `preview.example.com`. Lowercase labels only; no scheme, port,
+    /// path, wildcard or leading/trailing dot. Absent/empty ⇒ preview
+    /// serving is off (the default).
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Maximum preview-domain length (DNS hostname bound).
+const MAX_PREVIEW_DOMAIN_LEN: usize = 253;
+
+impl PreviewConfig {
+    /// Normalized suffix (`None` = preview serving off).
+    ///
+    /// Normalization is lowercase + trim ONLY, and validation refuses
+    /// everything else, so the value that reaches the route table is
+    /// exactly what an operator wrote (modulo case).
+    pub fn domain(&self) -> Option<String> {
+        let raw = self.domain.as_deref()?.trim().to_ascii_lowercase();
+        (!raw.is_empty()).then_some(raw)
+    }
+
+    /// Fail closed: a configured-but-unusable domain refuses startup
+    /// instead of silently serving no previews (or, worse, a hostname
+    /// with a path/port that could never be matched).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let Some(raw) = &self.domain else {
+            return Ok(());
+        };
+        let domain = raw.trim().to_ascii_lowercase();
+        if domain.is_empty() {
+            return Ok(());
+        }
+        if domain.len() > MAX_PREVIEW_DOMAIN_LEN
+            || domain.contains('/')
+            || domain.contains(':')
+            || domain.contains('*')
+            || domain.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+        {
+            return Err(ConfigError::Invalid(
+                "preview.domain must be a lowercase DNS name (no scheme/port/wildcard)",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// `[scaleToZero]` — tenant-level hibernate/wake (design:
@@ -2065,6 +2134,9 @@ impl HostConfig {
                 }
             }
         }
+        // PREVIEW: `[preview] domain` — fail closed on an unusable
+        // suffix instead of quietly serving no previews.
+        self.preview.validate()?;
         // PT1: runaway watchdog bounds — a nonsense value must fail
         // closed at startup, never produce a degenerate kill loop.
         self.limits.cpu_runaway.validate()?;
@@ -2746,6 +2818,47 @@ impl From<SystemModuleToml> for vrt_config::SystemModuleRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PREVIEW: absent section = preview serving off; a configured
+    /// domain is normalized and validated fail-closed.
+    #[test]
+    fn preview_config_defaults_off_and_validates() {
+        // Absent ⇒ off.
+        let off = PreviewConfig::default();
+        off.validate().unwrap();
+        assert_eq!(off.domain(), None);
+
+        // Empty string ⇒ still off (an operator may keep the key).
+        let blank: PreviewConfig = toml::from_str("domain = \"  \"").unwrap();
+        blank.validate().unwrap();
+        assert_eq!(blank.domain(), None);
+
+        // Configured ⇒ normalized (case) and routable.
+        let on: PreviewConfig = toml::from_str("domain = \"Preview.Example.COM\"").unwrap();
+        on.validate().unwrap();
+        assert_eq!(on.domain().as_deref(), Some("preview.example.com"));
+
+        // Unusable suffixes refuse startup instead of silently serving
+        // nothing (or a hostname that could never match a Host header).
+        for bad in [
+            "preview.example.com:443",
+            "https://preview.example.com",
+            "*.preview.example.com",
+            "preview_example.com",
+            "preview.example.com.",
+            ".preview.example.com",
+            "-preview.example.com",
+            "preview-.example.com",
+            "preview.example.com/path",
+            &format!("{}.com", "a".repeat(64)),
+        ] {
+            let c: PreviewConfig = toml::from_str(&format!("domain = \"{bad}\"")).unwrap();
+            assert!(c.validate().is_err(), "{bad:?} must be rejected");
+        }
+
+        // Unknown keys fail closed like every other host section.
+        assert!(toml::from_str::<PreviewConfig>("domain = \"p.example.com\"\nbogus = 1").is_err());
+    }
 
     /// Scale-to-zero P0: default off, off builds nothing, enabled
     /// validates fail-closed and builds the documented defaults.
