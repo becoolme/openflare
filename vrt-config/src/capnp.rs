@@ -175,6 +175,17 @@ pub struct SystemModuleRef {
     pub digest: String,
 }
 
+/// The capnp `Worker.Module` union member a system module emits: `.wasm`
+/// names embed as `wasm` (workerd hands the importer a `WebAssembly.Module`),
+/// everything else as `esModule`.
+pub fn system_module_capnp_field(name: &str) -> &'static str {
+    if name.ends_with(".wasm") {
+        "wasm"
+    } else {
+        "esModule"
+    }
+}
+
 /// A system worker placeholder: a named worker whose modules are
 /// content-addressed references vrt-host materializes from the artifact
 /// store.
@@ -2154,8 +2165,9 @@ fn emit_system_worker(
             },
         });
         out.push_str(&format!(
-            "        (name = {}, esModule = embed {}),\n",
+            "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
+            system_module_capnp_field(&module.name),
             capnp_text(&path),
         ));
     }
@@ -3324,8 +3336,9 @@ fn emit_router_worker(
             },
         });
         out.push_str(&format!(
-            "        (name = {}, esModule = embed {}),\n",
+            "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
+            system_module_capnp_field(&module.name),
             capnp_text(&path),
         ));
     }
@@ -3432,8 +3445,9 @@ fn emit_qconsumer_worker(
             },
         });
         out.push_str(&format!(
-            "        (name = {}, esModule = embed {}),\n",
+            "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
+            system_module_capnp_field(&module.name),
             capnp_text(&path),
         ));
     }

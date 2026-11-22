@@ -4,10 +4,11 @@
 container metadata and `input(stream).transform(opts).output(opts)`
 runs an image-transformation pipeline inside the platform.
 
-**Status: Partial** — `info()` is implemented; `transform()` is wired
-end to end but the pixel engine is not vendored yet, so transform
-calls fail closed with a typed error instead of silently passing the
-source bytes through.
+**Status: Partial** — `info()` and `transform()` are implemented with
+a vendored jSquash WASM engine. Coverage and fidelity limits are
+listed under *Known differences*; everything the engine cannot do
+correctly fails closed with a typed error rather than silently
+passing the source bytes through.
 
 ## Wrangler configuration
 
@@ -38,15 +39,14 @@ export default {
   async fetch(req, env) {
     const body = (await fetch("https://example.com/cat.png")).body;
 
-    // Metadata without a decode — works today.
     const info = await env.IMAGES.info(body);
     // → { fileSize, format: "image/png", width, height }
 
-    // Transform pipeline — fails closed until the WASM engine lands.
     const out = await env.IMAGES
       .input(body)
-      .transform({ width: 200 })
-      .output({ format: "image/webp" });
+      .transform({ width: 200, fit: "cover" })
+      .transform({ rotate: 90 })
+      .output({ format: "image/webp", quality: 85 });
     return out.response();
   },
 };
@@ -64,17 +64,40 @@ in.
 
 The facade speaks the shim's own upstream protocol verbatim —
 multipart/form-data POSTs to `/info` and `/transform` (the `image`
-file field carries the bytes, `transforms` a JSON op array), and
-errors ride the `cf-images-binding: err=<code>` response header that
-the shim translates into a thrown `ImagesError`. No shim fork, no
-parallel protocol.
+file field carries the bytes, `transforms` a JSON op array, extra
+`draw_image` file fields carry overlay sources), and errors ride the
+`cf-images-binding: err=<code>` response header that the shim
+translates into a thrown `ImagesError`. No shim fork, no parallel
+protocol.
+
+## The engine
+
+`facade/images-engine.ts` decodes → transforms → encodes entirely
+inside the system worker using vendored
+[jSquash](https://github.com/jamsinclair/jSquash) WASM modules
+(`facade/third_party/jsquash/`): mozjpeg, Squoosh PNG, WebP
+(lossy+lossless), AVIF **decode only**, and `@jsquash/resize`
+(Lanczos3/ triangle/bilinear/nearest). `.wasm` modules travel the same
+manifest → capnp `wasm = embed` pipeline as ES modules
+(`facade/tools/gen-manifest.mjs`, `vrt-config/src/capnp.rs`,
+`vrt-config/src/sysmanifest.rs`); Node tests load them through the
+same `WebAssembly.Module` injection path workerd uses
+(`facade/test/shims/resolve-hooks.mjs`).
+
+Transform ops execute in this order inside `images-transform.ts`:
+trim → gravity crop → fit resize/pad → rotate → flip → color ops
+(contrast/brightness/saturation/hue-rotate/invert/sepia/gamma/
+grayscale/opacity) → blur → sharpen → border paint. `draw()` ops
+composite overlays with the standard alpha-compositing modes
+(`source-over`, `multiply`, `screen`, `overlay`, `lighter`/additive,
+and the rest of the upstream op set).
 
 ## How the ops map
 
 | op | implementation |
 | --- | --- |
-| `info(stream)` | Pure-TS container sniffer (`facade/images-wire.ts`) — reads PNG IHDR, JPEG SOFn, WebP VP8/VP8L/VP8X, GIF and BMP headers; SVG markup returns the dim-less `{format: "image/svg+xml"}` shape. Returns the wire `{file_size, format, width, height}` the shim maps to `fileSize`/`width`/`height`/`format`; the pixel engine never runs. |
-| `input().transform()/.draw().output()` | The upstream shim serializes the op chain into the `transforms` multipart field (plus `output_format`/`output_quality`/`background`/`anim`/`text_input`/`draw_*`). The facade validates the field then returns 501 `err=9490` until the jSquash WASM engine is vendored. `input()`'s `encoding: "base64"` decode and `text()` sources are handled inside the shim already. |
+| `info(stream)` | Pure-TS container sniffer (`facade/images-wire.ts`) — reads PNG IHDR, JPEG SOFn, WebP VP8/VP8L/VP8X, GIF and BMP headers, ISO-BMFF `ftyp`+`ispe` for AVIF/HEIC; SVG markup returns the dim-less `{format: "image/svg+xml"}` shape. Returns the wire `{file_size, format, width, height}` the shim maps to `fileSize`/`width`/`height`/`format`; the pixel engine never runs. |
+| `input().transform()/.draw().output()` | The upstream shim serializes the op chain into the `transforms` multipart field (plus `output_format`/`output_quality`/`background`/`anim`/`text_input`/`draw_*`). The facade validates, decodes every `image`/`draw_image` file, applies the ops, flattens alpha over `background` when required, and encodes. `input()`'s `encoding: "base64"` decode and `text()` sources are handled inside the shim already. |
 | `hosted.*` (`env.IMAGES.hosted.image()/.upload()/.list()/.createDirectUpload()`) | Cloudflare Images **product** RPC surface — not implemented; the facade exposes no such methods so calls reject. |
 
 ## Backends
@@ -107,23 +130,37 @@ resource-identifying keys besides `binding`.
 - Source image ≤ **70 MP** (`IMAGES_MAX_PIXELS`), matching
   Cloudflare's documented source bound — enforced in `info()` and the
   transform gate.
+- `output_quality` is validated in `1–100`; out of range →
+  `err=9423`.
 
 ## Known differences from Cloudflare
 
-- **`transform()` not yet functional**: the jSquash WASM engine
-  (`@jsquash/resize` + jpeg/png/webp codecs) is the planned local
-  engine — a community build, not Cloudflare's proprietary pipeline.
-  Encoding quality, AVIF output, animated/multi-frame images and some
-  transform options will differ from production Cloudflare even after
-  vendoring; this section will carry the op-coverage matrix then.
-- **`info()` format coverage**: PNG, JPEG, WebP, GIF, BMP and SVG are
-  recognized (SVG returns the dim-less shape like CF); AVIF and other
-  containers return `err=9420` unsupported.
+- **Community engine**: jSquash is a community WASM build, not
+  Cloudflare's proprietary pipeline. Encoding quality, EXIF/color-
+  profile handling and resize kernel tuning will differ from
+  production Cloudflare output byte-for-byte.
+- **Decode coverage**: PNG, JPEG, WebP (lossy + lossless) and AVIF
+  decode. GIF/BMP decode is not vendored → `err=9401`; animated
+  sources decode as the first frame only, `anim` requests →
+  `err=9401`.
+- **Encode coverage**: `image/jpeg`, `image/png`, `image/webp`, plus
+  the wire `rgb`/`rgba` raw frames. `image/avif` encoding is not
+  vendored (the AVIF encoder is ~3× the size of everything else
+  combined) → `err=9401`.
+- **Draw coverage**: `draw_image` overlays (alpha compositing,
+  `repeat` tiling, `top`/`left`/`bottom`/`right`/`width`/`height`/
+  `opacity`) work; `draw_text`/`text_input` rasterization is not
+  implemented → `err=9401`.
+- **Gravity**: named gravity (`top`/`left`/`center`/…/`auto`) and
+  `{x,y}` coordinate gravity work; face/entropy segment gravity
+  (`gravity: "auto"` uses entropy-centre, not CF's ML saliency) is an
+  approximation → may differ from production output.
 - **Error codes**: errors ride the upstream
   `cf-images-binding: err=<code>` header. Codes reuse Cloudflare's
-  numbering where a documented equivalent exists (9401 oversized
-  source, 9420 unsupported/corrupt, 9423 malformed request) and
-  reserved `94xx` values where it does not (9490 engine-not-vendored).
+  numbering where a documented equivalent exists (9401 unsupported
+  content/format, 9420 corrupt/undecodable, 9423 malformed request,
+  9424 output too large) and reserved `94xx` values where it does not
+  (9490 engine-internal).
 - **`cf.image` fetch options and `/cdn-cgi/image/` URL resizing** are
   separate surfaces and remain unimplemented — this binding only
   covers the in-Worker `env.IMAGES` API.
@@ -134,6 +171,11 @@ resource-identifying keys besides `binding`.
   (accept `binding`/`remote`, reject everything else).
 - `vrt-config/tests/render.rs` — `images_binding_renders_wrapped_images_api`
   (wrapped module + inner fetcher service name).
+- `facade/test/images.test.mjs` — `/info` shape cases plus end-to-end
+  `/transform` coverage: real PNG→WebP resize round-trip,
+  crop-gravity+rotate→JPEG, `draw_image` alpha compositing, and the
+  fail-closed edges (unknown op key, GIF input, text ops, AVIF/GIF
+  output).
 - `shared/vrt-project-config-vectors.json` — six golden vectors:
   valid `[images]`, `remote = true` accepted-and-ignored, unknown
   sub-key, missing `binding`, non-boolean `remote`, non-table value.

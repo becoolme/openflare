@@ -1,5 +1,58 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { imagesError, sniffImage, sniffSvg, IMAGES_BODY_MAX_BYTES, IMAGES_MAX_PIXELS } from "./images-wire.js";
+import { EngineError, decodeImage, encodeImage, parseColor, composite } from "./images-engine.js";
+import { applyTransforms, IMAGES_TRANSFORM_MAX_PIXELS } from "./images-transform.js";
+const DECODE_FORMATS = new Set([
+    "jpeg",
+    "png",
+    "webp",
+    "avif"
+]);
+const OUTPUT_FORMATS = {
+    "image/jpeg": "jpeg",
+    "image/png": "png",
+    "image/webp": "webp",
+    rgb: "rgb",
+    rgba: "rgba"
+};
+function wireError(e) {
+    if (e instanceof EngineError) {
+        return imagesError(e.code, e.message, e.code === 9423 ? 400 : 415);
+    }
+    return imagesError(9523, "images: internal transform error", 500);
+}
+async function decodeField(file, what) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > IMAGES_BODY_MAX_BYTES) {
+        throw new EngineError(9409, `images: ${what} empty or over the 64MiB cap`);
+    }
+    if (sniffSvg(bytes)) {
+        throw new EngineError(9401, `images: ${what} is SVG — rasterization is not supported`);
+    }
+    const sniffed = sniffImage(bytes);
+    if (!sniffed) {
+        throw new EngineError(9420, `images: ${what} is not a recognized image`);
+    }
+    if (!DECODE_FORMATS.has(sniffed.format)) {
+        throw new EngineError(9401, `images: ${what} format ${sniffed.format} has no vendored decoder`);
+    }
+    return decodeImage(bytes, sniffed.format);
+}
+function flatten(img, color) {
+    const base = {
+        data: new Uint8ClampedArray(img.width * img.height * 4),
+        width: img.width,
+        height: img.height
+    };
+    for(let i = 0; i < base.data.length; i += 4){
+        base.data[i] = color[0];
+        base.data[i + 1] = color[1];
+        base.data[i + 2] = color[2];
+        base.data[i + 3] = color[3];
+    }
+    composite(base, img, 0, 0, 1, "over");
+    return base;
+}
 export class ImagesFacade extends WorkerEntrypoint {
     async fetch(req) {
         const url = new URL(req.url);
@@ -12,17 +65,17 @@ export class ImagesFacade extends WorkerEntrypoint {
         } catch  {
             return imagesError(9423, "images: malformed multipart body", 400);
         }
-        const image = form.get("image");
-        if (!(image instanceof File)) {
-            return imagesError(9423, "images: missing `image` field", 400);
-        }
-        const body = new Uint8Array(await image.arrayBuffer());
-        if (body.length === 0 || body.length > IMAGES_BODY_MAX_BYTES) {
-            return imagesError(9409, "images: body empty or over the 64MiB cap", 413);
-        }
         switch(url.pathname){
             case "/info":
                 {
+                    const image = form.get("image");
+                    if (!(image instanceof File)) {
+                        return imagesError(9423, "images: missing `image` field", 400);
+                    }
+                    const body = new Uint8Array(await image.arrayBuffer());
+                    if (body.length === 0 || body.length > IMAGES_BODY_MAX_BYTES) {
+                        return imagesError(9409, "images: body empty or over the 64MiB cap", 413);
+                    }
                     if (sniffSvg(body)) {
                         return Response.json({
                             format: "image/svg+xml"
@@ -44,19 +97,78 @@ export class ImagesFacade extends WorkerEntrypoint {
                 }
             case "/transform":
                 {
-                    const raw = form.get("transforms");
-                    if (typeof raw !== "string") {
-                        return imagesError(9423, "images: missing `transforms` field", 400);
-                    }
                     try {
-                        const parsed = JSON.parse(raw);
-                        if (!Array.isArray(parsed)) {
-                            return imagesError(9423, "images: `transforms` must be a JSON array", 400);
+                        if (form.get("text_input") !== null) {
+                            return imagesError(9401, "images: text_input rasterization is not supported", 415);
                         }
-                    } catch  {
-                        return imagesError(9423, "images: malformed `transforms` JSON", 400);
+                        if (form.get("draw_text") !== null) {
+                            return imagesError(9401, "images: draw_text rasterization is not supported", 415);
+                        }
+                        const image = form.get("image");
+                        if (!(image instanceof File)) {
+                            return imagesError(9423, "images: missing `image` field", 400);
+                        }
+                        const raw = form.get("transforms");
+                        if (typeof raw !== "string") {
+                            return imagesError(9423, "images: missing `transforms` field", 400);
+                        }
+                        let ops;
+                        try {
+                            const parsed = JSON.parse(raw);
+                            if (!Array.isArray(parsed)) throw new Error("shape");
+                            ops = parsed;
+                        } catch  {
+                            return imagesError(9423, "images: malformed `transforms` JSON", 400);
+                        }
+                        const canvas = await decodeField(image, "canvas image");
+                        const frames = [
+                            canvas
+                        ];
+                        for (const field of form.getAll("draw_image")){
+                            if (!(field instanceof File)) {
+                                return imagesError(9423, "images: malformed `draw_image` field", 400);
+                            }
+                            frames.push(await decodeField(field, `draw_image ${frames.length}`));
+                        }
+                        if (canvas.width * canvas.height > IMAGES_TRANSFORM_MAX_PIXELS) {
+                            return imagesError(9401, "images: source exceeds the transform pixel cap", 413);
+                        }
+                        const output = form.get("output_format");
+                        if (typeof output !== "string" || !output) {
+                            return imagesError(9423, "images: missing `output_format`", 400);
+                        }
+                        const format = OUTPUT_FORMATS[output];
+                        if (!format) {
+                            return imagesError(9401, `images: ${output} output is not supported`, 415);
+                        }
+                        const rawQuality = form.get("output_quality");
+                        const quality = rawQuality === null ? 85 : Number(rawQuality);
+                        if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
+                            return imagesError(9423, "images: invalid `output_quality`", 400);
+                        }
+                        const rawBg = form.get("background");
+                        const bg = rawBg === null ? null : typeof rawBg === "string" ? parseColor(rawBg) : null;
+                        if (rawBg !== null && !bg) {
+                            return imagesError(9423, "images: invalid `background` color", 400);
+                        }
+                        const done = await applyTransforms(frames, ops);
+                        const needsFlatten = bg !== null || format === "jpeg";
+                        const finalImage = needsFlatten ? flatten(done, bg ?? [
+                            255,
+                            255,
+                            255,
+                            255
+                        ]) : done;
+                        const { bytes, contentType } = await encodeImage(finalImage, format, quality);
+                        return new Response(bytes, {
+                            status: 200,
+                            headers: {
+                                "content-type": contentType
+                            }
+                        });
+                    } catch (e) {
+                        return wireError(e);
                     }
-                    return imagesError(9490, "images: transform engine not vendored in this build", 501);
                 }
             default:
                 return imagesError(9404, "images: unknown op", 404);

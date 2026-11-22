@@ -31,6 +31,25 @@ export function sniffImage(buf) {
             height: Math.abs(dv.getInt32(22, true))
         };
     }
+    if (buf.length >= 12 && dv.getUint32(4) === 0x66747970 && (dv.getUint32(8) === 0x61766966 || dv.getUint32(8) === 0x61766973)) {
+        const scanEnd = Math.min(buf.length - 16, 65536);
+        for(let off = 12; off < scanEnd; off++){
+            if (dv.getUint32(off + 4) === 0x69737065) {
+                const w = dv.getUint32(off + 12);
+                const h = dv.getUint32(off + 16);
+                if (w > 0 && h > 0) return {
+                    format: "avif",
+                    width: w,
+                    height: h
+                };
+            }
+        }
+        return {
+            format: "avif",
+            width: 0,
+            height: 0
+        };
+    }
     if (buf.length >= 30 && dv.getUint32(0) === 0x52494646 && dv.getUint32(8) === 0x57454250) {
         const fourcc = dv.getUint32(12);
         if (fourcc === 0x56503858) {

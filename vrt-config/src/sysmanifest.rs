@@ -85,6 +85,10 @@ struct WireModule {
     source_sha256: String,
     /// sha256 of the dist bytes — what `sys/<digest>` embeds.
     sha256: String,
+    /// Module kind — only `"wasm"` is meaningful (raw bytes embedded as a
+    /// `WebAssembly.Module`); absent means `esModule`.
+    #[serde(default, rename = "type")]
+    module_type: Option<String>,
 }
 
 /// Parsed facade manifest: the four product endpoints plus the egress
@@ -167,6 +171,15 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
             check_text(&module.source, 1024, "workers.modules.source")?;
             if !valid_module_name(&module.dist) {
                 return Err(ConfigError::Identifier("workers.modules.dist"));
+            }
+            // `type: "wasm"` is the only meaningful kind marker and must
+            // match the `.wasm` suffix the renderer keys on — anything else
+            // would silently emit the wrong capnp module union member.
+            let is_wasm_name = module.name.ends_with(".wasm");
+            match module.module_type.as_deref() {
+                None if !is_wasm_name => {}
+                Some("wasm") if is_wasm_name => {}
+                _ => return Err(ConfigError::Identifier("workers.modules.type")),
             }
             modules.push(SystemModuleRef {
                 name: module.name.clone(),

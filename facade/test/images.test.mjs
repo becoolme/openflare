@@ -18,6 +18,18 @@ function png({ width = 3, height = 2 } = {}) {
   return buf;
 }
 
+/** Solid-color RGBA frame for engine-encoded fixtures. */
+function solidFrame(width, height, [r, g, b, a] = [10, 20, 30, 255]) {
+  const data = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = r;
+    data[i + 1] = g;
+    data[i + 2] = b;
+    data[i + 3] = a;
+  }
+  return { data, width, height };
+}
+
 function gif({ width = 5, height = 4 } = {}) {
   const buf = new Uint8Array(10);
   buf.set([0x47, 0x49, 0x46, 0x38, 0x39, 0x61]);
@@ -145,14 +157,100 @@ test("missing image field → 400 err=9423", async () => {
   assert.equal(errCode(resp), 9423);
 });
 
-test("transform validates the upstream `transforms` field then fails closed 501", async () => {
+test("transform: PNG → scale-down → webp round-trips through the vendored engine", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const src = await eng.encodeImage(solidFrame(16, 16), "png", 90);
   const resp = await post("/transform", {
-    image: imageField(png()),
-    transforms: JSON.stringify([{ imageIndex: 0, width: 10 }]),
+    image: imageField(src.bytes),
+    transforms: JSON.stringify([{ imageIndex: 0, width: 8, height: 8 }]),
     output_format: "image/webp",
   });
-  assert.equal(resp.status, 501);
-  assert.equal(errCode(resp), 9490);
+  assert.equal(resp.status, 200);
+  assert.equal(resp.headers.get("content-type"), "image/webp");
+  const dec = await eng.decodeImage(new Uint8Array(await resp.arrayBuffer()), "webp");
+  assert.equal(dec.width, 8);
+  assert.equal(dec.height, 8);
+});
+
+test("transform: crop-gravity + rotate → jpeg", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const src = await eng.encodeImage(solidFrame(16, 16), "png", 90);
+  const resp = await post("/transform", {
+    image: imageField(src.bytes),
+    transforms: JSON.stringify([
+      { imageIndex: 0, width: 8, height: 16, fit: "crop", gravity: "left" },
+      { imageIndex: 0, rotate: 90 },
+    ]),
+    output_format: "image/jpeg",
+    output_quality: "80",
+  });
+  assert.equal(resp.status, 200);
+  const dec = await eng.decodeImage(new Uint8Array(await resp.arrayBuffer()), "jpeg");
+  assert.equal(dec.width, 16);
+  assert.equal(dec.height, 8);
+});
+
+test("transform: draw_image overlay composites at 50% opacity", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const src = await eng.encodeImage(solidFrame(16, 16, [200, 0, 0, 255]), "png", 90);
+  const over = await eng.encodeImage(solidFrame(4, 4, [255, 255, 255, 255]), "png", 90);
+  const resp = await post("/transform", {
+    image: imageField(src.bytes),
+    draw_image: imageField(over.bytes),
+    transforms: JSON.stringify([
+      { drawImageIndex: 1, targetImageIndex: 0, left: 0, top: 0, opacity: 0.5 },
+    ]),
+    output_format: "image/png",
+  });
+  assert.equal(resp.status, 200);
+  const dec = await eng.decodeImage(new Uint8Array(await resp.arrayBuffer()), "png");
+  // 0.5·255 over 1.0·200 → 227.5 → 227/228.
+  assert.ok(dec.data[0] > 220 && dec.data[0] < 235, `alpha composited red channel ${dec.data[0]}`);
+});
+
+test("transform: unknown transform key fails closed err=9423", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const src = await eng.encodeImage(solidFrame(8, 8), "png", 90);
+  const resp = await post("/transform", {
+    image: imageField(src.bytes),
+    transforms: JSON.stringify([{ imageIndex: 0, bogus: 1 }]),
+    output_format: "image/png",
+  });
+  assert.equal(resp.status, 400);
+  assert.equal(errCode(resp), 9423);
+});
+
+test("transform: gif input fails closed err=9401 (no vendored decoder)", async () => {
+  const resp = await post("/transform", {
+    image: imageField(gif()),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(resp.status, 415);
+  assert.equal(errCode(resp), 9401);
+});
+
+test("transform: text_input/draw_text fail closed err=9401", async () => {
+  const a = await post("/transform", {
+    text_input: JSON.stringify({ text: "hi", font: "x" }),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(errCode(a), 9401);
+});
+
+test("transform: avif/gif output_format fails closed err=9401", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const src = await eng.encodeImage(solidFrame(8, 8), "png", 90);
+  for (const output_format of ["image/avif", "image/gif"]) {
+    const resp = await post("/transform", {
+      image: imageField(src.bytes),
+      transforms: "[]",
+      output_format,
+    });
+    assert.equal(resp.status, 415, output_format);
+    assert.equal(errCode(resp), 9401);
+  }
 });
 
 test("malformed/missing transforms JSON → 400 err=9423", async () => {

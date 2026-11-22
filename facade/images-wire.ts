@@ -24,7 +24,7 @@ export const IMAGES_MAX_PIXELS = 70_000_000;
 
 /** Recognized container signatures → `image/*` format names on the
  * `info()` wire. */
-export type ImageFormat = "jpeg" | "png" | "webp" | "gif" | "bmp";
+export type ImageFormat = "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif";
 
 /** Parse container magic + dimensions without decoding pixels —
  * `info()` never runs the transform engine. Returns `null` on an
@@ -42,6 +42,22 @@ export function sniffImage(buf: Uint8Array): { format: ImageFormat; width: numbe
   // BMP: "BM", w,h little-endian i32 at 18/22 (BITMAPINFOHEADER+).
   if (buf.length >= 26 && buf[0] === 0x42 && buf[1] === 0x4d) {
     return { format: "bmp", width: Math.abs(dv.getInt32(18, true)), height: Math.abs(dv.getInt32(22, true)) };
+  }
+  // AVIF/HEIC: ISO-BMFF `ftyp` box with an avif/avis brand.
+  if (buf.length >= 12 && dv.getUint32(4) === 0x66747970 &&
+      (dv.getUint32(8) === 0x61766966 || dv.getUint32(8) === 0x61766973)) {
+    // Dims live in the meta box's `ispe` property: 4-byte size, 'ispe',
+    // 4-byte version/flags, then u32 width/height. Scan the head — the
+    // box sits early in every encoder's output.
+    const scanEnd = Math.min(buf.length - 16, 65536);
+    for (let off = 12; off < scanEnd; off++) {
+      if (dv.getUint32(off + 4) === 0x69737065) {
+        const w = dv.getUint32(off + 12);
+        const h = dv.getUint32(off + 16);
+        if (w > 0 && h > 0) return { format: "avif", width: w, height: h };
+      }
+    }
+    return { format: "avif", width: 0, height: 0 };
   }
   // WebP: "RIFF".."WEBP" — VP8/VP8L/VP8X dimension forms.
   if (buf.length >= 30 && dv.getUint32(0) === 0x52494646 && dv.getUint32(8) === 0x57454250) {

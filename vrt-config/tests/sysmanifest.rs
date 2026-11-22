@@ -97,7 +97,7 @@ fn parses_generated_manifest_into_system_workers() {
         );
         assert!(worker.modules.iter().any(|m| m.name == worker.main_module));
         for module in &worker.modules {
-            assert!(module.name.ends_with(".js"));
+            assert!(module.name.ends_with(".js") || module.name.ends_with(".wasm"));
             assert_eq!(module.digest.len(), 64);
         }
     }
