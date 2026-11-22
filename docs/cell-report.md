@@ -31,7 +31,9 @@ Each tick:
 
 A failed pod/data-plane/class scan only adds an entry to `resources.errors`;
 the rest of the report is still pushed. Failed pushes keep the delta state, so
-the next successful push covers the lost window.
+the next successful push covers the lost window. The control plane stores the
+report idempotently per `(cell, sampledAtMs)`, so a retried HTTP push cannot
+double-count a window.
 
 ## Wire shape
 
@@ -45,7 +47,8 @@ plane validates it with `apps/plane/src/cellReport.ts`).
 - `resources.queues[id]`: backlog/bytes/visible/in-flight/delayed/dead.
 - `resources.workflows[workerId][name]` and
   `resources.durableObjects[workerId][className]`: instance ids/bytes,
-  count, storage bytes, truncation.
+  count, storage bytes, truncation. Only 64-lowercase-hex `.sqlite` stems are
+  instances; symlinks and legacy scratch files are neither counted nor listed.
 
 R2 bucket stats are **not** in the desired (the physical bucket id is
 control-plane knowledge), so the control plane requests them on demand with a
@@ -54,9 +57,15 @@ read-only `R2_STATS` cell op; the cell returns a bounded list-scan aggregate.
 ## Collection bounds
 
 - Pod `/metrics` body: 4 MiB; instance response: 4 MiB; report: 8 MiB.
-- 1000 instances per class in the report (the API marks `truncated`).
+- 1000 instances per class, 5000 instances total across classes (the API
+  marks `truncated`); remaining classes are skipped with an error entry.
+- 500 table names per D1 database, 5000 table names total (the exact
+  `tableCount` is still reported).
 - 500 D1 databases and 500 queues per stats request.
 - R2 stats scans at most 20,000 objects / 100 pages and sets `truncated`.
+- If a report still exceeds 8 MiB, the point-in-time resource lists are
+  dropped (marked truncated); if it is still too large, `resources` is
+  omitted so the metrics window is not lost.
 
 ## What is intentionally still null
 

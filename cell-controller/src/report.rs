@@ -29,6 +29,17 @@ pub const MAX_SCRAPE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_INSTANCE_BYTES: usize = 4 * 1024 * 1024;
 /// Instances retained per class in the report (the API can show `truncated`).
 pub const MAX_INSTANCES_PER_CLASS: usize = 1000;
+/// Total instance entries across every class in one report. A cell with many
+/// classes must not build an 8 MiB+ document (the push would be lost).
+pub const MAX_TOTAL_INSTANCES: usize = 5000;
+/// Table names retained per D1 database (the count stays exact).
+pub const MAX_TABLES_PER_DB: usize = 500;
+/// Total table names across every D1 database in one report.
+pub const MAX_TOTAL_TABLES: usize = 5000;
+/// Error strings carried in a report / returned by a tick (the plane caps
+/// each at 512 chars; an unbounded error list would fail schema validation).
+pub const MAX_REPORT_ERRORS: usize = 500;
+pub const MAX_ERROR_CHARS: usize = 512;
 /// Hard cap on the report body pushed to the control plane.
 pub const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
 /// Default collection cadence.
@@ -806,9 +817,10 @@ pub trait ReportIo: Send + Sync {
     async fn push(&self, report: &CellReport) -> Result<(), String>;
 }
 
-fn instance_set(mut view: InstancesView) -> InstanceSet {
-    if view.instances.len() > MAX_INSTANCES_PER_CLASS {
-        view.instances.truncate(MAX_INSTANCES_PER_CLASS);
+fn instance_set(mut view: InstancesView, budget: usize) -> InstanceSet {
+    let limit = budget.min(MAX_INSTANCES_PER_CLASS);
+    if view.instances.len() > limit {
+        view.instances.truncate(limit);
         view.truncated = true;
     }
     InstanceSet {
@@ -819,6 +831,33 @@ fn instance_set(mut view: InstancesView) -> InstanceSet {
         truncated: view.truncated,
         sampled_at_ms: view.sampled_at_ms,
     }
+}
+
+/// Last-resort shrink for an oversize report: drop the point-in-time resource
+/// lists (metrics are the important part) and mark them truncated. If the
+/// document is still too large, the caller drops `resources` entirely.
+fn bounded_error(value: impl std::fmt::Display) -> String {
+    value.to_string().chars().take(MAX_ERROR_CHARS).collect()
+}
+
+fn shrink_report(mut report: CellReport) -> CellReport {
+    if let Some(resources) = &mut report.resources {
+        for classes in resources
+            .workflows
+            .values_mut()
+            .chain(resources.durable_objects.values_mut())
+        {
+            for set in classes.values_mut() {
+                set.instances.clear();
+                set.instance_count = 0;
+                set.truncated = true;
+            }
+        }
+        for stats in resources.d1.values_mut() {
+            stats.tables.clear();
+        }
+    }
+    report
 }
 
 // ======================= reporter =======================
@@ -880,6 +919,8 @@ impl<T: ReportIo> Reporter<T> {
             sampled_at_ms: now_ms,
             ..Default::default()
         };
+        let mut instance_budget = MAX_TOTAL_INSTANCES;
+        let mut table_budget = MAX_TOTAL_TABLES;
         if !plan.d1.is_empty() || !plan.queues.is_empty() {
             match self.io.stats(&plan.d1, &plan.queues).await {
                 Ok(stats) => {
@@ -887,6 +928,12 @@ impl<T: ReportIo> Reporter<T> {
                         match entry.stats {
                             Some(s) => {
                                 report.d1 += 1;
+                                let mut tables = s.tables;
+                                let allowed = table_budget.min(MAX_TABLES_PER_DB);
+                                if tables.len() > allowed {
+                                    tables.truncate(allowed);
+                                }
+                                table_budget = table_budget.saturating_sub(tables.len());
                                 resources.d1.insert(
                                     entry.database_id,
                                     D1Stats {
@@ -894,7 +941,7 @@ impl<T: ReportIo> Reporter<T> {
                                         page_count: s.page_count,
                                         page_size: s.page_size,
                                         table_count: s.table_count,
-                                        tables: s.tables,
+                                        tables,
                                         index_count: s.index_count,
                                         user_version: s.user_version,
                                     },
@@ -905,7 +952,7 @@ impl<T: ReportIo> Reporter<T> {
                                 entry.database_id,
                                 entry
                                     .error
-                                    .map(|e| e.to_string())
+                                    .map(bounded_error)
                                     .unwrap_or_else(|| "unknown error".into())
                             )),
                         }
@@ -932,7 +979,7 @@ impl<T: ReportIo> Reporter<T> {
                                 entry.queue_id,
                                 entry
                                     .error
-                                    .map(|e| e.to_string())
+                                    .map(bounded_error)
                                     .unwrap_or_else(|| "unknown error".into())
                             )),
                         }
@@ -949,6 +996,12 @@ impl<T: ReportIo> Reporter<T> {
                 .map(|a| a.pod_id.clone())
         };
         for target in &plan.workflows {
+            if instance_budget == 0 {
+                report
+                    .errors
+                    .push("instances: report budget exhausted; remaining classes skipped".into());
+                break;
+            }
             let Some(pod) = pod_of(&target.worker_id) else {
                 report
                     .errors
@@ -957,7 +1010,8 @@ impl<T: ReportIo> Reporter<T> {
             };
             match self.io.instances(&pod, target).await {
                 Ok(view) => {
-                    let set = instance_set(view);
+                    let set = instance_set(view, instance_budget);
+                    instance_budget = instance_budget.saturating_sub(set.instances.len());
                     report.workflows += 1;
                     resources
                         .workflows
@@ -969,6 +1023,12 @@ impl<T: ReportIo> Reporter<T> {
             }
         }
         for target in &plan.do_classes {
+            if instance_budget == 0 {
+                report
+                    .errors
+                    .push("instances: report budget exhausted; remaining classes skipped".into());
+                break;
+            }
             let Some(pod) = pod_of(&target.worker_id) else {
                 report
                     .errors
@@ -977,7 +1037,8 @@ impl<T: ReportIo> Reporter<T> {
             };
             match self.io.instances(&pod, target).await {
                 Ok(view) => {
-                    let set = instance_set(view);
+                    let set = instance_set(view, instance_budget);
+                    instance_budget = instance_budget.saturating_sub(set.instances.len());
                     report.do_classes += 1;
                     resources
                         .durable_objects
@@ -988,13 +1049,17 @@ impl<T: ReportIo> Reporter<T> {
                 Err(e) => report.errors.push(format!("do class {}: {e}", target.name)),
             }
         }
+        if report.errors.len() > MAX_REPORT_ERRORS {
+            report.errors.truncate(MAX_REPORT_ERRORS - 1);
+            report.errors.push("errors truncated".into());
+        }
         resources.errors = report.errors.clone();
 
         let window_ms = self
             .last_tick_ms
             .map(|prev| (now_ms - prev).clamp(0, MAX_WINDOW_MS))
             .unwrap_or(0);
-        let report_body = CellReport {
+        let mut report_body = CellReport {
             schema_version: REPORT_SCHEMA_VERSION,
             cell_id: self.cell_id.clone(),
             sampled_at_ms: now_ms,
@@ -1002,7 +1067,20 @@ impl<T: ReportIo> Reporter<T> {
             pods,
             resources: Some(resources),
         };
-        let bytes = serde_json::to_vec(&report_body).map_err(|e| format!("encode report: {e}"))?;
+        let mut bytes =
+            serde_json::to_vec(&report_body).map_err(|e| format!("encode report: {e}"))?;
+        if bytes.len() > MAX_REPORT_BYTES {
+            tracing::warn!(
+                bytes = bytes.len(),
+                "cell report oversize — dropping point-in-time resource lists"
+            );
+            report_body = shrink_report(report_body);
+            bytes = serde_json::to_vec(&report_body).map_err(|e| format!("encode report: {e}"))?;
+        }
+        if bytes.len() > MAX_REPORT_BYTES {
+            report_body.resources = None;
+            bytes = serde_json::to_vec(&report_body).map_err(|e| format!("encode report: {e}"))?;
+        }
         if bytes.len() > MAX_REPORT_BYTES {
             return Err(format!("report too large ({} bytes)", bytes.len()));
         }
@@ -1286,6 +1364,61 @@ vrt_host_wake_seconds_count 1
         let report: CellReport = serde_json::from_value(fixture.clone()).unwrap();
         assert_eq!(report.schema_version, REPORT_SCHEMA_VERSION);
         assert_eq!(serde_json::to_value(&report).unwrap(), fixture);
+    }
+
+    #[test]
+    fn instance_budget_truncates_and_marks_the_set() {
+        let view = InstancesView {
+            declared: true,
+            instances: vec![
+                Instance {
+                    id: "a".repeat(64),
+                    bytes: 1,
+                },
+                Instance {
+                    id: "b".repeat(64),
+                    bytes: 2,
+                },
+                Instance {
+                    id: "c".repeat(64),
+                    bytes: 3,
+                },
+            ],
+            storage_bytes: 6,
+            truncated: false,
+            sampled_at_ms: 1,
+        };
+        let set = instance_set(view, 2);
+        assert_eq!(set.instance_count, 2);
+        assert_eq!(set.instances.len(), 2);
+        assert!(set.truncated);
+    }
+
+    #[test]
+    fn errors_are_bounded() {
+        let long = "x".repeat(MAX_ERROR_CHARS * 10);
+        assert_eq!(bounded_error(long).chars().count(), MAX_ERROR_CHARS);
+    }
+
+    #[test]
+    fn shrink_report_clears_point_in_time_lists() {
+        let report: CellReport =
+            serde_json::from_str(include_str!("../../fixtures/vrt-wire/cell-report.json")).unwrap();
+        let shrunk = shrink_report(report);
+        let resources = shrunk.resources.unwrap();
+        for set in resources
+            .workflows
+            .values()
+            .flat_map(|m| m.values())
+            .chain(resources.durable_objects.values().flat_map(|m| m.values()))
+        {
+            assert!(set.instances.is_empty());
+            assert_eq!(set.instance_count, 0);
+            assert!(set.truncated);
+        }
+        for stats in resources.d1.values() {
+            assert!(stats.tables.is_empty());
+        }
     }
 
     #[test]
