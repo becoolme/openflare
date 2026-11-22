@@ -30,6 +30,8 @@ const MAX_OPEN_CONNS: usize = 64;
 // bindgen routes this through the extension-side `sqlite3_api`
 // function table, which is null in a host process. The bundled
 // sqlite always exports the real symbol.
+// SAFETY: declares a stable C symbol exported by the bundled sqlite
+// library; the signature matches the public sqlite3 API.
 unsafe extern "C" {
     fn sqlite3_auto_extension(cb: Option<unsafe extern "C" fn()>) -> std::ffi::c_int;
 }
@@ -38,6 +40,10 @@ unsafe extern "C" {
 /// new `Connection` picks it up.
 static REGISTER: Once = Once::new();
 fn ensure_extension() {
+    // SAFETY: `sqlite3_vec_init` has the exact `unsafe extern "C" fn()`
+    // signature sqlite expects for auto-extension callbacks (it is only
+    // exported as a plain fn item, hence the transmute of the fn pointer).
+    // Registration happens once and the callback outlives the process.
     REGISTER.call_once(|| unsafe {
         sqlite3_auto_extension(Some(std::mem::transmute::<
             *const (),
@@ -208,8 +214,10 @@ impl VectorizeStore {
 }
 
 fn decode_vals(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    blob.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
