@@ -23,6 +23,8 @@ pub enum ResourceKind {
     Queue,
     /// K2 durable event-log stream via vrt-sql K2Backend.
     K2,
+    /// Email sending binding — upstream adapter relay, no VRT storage.
+    Email,
 }
 
 /// Typed binding resource resolved from the authorized desired state.
@@ -69,6 +71,19 @@ pub enum BindingResource {
         /// Platform stream id (32 lowercase hex).
         id: String,
     },
+    /// `{"type":"sendEmail"}` — the resource IS the signed
+    /// send-bindings restriction set (no namespaced object exists);
+    /// the binding name is the resource key.
+    SendEmail {
+        /// Binding name — the resource identifier.
+        name: String,
+        /// `destination_address` pin (mutually exclusive with the list).
+        destination_address: Option<String>,
+        /// `allowed_destination_addresses` allowlist.
+        allowed_destination_addresses: Vec<String>,
+        /// `allowed_sender_addresses` allowlist.
+        allowed_sender_addresses: Vec<String>,
+    },
 }
 
 impl BindingResource {
@@ -82,6 +97,7 @@ impl BindingResource {
             Self::D1Database { .. } => ResourceKind::D1,
             Self::Queue { .. } => ResourceKind::Queue,
             Self::K2Stream { .. } => ResourceKind::K2,
+            Self::SendEmail { .. } => ResourceKind::Email,
         }
     }
 
@@ -95,6 +111,9 @@ impl BindingResource {
             Self::D1Database { id, .. } => id,
             Self::Queue { id } => id,
             Self::K2Stream { id } => id,
+            // No server resource id exists; the binding name is the
+            // resource key (the signed props are the state).
+            Self::SendEmail { name, .. } => name,
         }
     }
 }

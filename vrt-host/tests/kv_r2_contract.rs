@@ -108,6 +108,7 @@ fn spawn_provider(dir: &Path, digest: &str, port: u16) -> std::thread::JoinHandl
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     std::thread::spawn(move || {

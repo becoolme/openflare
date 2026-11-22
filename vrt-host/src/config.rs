@@ -2528,6 +2528,8 @@ pub fn params_json_from_manifest(
             "k2": endpoint(&manifest.facades.k2),
             // MIG-16: facade-ratelimit endpoint (REQUIRED_FACADES).
             "ratelimit": endpoint(&manifest.facades.ratelimit),
+            // send_email: facade-email endpoint (REQUIRED_FACADES).
+            "email": endpoint(&manifest.facades.email),
         },
         "systemWorkers": manifest.system_workers.iter().map(|w| {
             serde_json::json!({
@@ -2675,6 +2677,7 @@ struct FacadeRefsToml {
     queue: ServiceEndpointToml,
     k2: ServiceEndpointToml,
     ratelimit: ServiceEndpointToml,
+    email: ServiceEndpointToml,
 }
 
 impl From<FacadeRefsToml> for vrt_config::FacadeRefs {
@@ -2688,6 +2691,7 @@ impl From<FacadeRefsToml> for vrt_config::FacadeRefs {
             queue: v.queue.into(),
             k2: v.k2.into(),
             ratelimit: v.ratelimit.into(),
+            email: v.email.into(),
         }
     }
 }

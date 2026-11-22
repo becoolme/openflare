@@ -50,6 +50,7 @@ fn svc() -> Arc<TenantService> {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     })
 }
@@ -114,6 +115,7 @@ async fn assets_backend_reports_storage_unavailable() {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     let app = tenant_router(svc);

@@ -78,6 +78,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "services",
     "queues",
     "k2",
+    "send_email",
     "workflows",
     "tail_consumers",
     "streaming_tail_consumers",
@@ -511,6 +512,38 @@ fn opt_str<'a>(v: Option<&'a Value>, field: &str) -> Result<Option<&'a str>, Pro
         Some(v) => Ok(Some(req_str(v, field)?)),
     }
 }
+fn opt_str_list<'a>(
+    v: Option<&'a Value>,
+    field: &str,
+) -> Result<Vec<&'a str>, ProjectConfigError> {
+    match v {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|i| req_str(i, field))
+            .collect::<Result<Vec<_>, _>>(),
+        Some(_) => Err(invalid(field, "must be an array of strings")),
+    }
+}
+
+/// Same restrictive shape as snapshot-protocol `valid_email`: one `@`,
+/// non-empty local/domain, dotted domain, RFC size caps, limited
+/// ASCII. Normalize-time fail closed mirrors desired-state validation.
+fn valid_email(addr: &str) -> bool {
+    let Some((local, domain)) = addr.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && local.len() <= 64
+        && !domain.is_empty()
+        && domain.len() <= 253
+        && addr.len() <= 254
+        && domain.contains('.')
+        && addr
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'-' | b'_' | b'+' | b'%'))
+}
+
 fn opt_u64(v: Option<&Value>, field: &str) -> Result<Option<u64>, ProjectConfigError> {
     match v {
         None | Some(Value::Null) => Ok(None),
@@ -1166,6 +1199,80 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     b.insert("type".into(), Value::from("k2"));
                     b.insert("name".into(), Value::from(binding));
                     b.insert("stream".into(), Value::from(stream));
+                    bindings.push(Value::Object(b));
+                }
+            }
+            "send_email" => {
+                // CF `[[send_email]] {name, destination_address?,
+                // allowed_destination_addresses?,
+                // allowed_sender_addresses?}` — Email Service send
+                // binding. `destination_address` pins every send;
+                // `allowed_*` are allowlists (pin vs list are mutually
+                // exclusive per CF send-bindings).
+                for (i, e) in table_list(value, "send_email")?.iter().enumerate() {
+                    for k in e.keys() {
+                        match k.as_str() {
+                            "name" | "destination_address"
+                            | "allowed_destination_addresses" | "allowed_sender_addresses" => {}
+                            _ => {
+                                return Err(unsupported(&format!("send_email[{i}].{k}"), None))
+                            }
+                        }
+                    }
+                    let name = req_str(
+                        e.get("name").unwrap_or(&Value::Null),
+                        &format!("send_email[{i}].name"),
+                    )?;
+                    let destination = opt_str(
+                        e.get("destination_address"),
+                        &format!("send_email[{i}].destination_address"),
+                    )?;
+                    let allowed_dest = opt_str_list(
+                        e.get("allowed_destination_addresses"),
+                        &format!("send_email[{i}].allowed_destination_addresses"),
+                    )?;
+                    let allowed_senders = opt_str_list(
+                        e.get("allowed_sender_addresses"),
+                        &format!("send_email[{i}].allowed_sender_addresses"),
+                    )?;
+                    if destination.is_some() && !allowed_dest.is_empty() {
+                        return Err(invalid(
+                            &format!("send_email[{i}]"),
+                            "destination_address and allowed_destination_addresses are mutually exclusive",
+                        ));
+                    }
+                    for addr in destination
+                        .iter()
+                        .chain(allowed_dest.iter())
+                        .chain(allowed_senders.iter())
+                    {
+                        if !valid_email(addr) {
+                            return Err(invalid(
+                                &format!("send_email[{i}]"),
+                                "invalid email address",
+                            ));
+                        }
+                    }
+                    let mut b = Map::new();
+                    b.insert("type".into(), Value::from("send_email"));
+                    b.insert("name".into(), Value::from(name));
+                    if let Some(d) = destination {
+                        b.insert("destinationAddress".into(), Value::from(d));
+                    }
+                    if !allowed_dest.is_empty() {
+                        b.insert(
+                            "allowedDestinationAddresses".into(),
+                            Value::Array(allowed_dest.into_iter().map(Value::from).collect()),
+                        );
+                    }
+                    if !allowed_senders.is_empty() {
+                        b.insert(
+                            "allowedSenderAddresses".into(),
+                            Value::Array(
+                                allowed_senders.into_iter().map(Value::from).collect(),
+                            ),
+                        );
+                    }
                     bindings.push(Value::Object(b));
                 }
             }
@@ -2489,6 +2596,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut unsafe_evals = Vec::new();
         let mut flagship = Map::new();
         let mut k2 = Map::new();
+        let mut send_email = Map::new();
         for b in bindings {
             let ty = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
             let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -2602,6 +2710,23 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     let sn = b.get("stream").and_then(|i| i.as_str()).unwrap_or(name);
                     k2.insert(name.into(), Value::from(sn));
                 }
+                "send_email" => {
+                    // CF send-bindings restriction set — normalized
+                    // record already validated the shape; pass it
+                    // through to the pack wire as the camelCase object
+                    // BindingsToml::SendEmailToml expects.
+                    let mut r = Map::new();
+                    if let Some(d) = b.get("destinationAddress") {
+                        r.insert("destinationAddress".into(), d.clone());
+                    }
+                    if let Some(l) = b.get("allowedDestinationAddresses") {
+                        r.insert("allowedDestinationAddresses".into(), l.clone());
+                    }
+                    if let Some(l) = b.get("allowedSenderAddresses") {
+                        r.insert("allowedSenderAddresses".into(), l.clone());
+                    }
+                    send_email.insert(name.into(), Value::Object(r));
+                }
                 "secret" => {
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
@@ -2655,6 +2780,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !k2.is_empty() {
             bind.insert("k2".into(), Value::Object(k2));
+        }
+        if !send_email.is_empty() {
+            bind.insert("sendEmail".into(), Value::Object(send_email));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));
@@ -3544,6 +3672,38 @@ mod tests {
             "s".repeat(257)
         ));
         assert!(load_worker_meta(dir.path()).is_err());
+    }
+
+    #[test]
+    fn send_email_bindings_into_pack_shape() {
+        // CF `[[send_email]] {name, destination_address?,
+        // allowed_*}` → `{type:"send_email"}` records + the pack-shape
+        // `sendEmail` map carrying the restriction set.
+        let dir = wrangler_loader_body(
+            "[[send_email]]\nname=\"EMAIL\"\nallowed_sender_addresses=[\"a@x.com\",\"b@x.com\"]\n[[send_email]]\nname=\"PIN\"\ndestination_address=\"t@x.com\"\n",
+        );
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let b = meta.bindings.unwrap();
+        let e = b.send_email.get("EMAIL").unwrap();
+        assert_eq!(e.allowed_sender_addresses, ["a@x.com", "b@x.com"]);
+        assert!(e.destination_address.is_none());
+        let pin = b.send_email.get("PIN").unwrap();
+        assert_eq!(pin.destination_address.as_deref(), Some("t@x.com"));
+
+        // Fail closed: missing name, pin+list both set, invalid email,
+        // non-array allowlist, unknown keys, non-table shape.
+        for toml in [
+            "[[send_email]]\ndestination_address=\"t@x.com\"\n",
+            "[[send_email]]\nname=\"E\"\ndestination_address=\"t@x.com\"\nallowed_destination_addresses=[\"a@x.com\"]\n",
+            "[[send_email]]\nname=\"E\"\ndestination_address=\"not-an-email\"\n",
+            "[[send_email]]\nname=\"E\"\nallowed_sender_addresses=[\"no-at\"]\n",
+            "[[send_email]]\nname=\"E\"\nallowed_sender_addresses=\"a@x.com\"\n",
+            "[[send_email]]\nname=\"E\"\nextra=1\n",
+            "send_email={name=\"E\"}\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
     }
 
     /// wrangler `[limits]` → internal `quotas` — the CF surface maps onto

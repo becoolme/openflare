@@ -49,6 +49,7 @@ fn service_fixture() -> (Fixture, Arc<TenantService>) {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     (f, svc)
@@ -819,6 +820,7 @@ async fn missing_snapshot_fails_closed_over_http() {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     let (socket, shutdown) = spawn_tenant(svc).await;
@@ -938,6 +940,7 @@ fn perm_service(bindings: Vec<BindingDesired>) -> Arc<TenantService> {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     })
 }
@@ -1187,6 +1190,7 @@ async fn saturated_tenant_permits_answer_429() {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     // Hold the only global permit — the next request must 429 fast.
@@ -1244,6 +1248,7 @@ fn service_fixture_mp() -> (Fixture, Arc<TenantService>) {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     (f, svc)
@@ -1281,6 +1286,7 @@ fn service_fixture_readonly_r2() -> (Fixture, Arc<TenantService>) {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     (f, svc)
@@ -1662,6 +1668,7 @@ async fn multipart_complete_outer_timeout_is_result_unknown() {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     let (socket, shutdown) = spawn_tenant(svc).await;
@@ -1743,6 +1750,7 @@ fn tenant_svc(tenant_permits: usize, global: &Arc<tokio::sync::Semaphore>) -> Ar
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     })
 }
@@ -1850,6 +1858,7 @@ async fn kv_body_read_deadline_returns_typed_busy() {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     let (socket, shutdown) = spawn_tenant(svc).await;

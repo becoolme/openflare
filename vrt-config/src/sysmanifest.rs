@@ -25,7 +25,7 @@ use crate::manifest::valid_module_name;
 pub const FACADE_MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 /// Service names whose endpoints fill [`FacadeRefs`].
-const REQUIRED_FACADES: [&str; 8] = [
+const REQUIRED_FACADES: [&str; 9] = [
     "facade-kv",
     "facade-r2",
     "facade-assets",
@@ -34,6 +34,7 @@ const REQUIRED_FACADES: [&str; 8] = [
     "facade-queue",
     "facade-k2",
     "facade-ratelimit",
+    "facade-email",
 ];
 
 /// Service name of the T6 egress worker — required since T6: it is the
@@ -201,6 +202,7 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         queue: endpoint(REQUIRED_FACADES[5], "facades.required")?,
         k2: endpoint(REQUIRED_FACADES[6], "facades.required")?,
         ratelimit: endpoint(REQUIRED_FACADES[7], "facades.required")?,
+        email: endpoint(REQUIRED_FACADES[8], "facades.required")?,
     };
     let egress = endpoint(EGRESS_SERVICE, "egress.required")?;
     let deny_outbound = endpoint(DENY_OUTBOUND_SERVICE, "denyOutbound.required")?;

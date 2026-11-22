@@ -68,6 +68,7 @@ async fn unix_listener_serves_kv_protocol() {
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
 

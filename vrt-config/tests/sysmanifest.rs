@@ -72,6 +72,7 @@ fn parses_generated_manifest_into_system_workers() {
         "facade-queue",
         "facade-ratelimit",
         "facade-k2",
+        "facade-email",
         "vrt-egress",
         "vrt-no-network",
     ] {
@@ -187,6 +188,7 @@ fn minimal() -> serde_json::Value {
         "facade-queue",
         "facade-ratelimit",
         "facade-k2",
+        "facade-email",
         "vrt-egress",
         "vrt-no-network",
     ] {

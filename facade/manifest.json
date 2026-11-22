@@ -455,6 +455,76 @@
         }
       ]
     },
+    "facade-email": {
+      "entrypoint": "EmailFacade",
+      "needsBindingBackend": true,
+      "mainModule": "facade/facade-email.js",
+      "modules": [
+        {
+          "name": "facade/deadline.js",
+          "dist": "facade/dist/facade/deadline.js",
+          "source": "facade/deadline.ts",
+          "sourceSha256": "804b555002c7e59ae39e0acebb5aea7bd55b5e894fdbe0ecba6f4fe460332285",
+          "sha256": "e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"
+        },
+        {
+          "name": "facade/email-wire.js",
+          "dist": "facade/dist/facade/email-wire.js",
+          "source": "facade/email-wire.ts",
+          "sourceSha256": "d2dfdf2fa37cdc31c0f477b289417873d021a33b373785f482d789cd2c822a68",
+          "sha256": "67f66ebe06fc962eaafabad383c18467d718fe29c97f768a9970bbe9d79e69d2"
+        },
+        {
+          "name": "facade/facade-email.js",
+          "dist": "facade/dist/facade/facade-email.js",
+          "source": "facade/facade-email.ts",
+          "sourceSha256": "7de2f743ad2a2501285d70f15690c97716bdd0b05a7be84631646c6730c713f8",
+          "sha256": "4335174f6a26021f7bbe4a4f356c6a58382f354489c4b8bbfc3b0fc742db37b9"
+        },
+        {
+          "name": "facade/props.js",
+          "dist": "facade/dist/facade/props.js",
+          "source": "facade/props.ts",
+          "sourceSha256": "1fd29f8ddaea55911d86d9b32070e4aa9030ce4bbdbab8ff8c96298b1e297eb6",
+          "sha256": "f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"
+        },
+        {
+          "name": "facade/queue-wire.js",
+          "dist": "facade/dist/facade/queue-wire.js",
+          "source": "facade/queue-wire.ts",
+          "sourceSha256": "e1dc4563ebbaa5d7b0ecb3a3bf2025d257ba77f1e66c2ade7be6e41822c1c502",
+          "sha256": "03e39f43d67f734985a7ac5681d6c01f5790b568fddace60c9f0f4c6c0f72290"
+        },
+        {
+          "name": "third_party/open-compute/facade/bindings/json-body.js",
+          "dist": "facade/dist/third_party/open-compute/facade/bindings/json-body.js",
+          "source": "third_party/open-compute/facade/bindings/json-body.ts",
+          "sourceSha256": "d825baf1890f95f520fa6b548b7f1487021e62e287e91670cf050b8bfdd862cd",
+          "sha256": "d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"
+        },
+        {
+          "name": "third_party/open-compute/facade/loader/python-snapshot.js",
+          "dist": "facade/dist/third_party/open-compute/facade/loader/python-snapshot.js",
+          "source": "third_party/open-compute/facade/loader/python-snapshot.ts",
+          "sourceSha256": "a69bc46cd34708e1b57848f60fde07d51b2a331f5c9ed5e5c23067a57bd8d292",
+          "sha256": "97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"
+        },
+        {
+          "name": "third_party/open-compute/facade/loader/shared.js",
+          "dist": "facade/dist/third_party/open-compute/facade/loader/shared.js",
+          "source": "third_party/open-compute/facade/loader/shared.ts",
+          "sourceSha256": "0bcc1aef30a74df9d90237e4d2ef8276ab346bb0645207575746d9a0dd9feca5",
+          "sha256": "ad6ec6871acd01776f6fe414510e0126266f15f95480ce1172c3fa34babfef6e"
+        },
+        {
+          "name": "third_party/open-compute/facade/loader/snapshot.js",
+          "dist": "facade/dist/third_party/open-compute/facade/loader/snapshot.js",
+          "source": "third_party/open-compute/facade/loader/snapshot.ts",
+          "sourceSha256": "61cb57e3b0295e97d078553a321a5c3c6c88aeda66cdfb228de62fcb9cdb885b",
+          "sha256": "197e8b61660cae5b8829f707ea091adbc206f9ceec3a2bdb105ecbd65cde0a58"
+        }
+      ]
+    },
     "facade-ratelimit": {
       "entrypoint": "RateLimiter",
       "needsBindingBackend": false,

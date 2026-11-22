@@ -305,6 +305,7 @@ fn spawn_provider(
         d1: None,
         queue: None,
         k2: None,
+        email: None,
         pg: None,
     });
     std::thread::spawn(move || {

@@ -73,6 +73,7 @@ environment blocks.
 | `observability` | partial — Worker Logs gates + head sampling applied by the platform `vrt-tail` collector: `enabled`/`logs.enabled` `false` renders NO collector (nothing collected); `logs.head_sampling_rate` (or the deprecated top-level `head_sampling_rate` alias; when both are present `logs.*` wins, matching CF's authoritative slot) keeps that fraction of INVOCATIONS whole, decided per invocation (a dropped invocation keeps none of its records; deterministic FNV-1a over `scriptName`+`eventTimestamp`+`durableObjectId`); the rate crosses the signed wire as integer ppm `headSamplingRatePpm` (0..1_000_000 — canonical JSON is safe-integer-only), so effective granularity is 1e-6; `logs.invocation_logs` `false` drops only the outcome record. The table inherits into `[env.*]` like upstream wrangler (it is NOT in `NON_INHERITABLE_ENV_KEYS`) and an env block deep-merges onto the inherited table, so a top-level `enabled = false` or `logs.invocation_logs = false` stays in force in every named environment unless that environment overrides the exact key. `traces`, `persist`, `destinations` and other keys fail closed | `project_cfg.rs:991` |
 | `flagship` | partial — Flagship feature flags; per-entry keys `binding`, `app_id`, `remote` (`remote` accepted and ignored — no remote/local split; evaluation always uses the propagated app config). App definitions are tenant-level `flagshipApps` on the signed snapshot — standalone supplies them via `flagship.json` (bound-but-undeclared apps get an empty store); see [Flagship](bindings/flagship.md) | `project_cfg.rs:923` |
 | `k2` | partial — K2 durable event log produce binding; per-entry keys `binding`, `stream`, `remote` (`remote` accepted and ignored). `stream` is the user-side stream name (`[A-Za-z0-9_-]{1,256}`); the 32-hex `streamId` is derived server-side (`vrt-k2:{tenant}:{name}` standalone; server-minted row platform-side) — routing always uses the signed id. `env.<binding>.send(records)` resolves `{success:true}` or `{success:false,error:{code,retryable}}` and never throws (CF produce contract). Consumption is not a binding — it rides the platform subscription surface | `project_cfg.rs:1095` |
+| `send_email` | supported — Email Sending binding; per-entry keys `name` (required), `destination_address`, `allowed_destination_addresses`, `allowed_sender_addresses` (`destination_address` and `allowed_destination_addresses` are mutually exclusive — both set fails closed; every address format-validated; unknown keys `VRT_CONFIG_UNSUPPORTED_FIELD`). `env.<name>.send(message)` validates the CF Workers Email Sending contract provider-side (from required, ≥1 of to/cc/bcc, subject required, ≤50 recipients, ≤32 attachments, ≤25MiB total) and resolves `{messageId}` on success or throws an `Error` carrying the CF `E_*` code in `.code`. Restrictions are signed into desired state and enforced on every send. Delivery is NOT self-hosted — the provider `[email]` config selects an adapter: `cloudflare`, `resend`, `smtp`, or `log` | `project_cfg.rs:1179` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
 | `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1179` |
@@ -224,3 +225,24 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
   is the vrt-sql K2 append log (per-stream namespace, ≤30-day TTL,
   subscription+lease consume surface on the provider side). Admission
   requires the `k2` cell capability.
+- 2026-11-21: `send_email` is supported — `[[send_email]] {name,
+  destination_address?, allowed_destination_addresses?,
+  allowed_sender_addresses?}` declares a CF Email Sending binding.
+  `destination_address` and `allowed_destination_addresses` are
+  mutually exclusive at normalize time; all configured addresses are
+  validated. The binding name is the resource key (no separate email
+  resource row exists); the three restriction fields ride the signed
+  desired state and the provider enforces them on every send — the
+  signed `write` permission is required to send. Request validation
+  follows the CF Workers Email Sending contract (`from` required, at
+  least one of `to`/`cc`/`bcc`, `subject` required, ≤50 combined
+  recipients, ≤32 attachments, ≤25MiB total, `{email,name}` address
+  shapes, custom-header rules) and failures surface the CF `E_*`
+  codes — `send()` throws an `Error` with `.code` set and resolves
+  `{messageId}` on success. Delivery is pluggable, not self-hosted:
+  the provider `[email]` config selects `cloudflare`, `resend`,
+  `smtp`, or `log` (test/dev sink) adapters; upstream credentials
+  live in provider config/env references, never in desired state;
+  every upstream call is timeout-bounded and retryable failures map
+  to HTTP 503 vs 502 for non-retryable. Admission requires the
+  `email` cell capability.

@@ -156,6 +156,9 @@ pub struct FacadeRefs {
     /// `ratelimit` bindings -> plain service binding to this facade's
     /// `RateLimiter` entrypoint (MIG-16; no binding-backend).
     pub ratelimit: ServiceEndpoint,
+    /// `send_email` bindings → wrapped `cloudflare-internal:send-email`
+    /// whose inner `fetcher` service is this facade (POST /send).
+    pub email: ServiceEndpoint,
 }
 
 /// A system module referenced by content digest (the artifact for a
@@ -1623,6 +1626,9 @@ fn emit_binding(
         BindingDesired::K2(k) => {
             emit_k2_binding(out, k, worker, input)?;
         }
+        BindingDesired::SendEmail(e) => {
+            emit_email_binding(out, e, worker, input)?;
+        }
         BindingDesired::Ratelimit(r) => {
             emit_ratelimit_binding(out, r, worker, input)?;
         }
@@ -2029,6 +2035,43 @@ fn emit_k2_binding(
 ",
         capnp_text(&k.name),
         capnp_text("cloudflare-internal:k2"),
+        capnp_text(&facade.service),
+        capnp_text(&facade.entrypoint),
+        capnp_text(&props),
+    ));
+    Ok(())
+}
+
+/// Emit a `send_email` binding (CF Email Service): `env.<name>` is a
+/// `wrapped` binding over `cloudflare-internal:send-email`; the inner
+/// `fetcher` is facade-email, which signs and forwards to the
+/// provider's email route. The binding name doubles as the resource
+/// key — restrictions travel in signed desired state, not props.
+fn emit_email_binding(
+    out: &mut String,
+    e: &snapshot_protocol::compute_desired::SendEmailBinding,
+    worker: &WorkerDesired,
+    input: &TenantRenderInput<'_>,
+) -> Result<(), ConfigError> {
+    let props = String::from_utf8(canonical_bytes(&json!({
+        "bindingId": format!("{}~{}", worker.worker_id, e.name),
+        "descriptorSha256": worker.active_version.artifact_digest,
+        "instanceId": input.tenant.tenant_id,
+        "namespaceResourceId": e.name,
+        "permissions": {"read": e.permissions.read, "write": e.permissions.write},
+        "resourceSpecGeneration": input.revision,
+        "versionId": worker.active_version.version_id,
+        "workerId": worker.worker_id,
+    })))
+    .expect("canonical props are utf8");
+    let facade = &input.params.facades.email;
+    out.push_str(&format!(
+        "        (name = {}, wrapped = (moduleName = {}, innerBindings = [
+            (name = \"fetcher\", service = (name = {}, entrypoint = {}, props = (json = {})))
+        ])),
+",
+        capnp_text(&e.name),
+        capnp_text("cloudflare-internal:send-email"),
         capnp_text(&facade.service),
         capnp_text(&facade.entrypoint),
         capnp_text(&props),

@@ -207,6 +207,13 @@ pub struct AckCapabilities {
     /// that claim it. Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub k2: bool,
+    /// `{"type":"sendEmail"}` bindings render a `wrapped` binding over
+    /// `cloudflare-internal:send-email` routed through `facade-email` —
+    /// a cell predating either fails the snapshot parse or the config
+    /// load, so email bindings only admit onto cells claiming it.
+    /// Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub email: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

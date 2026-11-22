@@ -113,7 +113,9 @@ async fn run() -> ExitCode {
                 }
             },
             Err(_) => {
-                tracing::error!("cursor secret unavailable (cursorSecretFile unset and env var missing)");
+                tracing::error!(
+                    "cursor secret unavailable (cursorSecretFile unset and env var missing)"
+                );
                 return ExitCode::FAILURE;
             }
         },
@@ -155,7 +157,10 @@ async fn run() -> ExitCode {
     // verified snapshot names tenants. Untrusted snapshots never reach
     // this point — `wait_for_initial_snapshot` already failed closed.
     if tenants.is_empty() {
-        tracing::info!(revision, "verified snapshot has no tenants; standing by for the next snapshot");
+        tracing::info!(
+            revision,
+            "verified snapshot has no tenants; standing by for the next snapshot"
+        );
     }
 
     let kv_backend = match build_kv(&config).await {
@@ -202,11 +207,7 @@ async fn run() -> ExitCode {
                     .map_err(|_| ())
                 })
             }) {
-                Ok((d1, q, k)) => (
-                    Some(Arc::new(d1)),
-                    Some(Arc::new(q)),
-                    Some(Arc::new(k)),
-                ),
+                Ok((d1, q, k)) => (Some(Arc::new(d1)), Some(Arc::new(q)), Some(Arc::new(k))),
                 Err(_) => {
                     tracing::error!("vrtSql.addr invalid");
                     return ExitCode::FAILURE;
@@ -216,6 +217,18 @@ async fn run() -> ExitCode {
         None => (None, None, None),
     };
     let (d1_client, queue_client, k2_client) = d1_client;
+    // send_email upstream adapter — `[email]` config, secrets resolve
+    // from the named env vars. Absent config → route 503s honestly.
+    let email_backend: Option<Arc<dyn vrt_provider::email::EmailBackend>> = match &config.email {
+        Some(cfg) => match vrt_provider::email::adapter_from_config(cfg) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::error!(error = %e, "email backend init failed");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
     // P1: PG backend is a pure credential-file reader — constructing it
     // never touches the network (lazy egress per request).
     let pg_backend = config.pg.as_ref().map(|pg| {
@@ -484,6 +497,7 @@ async fn run() -> ExitCode {
                 d1: d1.clone(),
                 queue: queue_client.clone(),
                 k2: k2_client.clone(),
+                email: email_backend.clone(),
                 pg: pg.clone(),
             });
             // RV-R67: one quota per listener (bounded by live tenants).
