@@ -135,6 +135,15 @@ for t in "${TIER2[@]}"; do
   fi
 done
 
+# vrt-local `vrt dev` with real workerd: upload → request → update → new code.
+echo "-- vrt-local dev (real workerd)"
+if ! env VRT_HOST_UNIX_TESTS="${VRT_HOST_UNIX_TESTS:-1}" \
+  timeout -k 15 "${TARGET_TIMEOUT:-900}" \
+  cargo test --locked -p vrt-local --test dev \
+  -- --ignored --test-threads="$THREADS" --nocapture; then
+  FAILED+=("vrt-local-dev")
+fi
+
 if [ "${#FAILED[@]}" -gt 0 ]; then
   echo "== FAILED tier-2 targets: ${FAILED[*]} ==" >&2
   exit 1
