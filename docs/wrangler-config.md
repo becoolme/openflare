@@ -83,6 +83,8 @@ environment blocks.
 | `limits` | supported — see [Per-worker quotas](quotas.md); `cpu_ms` (1..300000) and `subrequests` (0..10000); other keys rejected | `project_cfg.rs:1393` |
 | `dev` | supported (dev-only) — `ip` (loopback only; `localhost` normalizes to `127.0.0.1`, `::1` binds as `[::1]:port`), `port` (1..65535), `host` (extra route hostname registered for the session via `DeployOverrides.hostnames`; must satisfy the route hostname rule), `local_protocol = "http"` no-op. The deploy-facing projection accepts and drops the table, so dev-only keys never fail `vrt deploy`; `vrt dev` validates strictly at session start (`parse_dev_table`) where `inspector_*`, `upstream_protocol`, `remote`/`experimental_remote`, `enable_containers`, `container_engine`, `generate_types` are rejected | `project_cfg.rs` `parse_dev_table`, `dev.rs` `DevPorts::alloc` |
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
+| `rules` | supported — ordered `{ type, globs, fallthrough? }` module-typing rules (wrangler `Rule` shape, `additionalProperties: false`). Types: `ESModule`, `CommonJS`, `CompiledWasm`, `Text`, `Data`; `PythonModule`/`PythonRequirement` fail closed (no Python runtime). At pack time every gathered file under the rule root evaluates rules in order — user rules first, then the wrangler built-ins (`Text: **/*.txt,html,sql`, `Data: **/*.bin`, `CompiledWasm: **/*.wasm[?module]`), then the extension fallback; a matched non-`fallthrough` rule prunes every LATER rule of the same type (wrangler `parseRules`). The entrypoint is never retyped by a rule | `project_cfg.rs` `normalize_module_rules`; `worker_pkg.rs` `effective_module_rules` |
+| `base_dir` | supported — the directory rule globs evaluate against (wrangler `moduleRoot`; default = the `main` directory). Files outside the root are not rule candidates and keep extension-fallback typing. Must be a clean relative dir inside the project (no absolute/traversal/`\\`/`:`) | `project_cfg.rs` `validate_base_dir`; `worker_pkg.rs` `module_root` |
 
 ## Accepted and ignored
 
@@ -90,10 +92,16 @@ Mirrors wrangler's own ignore list — present keys do not fail the deploy
 but change nothing (`IGNORED_TOP_LEVEL`, `project_cfg.rs:31–57`):
 
 `account_id`, `workers_dev`, `send_metrics`, `keep_vars`, `build`,
-`rules`, `alias`, `tsconfig`, `jsx_factory`, `jsx_fragment`,
+`alias`, `tsconfig`, `jsx_factory`, `jsx_fragment`,
 `no_bundle`, `minify`, `keep_names`, `find_additional_modules`,
-`preserve_file_names`, `base_dir`, `define`, `upload_source_maps`,
+`preserve_file_names`, `define`, `upload_source_maps`,
 `cwd`, `config`, `placement`.
+
+`no_bundle`/`find_additional_modules`/`preserve_file_names` stay ignored
+deliberately: the standalone pack ships the module table unbundled
+already, so there is no bundler for those knobs to steer — `rules` only
+chooses each module's uploaded type here, matching what wrangler's
+`--no-bundle` path does with them.
 
 Also type-checked then dropped inside supported blocks:
 

@@ -1459,3 +1459,61 @@ fn flagship_bindings_and_flag_store_deploy() {
     .unwrap();
     assert!(local.deploy(&dir3, &DeployOverrides::default()).is_err());
 }
+
+/// CF `rules`/`base_dir` — a wrangler project carries them into the
+/// pack: globs type gathered files against the `base_dir` root, the
+/// entry is never retyped, and unmatched files keep the extension
+/// table. Deployed end-to-end through `pack_with_resolver`.
+#[test]
+fn wrangler_rules_classify_pack_modules() {
+    let root = root();
+    let dir = root.join("worker-rules");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src/index.mjs"), "export default {}\n").unwrap();
+    std::fs::write(dir.join("src/readme.md"), "# hi\n").unwrap();
+    std::fs::write(dir.join("src/page.html"), "<p/>\n").unwrap();
+    std::fs::write(dir.join("src/blob.wasm"), [0u8, 97, 115, 109]).unwrap();
+    // Root-level file: outside the `src/` rule root — no glob sees it
+    // (not even the implicit defaults); the extension table types it.
+    std::fs::write(dir.join("notes.txt"), "x\n").unwrap();
+    std::fs::write(
+        dir.join("wrangler.toml"),
+        "name = \"rules-svc\"\nmain = \"src/index.mjs\"\n\
+         compatibility_date = \"2025-01-01\"\n\
+         base_dir = \"src\"\n\
+         rules = [{type = \"Text\", globs = [\"**/*.md\"], fallthrough = true},\n\
+         {type = \"Data\", globs = [\"*.wasm\"]}]\n",
+    )
+    .unwrap();
+
+    let pkg = vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &|_| None)
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&pkg.stored_document).unwrap();
+    let ty_of = |name: &str| -> String {
+        doc["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap_or_else(|| panic!("module {name} missing"))["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    // `readme.md` → user Text rule; `blob.wasm` → user Data rule
+    // (first match wins over the implicit CompiledWasm default);
+    // entry stays esModule despite the `*.wasm` glob.
+    assert_eq!(ty_of("src/readme.md"), "text");
+    assert_eq!(
+        ty_of("src/blob.wasm"),
+        "data",
+        "user Data rule shadows the implicit CompiledWasm default"
+    );
+    assert_eq!(ty_of("src/index.mjs"), "esModule");
+    // `page.html` inside `src/` hits the implicit Text default (kept
+    // alive by the user's `fallthrough = true`).
+    assert_eq!(ty_of("src/page.html"), "text");
+    // `notes.txt` sits outside `src/` — rule-invisible, typed by the
+    // extension table like before.
+    assert_eq!(ty_of("notes.txt"), "text");
+}
