@@ -246,7 +246,7 @@ const config :Workerd.Config = (
         (name = "facade/facade-vectorize.js", esModule = embed "sys/f9f5dcfa6508f06789299954c87e689c72193606a88cd591f95171392c373853"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
-        (name = "facade/queue-wire.js", esModule = embed "sys/f22d35fa0051d3576af9f56efae17d2f79e66dca674ae018ea322acbfc0e2508"),
+        (name = "facade/queue-wire.js", esModule = embed "sys/03e39f43d67f734985a7ac5681d6c01f5790b568fddace60c9f0f4c6c0f72290"),
         (name = "facade/vectorize-wire.js", esModule = embed "sys/14f85004360c33d0ae52c0638a51e8f2c8a3cd70fccf338f0180ff4c1b7e662a"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
         (name = "third_party/open-compute/facade/loader/python-snapshot.js", esModule = embed "sys/97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"),
