@@ -37,11 +37,13 @@
 //! never a half-state desired document.
 
 mod bundle;
+mod bundle_spec;
 pub mod check;
 mod desired;
 pub mod dev;
 pub mod devvars;
 pub mod doctor;
+pub(crate) mod glob;
 pub mod keys;
 pub mod layout;
 mod lock;

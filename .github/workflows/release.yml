@@ -38,13 +38,23 @@ jobs:
           targets: ${{ matrix.target }}${{ matrix.extra_target && format(', {0}', matrix.extra_target) || '' }}
       - uses: Swatinem/rust-cache@v2
 
+      # of-bundler is a separate cargo workspace — rolldown's dep tree
+      # enables serde_json preserve_order/arbitrary_precision, and
+      # feature unification must not leak that into the shipped `of`.
+      # Release binaries embed the helper (build.rs OF_EMBED_BUNDLER);
+      # at run time it materializes to a hashed cache file, so the
+      # single `of` download stays self-contained.
       - name: Build of
         run: |
-          cargo build --release --locked -p vrt-local --bin of --target ${{ matrix.target }}
+          cargo build --release --locked --manifest-path of-bundler/Cargo.toml --target ${{ matrix.target }}
           mkdir -p dist
+          OF_EMBED_BUNDLER="of-bundler/target/${{ matrix.target }}/release/of-bundler" \
+            cargo build --release --locked -p vrt-local --bin of --target ${{ matrix.target }}
           cp "target/${{ matrix.target }}/release/of" "dist/of-${{ matrix.name }}"
           if [ -n "${{ matrix.extra_target || '' }}" ]; then
-            cargo build --release --locked -p vrt-local --bin of --target ${{ matrix.extra_target }}
+            cargo build --release --locked --manifest-path of-bundler/Cargo.toml --target ${{ matrix.extra_target }}
+            OF_EMBED_BUNDLER="of-bundler/target/${{ matrix.extra_target }}/release/of-bundler" \
+              cargo build --release --locked -p vrt-local --bin of --target ${{ matrix.extra_target }}
             cp "target/${{ matrix.extra_target }}/release/of" "dist/of-${{ matrix.extra_name }}"
           fi
 

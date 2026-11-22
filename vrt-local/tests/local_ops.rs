@@ -260,18 +260,16 @@ fn status_pretty_output_worker_id_lookup_is_order_independent() {
         .keys()
         .map(String::as_str)
         .collect();
-    // Struct-declaration order (serde_json preserve_order): `versions`
-    // interposes between `name`/`workerId`.
     assert_eq!(
         keys,
         [
-            "name",
-            "workerId",
             "activeVersionId",
-            "versions",
             "hostnames",
+            "name",
             "quotas",
-            "quotasEnforced"
+            "quotasEnforced",
+            "versions",
+            "workerId"
         ]
     );
 }

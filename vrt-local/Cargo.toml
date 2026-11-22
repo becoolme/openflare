@@ -27,10 +27,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ring = "0.17"
 thiserror = "2"
 toml = "0.8"
-rolldown = "1.3"
-rolldown_common = "=1.3.2"
-nodejs-built-in-modules = "1.0"
-futures = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

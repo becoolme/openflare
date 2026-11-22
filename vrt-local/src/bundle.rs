@@ -1,20 +1,31 @@
 //! Wrangler-semantic bundling: `main` + its import graph compiled to a
-//! single ESM mainModule via rolldown (the Rust bundler behind
-//! rolldown-vite). `cloudflare:*`/`node:*` specifiers, bare Node
-//! builtins under `nodejs_compat`, and rule-typed modules
-//! (Text/Data/CompiledWasm) stay external so the pack carries each as a
-//! first-class wire module — the same shape wrangler's esbuild step
-//! produces for the upload API.
+//! single ESM mainModule by the `of-bundler` helper subprocess
+//! (rolldown — the Rust bundler behind rolldown-vite).
+//! `cloudflare:*`/`node:*` specifiers, bare Node builtins under
+//! `nodejs_compat`, and rule-typed modules (Text/Data/CompiledWasm)
+//! stay external so the pack carries each as a first-class wire
+//! module — the same shape wrangler's esbuild step produces for the
+//! upload API.
+//!
+//! The bundler is a separate binary, not a linked dependency:
+//! rolldown's dep tree enables serde_json `preserve_order` +
+//! `arbitrary_precision`, and cargo feature unification would leak
+//! those semantics into every crate sharing a build graph with
+//! vrt-local (signed desired-state docs, wire shapes, axum `Json`
+//! serialization, golden fixtures). `of` resolves the helper in this
+//! order:
+//!   1. `$OF_BUNDLER` — explicit path (dev/CI override)
+//!   2. embedded bytes — written to a hashed cache file and executed
+//!      (release binaries ship self-contained)
+//!   3. `<repo>/of-bundler/target/{debug,release}/of-bundler` —
+//!      in-repo builds
+//!   4. `of-bundler` next to the running executable (co-installed)
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
-use rolldown::{
-    Bundler, BundlerOptions, BundlerTransformOptions, ChunkFilenamesOutputOption, InputItem,
-    IsExternal, OutputFormat, Platform, RawMinifyOptions, ResolveOptions, TypeScriptOptions,
-};
-use rolldown_common::Output;
-
+use crate::bundle_spec::{BundleOutcome, BundleOptsSpec, BundleSpec};
 use crate::LocalError;
 
 /// Bundler knobs normalized from wrangler keys (`[bundle]` in the
@@ -45,385 +56,138 @@ pub struct Bundled {
     pub externals: Vec<(String, String)>,
 }
 
-/// Normalize `p` to a `/`-separated relative path (no `.` segments —
-/// the bundle format forbids them). `None` when the path escapes the
-/// worker dir.
-fn rel_norm(base: &Path, joined: &Path) -> Option<String> {
-    let rel = joined.strip_prefix(base).ok().unwrap_or(joined);
-    let mut out: Vec<String> = Vec::new();
-    for c in rel.components() {
-        match c {
-            std::path::Component::Normal(s) => out.push(s.to_string_lossy().replace('\\', "/")),
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if out.pop().is_none() {
-                    return None;
-                }
-            }
-            _ => return None,
+/// `of-bundler` bytes embedded at build time via `OF_EMBED_BUNDLER`
+/// (release packaging); empty in dev builds — see build.rs.
+const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/of-bundler.bin"));
+
+/// Where a materialized copy of the embedded helper lives. Hashed by
+/// content so upgraded `of` binaries don't reuse a stale helper.
+fn embedded_path() -> Result<PathBuf, LocalError> {
+    if EMBEDDED.is_empty() {
+        return Err(LocalError::Worker("of-bundler not embedded"));
+    }
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in EMBEDDED {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    let path = std::env::temp_dir()
+        .join("openflare")
+        .join(format!("of-bundler-{h:016x}"));
+    if !path.is_file() {
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).map_err(|_| LocalError::Worker("of-bundler cache"))?;
+        let tmp = dir.join(format!(".of-bundler-{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .map_err(|_| LocalError::Worker("of-bundler cache"))?;
+            f.write_all(EMBEDDED)
+                .map_err(|_| LocalError::Worker("of-bundler cache"))?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| LocalError::Worker("of-bundler cache"))?;
+        }
+        // Atomic publish; a racing same-version helper is byte-identical.
+        let _ = std::fs::rename(&tmp, &path);
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(path)
+}
+
+fn find_bundler() -> Result<PathBuf, LocalError> {
+    if let Ok(p) = std::env::var("OF_BUNDLER") {
+        if !p.is_empty() {
+            return Ok(PathBuf::from(p));
         }
     }
-    Some(out.join("/"))
-}
-
-/// `(specifier → project-rel file)` recorded while marking externals,
-/// plus the emitted-specifier → module-name mapping applied after
-/// generate. Bare specifiers (`pkg/a.txt`) keep their written name —
-/// workerd matches bare specifiers by exact module name.
-struct ExtTracker {
-    // specifier as written in source → resolved project-rel path
-    by_spec: Mutex<BTreeMap<String, String>>,
-}
-
-impl ExtTracker {
-    fn record(&self, spec: &str, rel: String) {
-        self.by_spec.lock().unwrap().insert(spec.to_string(), rel);
+    if let Ok(p) = embedded_path() {
+        return Ok(p);
     }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    for profile in ["debug", "release"] {
+        let p = manifest
+            .join("../of-bundler/target")
+            .join(profile)
+            .join("of-bundler");
+        if p.is_file() {
+            return Ok(p);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let p = dir.join("of-bundler");
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+    }
+    Err(LocalError::WorkerOwned(
+        "of-bundler helper not found (set OF_BUNDLER, build of-bundler/, or use a release binary)"
+            .into(),
+    ))
 }
 
-/// Run rolldown on `entry` inside `root` on a dedicated thread with a
-/// current-thread runtime — safe to call from both sync and async
-/// callers (`tokio::runtime` cannot nest).
+/// Bundle `entry` inside `root` via the `of-bundler` subprocess.
+/// `rule_globs`/`rule_prefix` reproduce `worker_pkg`'s rule predicate:
+/// a project-relative path under `rule_prefix` matching any glob is a
+/// rule-typed module and stays external.
 pub fn bundle_sync(
     root: PathBuf,
     entry: String,
     main_dir: String,
-    is_rule_module: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    rule_globs: Vec<String>,
+    rule_prefix: String,
     opts: BundleOpts,
 ) -> Result<Bundled, LocalError> {
-    std::thread::scope(|s| {
-        s.spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| LocalError::Worker("bundle rt"))
-                .and_then(|rt| {
-                    rt.block_on(bundle_entry(&root, &entry, &main_dir, is_rule_module, opts))
-                })
-        })
-        .join()
-        .map_err(|_| LocalError::Worker("bundle panic"))?
-    })
-}
-
-async fn bundle_entry(
-    root: &Path,
-    entry: &str,
-    main_dir: &str,
-    is_rule_module: Arc<dyn Fn(&str) -> bool + Send + Sync>,
-    opts: BundleOpts,
-) -> Result<Bundled, LocalError> {
-    let root_c = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let tracker = Arc::new(ExtTracker {
-        by_spec: Mutex::new(BTreeMap::new()),
-    });
-    let tr = tracker.clone();
-    let rule = is_rule_module.clone();
-    let nodejs = opts.nodejs_compat;
-    let root_cb = root_c.clone();
-    let external = IsExternal::Fn(Some(Arc::new(move |spec, importer, _resolved| {
-        let spec = spec.to_string();
-        let importer = importer.map(|s| s.to_string());
-        let tr = tr.clone();
-        let rule = rule.clone();
-        let root_cb = root_cb.clone();
-        Box::pin(async move {
-            if spec.starts_with("node:") || spec.starts_with("cloudflare:") {
-                return Ok(true);
-            }
-            if nodejs
-                && nodejs_built_in_modules::BUILTINS
-                    .contains(&spec.split('/').next().unwrap_or(&spec))
-            {
-                return Ok(true);
-            }
-            // Rule-typed file? Resolve the specifier to a project-rel
-            // path, then let the caller's rule table decide.
-            let resolved = if spec.starts_with("./") || spec.starts_with("../") {
-                importer
-                    .as_deref()
-                    .map(Path::new)
-                    .and_then(|imp| imp.parent())
-                    .map(|d| d.join(&spec))
-            } else {
-                // Bare specifier — resolve through node_modules chains
-                // walking up from the importer's directory.
-                importer
-                    .as_deref()
-                    .map(Path::new)
-                    .and_then(|imp| imp.parent())
-                    .map(|start| {
-                        let mut dir = Some(start.to_path_buf());
-                        loop {
-                            let d = dir?;
-                            let cand = d.join("node_modules").join(&spec);
-                            if cand.is_file() {
-                                return Some(cand);
-                            }
-                            dir = d.parent().map(|p| p.to_path_buf());
-                            if !d.starts_with(&root_cb) {
-                                return None;
-                            }
-                        }
-                    })
-                    .flatten()
-            };
-            let Some(abs) = resolved else {
-                return Ok(false);
-            };
-            let Some(rel) = rel_norm(&root_cb, &abs) else {
-                return Ok(false);
-            };
-            if !rule(&rel) {
-                return Ok(false);
-            }
-            tr.record(&spec, rel);
-            Ok(true)
-        })
-    })));
-
-    let mut transform = BundlerTransformOptions::default();
-    if opts.jsx_factory.is_some() || opts.jsx_fragment.is_some() {
-        // Wrangler `jsx_factory`/`jsx_fragment` = esbuild classic
-        // pragma — no auto-runtime import.
-        transform.jsx = Some(rolldown::Either::Right(rolldown::JsxOptions {
-            runtime: Some("classic".into()),
-            pragma: opts.jsx_factory.clone(),
-            pragma_frag: opts.jsx_fragment.clone(),
-            ..Default::default()
-        }));
-        transform.typescript = Some(TypeScriptOptions {
-            jsx_pragma: opts.jsx_factory.clone(),
-            jsx_pragma_frag: opts.jsx_fragment.clone(),
-            ..Default::default()
-        });
-    }
-
-    let opts_rolldown = BundlerOptions {
-        input: Some(vec![InputItem {
-            name: None,
-            import: entry.to_string(),
-        }]),
-        cwd: Some(root_c.clone()),
-        external: Some(external),
-        platform: Some(Platform::Neutral),
-        format: Some(OutputFormat::Esm),
-        keep_names: Some(opts.keep_names.unwrap_or(true)),
-        // Logical location of every emitted chunk = the main module's
-        // dir — emitted external specifiers come out relative to it,
-        // matching how workerd resolves them against the module name.
-        dir: Some(if main_dir.is_empty() {
-            ".".to_string()
-        } else {
-            main_dir.to_string()
-        }),
-        // Emit the entry under its own basename so a lazy chunk's
-        // `import("./index.ts")` resolves back to the main module name.
-        entry_filenames: Some(ChunkFilenamesOutputOption::String(
-            Path::new(entry)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| entry.to_string()),
-        )),
-        minify: opts.minify.map(RawMinifyOptions::Bool),
-        define: Some(
-            opts.define
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        ),
-        transform: Some(transform),
-        resolve: Some(ResolveOptions {
-            extensions: Some(vec![
-                ".js".into(),
-                ".mjs".into(),
-                ".ts".into(),
-                ".mts".into(),
-                ".jsx".into(),
-                ".tsx".into(),
-                ".cjs".into(),
-                ".json".into(),
-            ]),
-            // `import './x.js'` resolving `./x.ts` — the TS-ecosystem
-            // convention wrangler follows.
-            extension_alias: Some(vec![
-                (
-                    ".js".into(),
-                    vec![".ts".into(), ".tsx".into(), ".js".into(), ".jsx".into()],
-                ),
-                (".mjs".into(), vec![".mts".into(), ".mjs".into()]),
-                (".cjs".into(), vec![".cts".into(), ".cjs".into()]),
-            ]),
-            condition_names: Some(vec![
-                "workerd".into(),
-                "worker".into(),
-                "browser".into(),
-                "import".into(),
-                "module".into(),
-                "default".into(),
-            ]),
-            main_fields: Some(vec!["browser".into(), "module".into(), "main".into()]),
-            ..Default::default()
-        }),
-        ..Default::default()
+    let spec = BundleSpec {
+        root: root.to_string_lossy().into_owned(),
+        entry,
+        main_dir,
+        rule_prefix,
+        rule_globs,
+        opts: BundleOptsSpec {
+            minify: opts.minify,
+            keep_names: opts.keep_names,
+            define: opts.define,
+            jsx_factory: opts.jsx_factory,
+            jsx_fragment: opts.jsx_fragment,
+            nodejs_compat: opts.nodejs_compat,
+        },
     };
-    let mut bundler = Bundler::new(opts_rolldown).map_err(|_| LocalError::Worker("bundle init"))?;
-    let out = bundler
-        .generate()
-        .await
-        .map_err(|e| LocalError::WorkerOwned(format!("bundle: {e}")))?;
-    bundler.close().await.ok();
-
-    // Module names every emitted chunk occupies — inter-chunk edges
-    // resolve to these, so they must not be mistaken for file externals.
-    let mut emitted = std::collections::BTreeSet::new();
-    let mut main_source = None;
-    let mut chunks = Vec::new();
-    let entry_name = rel_norm(Path::new("/"), Path::new(entry))
-        .ok_or(LocalError::Worker("module escapes worker dir"))?;
-    for asset in out.assets.iter() {
-        let Output::Chunk(chunk) = asset else {
-            continue;
-        };
-        if chunk.is_entry {
-            main_source = Some(chunk.code.clone());
-            emitted.insert(entry_name.clone());
-        } else {
-            let name = rel_norm(
-                Path::new("/"),
-                &Path::new(main_dir).join(chunk.filename.as_str()),
-            )
-            .ok_or(LocalError::Worker("module escapes worker dir"))?;
-            emitted.insert(name.clone());
-            chunks.push((name, chunk.code.clone()));
-        }
-    }
-    let Some(main_source) = main_source else {
-        return Err(LocalError::Worker("bundle output"));
-    };
-
-    let map = tracker.by_spec.lock().unwrap();
-    let mut externals: BTreeMap<String, String> = BTreeMap::new();
-    for asset in out.assets.iter() {
-        let Output::Chunk(chunk) = asset else {
-            continue;
-        };
-        for spec in chunk.imports.iter().chain(chunk.dynamic_imports.iter()) {
-            let s = spec.as_str();
-            if s.starts_with("node:") || s.starts_with("cloudflare:") {
-                continue;
-            }
-            // Normalize the specifier to the module name it resolves to
-            // from main_dir; an emitted-chunk name is an internal edge.
-            let cand = rel_norm(Path::new("/"), &Path::new(main_dir).join(s));
-            if cand.as_ref().is_some_and(|c| emitted.contains(c)) || emitted.contains(s) {
-                continue;
-            }
-            if s.starts_with("./") || s.starts_with("../") {
-                let Some(name) = cand else {
-                    return Err(LocalError::Worker("module escapes worker dir"));
-                };
-                let rel = map.get(s).cloned().unwrap_or_else(|| name.clone());
-                externals.entry(name).or_insert(rel);
-                continue;
-            }
-            // Bare specifier: a recorded rule-typed file → wire module
-            // under the emitted name (rolldown may emit a same-dir
-            // `./x` import as bare `x`; the tracker keys on the source
-            // spelling).
-            let rel = map
-                .get(s)
-                .or_else(|| map.get(&format!("./{s}")))
-                .or_else(|| map.get(&format!("../{s}")));
-            if let Some(rel) = rel {
-                externals.entry(s.to_string()).or_insert(rel.clone());
-                continue;
-            }
-            if nodejs
-                && nodejs_built_in_modules::BUILTINS.contains(&s.split('/').next().unwrap_or(s))
-            {
-                continue;
-            }
-            return Err(LocalError::WorkerOwned(format!("unresolved import: {s}")));
-        }
-    }
-
-    Ok(Bundled {
-        main_source,
-        chunks,
-        externals: externals.into_iter().collect(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-
-    fn run(dir: &Path, entry: &str, main_dir: &str, rule: fn(&str) -> bool) -> Bundled {
-        let rule: Arc<dyn Fn(&str) -> bool + Send + Sync> = Arc::new(rule);
-        bundle_sync(
-            dir.to_path_buf(),
-            entry.to_string(),
-            main_dir.to_string(),
-            rule,
-            BundleOpts::default(),
-        )
+    let wire = serde_json::to_vec(&spec).map_err(|_| LocalError::Worker("bundle spec"))?;
+    let exe = find_bundler()?;
+    let mut child = Command::new(exe)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|_| LocalError::Worker("of-bundler spawn"))?;
+    child
+        .stdin
+        .take()
         .unwrap()
+        .write_all(&wire)
+        .map_err(|_| LocalError::Worker("of-bundler stdin"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|_| LocalError::Worker("of-bundler wait"))?;
+    if !out.status.success() {
+        return Err(LocalError::WorkerOwned(format!(
+            "of-bundler exited {status}",
+            status = out.status
+        )));
     }
-
-    #[test]
-    fn ts_dep_bundled_externals_kept() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("helper.ts"), "export const x: number = 1;").unwrap();
-        fs::write(
-            dir.path().join("index.ts"),
-            "import { x } from './helper';\nimport { connect } from 'cloudflare:sockets';\nimport crypto from 'node:crypto';\nexport default { fetch() { return new Response(String(x + typeof connect + typeof crypto.randomUUID)) } };",
-        )
-        .unwrap();
-        let b = run(dir.path(), "index.ts", "", |_| false);
-        assert!(b.main_source.contains("node:crypto"));
-        assert!(b.main_source.contains("cloudflare:sockets"));
-        assert!(b.externals.is_empty());
-    }
-
-    #[test]
-    fn rule_externals_map_to_module_names() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("a.txt"), "hi").unwrap();
-        fs::write(
-            dir.path().join("src/index.ts"),
-            "import t from '../a.txt';\nexport default { fetch() { return new Response(t) } };",
-        )
-        .unwrap();
-        let b = run(dir.path(), "src/index.ts", "src", |rel| {
-            rel.ends_with(".txt")
-        });
-        assert_eq!(
-            b.externals,
-            vec![("a.txt".to_string(), "a.txt".to_string())]
-        );
-        assert!(b.main_source.contains("../a.txt"));
-    }
-
-    #[test]
-    fn dynamic_import_emits_lazy_chunk() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::create_dir_all(dir.path().join("src")).unwrap();
-        fs::write(dir.path().join("src/lazy.ts"), "export const tag = 'lazy';").unwrap();
-        fs::write(
-            dir.path().join("src/index.ts"),
-            "export default { async fetch() { const m = await import('./lazy.ts'); return new Response(m.tag) } };",
-        )
-        .unwrap();
-        let b = run(dir.path(), "src/index.ts", "src", |_| false);
-        // A lazy chunk rides under src/ as an esModule — the dynamic
-        // edge must not appear among file externals.
-        assert_eq!(b.chunks.len(), 1);
-        assert!(b.chunks[0].0.starts_with("src/"));
-        assert!(b.chunks[0].0.ends_with(".js"));
-        assert!(b.main_source.contains("import("));
-        assert!(b.externals.is_empty());
+    let outcome: BundleOutcome =
+        serde_json::from_slice(&out.stdout).map_err(|_| LocalError::Worker("of-bundler output"))?;
+    match (outcome.ok, outcome.err) {
+        (Some(b), None) => Ok(Bundled {
+            main_source: b.main_source,
+            chunks: b.chunks,
+            externals: b.externals,
+        }),
+        (None, Some(e)) => Err(LocalError::WorkerOwned(format!("bundle: {e}"))),
+        _ => Err(LocalError::Worker("of-bundler output")),
     }
 }

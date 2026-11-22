@@ -1122,9 +1122,14 @@ fn gather_bundled(
     } else {
         format!("{root}/")
     };
+    let rule_globs: Vec<String> = rules
+        .iter()
+        .flat_map(|(_, globs)| globs.iter().cloned())
+        .collect();
+    let rule_prefix_c = root_prefix.clone();
     let is_rule: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> =
         std::sync::Arc::new(move |rel: &str| {
-            rel.strip_prefix(&root_prefix).is_some_and(|eval| {
+            rel.strip_prefix(&rule_prefix_c).is_some_and(|eval| {
                 rules
                     .iter()
                     .any(|(_, globs)| globs.iter().any(|g| glob_match(g, eval)))
@@ -1142,7 +1147,8 @@ fn gather_bundled(
         worker_dir.to_path_buf(),
         main.clone(),
         main_dir,
-        is_rule.clone(),
+        rule_globs,
+        root_prefix,
         crate::bundle::BundleOpts {
             minify: b.minify,
             keep_names: b.keep_names,
@@ -2033,103 +2039,7 @@ fn module_root(meta: &WorkerToml) -> Result<String, LocalError> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum GlobTok {
-    Lit(char),
-    /// `*` — any run of non-`/` chars.
-    Star,
-    /// `**` between `/`s or string ends — any run incl. `/`, but it may
-    /// only stop at a segment boundary (mirrors
-    /// `((?:[^/]*(?:/|$))*)`).
-    Globstar,
-}
-
-/// Mirror of wrangler's `glob-to-regexp` ({globstar:true}, no
-/// `extended`): `*`/`**` are the only wildcards — `?`, `[...]`,
-/// `{a,b}` are LITERAL characters; `\` escapes the next char into a
-/// literal. Whole-string anchored match, memoized so `**` chains
-/// cannot backtrack exponentially.
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let mut toks: Vec<GlobTok> = Vec::with_capacity(p.len());
-    let mut i = 0usize;
-    while i < p.len() {
-        match p[i] {
-            '*' => {
-                let start = i;
-                while p.get(i + 1) == Some(&'*') {
-                    i += 1;
-                }
-                let prev = if start == 0 { None } else { Some(p[start - 1]) };
-                let next = p.get(i + 1).copied();
-                if i + 1 - start > 1
-                    && (prev.is_none() || prev == Some('/'))
-                    && (next.is_none() || next == Some('/'))
-                {
-                    toks.push(GlobTok::Globstar);
-                    if next == Some('/') {
-                        i += 1;
-                    }
-                } else {
-                    toks.push(GlobTok::Star);
-                }
-            }
-            '\\' => {
-                i += 1;
-                toks.push(GlobTok::Lit(p.get(i).copied().unwrap_or('\\')));
-            }
-            c => toks.push(GlobTok::Lit(c)),
-        }
-        i += 1;
-    }
-    let s: Vec<char> = path.chars().collect();
-    let mut memo: std::collections::HashMap<(usize, usize), bool> =
-        std::collections::HashMap::new();
-    fn m(
-        toks: &[GlobTok],
-        ti: usize,
-        s: &[char],
-        si: usize,
-        memo: &mut std::collections::HashMap<(usize, usize), bool>,
-    ) -> bool {
-        if let Some(&v) = memo.get(&(ti, si)) {
-            return v;
-        }
-        let v = match toks.get(ti) {
-            None => si == s.len(),
-            Some(GlobTok::Lit(c)) => s.get(si) == Some(c) && m(toks, ti + 1, s, si + 1, memo),
-            Some(GlobTok::Star) => {
-                let mut k = si;
-                let mut ok = false;
-                loop {
-                    if m(toks, ti + 1, s, k, memo) {
-                        ok = true;
-                        break;
-                    }
-                    match s.get(k) {
-                        Some(&ch) if ch != '/' => k += 1,
-                        _ => break,
-                    }
-                }
-                ok
-            }
-            Some(GlobTok::Globstar) => {
-                let mut ok = m(toks, ti + 1, s, si, memo);
-                let mut k = si + 1;
-                while !ok && k <= s.len() {
-                    if k == s.len() || s[k - 1] == '/' {
-                        ok = m(toks, ti + 1, s, k, memo);
-                    }
-                    k += 1;
-                }
-                ok
-            }
-        };
-        memo.insert((ti, si), v);
-        v
-    }
-    m(&toks, 0, &s, 0, &mut memo)
-}
+use crate::glob::glob_match;
 
 /// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`
 /// (reported via `skipped` so `--dry-run` can list them).
