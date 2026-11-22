@@ -288,3 +288,99 @@ async fn dev_no_watch_never_redeploys() {
 fn repo_facade() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../facade")
 }
+
+/// Real-workerd counterpart of the smoke above: the uploaded worker code is
+/// actually executed, and a file update is picked up by the watcher and the
+/// NEW response is served. Gated on `VRT_WORKERD_BIN` (the real-workerd CI
+/// job); ignored in the regular suite.
+#[ignore = "requires VRT_WORKERD_BIN and workspace binaries"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dev_real_workerd_runs_new_code_after_redeploy() {
+    let workerd = match std::env::var("VRT_WORKERD_BIN") {
+        Ok(p) if !p.is_empty() => PathBuf::from(p),
+        _ => {
+            eprintln!("SKIP: VRT_WORKERD_BIN unset");
+            return;
+        }
+    };
+    if !workerd.is_file() {
+        eprintln!("SKIP: VRT_WORKERD_BIN not a file: {}", workerd.display());
+        return;
+    }
+    let Some((host, provider, sql, _stub)) = require_stack() else {
+        eprintln!("SKIP: workspace binaries not built");
+        return;
+    };
+    let base = match vrt_securefs::ShortRoot::new("vrtdevwk") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("SKIP: short root not writable: {e}");
+            return;
+        }
+    };
+    if !unix_bind_ok(base.path()) {
+        eprintln!("SKIP: unix bind() denied in this sandbox");
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let worker_dir = base.path().join("proj");
+    worker_fixture(&worker_dir, 1);
+
+    let listen = ephemeral();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let session = vrt_local::dev::start(vrt_local::dev::DevOptions {
+        worker_dir: worker_dir.clone(),
+        env_name: None,
+        listen: Some(listen.clone()),
+        no_watch: false,
+        workerd: Some(workerd),
+        stub: false,
+        allow_unpinned_workerd: true,
+        vrt_host_bin: Some(host),
+        vrt_provider_bin: Some(provider),
+        vrt_sql_bin: Some(sql),
+        facade_dist: Some(repo_facade()),
+        stop: Some(stop_rx),
+        print_logs: false,
+        no_color: true,
+    })
+    .await
+    .unwrap_or_else(|e| {
+        let _ = stop_tx.send(true);
+        panic!("dev start failed: {e}");
+    });
+    let addr = session
+        .summary
+        .url
+        .trim_start_matches("http://")
+        .to_string();
+
+    async fn wait_body(addr: &str, expected: &str) -> bool {
+        for _ in 0..400 {
+            if let Some((200, body)) = http_get(addr, "localhost", "/") {
+                if body.contains(expected) {
+                    return true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    assert!(
+        wait_body(&addr, "v1").await,
+        "uploaded v1 code must actually run on real workerd"
+    );
+    worker_fixture(&worker_dir, 2);
+    assert!(
+        wait_body(&addr, "v2").await,
+        "after update the NEW code must be served"
+    );
+
+    session.shutdown();
+    let res = tokio::time::timeout(Duration::from_secs(30), session.wait())
+        .await
+        .expect("session wait timed out");
+    assert!(res.is_ok(), "clean stop: {res:?}");
+}

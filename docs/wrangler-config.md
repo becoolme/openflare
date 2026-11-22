@@ -18,9 +18,11 @@ error messages.
 3. `wrangler.toml`
 
 A `vrt.toml` in the project root takes precedence — it is treated as
-native standalone configuration and the wrangler file is not read.
-`cloudflare.config.ts` and `wrangler.config.ts` are never executed and
-fail closed. The file is capped at 256 KiB (`MAX_CONFIG_BYTES`).
+native standalone configuration and the wrangler file is not read. After
+that, Cloudflare's programmatic `cloudflare.config.ts` / `.js` wins over
+the wrangler family (see the next section). `wrangler.config.ts` / `.js`
+is a different, wrangler-specific format and is still never executed — it
+fails closed. The file is capped at 256 KiB (`MAX_CONFIG_BYTES`).
 
 `env.<name>` blocks are resolved before normalization:
 `NON_INHERITABLE_ENV_KEYS` (`project_cfg.rs:59`) replace the top-level
@@ -40,6 +42,106 @@ If named environments exist and `--env` is omitted, the command fails with
 the available environment names instead of using the base config. `--env`
 with a higher-precedence `vrt.toml` is rejected because that format has no
 environment blocks.
+
+## Programmatic `cloudflare.config.ts` / `.js`
+
+`vrt` evaluates the `cf` CLI's programmatic config through Cloudflare's
+own loader instead of shipping an evaluator:
+
+1. `scripts/load-cloudflare-config.mjs` imports `@cloudflare/config`,
+   calls `registerConfigHooks()` and `loadAndParseConfig(path, { mode,
+   isPreview })`, then `convertToWranglerConfig(result.data)` and prints
+   `{raw, dependencies}` as JSON.
+2. `project_cfg.rs` reads that raw wrangler document and feeds it through
+   the **same** `resolve_env` → `normalize_wrangler_config` path a
+   `wrangler.toml` takes. There is no second mapping table: every key,
+   bound and error code below applies unchanged.
+
+Selection order is `vrt.toml` > `cloudflare.config.ts` >
+`cloudflare.config.js` > `wrangler.json` > `wrangler.jsonc` >
+`wrangler.toml`. A `wrangler.config.*` file next to them still fails
+closed with the "programmatic config file" message.
+
+### Requirements
+
+- **Node.js must be installed** and on `PATH` (override with
+  `VRT_NODE_BIN`). The helper needs `module.registerHooks`
+  (Node >= 22.15) and, for a `.ts` config, Node's built-in TypeScript
+  type stripping (Node >= 22.18; this repo pins Node 24).
+- **`@cloudflare/config` must be resolvable from the config file**, i.e.
+  installed in the project, exactly like the `cf` CLI expects. The repo
+  root carries it as a devDependency for tests and local use; standalone
+  installs must ship `node_modules` next to the project or the loader
+  fails with `VRT_CONFIG_LOADER_FAILED`.
+- The helper script itself is resolved from `VRT_CF_CONFIG_LOADER`, then
+  a `scripts/load-cloudflare-config.mjs` found by walking up from the
+  `vrt` executable (repo `target/<profile>/vrt` → repo root).
+
+### `--env` is the eval `mode`
+
+This format has no `[env.*]` blocks; the environment selector is the
+`mode` the config factory receives. `--env staging` is passed to the
+loader as `--mode staging`, so `defineConfig(({ mode }) => …)` can branch
+per environment, and env resolution runs in pass-through mode. `--preview`
+is understood by the helper (`isPreview`) but `vrt` does not pass it yet.
+`[dev]` settings do not exist in this format; `vrt dev` simply has no
+dev-table overrides for it.
+
+### Entrypoints
+
+A `cf-worker` import attribute gives `convertToWranglerConfig` an absolute
+`main` path; `vrt` rebases it onto the worker directory and refuses an
+entrypoint that resolves outside it (including through a symlink). The
+referenced module is never loaded or executed by the loader — the test
+fixture at [`vrt-local/tests/fixtures/cf-config`](../vrt-local/tests/fixtures/cf-config)
+throws at its top level on purpose.
+
+Only the helper's final JSON object line on stdout is read, so a config
+that calls `console.log()` while it is evaluated neither corrupts the
+result nor has its output interpreted.
+
+`vrt` ships the project unbundled (it has no esbuild-style bundler), so a
+`.ts`/`.tsx` **worker entrypoint** still fails at pack time with a module
+type error even though the config itself may be TypeScript. Pre-build the
+worker to `.js`/`.mjs`, or point `worker.entrypoint` at a JS file.
+
+### Restricted child process — not a sandbox
+
+The loader runs as a child of `vrt deploy` / `vrt dev` / `vrt doctor`
+with:
+
+- a fixed working directory (the worker project) and no shell involved;
+- a **cleared environment**: only a small allowlist is forwarded
+  (`PATH`, `HOME`, `TMPDIR`, `LANG`, `TZ`, ...), so `NODE_OPTIONS`,
+  `NODE_PATH`, `NODE_EXTRA_CA_CERTS`, cloud credentials and `VRT_*`
+  never reach the config;
+- a wall-clock deadline of 60 s (`VRT_CF_CONFIG_LOADER_TIMEOUT_MS`,
+  bounded to 100..600000 ms); on timeout the child's whole process group
+  is killed, so a config that spawned helpers does not leave them behind;
+- bounded stdout (4 MiB) and stderr (64 KiB) — an oversized helper is
+  killed instead of buffered without limit, and a leaked inherited pipe
+  cannot block the command.
+
+This is **not** a sandbox. A config file is arbitrary Node code: it can
+read the filesystem, open sockets, spawn processes and inherit the
+invoking user's privileges. Only run `cloudflare.config.*` from projects
+you trust, exactly as you would for `wrangler`/`cf`. A real sandbox
+(read-only root, no network, no child processes) is tracked as follow-up
+work; this page does not claim one.
+
+### Failure mapping
+
+| Failure | Error |
+| --- | --- |
+| zod parse of the config (helper exit 2) | `VRT_CONFIG_INVALID`, message carries the first `path: message` |
+| thrown import / missing `@cloudflare/config` / unsupported Node (exit 3) | `VRT_CONFIG_LOADER_FAILED` |
+| helper exceeded the deadline | `VRT_CONFIG_LOADER_TIMEOUT` |
+| helper printed invalid JSON or no `raw` object | `VRT_CONFIG_LOADER_FAILED` |
+| helper script or `VRT_CF_CONFIG_LOADER` target missing | `VRT_CONFIG_LOADER_FAILED` |
+
+Nothing is silently ignored: a broken programmatic config fails the
+command. Zod issues are projected to `code`/`path`/`message` (capped at 20)
+before they reach stderr, so config values are not echoed back.
 
 ## Behaviors
 
@@ -166,6 +268,16 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 
 ## Changelog
 
+- 2026-11-22: `cloudflare.config.ts` / `.js` (the `cf` CLI programmatic
+  format) is now evaluated through Cloudflare's official
+  `@cloudflare/config` loader in a restricted Node child process and then
+  normalized by the existing wrangler path (one mapping table, not two).
+  `--env` doubles as the loader `mode`; `cf-worker` entrypoints are
+  rebased onto the worker directory; loader failures map to
+  `VRT_CONFIG_INVALID` / `VRT_CONFIG_LOADER_FAILED` /
+  `VRT_CONFIG_LOADER_TIMEOUT`. `wrangler.config.*` still fails closed.
+  The child process is restricted (fixed cwd, cleared env allowlist,
+  timeout, output caps) but **not** sandboxed — see the section above.
 - 2026-11-21: `tail_consumers` is accepted (table or legacy string
   entries, deduped, max 16) and carried to the signed snapshot as
   resolved same-tenant worker ids; empty lists are ignored.

@@ -648,7 +648,22 @@ fn check_project_for_env(dir: &Path, env_name: Option<&str>) -> Check {
 /// hard failures.
 fn classify_project_err(msg: &str) -> Check {
     let id = "project";
-    if msg.contains("not supported by the VRT runtime") || msg.contains("programmatic config") {
+    if msg.contains("VRT_CONFIG_LOADER_TIMEOUT") {
+        Check::fail(
+            id,
+            format!("config evaluation timed out: {msg}"),
+            "raise VRT_CF_CONFIG_LOADER_TIMEOUT_MS or simplify cloudflare.config.ts",
+        )
+    } else if msg.contains("VRT_CONFIG_LOADER_FAILED") {
+        Check::action(
+            id,
+            format!("cloudflare.config loader unavailable: {msg}"),
+            "install Node.js >= 22.15 and @cloudflare/config in the project, or set VRT_CF_CONFIG_LOADER",
+        )
+        .docs("deploy/standalone/README.md")
+    } else if msg.contains("not supported by the VRT runtime")
+        || msg.contains("programmatic config")
+    {
         Check::action(
             id,
             format!("config issue: {msg}"),

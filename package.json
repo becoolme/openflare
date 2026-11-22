@@ -7,6 +7,7 @@
     "node": ">=24"
   },
   "devDependencies": {
+    "@cloudflare/config": "1.0.0-rc.3",
     "esbuild": "0.25.12",
     "pg": "8.16.3",
     "pg-cloudflare": "1.4.0"
