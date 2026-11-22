@@ -1,5 +1,5 @@
 //! R2 data cell-ops — `R2_LIST` / `R2_HEAD` / `R2_GET` / `R2_PUT` /
-//! `R2_DELETE`, dispatched over the generic cell-ops channel for the
+//! `R2_DELETE` / `R2_STATS`, dispatched over the generic cell-ops channel for the
 //! bucket data API and the `vibeploy workers r2` CLI (CF R2 import/export).
 //!
 //! Trust boundary (same shape as `kvops.rs` / STORAGE_PURGE): the control
@@ -41,7 +41,14 @@ const R2_OP_RESULT_MAX_BYTES: usize = 5_900 * 1024;
 const R2_OP_BUDGET: Duration = Duration::from_secs(15);
 const MAX_CONTENT_TYPE_BYTES: usize = 256;
 
-pub const R2_OP_KINDS: &[&str] = &["R2_LIST", "R2_HEAD", "R2_GET", "R2_PUT", "R2_DELETE"];
+pub const R2_OP_KINDS: &[&str] = &[
+    "R2_LIST",
+    "R2_HEAD",
+    "R2_GET",
+    "R2_PUT",
+    "R2_DELETE",
+    "R2_STATS",
+];
 
 pub fn is_r2_kind(kind: &str) -> bool {
     R2_OP_KINDS.contains(&kind)
@@ -49,7 +56,11 @@ pub fn is_r2_kind(kind: &str) -> bool {
 
 /// Kinds that never mutate the bucket: re-executing one on redelivery
 /// is safe, so its (up to ~5.6 MiB) result is never journaled.
-pub const R2_READ_KINDS: &[&str] = &["R2_LIST", "R2_HEAD", "R2_GET"];
+pub const R2_READ_KINDS: &[&str] = &["R2_LIST", "R2_HEAD", "R2_GET", "R2_STATS"];
+/// Stats scan bounds: the control plane shows `truncated` when a bucket
+/// exceeds these; it never blocks an op forever on a huge bucket.
+const R2_STATS_MAX_OBJECTS: usize = 20_000;
+const R2_STATS_MAX_PAGES: usize = 100;
 
 fn failed(op: &CellOp, error: &str) -> CellOpAck {
     CellOpAck {
@@ -209,8 +220,67 @@ impl R2OpsExecutor {
             "R2_GET" => self.get(op).await,
             "R2_PUT" => self.put(op).await,
             "R2_DELETE" => self.delete(op).await,
+            "R2_STATS" => self.stats(op).await,
             _ => failed(op, "unknown r2 op kind"),
         }
+    }
+
+    /// Read-only bucket aggregate: object count, bytes and a truncation flag.
+    /// Pages the backend list API so a large bucket stays bounded by
+    /// `R2_STATS_MAX_OBJECTS`/`R2_STATS_MAX_PAGES` instead of an unbounded scan.
+    async fn stats(&self, op: &CellOp) -> CellOpAck {
+        let Ok(scope) = serde_json::from_value::<R2Scope>(op.payload.clone()) else {
+            return failed(op, "malformed payload");
+        };
+        if !valid_scope(&scope) {
+            return failed(op, "invalid bucket scope");
+        }
+        let mut objects: usize = 0;
+        let mut size_bytes: u64 = 0;
+        let mut after: Option<String> = None;
+        let mut truncated = false;
+        for _ in 0..R2_STATS_MAX_PAGES {
+            let page = match self
+                .backend
+                .data_list(
+                    &scope.tenant_id,
+                    &scope.bucket_id,
+                    "",
+                    None,
+                    after.as_deref(),
+                    R2_OP_LIST_MAX_LIMIT,
+                    R2_OP_BUDGET,
+                )
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => return provider_failed(op, e),
+            };
+            for object in page.objects {
+                objects += 1;
+                size_bytes = size_bytes.saturating_add(object.size);
+                if objects >= R2_STATS_MAX_OBJECTS {
+                    truncated = true;
+                    break;
+                }
+            }
+            if truncated {
+                break;
+            }
+            match page.next_after {
+                Some(next) => after = Some(next),
+                None => break,
+            }
+        }
+        done(
+            op,
+            serde_json::json!({
+                "objects": objects,
+                "sizeBytes": size_bytes,
+                "truncated": truncated,
+                "sampledAtMs": crate::execset::now_secs() * 1000,
+            }),
+        )
     }
 
     async fn list(&self, op: &CellOp) -> CellOpAck {
@@ -523,6 +593,17 @@ mod tests {
         let r = a.result.unwrap();
         assert_eq!(r["delimitedPrefixes"], serde_json::json!(["dir/"]));
         assert_eq!(r["objects"][0]["key"], "top.txt");
+        // stats: real aggregate over the full bucket.
+        let a = e.execute(&op("R2_STATS", scope())).await;
+        let r = a.result.unwrap();
+        assert_eq!(r["objects"], 3, "{r}");
+        assert_eq!(r["sizeBytes"], 11, "{r}");
+        assert_eq!(r["truncated"], false, "{r}");
+        // bad scope is refused before any backend call.
+        let a = e
+            .execute(&op("R2_STATS", with(serde_json::json!({"tenantId": "../x"}))))
+            .await;
+        assert_eq!(a.status, "FAILED");
         // delete batch (+ idempotent on missing).
         let a = e
             .execute(&op(

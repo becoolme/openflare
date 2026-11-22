@@ -441,6 +441,7 @@ fn authorize_internal(ctx: AuthContext) -> Authorization {
                     | "synchronous"
                     | "page_count"
                     | "page_size"
+                    | "user_version"
                     | "wal_checkpoint"
                     | "wal_autocheckpoint"
             ) {

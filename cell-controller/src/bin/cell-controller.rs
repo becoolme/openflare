@@ -471,6 +471,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Periodic cell report: pod metrics + D1/queue stats + Workflow/DO
+    // instance listings. Enabled by default when there is anything to
+    // report on; `[report] enabled = false` opts out.
+    let report_cfg = config.report.clone().unwrap_or_default();
+    if report_cfg.enabled && (!config.pods.is_empty() || config.d1sql.is_some()) {
+        let token = std::fs::read_to_string(&config.token_file)
+            .expect("token_file unreadable")
+            .trim()
+            .to_string();
+        let pods: Vec<(String, String)> = config
+            .pods
+            .iter()
+            .map(|p| (p.id.clone(), p.readyz.clone()))
+            .collect();
+        let stats = config.d1sql.as_ref().and_then(|cfg| {
+            match cell_controller::d1ops::D1OpsExecutor::new(cfg) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!(%e, "report stats disabled — d1sql executor init failed");
+                    None
+                }
+            }
+        });
+        match cell_controller::report::HttpReportIo::new(
+            &pods,
+            &config.control_plane_url,
+            &config.cell_id,
+            token,
+            stats,
+            std::time::Duration::from_secs(report_cfg.timeout_secs),
+        ) {
+            Ok(io) => {
+                let ctl = controller.dispatch_handle();
+                let cell = config.cell_id.clone();
+                let every = std::time::Duration::from_secs(report_cfg.interval_secs);
+                tokio::spawn(async move {
+                    let mut reporter = cell_controller::report::Reporter::new(io, cell);
+                    let mut tick = tokio::time::interval(every);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let (desired, _, assignments) = ctl.snapshot();
+                        let Some(desired) = desired else { continue };
+                        let now = Utc::now().timestamp_millis();
+                        match reporter.tick(&desired, &assignments, now).await {
+                            Ok(out) if out.errors.is_empty() => tracing::debug!(
+                                pods = out.pods,
+                                d1 = out.d1,
+                                queues = out.queues,
+                                workflows = out.workflows,
+                                do_classes = out.do_classes,
+                                "cell report pushed"
+                            ),
+                            Ok(out) => tracing::warn!(
+                                pods = out.pods,
+                                errors = ?out.errors,
+                                "cell report pushed with collection errors"
+                            ),
+                            Err(e) => tracing::warn!(%e, "cell report push failed"),
+                        }
+                    }
+                });
+                tracing::info!(
+                    interval_secs = report_cfg.interval_secs,
+                    "cell report enabled"
+                );
+            }
+            Err(e) => tracing::error!(%e, "cell report disabled — init failed"),
+        }
+    }
     // T37b: queue consumer dispatcher — same data-plane authority as
     // d1ops (`[d1sql]` endpoint+secret); absent config ⇒ disabled.
     // Tick rides the main loop cadence (1s sub-tick below).

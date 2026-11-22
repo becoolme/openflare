@@ -414,6 +414,49 @@ impl D1OpsExecutor {
         Ok(normalize_execute_body(body))
     }
 
+    /// Read-only stats fetch for the periodic cell report. Same signed
+    /// `[d1sql]` channel as ops, but no dedup seq is meaningful: the
+    /// request is a pure read, so a wall-clock seq keeps the header valid.
+    pub async fn stats(
+        &self,
+        d1: &[String],
+        queues: &[String],
+    ) -> Result<serde_json::Value, String> {
+        let body = serde_json::to_vec(&serde_json::json!({"d1": d1, "queues": queues}))
+            .map_err(|e| format!("stats body: {e}"))?;
+        let path = "/internal/stats";
+        let url = format!("{}{}", self.endpoint, path);
+        let seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .max(1) as u64;
+        let auth = self.signer.sign("POST", path, &body, 1, seq);
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.http
+                .post(&url)
+                .header(vrt_provider::d1::SQL_AUTH_HEADER, auth)
+                .header(vrt_provider::d1::SQL_EPOCH_HEADER, "1")
+                .header(vrt_provider::d1::SQL_SEQ_HEADER, seq.to_string())
+                .header("content-type", "application/json")
+                .body(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| "stats request timeout".to_string())?
+        .map_err(|e| format!("stats transport: {e}"))?;
+        let status = resp.status();
+        let bytes = resp.bytes().await.map_err(|e| format!("stats body: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("vrt-sql stats status {status}"));
+        }
+        if bytes.len() > MAX_RESULT_BYTES {
+            return Err("vrt-sql stats body too large".into());
+        }
+        serde_json::from_slice(&bytes).map_err(|_| "vrt-sql stats non-JSON response".into())
+    }
+
     /// Generic-channel entry — adapt the cell-op row then run the
     /// identical execute path (same validation, same deadline rule).
     pub async fn execute_cell(&self, op: &crate::execset::CellOp) -> D1OpAck {

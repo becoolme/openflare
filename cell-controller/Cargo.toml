@@ -34,3 +34,4 @@ path = "src/bin/cell-controller.rs"
 
 [dev-dependencies]
 tempfile = "3"
+vrt-sql = { path = "../vrt-sql" }
