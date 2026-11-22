@@ -65,7 +65,14 @@ fn cli_restores_to_time_and_reports_bookmarks() {
         queue_root_for(&db_root),
         vrt_sql::paths::ResourceKind::Queue,
     ));
-    let reg = EngineRegistry::new(db_root.clone()).with_persisters(PersisterPair { d1, queue });
+    let k2 = Arc::new(Persister::new(
+        queue.store().clone(),
+        queue.config().clone(),
+        queue.clock().clone(),
+        vrt_sql::paths::k2_root_for(&db_root),
+        vrt_sql::paths::ResourceKind::K2,
+    ));
+    let reg = EngineRegistry::new(db_root.clone()).with_persisters(PersisterPair { d1, queue, k2 });
     let e = reg.get(D1, DB).unwrap();
     write(&e, "CREATE TABLE t(v INTEGER)");
     clock.advance(10);
