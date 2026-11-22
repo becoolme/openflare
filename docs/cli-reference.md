@@ -1,6 +1,6 @@
 # CLI reference (placeholder)
 
-A fuller `vrt` CLI reference will be added by the CLI work. This page
+A fuller `of` CLI reference will be added by the CLI work. This page
 only lists commands that exist on the current tree — the usage string in
 `vrt-local/src/bin/of.rs` is the source of truth.
 

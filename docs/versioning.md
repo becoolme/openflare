@@ -1,6 +1,6 @@
 # Deploy versions (MVP)
 
-`vrt` stores every deploy as an immutable version. The MVP separates
+`of` stores every deploy as an immutable version. The MVP separates
 "upload a version" from "serve a version": `deploy --preview` writes a
 version without moving traffic, `promote` switches the active pointer
 through the existing signed-desired path, and `versions list` shows
@@ -15,7 +15,7 @@ Cloudflare's full version and preview-routing model.
 
 ```text
 of deploy --preview --root <dir> [--name <n>] <worker_dir>
-vrt promote --root <dir> [--worker <name|workerId>] <version_id>
+of promote --root <dir> [--worker <name|workerId>] <version_id>
 of versions list --root <dir> <worker>
 ```
 
@@ -47,7 +47,7 @@ worker has `versions: [VersionRecord]` plus `activeVersionId`.
 | `configHash` | `cfg_<sha256-prefix>` over the same canonical behavior record. Diagnostic only; identity lives in `versionId`. |
 | `status` | `preview`, `active`, or `archived`. |
 | `createdAtUnixMs` | Creation time. `0` for records written before this MVP. |
-| `createdBy` | Creator when the caller has an identity. Standalone `vrt` has no authenticated principal, so this is `null` today. |
+| `createdBy` | Creator when the caller has an identity. Standalone `of` has no authenticated principal, so this is `null` today. |
 | bindings / vars / crons / consumers / observability / DO classes / workflows / quotas | The complete behavior of this version, replayed by `to_desired` and rollback. |
 
 Version identity deliberately excludes `versionId`, `createdAtUnixMs`,

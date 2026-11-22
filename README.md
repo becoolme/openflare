@@ -19,7 +19,7 @@ The standalone mode runs the whole stack with one `docker compose up`.
 | | Standalone | Kubernetes + control plane |
 | --- | --- | --- |
 | Good for | local development, CI, a single owner on one machine | multi-cell, production deployments |
-| Control plane | `vrt-local` in this repo (`vrt` CLI, `docker compose`) | [`openflare-control`](https://github.com/becoolme/openflare-control): signed desired snapshots, Postgres store, cell API |
+| Control plane | `vrt-local` in this repo (`of` CLI, `docker compose`) | [`openflare-control`](https://github.com/becoolme/openflare-control): signed desired snapshots, Postgres store, cell API |
 | State | a local directory or S3 | Postgres plus S3/filesystem |
 | Deploy | `docker compose up` or `of dev` | kustomize manifests from the control repository |
 | Trust | one trusted owner | one owner per control plane; cells verify Ed25519-signed snapshots |
@@ -103,7 +103,7 @@ limits) are documented in [`docs/compatibility.md`](docs/compatibility.md).
 | `vrt-provider` | binding provider: KV, R2, Queues, rate limiting (memory / filesystem / Kvrocks / S3 backends) |
 | `vrt-sql` | D1 and Durable Object SQL storage service |
 | `cell-controller` | consumes signed desired state and orchestrates hosts (cron, queues, leases, assignment) |
-| `vrt-local` | standalone management plane and `vrt` CLI (init, dev, deploy, rollback, secrets, hostnames, logs, doctor) |
+| `vrt-local` | standalone management plane and `of` CLI (init, dev, deploy, rollback, secrets, hostnames, logs, doctor) |
 | `vrt-securefs` | hardened shared-filesystem helpers (0700 dirs, atomic writes, safe path segments) |
 | `vrt-objstore`, `vrt-metrics` | shared object-store and metrics helpers |
 | `facade/` | TypeScript system workers that expose bindings to user code inside workerd |

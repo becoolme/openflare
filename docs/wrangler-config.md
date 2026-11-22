@@ -1,6 +1,6 @@
 # Wrangler configuration support
 
-How `vrt` reads a Cloudflare wrangler file and what it does with every
+How `of` reads a Cloudflare wrangler file and what it does with every
 key. The parser is `normalize_wrangler_config` in
 [`vrt-local/src/project_cfg.rs`](../vrt-local/src/project_cfg.rs); every
 rejection is a typed `ProjectConfigError` — `VRT_CONFIG_UNSUPPORTED_FIELD`
@@ -45,7 +45,7 @@ environment blocks.
 
 ## Programmatic `cloudflare.config.ts` / `.js`
 
-`vrt` evaluates the `cf` CLI's programmatic config through Cloudflare's
+`of` evaluates the `cf` CLI's programmatic config through Cloudflare's
 own loader instead of shipping an evaluator:
 
 1. `scripts/load-cloudflare-config.mjs` imports `@cloudflare/config`,
@@ -75,7 +75,7 @@ closed with the "programmatic config file" message.
   fails with `VRT_CONFIG_LOADER_FAILED`.
 - The helper script itself is resolved from `VRT_CF_CONFIG_LOADER`, then
   a `scripts/load-cloudflare-config.mjs` found by walking up from the
-  `vrt` executable (repo `target/<profile>/vrt` → repo root).
+  `of` executable (repo `target/<profile>/of` → repo root).
 
 ### `--env` is the eval `mode`
 
@@ -88,7 +88,7 @@ dev-table overrides for it.
 
 ### `isPreview`
 
-`defineConfig(({ isPreview }) => …)` is supported. `vrt` passes the
+`defineConfig(({ isPreview }) => …)` is supported. `of` passes the
 loader's `--preview` flag **only** for `of deploy --preview`:
 
 | command | `isPreview` |
@@ -108,7 +108,7 @@ can never write the active pointer. `vrt.toml` and the wrangler family
 have no preview branch, so they ignore the flag.
 
 The helper maps `--preview` onto Cloudflare's own
-`loadAndParseConfig(path, { isPreview })`; `vrt` never evaluates the
+`loadAndParseConfig(path, { isPreview })`; `of` never evaluates the
 config itself. See [versioning.md](./versioning.md) for preview URLs,
 the `previewUrl` field and the security boundary (a preview never
 receives tenant secrets).
@@ -116,7 +116,7 @@ receives tenant secrets).
 ### Entrypoints
 
 A `cf-worker` import attribute gives `convertToWranglerConfig` an absolute
-`main` path; `vrt` rebases it onto the worker directory and refuses an
+`main` path; `of` rebases it onto the worker directory and refuses an
 entrypoint that resolves outside it (including through a symlink). The
 referenced module is never loaded or executed by the loader — the test
 fixture at [`vrt-local/tests/fixtures/cf-config`](../vrt-local/tests/fixtures/cf-config)
@@ -126,7 +126,7 @@ Only the helper's final JSON object line on stdout is read, so a config
 that calls `console.log()` while it is evaluated neither corrupts the
 result nor has its output interpreted.
 
-`vrt` ships the project unbundled (it has no esbuild-style bundler), so a
+`of` ships the project unbundled (it has no esbuild-style bundler), so a
 `.ts`/`.tsx` **worker entrypoint** still fails at pack time with a module
 type error even though the config itself may be TypeScript. Pre-build the
 worker to `.js`/`.mjs`, or point `worker.entrypoint` at a JS file.
