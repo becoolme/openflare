@@ -146,6 +146,7 @@ pub fn filter_desired(desired: &ComputeDesired, assignment: &PodAssignment) -> C
             (!workers.is_empty()).then(|| TenantDesired {
                 tenant_id: tenant.tenant_id.clone(),
                 workers,
+                flagship_apps: tenant.flagship_apps.clone(),
             })
         })
         .collect();

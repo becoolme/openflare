@@ -1308,6 +1308,101 @@
     "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
     "field": "streaming_tail_consumers[0].namespace"
    }
+  },
+  {
+   "name": "flagship binds with app_id",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-01\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "bindings": [
+      {
+       "type": "flagship",
+       "name": "FLAGS",
+       "appId": "app-01"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "flagship multiple apps bind",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[flagship]]\nbinding = \"FLAGS_A\"\napp_id = \"app-a\"\n\n[[flagship]]\nbinding = \"FLAGS_B\"\napp_id = \"app-b\"\nremote = true\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01",
+     "bindings": [
+      {
+       "type": "flagship",
+       "name": "FLAGS_A",
+       "appId": "app-a"
+      },
+      {
+       "type": "flagship",
+       "name": "FLAGS_B",
+       "appId": "app-b"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "name": "flagship missing app_id rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[flagship]]\nbinding = \"FLAGS\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "flagship[0].app_id"
+   }
+  },
+  {
+   "name": "flagship non-boolean remote rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-01\"\nremote = \"yes\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "flagship[0].remote"
+   }
+  },
+  {
+   "name": "flagship unknown key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[flagship]]\nbinding = \"FLAGS\"\napp_id = \"app-01\"\nenvironment = \"prod\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "flagship[0].environment"
+   }
+  },
+  {
+   "name": "flagship overlong app_id rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[[flagship]]\nbinding = \"FLAGS\"\napp_id = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "flagship[0].app_id"
+   }
   }
  ]
 }
