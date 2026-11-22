@@ -221,6 +221,10 @@ pub(crate) struct BindingsToml {
     /// `secrets-store:{store_id}:{secret_name}` ref at render.
     #[serde(default)]
     pub(crate) secrets_store: BTreeMap<String, SecretsStoreToml>,
+    /// CF `[version_metadata]` — a single binding name (`env.<name>`
+    /// serves `{id, tag, timestamp}` of the active version).
+    #[serde(default)]
+    pub(crate) version_metadata: Option<String>,
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
     /// `binding name -> vrt database tenant name`; credentials are resolved
@@ -564,6 +568,10 @@ pub struct DeployOverrides {
     /// Secret values must NEVER be passed here; they go through
     /// `put_secret` + `[secrets]` refs.
     pub vars: BTreeMap<String, String>,
+    /// CF `--tag` (`wrangler deploy`/`versions upload`) — the version's
+    /// user label, surfaced via the `versionMetadata` binding's `tag`.
+    /// `None`/empty = untagged (CF default).
+    pub tag: Option<String>,
 }
 
 /// Fully packed worker ready for state application.
@@ -618,6 +626,11 @@ pub struct PackedWorker {
     /// overwrite same-id entries; apps bound but undefined get an
     /// empty `{"flags":{}}` config so every binding resolves).
     pub flagship_apps: Vec<snapshot_protocol::compute_desired::FlagshipAppDesired>,
+    /// CF `--tag` — the deployed version's user label (stored on the
+    /// version record; `""` = untagged). Part of version identity: the
+    /// `versionMetadata` binding exposes it, so a tag change is a
+    /// behavioral change.
+    pub tag: String,
 }
 
 /// T21: assets scanned at pack time — the deploy writes objects +
@@ -1315,6 +1328,13 @@ pub fn assemble(
                 },
             ));
         }
+        if let Some(name) = &b.version_metadata {
+            bindings.push(BindingDesired::VersionMetadata(
+                snapshot_protocol::compute_desired::VersionMetadataBinding {
+                    name: name.clone(),
+                },
+            ));
+        }
         for (binding, target) in &b.service {
             let worker_id =
                 resolve_worker(target.service()).ok_or(LocalError::Worker("service target"))?;
@@ -1700,6 +1720,7 @@ pub fn assemble(
         first_deploy_id: id_material[..16].to_string(),
         pending_assets,
         flagship_apps,
+        tag: overrides.tag.clone().unwrap_or_default(),
     })
 }
 
@@ -2391,6 +2412,10 @@ pub struct DeployUpload {
     /// Worker name override (`vrt.toml` name otherwise).
     #[serde(default)]
     pub name: Option<String>,
+    /// CF `--tag` — the deployed version's user label
+    /// (`versionMetadata.tag`; `None` = untagged).
+    #[serde(default)]
+    pub tag: Option<String>,
     /// `true` for `deploy --preview`: store the immutable version
     /// without changing the worker's active version.
     #[serde(default)]

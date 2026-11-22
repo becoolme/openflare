@@ -346,6 +346,19 @@ pub struct VersionDesired {
 
     /// Cloudflare `compatibility_flags` tokens.
     pub compatibility_flags: Vec<String>,
+
+    /// CF version tag (`wrangler versions upload --tag`) — surfaced via
+    /// the `versionMetadata` binding's `tag`. Projected only when the
+    /// version declares the binding, so pre-version-metadata cells never
+    /// see the field (deny_unknown_fields would reject the whole
+    /// snapshot). `""` = untagged, matching CF.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
+
+    /// CF version creation timestamp (ISO 8601) — surfaced via the
+    /// binding's `timestamp`. Same projection rule as `tag`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_at: String,
 }
 
 /// A worker binding. Internally tagged on `type`
@@ -441,6 +454,14 @@ pub enum BindingDesired {
     /// `env:<secret_name>` binding on that worker, resolved from the
     /// tenant's secret map by `secret_ref`.
     SecretsStore(SecretsStoreBinding),
+    /// `{"type":"versionMetadata"}` — CF `[version_metadata]`:
+    /// `env.<name>` is `{id, tag, timestamp}` describing the worker's
+    /// active version. Rendered as a `json` binding; the values come
+    /// from `active_version` (`version_id`/`tag`/`created_at`), never
+    /// from the binding itself — version metadata is a property of the
+    /// version, and keeping it there preserves content-addressed
+    /// version dedup.
+    VersionMetadata(VersionMetadataBinding),
 }
 
 /// `{"type":"flagship"}` — see [`BindingDesired::Flagship`].
@@ -496,6 +517,15 @@ pub struct SecretsStoreBinding {
 /// pack, render and docs).
 pub fn secrets_store_secret_ref(store_id: &str, secret_name: &str) -> String {
     format!("secrets-store:{store_id}:{secret_name}")
+}
+
+/// `{"type":"versionMetadata"}` — see [`BindingDesired::VersionMetadata`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VersionMetadataBinding {
+    /// Binding name (`env.<name>`), JS identifier — CF convention is
+    /// `CF_VERSION_METADATA` but any name is accepted.
+    pub name: String,
 }
 
 /// Access grant for a binding that has a provider data plane
@@ -1656,6 +1686,14 @@ impl VersionDesired {
         {
             return Err(DesiredError::CompatibilityFlag);
         }
+        // Version-metadata surface — free-form strings bounded like
+        // other references (tag is a user label; createdAt is ISO).
+        if self.tag.len() > MAX_IDENTIFIER_LEN {
+            return Err(DesiredError::Identifier("activeVersion.tag"));
+        }
+        if self.created_at.len() > MAX_IDENTIFIER_LEN {
+            return Err(DesiredError::Identifier("activeVersion.createdAt"));
+        }
         Ok(())
     }
 }
@@ -1932,6 +1970,10 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.appId"));
                     }
                 }
+                // VersionMetadata carries no resource reference —
+                // `name` is the only field; values are version-scoped
+                // (`activeVersion.{versionId,tag,createdAt}`).
+                BindingDesired::VersionMetadata(_) => {}
             }
         }
         Ok(())
@@ -2110,6 +2152,7 @@ impl BindingDesired {
             Self::UnsafeEval(b) => &b.name,
             Self::Flagship(b) => &b.name,
             Self::SecretsStore(b) => &b.name,
+            Self::VersionMetadata(b) => &b.name,
         }
     }
 
@@ -2136,7 +2179,7 @@ impl BindingDesired {
             | Self::WorkerLoader(_)
             | Self::Images(_)
             | Self::AnalyticsEngine(_)
-            | Self::UnsafeEval(_) | Self::Flagship(_) | Self::SecretsStore(_) => None,
+            | Self::UnsafeEval(_) | Self::Flagship(_) | Self::SecretsStore(_) | Self::VersionMetadata(_) => None,
         }
     }
 }

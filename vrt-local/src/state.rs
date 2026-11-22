@@ -168,6 +168,11 @@ pub struct VersionRecord {
     /// byte-compatible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tail_consumers: Vec<snapshot_protocol::compute_desired::TailConsumerDesired>,
+    /// CF `--tag` — the version's user label (`versionMetadata.tag`).
+    /// `""` = untagged. Part of version identity (the binding exposes
+    /// it), so `version_id` does NOT strip it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tag: String,
     pub quotas: WorkerQuotas,
 }
 
@@ -257,7 +262,6 @@ impl LocalState {
             compatibility_date: pkg.compatibility_date.clone(),
             compatibility_flags: pkg.compatibility_flags.clone(),
             status: VersionStatus::Archived,
-            created_at_unix_ms: 0,
             created_by: None,
             config_hash: String::new(),
             bindings: pkg.bindings.clone(),
@@ -269,6 +273,8 @@ impl LocalState {
             observability: pkg.observability.clone(),
             durable_object_classes: pkg.durable_object_classes.clone(),
             workflows: pkg.workflows.clone(),
+            tag: pkg.tag.clone(),
+            created_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
             quotas: pkg.quotas.clone(),
         };
         record.config_hash = Self::config_hash(&record);
@@ -502,6 +508,24 @@ impl LocalState {
                 .iter()
                 .find(|v| &v.version_id == active_id)
                 .ok_or(LocalError::State("activeVersion"))?;
+            // Version metadata fields ride the wire only when the
+            // version declares the binding — `deny_unknown_fields`
+            // makes pre-versionMetadata cells reject the whole
+            // snapshot, so they must never see the fields otherwise.
+            let has_version_metadata = active
+                .bindings
+                .iter()
+                .any(|b| matches!(b, BindingDesired::VersionMetadata(_)));
+            let (tag, created_at) = if has_version_metadata {
+                (
+                    active.tag.clone(),
+                    chrono::DateTime::from_timestamp_millis(active.created_at_unix_ms as i64)
+                        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+                        .unwrap_or_default(),
+                )
+            } else {
+                (String::new(), String::new())
+            };
             workers.push(WorkerDesired {
                 worker_id: w.worker_id.clone(),
                 name: name.clone(),
@@ -510,6 +534,8 @@ impl LocalState {
                     artifact_digest: active.artifact_digest.clone(),
                     compatibility_date: active.compatibility_date.clone(),
                     compatibility_flags: active.compatibility_flags.clone(),
+                    tag,
+                    created_at,
                 },
                 bindings: active.bindings.clone(),
                 routes: w
@@ -674,6 +700,7 @@ mod tests {
             quotas: WorkerQuotas::platform_default(),
             first_deploy_id: "0123456789abcdef".into(),
             pending_assets: None,
+            tag: String::new(),
         }
     }
 

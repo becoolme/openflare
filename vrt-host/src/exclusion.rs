@@ -246,6 +246,8 @@ mod tests {
                 artifact_digest: "a".repeat(64),
                 compatibility_date: "2024-01-01".to_string(),
                 compatibility_flags: Vec::new(),
+                tag: String::new(),
+                created_at: String::new(),
             },
             bindings: Vec::new(),
             routes: Vec::new(),

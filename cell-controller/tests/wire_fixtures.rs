@@ -192,6 +192,7 @@ fn desired_ack_fixture() {
             email: true,
             images: true,
             secrets_store: true,
+            version_metadata: true,
         }),
     };
     check(

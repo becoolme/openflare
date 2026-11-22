@@ -133,6 +133,10 @@ const USER_MODULE: &str = r#"export default {
         }
         return Response.json({ value, missing });
       }
+      if (p === "/versionmeta") {
+        const m = env.CF_VERSION_METADATA;
+        return Response.json({ id: m.id, tag: m.tag, timestamp: m.timestamp });
+      }
       return new Response("ok");
     } catch (e) {
       return new Response("unexpected:" + String((e && e.stack) || e), { status: 500 });
@@ -236,7 +240,9 @@ fn render_and_write(
                 "versionId": "v-smoke-1",
                 "artifactDigest": bundle.digest(),
                 "compatibilityDate": "2026-09-08",
-                "compatibilityFlags": []
+                "compatibilityFlags": [],
+                "tag": "smoke-tag",
+                "createdAt": "2026-11-23T01:02:03Z"
             },
             "bindings": bindings,
             "routes": [{"hostname": "smoke--team-smoke.vibeploy.app"}],
@@ -719,5 +725,41 @@ fn secrets_store_binding_serves_env_backed_value() {
     assert_eq!(
         v["missing"], "err:Secret \"other-key\" not found",
         "unset env var must surface upstream's not-found: {v}"
+    );
+}
+
+/// `env.CF_VERSION_METADATA` is a plain `json` binding materialized
+/// from the active version: `{id, tag, timestamp}` per CF's
+/// `WorkerVersionMetadata`. The render helper stamps
+/// `tag = "smoke-tag"` / `createdAt = "2026-11-23T01:02:03Z"` on the
+/// version, so the binding must echo exactly those.
+#[test]
+#[ignore = "needs VRT_WORKERD_BIN"]
+fn version_metadata_binding_serves_active_version_json() {
+    let Some(bin) = workerd_bin() else {
+        eprintln!("SKIP: VRT_WORKERD_BIN unset — real workerd required");
+        return;
+    };
+    let Some(dir) = smoke_root("vrt-bindings-smoke") else {
+        return;
+    };
+    let port = free_port();
+    let cfg = render_and_write(
+        &dir,
+        port,
+        json!([{ "type": "versionMetadata", "name": "CF_VERSION_METADATA" }]),
+        json!([]),
+        &[],
+        &["json = \"{\\\"id\\\":\\\"v-smoke-1\\\",\\\"tag\\\":\\\"smoke-tag\\\",\\\"timestamp\\\":\\\"2026-11-23T01:02:03Z\\\"}\""],
+    );
+    let proc = spawn(&bin, &cfg, &dir);
+    assert!(wait_ready(port), "workerd did not start:\n{}", log_text(&proc));
+
+    let v = http_json(port, "/versionmeta");
+    assert_eq!(
+        v,
+        json!({ "id": "v-smoke-1", "tag": "smoke-tag",
+                "timestamp": "2026-11-23T01:02:03Z" }),
+        "version metadata must mirror the active version"
     );
 }

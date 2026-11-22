@@ -112,6 +112,7 @@ fn upload_body(dir: &Path) -> vrt_local::worker_pkg::DeployUpload {
         vars: BTreeMap::from([("EXTRA".to_string(), "yes".to_string())]),
         secrets: BTreeMap::from([("api-key-ref".to_string(), "s3cr3t-value".to_string())]),
         name: None,
+        tag: None,
         preview: false,
         flagship_apps: g.flagship_apps.clone(),
     }

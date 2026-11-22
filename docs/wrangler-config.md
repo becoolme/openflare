@@ -178,6 +178,7 @@ before they reach stderr, so config values are not echoed back.
 | `k2` | partial — K2 durable event log produce binding; per-entry keys `binding`, `stream`, `remote` (`remote` accepted and ignored). `stream` is the user-side stream name (`[A-Za-z0-9_-]{1,256}`); the 32-hex `streamId` is derived server-side (`vrt-k2:{tenant}:{name}` standalone; server-minted row platform-side) — routing always uses the signed id. `env.<binding>.send(records)` resolves `{success:true}` or `{success:false,error:{code,retryable}}` and never throws (CF produce contract). Consumption is not a binding — it rides the platform subscription surface | `project_cfg.rs:1095` |
 | `send_email` | supported — Email Sending binding; per-entry keys `name` (required), `destination_address`, `allowed_destination_addresses`, `allowed_sender_addresses` (`destination_address` and `allowed_destination_addresses` are mutually exclusive — both set fails closed; every address format-validated; unknown keys `VRT_CONFIG_UNSUPPORTED_FIELD`). `env.<name>.send(message)` validates the CF Workers Email Sending contract provider-side (from required, ≥1 of to/cc/bcc, subject required, ≤50 recipients, ≤32 attachments, ≤25MiB total) and resolves `{messageId}` on success or throws an `Error` carrying the CF `E_*` code in `.code`. Restrictions are signed into desired state and enforced on every send. Delivery is NOT self-hosted — the provider `[email]` config selects an adapter: `cf`, `resend`, `smtp`, or `log` | `project_cfg.rs:1179` |
 | `secrets_store_secrets` | supported — Secrets Store binding; per-entry keys `binding` (required), `store_id` (optional, CF default `"default"`), `secret_name` (required); unknown keys fail closed. `env.<binding>` is a read-only `SecretsStoreSecret` stub — `get()` resolves to the value served by the bundled `/workerd/secrets-store.js` worker via an `env:<secret_name>` `fromEnvironment` binding. The value resolves from the tenant secret map under the derived `secrets-store:{store_id}:{secret_name}` ref and never enters config text or digest. See [Secrets Store](bindings/secrets-store.md) | `project_cfg.rs:1279` |
+| `version_metadata` | supported — Version Metadata binding; table key `binding` (required) only — `id`/`tag`/`timestamp` are version facts, not config. `env.<binding>` is `{id, tag, timestamp}` (`WorkerVersionMetadata`) for the worker's active version: `id` = the content-addressed `versionId`, `tag` = the deploy's `--tag` (`""` untagged), `timestamp` = ISO 8601 record creation (deduped re-deploys keep the first upload's). Rendered as a `json` binding — no shim, no adapter. See [Version metadata](bindings/version-metadata.md) | `project_cfg.rs` `version_metadata` |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
 | `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1179` |
@@ -245,7 +246,6 @@ That includes, non-exhaustively: `ai`, `ai_search`,
 `ai_search_namespaces`,
 `mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
-`version_metadata`,
 `migrations_pattern`,
 `logpush`, `site`, `preview_id` (top level),
 `node_compat`. Inside `routes[]` objects, CF carries `custom_domain`,
@@ -382,3 +382,15 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
   mapped to two different refs excludes the worker
   (`skipped_workers`), matching upstream `check_bindings`' one-value-
   per-name invariant at worker scope.
+- 2026-11-23: `version_metadata` is supported —
+  `[version_metadata] {binding}` declares a `{"type":"versionMetadata"}`
+  binding rendered as a `json` binding `{id, tag, timestamp}` of the
+  worker's active version (`WorkerVersionMetadata`). `id` = the
+  content-addressed `versionId`; `tag` = the deploy's `--tag` (`""`
+  untagged, like `wrangler versions upload` without `--tag`);
+  `timestamp` = ISO 8601 version-record creation, carried on the wire
+  via `activeVersion.{tag,createdAt}` — projected only when the
+  version declares the binding so pre-versionMetadata cells never see
+  the new fields (their `deny_unknown_fields` would reject the whole
+  snapshot; admission is gated on the `versionMetadata` capability
+  bit).

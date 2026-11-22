@@ -406,6 +406,8 @@ pub fn worker(worker_id: &str, hostname: &str, digest: &str) -> WorkerDesired {
             artifact_digest: digest.to_string(),
             compatibility_date: "2024-01-01".to_string(),
             compatibility_flags: vec![],
+            tag: String::new(),
+            created_at: String::new(),
         },
         bindings: vec![],
         routes: vec![RouteDesired {

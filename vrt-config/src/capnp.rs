@@ -1858,6 +1858,27 @@ fn emit_binding(
                 capnp_text(&props),
             ));
         }
+        BindingDesired::VersionMetadata(vm) => {
+            // CF `[version_metadata]` — `env.<name>` is
+            // `{id, tag, timestamp}` (`WorkerVersionMetadata`) for
+            // the worker's ACTIVE version. Rendered as a `json`
+            // binding; the values are version-scoped
+            // (`active_version.*`), never binding-carried — keeping
+            // them out of the binding preserves content-addressed
+            // version dedup (a timestamp inside bindings would mint
+            // a new versionId on every identical re-deploy).
+            let meta = String::from_utf8(canonical_bytes(&json!({
+                "id": worker.active_version.version_id,
+                "tag": worker.active_version.tag,
+                "timestamp": worker.active_version.created_at,
+            })))
+            .expect("canonical version metadata is utf8");
+            out.push_str(&format!(
+                "        (name = {}, json = {}),\n",
+                capnp_text(&vm.name),
+                capnp_text(&meta),
+            ));
+        }
     }
     Ok(())
 }

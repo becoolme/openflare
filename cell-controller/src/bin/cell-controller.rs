@@ -157,6 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // bundled `/workerd/secrets-store.js` worker ships in every
         // pinned binary — upstream, no fork shim) -- unconditionally on.
         secrets_store: true,
+        version_metadata: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,
