@@ -75,7 +75,7 @@ protocol.
 `facade/images-engine.ts` decodes → transforms → encodes entirely
 inside the system worker using vendored
 [jSquash](https://github.com/jamsinclair/jSquash) WASM modules
-(`facade/third_party/jsquash/`): mozjpeg, Squoosh PNG, WebP
+(`third_party/jsquash/`): mozjpeg, Squoosh PNG, WebP
 (lossy+lossless), AVIF **decode only**, and `@jsquash/resize`
 (Lanczos3/ triangle/bilinear/nearest). `.wasm` modules travel the same
 manifest → capnp `wasm = embed` pipeline as ES modules
