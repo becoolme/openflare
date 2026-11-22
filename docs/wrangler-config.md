@@ -83,22 +83,22 @@ This format has no `[env.*]` blocks; the environment selector is the
 `mode` the config factory receives. `--env staging` is passed to the
 loader as `--mode staging`, so `defineConfig(({ mode }) => …)` can branch
 per environment, and env resolution runs in pass-through mode. `[dev]`
-settings do not exist in this format; `vrt dev` simply has no
+settings do not exist in this format; `of dev` simply has no
 dev-table overrides for it.
 
 ### `isPreview`
 
 `defineConfig(({ isPreview }) => …)` is supported. `vrt` passes the
-loader's `--preview` flag **only** for `vrt deploy --preview`:
+loader's `--preview` flag **only** for `of deploy --preview`:
 
 | command | `isPreview` |
 | --- | --- |
-| `vrt deploy <dir>` | `false` |
-| `vrt deploy --dry-run <dir>` | `false` |
-| `vrt deploy --url … <dir>` | `false` |
-| `vrt deploy --preview <dir>` | `true` |
-| `vrt deploy --url … --preview <dir>` | `true` (evaluated client-side) |
-| `vrt dev` / `vrt doctor` | `false` |
+| `of deploy <dir>` | `false` |
+| `of deploy --dry-run <dir>` | `false` |
+| `of deploy --url … <dir>` | `false` |
+| `of deploy --preview <dir>` | `true` |
+| `of deploy --url … --preview <dir>` | `true` (evaluated client-side) |
+| `of dev` / `of doctor` | `false` |
 
 The flag is derived from the deploy **mode**, never from a caller
 override, so a production deploy can only ever evaluate the production
@@ -133,7 +133,7 @@ worker to `.js`/`.mjs`, or point `worker.entrypoint` at a JS file.
 
 ### Restricted child process — not a sandbox
 
-The loader runs as a child of `vrt deploy` / `vrt dev` / `vrt doctor`
+The loader runs as a child of `of deploy` / `of dev` / `of doctor`
 with:
 
 - a fixed working directory (the worker project) and no shell involved;

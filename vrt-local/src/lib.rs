@@ -884,7 +884,7 @@ impl VrtLocal {
         }
     }
 
-    /// Detailed version list for one worker (`vrt versions list`).
+    /// Detailed version list for one worker (`of versions list`).
     pub fn versions(&self, worker: &str) -> Result<WorkerVersions, LocalError> {
         let st = state::read(&self.root)?;
         let (name, record) = st

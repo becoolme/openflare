@@ -505,7 +505,7 @@ fn cf_helper_failure(stderr: &[u8]) -> (Option<String>, String) {
 /// the raw (wrangler-shaped) config object. `is_preview` maps onto the
 /// helper's `--preview` flag (the `isPreview` argument Cloudflare's own
 /// loader hands to `defineConfig`); it is only ever `true` for
-/// `vrt deploy --preview`.
+/// `of deploy --preview`.
 fn run_cf_config_loader(
     project_dir: &Path,
     config_file: &str,
@@ -576,7 +576,7 @@ fn run_cf_config_loader(
     // Readers drain both pipes concurrently (a full stderr pipe would
     // otherwise block the child) and report over a channel: results are
     // awaited with a bound, so a config that leaks an inherited pipe cannot
-    // hang `vrt deploy`.
+    // hang `of deploy`.
     let (out_tx, out_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = out_tx.send(read_capped(stdout_pipe, CF_CONFIG_MAX_STDOUT_BYTES));
@@ -758,7 +758,7 @@ fn rebase_cf_main(
 /// format has no `[env.*]` blocks, so env resolution runs in pass-through
 /// mode. `is_preview` is passed as `--preview`, so
 /// `defineConfig(({ isPreview }) => …)` takes its preview branch ONLY for
-/// `vrt deploy --preview`. Returns (normalized config, resolved raw
+/// `of deploy --preview`. Returns (normalized config, resolved raw
 /// object, shadowed files).
 pub fn load_cf_project_config(
     project_dir: &Path,
@@ -3123,7 +3123,7 @@ pub(crate) fn load_dev_table_for_env(
         return Ok(None);
     }
     // `cloudflare.config.*` has no `[dev]` table (the `cf` format keeps dev
-    // settings elsewhere); there is nothing to parse for `vrt dev`.
+    // settings elsewhere); there is nothing to parse for `of dev`.
     if CLOUDFLARE_CONFIG_CANDIDATES
         .iter()
         .any(|c| worker_dir.join(c).exists())

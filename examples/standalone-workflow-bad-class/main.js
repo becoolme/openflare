@@ -5,7 +5,7 @@ export default {
 };
 
 // Exported and named like the declaration — but a PLAIN class, not a
-// WorkflowEntrypoint subclass. `vrt deploy` must reject this pack.
+// WorkflowEntrypoint subclass. `of deploy` must reject this pack.
 export class OrderFlow {
   async run() {
     return "never-runs";

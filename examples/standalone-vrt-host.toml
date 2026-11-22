@@ -137,7 +137,7 @@ maxBodyBytes = 1048576
 # `fixed-http` default is correct here (client headers are always
 # stripped; nothing promotes the scheme).
 
-# Versioned preview URLs (`vrt deploy --preview`). OFF by default: with
+# Versioned preview URLs (`of deploy --preview`). OFF by default: with
 # no `domain`, every preview hostname is a 404 and production routing is
 # byte-identical. When set, the host derives
 # `<versionId>--<workerName>.<domain>` for each preview version (and for
@@ -146,6 +146,6 @@ maxBodyBytes = 1048576
 # `x-vrt-preview: 1` + `x-vrt-preview-version`. Previews never receive
 # tenant secrets; KV/R2/D1/queue bindings stay shared with production.
 # `vrt-local` reads this same file to report `previewUrl` in
-# `vrt deploy --preview` / `vrt versions list`.
+# `of deploy --preview` / `of versions list`.
 [preview]
 # domain = "preview.example.com"

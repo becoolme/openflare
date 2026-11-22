@@ -647,7 +647,7 @@ async fn promote_switches_traffic_and_replays_idempotently() {
 // 3. preview + secret values is refused before anything is written
 // ---------------------------------------------------------------------
 
-/// A remote-upload wire body (`vrt deploy --url`) for `dir`.
+/// A remote-upload wire body (`of deploy --url`) for `dir`.
 fn upload_body(dir: &Path) -> vrt_local::worker_pkg::DeployUpload {
     use base64::Engine;
     let g = vrt_local::worker_pkg::gather_dir(dir).unwrap();

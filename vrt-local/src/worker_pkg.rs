@@ -628,7 +628,7 @@ pub struct DeployOverrides {
     /// user label, surfaced via the `versionMetadata` binding's `tag`.
     /// `None`/empty = untagged (CF default).
     pub tag: Option<String>,
-    /// `vrt deploy --preview`: evaluates a `cloudflare.config.*` with
+    /// `of deploy --preview`: evaluates a `cloudflare.config.*` with
     /// `isPreview = true` (the helper's `--preview` flag). A production
     /// deploy always leaves this `false`, so a config's preview branch is
     /// unreachable from a normal deploy. Ignored by `vrt.toml`/wrangler

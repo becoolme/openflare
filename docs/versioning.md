@@ -14,24 +14,24 @@ Cloudflare's full version and preview-routing model.
 ## Commands
 
 ```text
-vrt deploy --preview --root <dir> [--name <n>] <worker_dir>
+of deploy --preview --root <dir> [--name <n>] <worker_dir>
 vrt promote --root <dir> [--worker <name|workerId>] <version_id>
-vrt versions list --root <dir> <worker>
+of versions list --root <dir> <worker>
 ```
 
-The legacy `vrt versions <worker>` form is an alias for
-`vrt versions list`. Remote deploys (`vrt deploy --url ...`) accept
+The legacy `of versions <worker>` form is an alias for
+`of versions list`. Remote deploys (`of deploy --url ...`) accept
 `--preview`; the management API also exposes `POST /v1/promote` with
 `{ "versionId": "...", "worker": "..." }` (`worker` optional; omit it
 only when the id is unique across workers).
 
-`vrt deploy --preview` returns the same JSON shape as a normal deploy,
+`of deploy --preview` returns the same JSON shape as a normal deploy,
 including `versionId`, plus `previewUrl` (`null` when the host has no
 preview domain configured). No id is printed unless the version record
 was persisted; a failure after the object write but before the state
 write leaves only a harmless orphan object, never a reported version.
 
-`vrt versions list` prints `WorkerVersions` JSON; every
+`of versions list` prints `WorkerVersions` JSON; every
 `versions[*]` row carries `previewUrl` (same rule: `null` for archived
 versions and for every version when no preview domain is configured).
 
@@ -165,7 +165,7 @@ never shadow a production hostname with a derived one.
 Up to `MAX_PREVIEWS_PER_WORKER` (4) newest preview versions per worker
 are projected as instances (and are therefore routable). Older preview
 versions stay stored and promotable; they are just not served over HTTP
-until re-previewed (`vrt deploy --preview` again).
+until re-previewed (`of deploy --preview` again).
 
 `x-vrt-preview` / `x-vrt-preview-version` are also forwarded to the
 worker on the request path, so the code can branch its own side effects
@@ -319,10 +319,10 @@ real browsers needs, in addition:
 
 ## `isPreview` for `cloudflare.config.ts`
 
-`vrt deploy --preview` passes `--preview` to the config loader, so
+`of deploy --preview` passes `--preview` to the config loader, so
 `defineConfig(({ isPreview }) => …)` takes its preview branch. The flag
 is derived from the deploy mode (never from a caller-supplied override):
-a normal `vrt deploy` can only evaluate with `isPreview = false`. See
+a normal `of deploy` can only evaluate with `isPreview = false`. See
 [wrangler-config.md](./wrangler-config.md#ispreview) for the exact
 semantics.
 

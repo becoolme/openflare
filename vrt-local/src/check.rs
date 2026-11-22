@@ -85,6 +85,10 @@ pub fn check_worker(
                     created_at: chrono::Utc::now().to_rfc3339(),
                 },
                 bindings: pkg.bindings.clone(),
+                // `of check` is a validation snapshot, not a preview
+                // deploy — `cloudflare.config.*` evaluates with
+                // isPreview = false.
+                preview: None,
                 routes: overrides
                     .hostnames
                     .iter()
