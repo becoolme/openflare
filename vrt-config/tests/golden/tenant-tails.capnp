@@ -274,13 +274,16 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/egress/egress.js", esModule = embed "sys/fbea734df54b11e66b2157123c5fb7f36d4f624d6cf2ea4f0691df548bc4c3d1"),
+        (name = "facade/egress/egress.js", esModule = embed "sys/65ab2aa3980e197c3258f378238c395a9a83f205f4d8183b371f94e46295ff61"),
+        (name = "facade/egress/cf-image.js", esModule = embed "sys/53e822f938f6a9801a33e2f928ed0b7a66fe4072a2e8259f9e154489452c40e3"),
         (name = "facade/egress/ip.js", esModule = embed "sys/6575c6e66245aebea369d5e97ae7ffc6783652044ed2adc2be462c9df3e7b97b"),
         (name = "facade/egress/policy.js", esModule = embed "sys/e6dc4ee5d55668354c4a180e570142fb0a0df195e6228baa038c4d7a96d72fef"),
         (name = "facade/egress/shared.js", esModule = embed "sys/353d7aa02d71f0745c83d132dd884378b3ff2fc2ec2215ebdd8e08d5e4ab89dc"),
+        (name = "facade/images-wire.js", esModule = embed "sys/092f5e374b124771938623bed2c0c6cf908a64f4029118112519dcc11dcce483"),
       ],
       bindings = [
         (name = "VRT_EGRESS_POLICY", text = "{\"allow\":[{\"host\":\"api.vibeploy.internal\",\"port\":8443}],\"allowedPorts\":[80,443],\"denyNames\":[\"*.tenant.example\",\"blocked.example\"],\"internalTcpAllow\":[],\"internalTcpTargets\":[],\"requestTimeoutMs\":30000,\"tcpAllowedPorts\":[43],\"tcpConnectTimeoutMs\":10000,\"tcpIdleTimeoutMs\":60000,\"tcpMaxConcurrent\":64}"),
+        (name = "VRT_IMAGES", service = (name = "facade-images", entrypoint = "ImagesFacade")),
       ],
       globalOutbound = "outbound-network",
     )),

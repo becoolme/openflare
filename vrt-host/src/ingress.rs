@@ -2824,6 +2824,7 @@ mod ws_tests {
             tenant_id: "t".into(),
             worker_id: "w".into(),
             assets_first: false,
+            images: false,
         };
         scrubbed_headers(
             inbound,
