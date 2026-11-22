@@ -6,12 +6,15 @@ const DECODE_FORMATS = new Set([
     "jpeg",
     "png",
     "webp",
-    "avif"
+    "avif",
+    "gif",
+    "bmp"
 ]);
 const OUTPUT_FORMATS = {
     "image/jpeg": "jpeg",
     "image/png": "png",
     "image/webp": "webp",
+    "image/avif": "avif",
     rgb: "rgb",
     rgba: "rgba"
 };
@@ -36,7 +39,10 @@ async function decodeField(file, what) {
     if (!DECODE_FORMATS.has(sniffed.format)) {
         throw new EngineError(9401, `images: ${what} format ${sniffed.format} has no vendored decoder`);
     }
-    return decodeImage(bytes, sniffed.format);
+    return {
+        frame: await decodeImage(bytes, sniffed.format),
+        format: sniffed.format
+    };
 }
 function flatten(img, color) {
     const base = {
@@ -120,7 +126,7 @@ export class ImagesFacade extends WorkerEntrypoint {
                         } catch  {
                             return imagesError(9423, "images: malformed `transforms` JSON", 400);
                         }
-                        const canvas = await decodeField(image, "canvas image");
+                        const { frame: canvas, format: canvasFormat } = await decodeField(image, "canvas image");
                         const frames = [
                             canvas
                         ];
@@ -128,7 +134,7 @@ export class ImagesFacade extends WorkerEntrypoint {
                             if (!(field instanceof File)) {
                                 return imagesError(9423, "images: malformed `draw_image` field", 400);
                             }
-                            frames.push(await decodeField(field, `draw_image ${frames.length}`));
+                            frames.push((await decodeField(field, `draw_image ${frames.length}`)).frame);
                         }
                         if (canvas.width * canvas.height > IMAGES_TRANSFORM_MAX_PIXELS) {
                             return imagesError(9401, "images: source exceeds the transform pixel cap", 413);
@@ -145,6 +151,9 @@ export class ImagesFacade extends WorkerEntrypoint {
                         const quality = rawQuality === null ? 85 : Number(rawQuality);
                         if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
                             return imagesError(9423, "images: invalid `output_quality`", 400);
+                        }
+                        if (form.get("anim") !== null && canvasFormat === "gif") {
+                            return imagesError(9401, "images: animated output is not supported", 415);
                         }
                         const rawBg = form.get("background");
                         const bg = rawBg === null ? null : typeof rawBg === "string" ? parseColor(rawBg) : null;

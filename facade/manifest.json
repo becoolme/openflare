@@ -534,15 +534,22 @@
           "name": "facade/facade-images.js",
           "dist": "facade/dist/facade/facade-images.js",
           "source": "facade/facade-images.ts",
-          "sourceSha256": "c4e1e22593f90b3a8a864e914bd1e0b65093bbdc9c120b3b1bc898be7839fcca",
-          "sha256": "457a9b5f2f11f37dfbc266520b36f416b19d17885e89c84ef11fc0337bf66541"
+          "sourceSha256": "5df2736096d63b7383cf0467fbaed8cb8391ea4bc61839592979ea42fbb7aba0",
+          "sha256": "1b3ef36b70634426f9198a34381caa60e34248e176cb377f2a066660126e11f0"
+        },
+        {
+          "name": "facade/images-decode.js",
+          "dist": "facade/dist/facade/images-decode.js",
+          "source": "facade/images-decode.ts",
+          "sourceSha256": "0b87b96cc0af2e37478002fd4b9b729a14c0fdc49f58736afdabf2dbe3b56be3",
+          "sha256": "9918195eb004ae7d72b86e021f0c79e133b1348e6cd4b1629f3912cc85beaa92"
         },
         {
           "name": "facade/images-engine.js",
           "dist": "facade/dist/facade/images-engine.js",
           "source": "facade/images-engine.ts",
-          "sourceSha256": "c4b400612a28f943327eea9b4c530b615b4e6a832cff58daa960c8a2a94b69ad",
-          "sha256": "62564e6f417f8abfab28b7fd363f0d03656feb7cd9279245a072827e38ea88b2"
+          "sourceSha256": "54c7697155bf30c4f85718ee4e307ad9e3414ce66ecc479a6a767c693163c277",
+          "sha256": "2d9afc9330930e841172a4e90e428d6b3e9a35358709bc8c1e038e0df9b2a596"
         },
         {
           "name": "facade/images-transform.js",
@@ -555,8 +562,8 @@
           "name": "facade/images-wire.js",
           "dist": "facade/dist/facade/images-wire.js",
           "source": "facade/images-wire.ts",
-          "sourceSha256": "125e6c800c870e436df74e94855ccfd39697ce4a3b18889d2c0952b0c8467d10",
-          "sha256": "cf8d7aa4f99fec5d54a0457418cc29b26575412b36ef95e1ce9f0cba112d3eff"
+          "sourceSha256": "9ec45de3235dc7e8ea73733fbd97e2e0a5b257062a4aaaead7183ef23df3db92",
+          "sha256": "092f5e374b124771938623bed2c0c6cf908a64f4029118112519dcc11dcce483"
         },
         {
           "name": "third_party/jsquash/avif/avif_dec.js",
@@ -571,6 +578,21 @@
           "source": "third_party/jsquash/avif/avif_dec.wasm",
           "sourceSha256": "5c35dde23dfd862088a49a6b8a9fe81f9f9a1a46aaa27de7efd7baa7611c4b47",
           "sha256": "5c35dde23dfd862088a49a6b8a9fe81f9f9a1a46aaa27de7efd7baa7611c4b47",
+          "type": "wasm"
+        },
+        {
+          "name": "third_party/jsquash/avif/avif_enc.js",
+          "dist": "facade/dist/third_party/jsquash/avif/avif_enc.js",
+          "source": "third_party/jsquash/avif/avif_enc.js",
+          "sourceSha256": "c6805e62cae5c1b9870fcc0448437da9e4edfc58c3da264af52361281082c63c",
+          "sha256": "c6805e62cae5c1b9870fcc0448437da9e4edfc58c3da264af52361281082c63c"
+        },
+        {
+          "name": "third_party/jsquash/avif/avif_enc.wasm",
+          "dist": "facade/dist/third_party/jsquash/avif/avif_enc.wasm",
+          "source": "third_party/jsquash/avif/avif_enc.wasm",
+          "sourceSha256": "d9f2a95164362af48558d176e619becfd49dd97b50b86c679b47100860522b3d",
+          "sha256": "d9f2a95164362af48558d176e619becfd49dd97b50b86c679b47100860522b3d",
           "type": "wasm"
         },
         {

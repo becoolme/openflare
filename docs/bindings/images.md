@@ -76,8 +76,10 @@ protocol.
 inside the system worker using vendored
 [jSquash](https://github.com/jamsinclair/jSquash) WASM modules
 (`third_party/jsquash/`): mozjpeg, Squoosh PNG, WebP
-(lossy+lossless), AVIF **decode only**, and `@jsquash/resize`
-(Lanczos3/ triangle/bilinear/nearest). `.wasm` modules travel the same
+(lossy+lossless), AVIF decode + encode, and `@jsquash/resize`
+(Lanczos3/ triangle/bilinear/nearest). GIF (first frame) and BMP
+(24/32bpp uncompressed) decode in pure TS (`facade/images-decode.ts`).
+`.wasm` modules travel the same
 manifest → capnp `wasm = embed` pipeline as ES modules
 (`facade/tools/gen-manifest.mjs`, `vrt-config/src/capnp.rs`,
 `vrt-config/src/sysmanifest.rs`); Node tests load them through the
@@ -139,14 +141,15 @@ resource-identifying keys besides `binding`.
   Cloudflare's proprietary pipeline. Encoding quality, EXIF/color-
   profile handling and resize kernel tuning will differ from
   production Cloudflare output byte-for-byte.
-- **Decode coverage**: PNG, JPEG, WebP (lossy + lossless) and AVIF
-  decode. GIF/BMP decode is not vendored → `err=9401`; animated
-  sources decode as the first frame only, `anim` requests →
-  `err=9401`.
-- **Encode coverage**: `image/jpeg`, `image/png`, `image/webp`, plus
-  the wire `rgb`/`rgba` raw frames. `image/avif` encoding is not
-  vendored (the AVIF encoder is ~3× the size of everything else
-  combined) → `err=9401`.
+- **Decode coverage**: PNG, JPEG, WebP (lossy + lossless), AVIF, GIF
+  (first frame only — pure-TS LZW decoder), and BMP (24/32bpp
+  uncompressed). SVG rasterization is not implemented → `err=9401`;
+  an `anim` request on an animated (GIF) source → `err=9401` since
+  multi-frame output is impossible.
+- **Encode coverage**: `image/jpeg`, `image/png`, `image/webp`,
+  `image/avif` (single-threaded encoder, speed 6), plus the wire
+  `rgb`/`rgba` raw frames. `image/gif` output has no vendored encoder
+  → `err=9401`.
 - **Draw coverage**: `draw_image` overlays (alpha compositing,
   `repeat` tiling, `top`/`left`/`bottom`/`right`/`width`/`height`/
   `opacity`) work; `draw_text`/`text_input` rasterization is not
@@ -173,9 +176,13 @@ resource-identifying keys besides `binding`.
   (wrapped module + inner fetcher service name).
 - `facade/test/images.test.mjs` — `/info` shape cases plus end-to-end
   `/transform` coverage: real PNG→WebP resize round-trip,
-  crop-gravity+rotate→JPEG, `draw_image` alpha compositing, and the
-  fail-closed edges (unknown op key, GIF input, text ops, AVIF/GIF
-  output).
+  crop-gravity+rotate→JPEG, `draw_image` alpha compositing, GIF/BMP
+  input decode, AVIF output, and the fail-closed edges (unknown op
+  key, corrupt input, text ops, `anim`, GIF output).
+- `vrt-host/tests/images_workerd.rs` — real-workerd smoke (`VRT_WORKERD_BIN`
+  gated): the rendered `wasm = embed` modules instantiate in the
+  pinned binary and `env.IMAGES` info/transform round-trip through the
+  actual shim + fetcher wiring.
 - `shared/vrt-project-config-vectors.json` — six golden vectors:
   valid `[images]`, `remote = true` accepted-and-ignored, unknown
   sub-key, missing `binding`, non-boolean `remote`, non-table value.

@@ -12,6 +12,11 @@ import webpEncFactory from "../third_party/jsquash/webp/webp_enc_simd.js";
 import webpEncWasmBytes from "../third_party/jsquash/webp/webp_enc_simd.wasm";
 import avifDecFactory from "../third_party/jsquash/avif/avif_dec.js";
 import avifDecWasmBytes from "../third_party/jsquash/avif/avif_dec.wasm";
+import avifEncFactory from "../third_party/jsquash/avif/avif_enc.js";
+import avifEncWasmBytes from "../third_party/jsquash/avif/avif_enc.wasm";
+import { decodeBmp, decodeGif } from "./images-decode.js";
+import { EngineError } from "./images-wire.js";
+export { EngineError };
 if (typeof globalThis.ImageData === "undefined") {
     globalThis.ImageData = class {
         data;
@@ -35,19 +40,13 @@ function instantiateEmscripten(factory, wasmModule) {
     });
     return Promise.resolve(mod.ready).then(()=>mod);
 }
-export class EngineError extends Error {
-    code;
-    constructor(code, message){
-        super(message);
-        this.code = code;
-    }
-}
 let engineInit = null;
 let jpegDec;
 let jpegEnc;
 let webpDec;
 let webpEnc;
 let avifDec;
+let avifEnc;
 const RESIZE_METHODS = [
     "triangle",
     "catrom",
@@ -61,12 +60,13 @@ async function ensureEngine() {
                 initResizeWasm(resizeWasmBytes),
                 initPngWasm(pngWasmBytes)
             ]);
-            [jpegDec, jpegEnc, webpDec, webpEnc, avifDec] = await Promise.all([
+            [jpegDec, jpegEnc, webpDec, webpEnc, avifDec, avifEnc] = await Promise.all([
                 instantiateEmscripten(mozjpegDecFactory, mozjpegDecWasmBytes),
                 instantiateEmscripten(mozjpegEncFactory, mozjpegEncWasmBytes),
                 instantiateEmscripten(webpDecFactory, webpDecWasmBytes),
                 instantiateEmscripten(webpEncFactory, webpEncWasmBytes),
-                instantiateEmscripten(avifDecFactory, avifDecWasmBytes)
+                instantiateEmscripten(avifDecFactory, avifDecWasmBytes),
+                instantiateEmscripten(avifEncFactory, avifEncWasmBytes)
             ]);
         })();
     }
@@ -95,6 +95,12 @@ export async function decodeImage(bytes, format) {
         case "avif":
             out = avifDec.decode(bytes, 8);
             break;
+        case "gif":
+            out = decodeGif(bytes);
+            break;
+        case "bmp":
+            out = decodeBmp(bytes);
+            break;
         default:
             throw new EngineError(9401, `images: ${format} decode is not supported by the vendored engine`);
     }
@@ -107,6 +113,7 @@ export const ENCODE_FORMATS = [
     "jpeg",
     "png",
     "webp",
+    "avif",
     "rgb",
     "rgba"
 ];
@@ -210,6 +217,29 @@ export async function encodeImage(img, format, quality = 85) {
                 bytes: new Uint8Array(img.data.buffer.slice(0)),
                 contentType: "application/octet-stream"
             };
+        case "avif":
+            {
+                const out = avifEnc.encode(new Uint8Array(img.data.buffer, img.data.byteOffset, img.data.length), img.width, img.height, {
+                    quality: Math.max(0, Math.min(100, quality)),
+                    qualityAlpha: -1,
+                    denoiseLevel: 0,
+                    tileColsLog2: 0,
+                    tileRowsLog2: 0,
+                    speed: 6,
+                    subsample: 1,
+                    chromaDeltaQ: false,
+                    sharpness: 0,
+                    tune: 0,
+                    enableSharpYUV: false,
+                    bitDepth: 8,
+                    lossless: false
+                });
+                if (!out) throw new EngineError(9523, "images: avif encode failed");
+                return {
+                    bytes: out,
+                    contentType: "image/avif"
+                };
+            }
         default:
             throw new EngineError(9401, `images: ${format} output is not supported by the vendored engine`);
     }

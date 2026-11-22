@@ -28,17 +28,19 @@ import webpEncFactory from "../third_party/jsquash/webp/webp_enc_simd.js";
 import webpEncWasmBytes from "../third_party/jsquash/webp/webp_enc_simd.wasm";
 import avifDecFactory from "../third_party/jsquash/avif/avif_dec.js";
 import avifDecWasmBytes from "../third_party/jsquash/avif/avif_dec.wasm";
+import avifEncFactory from "../third_party/jsquash/avif/avif_enc.js";
+import avifEncWasmBytes from "../third_party/jsquash/avif/avif_enc.wasm";
+import { decodeBmp, decodeGif } from "./images-decode.js";
+import { EngineError, type ImageDataLike } from "./images-wire.js";
+
+export { EngineError };
+export type { ImageDataLike };
 
 // jSquash codecs return `ImageData` instances; workerd has no DOM
 // `ImageData` global, so provide the structural twin they expect.
 declare global {
   // eslint-disable-next-line no-var
   var ImageData: { new (data: Uint8ClampedArray, width: number, height: number): ImageDataLike } | undefined;
-}
-export interface ImageDataLike {
-  data: Uint8ClampedArray;
-  width: number;
-  height: number;
 }
 if (typeof globalThis.ImageData === "undefined") {
   (globalThis as Record<string, unknown>).ImageData = class {
@@ -74,14 +76,7 @@ function instantiateEmscripten(
   return Promise.resolve(mod.ready).then(() => mod);
 }
 
-/** Typed engine failure → mapped to an `err=<code>` wire response. */
-export class EngineError extends Error {
-  readonly code: number;
-  constructor(code: number, message: string) {
-    super(message);
-    this.code = code;
-  }
-}
+
 
 // ---- lazy WASM singletons -------------------------------------------
 // Instantiation is request-scoped by laziness: the first transform pays
@@ -92,6 +87,7 @@ let jpegEnc: Record<string, (...a: unknown[]) => unknown>;
 let webpDec: Record<string, (...a: unknown[]) => unknown>;
 let webpEnc: Record<string, (...a: unknown[]) => unknown>;
 let avifDec: Record<string, (...a: unknown[]) => unknown>;
+let avifEnc: Record<string, (...a: unknown[]) => unknown>;
 
 const RESIZE_METHODS = ["triangle", "catrom", "mitchell", "lanczos3"];
 
@@ -102,12 +98,13 @@ async function ensureEngine(): Promise<void> {
         initResizeWasm(resizeWasmBytes as unknown as WebAssembly.Module),
         initPngWasm(pngWasmBytes as unknown as WebAssembly.Module),
       ]);
-      [jpegDec, jpegEnc, webpDec, webpEnc, avifDec] = await Promise.all([
+      [jpegDec, jpegEnc, webpDec, webpEnc, avifDec, avifEnc] = await Promise.all([
         instantiateEmscripten(mozjpegDecFactory, mozjpegDecWasmBytes as unknown as WebAssembly.Module),
         instantiateEmscripten(mozjpegEncFactory, mozjpegEncWasmBytes as unknown as WebAssembly.Module),
         instantiateEmscripten(webpDecFactory, webpDecWasmBytes as unknown as WebAssembly.Module),
         instantiateEmscripten(webpEncFactory, webpEncWasmBytes as unknown as WebAssembly.Module),
         instantiateEmscripten(avifDecFactory, avifDecWasmBytes as unknown as WebAssembly.Module),
+        instantiateEmscripten(avifEncFactory, avifEncWasmBytes as unknown as WebAssembly.Module),
       ]);
     })();
   }
@@ -137,8 +134,15 @@ export async function decodeImage(bytes: Uint8Array, format: string): Promise<Im
     case "avif":
       out = avifDec.decode(bytes, 8) as ImageDataLike | undefined;
       break;
+    case "gif":
+      // First frame only — multi-frame `anim` is rejected upstream.
+      out = decodeGif(bytes);
+      break;
+    case "bmp":
+      out = decodeBmp(bytes);
+      break;
     default:
-      // gif/bmp/svg have no vendored decoder — fail closed upstream of
+      // svg has no vendored decoder — fail closed upstream of
       // a silent identity render.
       throw new EngineError(9401, `images: ${format} decode is not supported by the vendored engine`);
   }
@@ -149,7 +153,7 @@ export async function decodeImage(bytes: Uint8Array, format: string): Promise<Im
 }
 
 // ---- encode ----------------------------------------------------------
-export const ENCODE_FORMATS = ["jpeg", "png", "webp", "rgb", "rgba"] as const;
+export const ENCODE_FORMATS = ["jpeg", "png", "webp", "avif", "rgb", "rgba"] as const;
 export type EncodeFormat = (typeof ENCODE_FORMATS)[number];
 
 const JPEG_OPTIONS = {
@@ -243,8 +247,35 @@ export async function encodeImage(
     }
     case "rgba":
       return { bytes: new Uint8Array(img.data.buffer.slice(0)), contentType: "application/octet-stream" };
+    case "avif": {
+      // Single-threaded encoder (the mt variant needs Worker threads
+      // workerd does not provide); speed 6 / subsample 4:2:0 matches
+      // the package's CF-flavoured defaults.
+      const out = avifEnc.encode(
+        new Uint8Array(img.data.buffer, img.data.byteOffset, img.data.length),
+        img.width,
+        img.height,
+        {
+          quality: Math.max(0, Math.min(100, quality)),
+          qualityAlpha: -1,
+          denoiseLevel: 0,
+          tileColsLog2: 0,
+          tileRowsLog2: 0,
+          speed: 6,
+          subsample: 1,
+          chromaDeltaQ: false,
+          sharpness: 0,
+          tune: 0,
+          enableSharpYUV: false,
+          bitDepth: 8,
+          lossless: false,
+        },
+      ) as Uint8Array | undefined;
+      if (!out) throw new EngineError(9523, "images: avif encode failed");
+      return { bytes: out, contentType: "image/avif" };
+    }
     default:
-      // gif/avif output has no vendored encoder — fail closed.
+      // gif output has no vendored encoder — fail closed.
       throw new EngineError(9401, `images: ${format} output is not supported by the vendored engine`);
   }
 }

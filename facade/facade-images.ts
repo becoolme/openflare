@@ -10,8 +10,8 @@
 // `transform()` runs the vendored jSquash WASM engine
 // (facade/images-engine.ts) — decode → op chain → encode entirely
 // inside this worker. `text_input`/`draw_text` rasterization, animated
-// formats, GIF/BMP decode, AVIF/GIF encode, and `segment` gravity fail
-// closed — never a silent identity passthrough.
+// multi-frame output, GIF encode, SVG rasterization, and `segment`
+// gravity fail closed — never a silent identity passthrough.
 import { WorkerEntrypoint } from "cloudflare:workers";
 import {
   imagesError,
@@ -33,11 +33,12 @@ import {
   IMAGES_TRANSFORM_MAX_PIXELS,
 } from "./images-transform.js";
 
-const DECODE_FORMATS = new Set(["jpeg", "png", "webp", "avif"]);
+const DECODE_FORMATS = new Set(["jpeg", "png", "webp", "avif", "gif", "bmp"]);
 const OUTPUT_FORMATS: Record<string, string> = {
   "image/jpeg": "jpeg",
   "image/png": "png",
   "image/webp": "webp",
+  "image/avif": "avif",
   rgb: "rgb",
   rgba: "rgba",
 };
@@ -50,8 +51,9 @@ function wireError(e: unknown): Response {
 }
 
 /** Decode a multipart file field into an RGBA frame, or throw a typed
- * EngineError. */
-async function decodeField(file: File, what: string): Promise<ImageDataLike> {
+ * EngineError. Returns the sniffed container format alongside — the
+ * caller needs it for anim/multi-frame policy. */
+async function decodeField(file: File, what: string): Promise<{ frame: ImageDataLike; format: string }> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (bytes.length === 0 || bytes.length > IMAGES_BODY_MAX_BYTES) {
     throw new EngineError(9409, `images: ${what} empty or over the 64MiB cap`);
@@ -66,7 +68,7 @@ async function decodeField(file: File, what: string): Promise<ImageDataLike> {
   if (!DECODE_FORMATS.has(sniffed.format)) {
     throw new EngineError(9401, `images: ${what} format ${sniffed.format} has no vendored decoder`);
   }
-  return decodeImage(bytes, sniffed.format);
+  return { frame: await decodeImage(bytes, sniffed.format), format: sniffed.format };
 }
 
 /** Alpha-flatten onto `color` for opaque output formats. */
@@ -154,13 +156,13 @@ export class ImagesFacade extends WorkerEntrypoint {
             return imagesError(9423, "images: malformed `transforms` JSON", 400);
           }
 
-          const canvas = await decodeField(image, "canvas image");
+          const { frame: canvas, format: canvasFormat } = await decodeField(image, "canvas image");
           const frames = [canvas];
           for (const field of form.getAll("draw_image")) {
             if (!(field instanceof File)) {
               return imagesError(9423, "images: malformed `draw_image` field", 400);
             }
-            frames.push(await decodeField(field, `draw_image ${frames.length}`));
+            frames.push((await decodeField(field, `draw_image ${frames.length}`)).frame);
           }
           if (canvas.width * canvas.height > IMAGES_TRANSFORM_MAX_PIXELS) {
             return imagesError(9401, "images: source exceeds the transform pixel cap", 413);
@@ -179,10 +181,13 @@ export class ImagesFacade extends WorkerEntrypoint {
           if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
             return imagesError(9423, "images: invalid `output_quality`", 400);
           }
-          // `anim` only matters for animated sources, which the vendored
-          // engine never produces (no GIF decode) — accepted and ignored,
-          // matching the "single frame" output semantics CF gives a
-          // still image.
+          // `anim` requests multi-frame output: the engine decodes a
+          // single frame, so an animated source + anim must fail closed
+          // rather than silently collapse frames. A still source ignores
+          // the flag like CF does.
+          if (form.get("anim") !== null && canvasFormat === "gif") {
+            return imagesError(9401, "images: animated output is not supported", 415);
+          }
           const rawBg = form.get("background");
           const bg = rawBg === null
             ? null

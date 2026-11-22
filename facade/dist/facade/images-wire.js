@@ -8,6 +8,13 @@ export function imagesError(code, message, status = 400) {
 }
 export const IMAGES_BODY_MAX_BYTES = 64 * 1024 * 1024;
 export const IMAGES_MAX_PIXELS = 70_000_000;
+export class EngineError extends Error {
+    code;
+    constructor(code, message){
+        super(message);
+        this.code = code;
+    }
+}
 export function sniffImage(buf) {
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     if (buf.length >= 24 && dv.getUint32(0) === 0x89504e47 && dv.getUint32(4) === 0x0d0a1a0a) {

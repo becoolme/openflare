@@ -220,11 +220,56 @@ test("transform: unknown transform key fails closed err=9423", async () => {
   assert.equal(errCode(resp), 9423);
 });
 
-test("transform: gif input fails closed err=9401 (no vendored decoder)", async () => {
-  const resp = await post("/transform", {
+test("transform: real gif decodes (first frame); truncated gif → err=9420", async () => {
+  // 1x1 transparent GIF fixture.
+  const realGif = Uint8Array.from(
+    atob("R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="),
+    (c) => c.charCodeAt(0),
+  );
+  const ok = await post("/transform", {
+    image: imageField(realGif),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.headers.get("content-type"), "image/png");
+
+  // A 10-byte header-only GIF sniffs as gif but has no image data.
+  const bad = await post("/transform", {
     image: imageField(gif()),
     transforms: "[]",
     output_format: "image/png",
+  });
+  assert.equal(bad.status, 415);
+  assert.equal(errCode(bad), 9420);
+});
+
+test("transform: bmp input decodes", async () => {
+  const b = new Uint8Array(70);
+  const dv = new DataView(b.buffer);
+  b[0] = 0x42; b[1] = 0x4d;
+  dv.setUint32(2, 70, true); dv.setUint32(10, 54, true); dv.setUint32(14, 40, true);
+  dv.setInt32(18, 2, true); dv.setInt32(22, 2, true);
+  dv.setUint16(26, 1, true); dv.setUint16(28, 24, true);
+  for (let x = 0; x < 2; x++) { b[54 + x * 4 + 2] = 255; b[62 + x * 4] = 255; }
+  const resp = await post("/transform", {
+    image: imageField(b),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(resp.status, 200);
+});
+
+test("transform: anim on a gif source fails closed err=9401", async () => {
+  const realGif = Uint8Array.from(
+    atob("R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="),
+    (c) => c.charCodeAt(0),
+  );
+  const resp = await post("/transform", {
+    image: imageField(realGif),
+    anim: "true",
+    transforms: "[]",
+    output_format: "image/gif",
   });
   assert.equal(resp.status, 415);
   assert.equal(errCode(resp), 9401);
@@ -239,18 +284,27 @@ test("transform: text_input/draw_text fail closed err=9401", async () => {
   assert.equal(errCode(a), 9401);
 });
 
-test("transform: avif/gif output_format fails closed err=9401", async () => {
+test("transform: avif output encodes; gif output still fails closed err=9401", async () => {
   const eng = await import(facadeModule("images-engine.js"));
   const src = await eng.encodeImage(solidFrame(8, 8), "png", 90);
-  for (const output_format of ["image/avif", "image/gif"]) {
-    const resp = await post("/transform", {
-      image: imageField(src.bytes),
-      transforms: "[]",
-      output_format,
-    });
-    assert.equal(resp.status, 415, output_format);
-    assert.equal(errCode(resp), 9401);
-  }
+  const avif = await post("/transform", {
+    image: imageField(src.bytes),
+    transforms: "[]",
+    output_format: "image/avif",
+  });
+  assert.equal(avif.status, 200);
+  assert.equal(avif.headers.get("content-type"), "image/avif");
+  const bytes = new Uint8Array(await avif.arrayBuffer());
+  // ISO-BMFF ftyp box at offset 4.
+  assert.deepEqual([...bytes.subarray(4, 8)], [0x66, 0x74, 0x79, 0x70]);
+
+  const gifOut = await post("/transform", {
+    image: imageField(src.bytes),
+    transforms: "[]",
+    output_format: "image/gif",
+  });
+  assert.equal(gifOut.status, 415);
+  assert.equal(errCode(gifOut), 9401);
 });
 
 test("malformed/missing transforms JSON → 400 err=9423", async () => {

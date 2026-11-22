@@ -22,6 +22,24 @@ export const IMAGES_BODY_MAX_BYTES = 64 * 1024 * 1024;
 /** Pixel bound across decode/transform (CF ~70MP). */
 export const IMAGES_MAX_PIXELS = 70_000_000;
 
+/** Decoded RGBA frame — jSquash codecs return `ImageData` instances;
+ * workerd has no DOM `ImageData` global, so the engine carries this
+ * structural twin. */
+export interface ImageDataLike {
+  data: Uint8ClampedArray;
+  width: number;
+  height: number;
+}
+
+/** Typed engine failure → mapped to an `err=<code>` wire response. */
+export class EngineError extends Error {
+  readonly code: number;
+  constructor(code: number, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+
 /** Recognized container signatures → `image/*` format names on the
  * `info()` wire. */
 export type ImageFormat = "jpeg" | "png" | "webp" | "gif" | "bmp" | "avif";
