@@ -1,11 +1,11 @@
-//! `vrt serve` management API — axum over a unix socket (0600 dir,
+//! `of serve` management API — axum over a unix socket (0600 dir,
 //! token-authenticated). Every handler is a thin adapter onto the
 //! typed [`VrtLocal`] ops; input validation lives in the library, the
 //! wire layer only enforces shape, body cap, token and timeout.
 //!
 //! An OPTIONAL TCP listener (`--mgmt-tcp-listen`) shares the same
 //! router under a SEPARATE bearer token and a per-source-IP rate
-//! limit — it exists for remote `vrt deploy --url` and is off by
+//! limit — it exists for remote `of deploy --url` and is off by
 //! default. The unix socket's security level is never lowered to
 //! accommodate it.
 
@@ -460,7 +460,7 @@ async fn renew(State(api): State<Arc<Api>>) -> Result<Json<serde_json::Value>, R
     Ok(Json(serde_json::json!({"revision": revision})))
 }
 
-/// `vrt serve` liveness: envelope fresh + renewal loop healthy.
+/// `of serve` liveness: envelope fresh + renewal loop healthy.
 /// NOT readiness — it reports the control-plane's own health; the
 /// host's /readyz is authoritative for serving state.
 async fn healthz(State(api): State<Arc<Api>>) -> Response {

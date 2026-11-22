@@ -1,4 +1,4 @@
-//! `vrt logs` client: tail_once against a stub control listener and
+//! `of logs` client: tail_once against a stub control listener and
 //! the follow loop's termination paths (max_polls + stop flag).
 
 use std::io::{Read, Write};

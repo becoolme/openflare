@@ -86,7 +86,7 @@ fn unix_ms_now() -> i64 {
 }
 
 /// Dispatcher startup config -- built from `[queue_dispatch]` (platform) or
-/// `vrt serve` arguments (standalone); `validate` fails closed.
+/// `of serve` arguments (standalone); `validate` fails closed.
 #[derive(Clone, Debug)]
 pub struct DispatchConfig {
     /// `_vrt_q_dispatch.holder` identity (`[a-zA-Z0-9_.:-]{1,64}` --

@@ -257,7 +257,7 @@ fn t25_standalone_compose_passes_the_dev_durability_opt_in() {
         );
     }
     // The production-facing template stays armed: the key must only be
-    // injected by `vrt init --dev-allow-same-device-durability`.
+    // injected by `of init --dev-allow-same-device-durability`.
     let sql = read("examples/standalone-vrt-sql.toml");
     assert!(!sql.contains("allowSameDeviceDurability"), "{sql}");
 }
@@ -345,7 +345,7 @@ fn t25_dockerfile_installs_ca_certificates() {
 #[test]
 fn t25_dockerfile_facade_layout_matches_seed_convention() {
     // L3+L4: the image ships a FACADE DIR = {manifest.json, dist/} —
-    // the same layout `vrt init --facade-dist <repo>/facade` reads.
+    // the same layout `of init --facade-dist <repo>/facade` reads.
     let df = read("deploy/docker/Dockerfile.vrt-local");
     assert!(df.contains("/usr/share/vrt/facade/manifest.json"));
     assert!(
@@ -380,7 +380,7 @@ fn t25_dockerfile_facade_layout_matches_seed_convention() {
 #[test]
 fn t25_compose_paths_agree_with_init_root() {
     // L11: every /data… path referenced in the base compose must be
-    // a path `vrt init --root /data` actually produces (configs,
+    // a path `of init --root /data` actually produces (configs,
     // listener dir, desired envelope). Whitelist of init-owned paths.
     let y = read("deploy/standalone/docker-compose.yml");
     let init_owned = [

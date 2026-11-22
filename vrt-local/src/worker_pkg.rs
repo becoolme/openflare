@@ -18,7 +18,7 @@
 //!                                  # — values are part of VERSION identity (F2)
 //!
 //! [secrets]                        # binding name → secretRef (values
-//! API_KEY = "api-key-ref"          #   via `vrt secret put`, never here)
+//! API_KEY = "api-key-ref"          #   via `of secret put`, never here)
 //!
 //! [bindings]                       # resource bindings
 //! kv = { CACHE = "ns-1" }
@@ -144,13 +144,13 @@ pub struct WorkerToml {
     #[serde(default)]
     pub(crate) assets: Option<AssetsToml>,
     /// CF `[dev]` — wrangler dev-server settings (`ip`/`port`/`host`),
-    /// consumed by `vrt dev` for the loopback ingress; never part of
+    /// consumed by `of dev` for the loopback ingress; never part of
     /// the desired state (dev-tooling config, not runtime semantics).
     #[serde(default)]
     pub(crate) dev: Option<DevToml>,
 }
 
-/// `[dev]` — wrangler dev-server settings (`vrt dev` only).
+/// `[dev]` — wrangler dev-server settings (`of dev` only).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DevToml {
@@ -957,7 +957,7 @@ pub struct Gathered {
 /// self-contained-file scan (symlinks rejected), module-byte cap
 /// (pre-read), and the `[assets] dir` scan. Type assignment and
 /// everything downstream live in [`assemble`] — the single
-/// validation path shared by `vrt deploy --root` and remote uploads.
+/// validation path shared by `of deploy --root` and remote uploads.
 pub fn gather_dir(worker_dir: &Path) -> Result<Gathered, LocalError> {
     gather_dir_for_env(worker_dir, None)
 }
@@ -2277,7 +2277,7 @@ fn build_pack_json(
     ))
 }
 
-/// `vrt deploy --dry-run` output — pack-side facts only: worker name,
+/// `of deploy --dry-run` output — pack-side facts only: worker name,
 /// module count, bundle bytes, declared bindings, scan-skipped paths.
 /// Server-side derivations (service target ids, DO/workflow unique
 /// keys) are listed as declared, never resolved — the dry run proves
@@ -2384,7 +2384,7 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
     })
 }
 
-/// Remote-upload wire body (`vrt deploy --url`): the client
+/// Remote-upload wire body (`of deploy --url`): the client
 /// materializes meta + module bytes + `[assets]` content locally and
 /// the server re-validates everything through [`assemble`]. Secret
 /// values travel only inside this body — never in argv, logs, or

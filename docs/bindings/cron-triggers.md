@@ -25,7 +25,7 @@ expression = "*/15 * * * *"
 
 ## Where it runs
 
-- `cell-controller`'s `CronRunner` (platform) or the `vrt serve` cron
+- `cell-controller`'s `CronRunner` (platform) or the `of serve` cron
   loop (standalone, 30 s tick) walks the signed desired snapshot once
   per minute and fires each matching schedule.
 - Delivery: `POST /v1/cron/trigger` on the host's loopback control

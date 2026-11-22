@@ -1,4 +1,4 @@
-//! `vrt dev` end-to-end with the stub runtime — real processes:
+//! `of dev` end-to-end with the stub runtime — real processes:
 //!
 //!   dev::start → supervise vrt-host + vrt-provider + vrt-sql →
 //!   catch-all ingress → stub workerd → file watch → redeploy →
@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 /// Sibling binaries of `target/debug/vrt` — `None` → skip.
 fn bin(name: &str) -> Option<PathBuf> {
-    let exe = Path::new(env!("CARGO_BIN_EXE_vrt"));
+    let exe = Path::new(env!("CARGO_BIN_EXE_of"));
     let p = exe.parent()?.join(name);
     p.is_file().then_some(p)
 }

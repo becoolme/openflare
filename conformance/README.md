@@ -224,7 +224,7 @@ stack), not that it passed.
 
 Pinned public Workers projects for manual regression. The runner does
 not fetch them automatically; to run one: clone at the listed commit,
-drop it onto a stack (`vrt deploy` in the compose `vrt` container —
+drop it onto a stack (`of deploy` in the compose `vrt` container —
 see `deploy/standalone/README.md`), and compare behavior against the
 recorded `expect` (`works|partial|fails|unknown`). Update the entry's
 `expect`/`notes` when verified. `node conformance/run.mjs --list`

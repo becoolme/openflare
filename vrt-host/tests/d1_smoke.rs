@@ -697,7 +697,7 @@ fn tail(path: &Path) -> String {
 }
 
 /// T34d: REAL chain — no stubs anywhere. Replicates standalone e2e:
-/// `vrt init` (capnp) → `vrt deploy` a d1 worker → REAL vrt-sql +
+/// `of init` (capnp) → `of deploy` a d1 worker → REAL vrt-sql +
 /// vrt-provider + vrt-host (which spawns real workerd) → ingress →
 /// `env.DB` round-trip. The stub test above cannot see the provider's
 /// authorization layer; this is the test that would have caught the
@@ -709,7 +709,7 @@ fn real_provider_d1_end_to_end() {
         return;
     };
     let debug = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug");
-    for name in ["vrt", "vrt-host", "vrt-provider", "vrt-sql"] {
+    for name in ["of", "vrt-host", "vrt-provider", "vrt-sql"] {
         assert!(
             debug.join(name).is_file(),
             "{name} missing at {} — run `cargo build --workspace --bins` first",
@@ -759,7 +759,7 @@ fn real_provider_d1_end_to_end() {
     let sql_metrics = free_port();
     let facade = facade_root();
     run_ok(
-        &debug.join("vrt"),
+        &debug.join("of"),
         &[
             "init",
             "--root",
@@ -842,7 +842,7 @@ fn real_provider_d1_end_to_end() {
     )
     .unwrap();
     run_ok(
-        &debug.join("vrt"),
+        &debug.join("of"),
         &[
             "deploy",
             "--root",

@@ -32,7 +32,7 @@ fn platform_and_standalone_provider_examples_validate() {
         let text = raw
             .replace("__VRT_ROOT__", &root.to_string_lossy())
             .replace("__VRT_KEY_ID__", "example-key")
-            // RV-R72: every placeholder `vrt init` renders must be
+            // RV-R72: every placeholder `of init` renders must be
             // substituted — an unparseable address now fails validate.
             .replace("__VRT_CELL__", "cell-example-1")
             .replace("__VRT_PROVIDER_METRICS__", "127.0.0.1:9100")

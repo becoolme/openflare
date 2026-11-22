@@ -53,4 +53,4 @@ fi
 # staged tree is public repo fixtures — make it readable before copying.
 chmod -R a+rX "$CASE_DIR"
 "${DC[@]}" cp "$CASE_DIR" "vrt:$remote"
-"${DC[@]}" exec -T vrt vrt deploy --root /data "$remote"
+"${DC[@]}" exec -T vrt of deploy --root /data "$remote"

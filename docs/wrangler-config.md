@@ -10,7 +10,7 @@ error messages.
 
 ## File selection
 
-`vrt deploy` / `vrt serve` look for, in order (`WRANGLER_CANDIDATES`,
+`of deploy` / `of serve` look for, in order (`WRANGLER_CANDIDATES`,
 `project_cfg.rs:28`):
 
 1. `wrangler.json`
@@ -30,12 +30,12 @@ at top level (`TOP_LEVEL_ONLY_ENV_KEYS`, `project_cfg.rs:82`).
 Select a named environment with `--env` when deploying or running locally:
 
 ```sh
-vrt deploy --root .vrt --env staging ./worker
-vrt dev --env staging ./worker
-vrt doctor --env staging
+of deploy --root .vrt --env staging ./worker
+of dev --env staging ./worker
+of doctor --env staging
 ```
 
-The same option applies to remote `vrt deploy --url` and `vrt deploy --dry-run`.
+The same option applies to remote `of deploy --url` and `of deploy --dry-run`.
 If named environments exist and `--env` is omitted, the command fails with
 the available environment names instead of using the base config. `--env`
 with a higher-precedence `vrt.toml` is rejected because that format has no
@@ -86,7 +86,7 @@ environment blocks.
 | `tail_consumers` | supported — see [Tail Workers](bindings/tail-workers.md); `service` table or legacy string entries; distinct same-tenant already-deployed consumers, deduped, max 16; empty list valid | `project_cfg.rs:1352` |
 | `streaming_tail_consumers` | supported — Streaming Tail Workers; per-entry key `service` only; same same-tenant resolution as `tail_consumers`, rendered as workerd `streamingTails` designators so the consumer's `tailStream()` receives the event stream; one channel per consumer | `project_cfg.rs` `streaming_tail_consumers` |
 | `limits` | supported — see [Per-worker quotas](quotas.md); `cpu_ms` (1..300000) and `subrequests` (0..10000); other keys rejected | `project_cfg.rs:1393` |
-| `dev` | supported (dev-only) — `ip` (loopback only; `localhost` normalizes to `127.0.0.1`, `::1` binds as `[::1]:port`), `port` (1..65535), `host` (extra route hostname registered for the session via `DeployOverrides.hostnames`; must satisfy the route hostname rule), `local_protocol = "http"` no-op. The deploy-facing projection accepts and drops the table, so dev-only keys never fail `vrt deploy`; `vrt dev` validates strictly at session start (`parse_dev_table`) where `inspector_*`, `upstream_protocol`, `remote`/`experimental_remote`, `enable_containers`, `container_engine`, `generate_types` are rejected | `project_cfg.rs` `parse_dev_table`, `dev.rs` `DevPorts::alloc` |
+| `dev` | supported (dev-only) — `ip` (loopback only; `localhost` normalizes to `127.0.0.1`, `::1` binds as `[::1]:port`), `port` (1..65535), `host` (extra route hostname registered for the session via `DeployOverrides.hostnames`; must satisfy the route hostname rule), `local_protocol = "http"` no-op. The deploy-facing projection accepts and drops the table, so dev-only keys never fail `of deploy`; `of dev` validates strictly at session start (`parse_dev_table`) where `inspector_*`, `upstream_protocol`, `remote`/`experimental_remote`, `enable_containers`, `container_engine`, `generate_types` are rejected | `project_cfg.rs` `parse_dev_table`, `dev.rs` `DevPorts::alloc` |
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
 | `rules` | supported — ordered `{ type, globs, fallthrough? }` module-typing rules (wrangler `Rule` shape, `additionalProperties: false`). Types: `ESModule`, `CommonJS`, `CompiledWasm`, `Text`, `Data`; `PythonModule`/`PythonRequirement` fail closed (no Python runtime). At pack time every gathered file under the rule root evaluates rules in order — user rules first, then the wrangler built-ins (`Text: **/*.txt,html,sql`, `Data: **/*.bin`, `CompiledWasm: **/*.wasm[?module]`), then the extension fallback; a matched non-`fallthrough` rule prunes every LATER rule of the same type (wrangler `parseRules`). The entrypoint is never retyped by a rule | `project_cfg.rs` `normalize_module_rules`; `worker_pkg.rs` `effective_module_rules` |
 | `base_dir` | supported — the directory rule globs evaluate against (wrangler `moduleRoot`; default = the `main` directory). Files outside the root are not rule candidates and keep extension-fallback typing. Must be a clean relative dir inside the project (no absolute/traversal/`\\`/`:`) | `project_cfg.rs` `validate_base_dir`; `worker_pkg.rs` `module_root` |
@@ -126,7 +126,7 @@ Also type-checked then dropped inside supported blocks:
   (or joins `entrypoint`); must be a JSON object of at most 8 KiB and is
   rendered into the signed workerd service designator as `ctx.props`.
 - `routes[].custom_domain` — merges into the worker's wire `hostnames`
-  (standalone: same as `vrt hostnames add`). Standalone has no DNS/TLS
+  (standalone: same as `of hostnames add`). Standalone has no DNS/TLS
   pipeline: the operator must point the domain at the vrt-host listener
   and terminate TLS in front (Caddy/nginx) or serve plain HTTP — same
   responsibility CF assigns to a zone it does not manage.
@@ -173,8 +173,8 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 - 2026-11-21 (r2): `[dev]` handling corrected against review — the
   shared normalize path now accepts-and-drops the table (mirroring the
   TS ignore list), so config `wrangler deploy` accepts (`ip =
-  "0.0.0.0"`, `inspector_port`, …) can no longer fail `vrt deploy`.
-  `vrt dev` re-validates it strictly at session start via
+  "0.0.0.0"`, `inspector_port`, …) can no longer fail `of deploy`.
+  `of dev` re-validates it strictly at session start via
   `parse_dev_table` on the env-resolved config: loopback-only `ip`
   (IPv6 `::1` binds as a bracketed `SocketAddr`), `port`, and `host`
   validated against the route hostname rule. `dev.host` now rides
@@ -195,19 +195,19 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
   deprecated rate alias now yields to `logs.head_sampling_rate`; and
   `VersionRecord` no longer uses `deny_unknown_fields`, so an older
   cell can read state written by a newer build after a rollback.
-- 2026-11-20: `vrt deploy`, `vrt dev`, and `vrt doctor` accept `--env` to select Wrangler named environments.
-- 2026-11-21: `[dev]` is consumed instead of ignored — `vrt dev` reads
+- 2026-11-20: `of deploy`, `of dev`, and `of doctor` accept `--env` to select Wrangler named environments.
+- 2026-11-21: `[dev]` is consumed instead of ignored — `of dev` reads
   `ip`/`port` for the loopback ingress bind (`--listen` still wins, same
   flag-over-config order as wrangler) and registers `host` as a
-  forwarded-`Host` hostname for the session. On the `vrt dev` entry
+  forwarded-`Host` hostname for the session. On the `of dev` entry
   `dev.ip` must be loopback: wrangler permits `0.0.0.0` to share a
-  session on the LAN, but `vrt dev` never binds publicly, so a
+  session on the LAN, but `of dev` never binds publicly, so a
   non-loopback value is `VRT_CONFIG_INVALID` there (same gate as
-  `--listen`). Keys naming dev machinery vrt does not implement
+  `--listen`). Keys naming dev machinery `of` does not implement
   (`inspector_*`, `upstream_protocol`, `remote`, `experimental_remote`,
   `enable_containers`, `container_engine`, `generate_types`) fail closed
   as `VRT_CONFIG_UNSUPPORTED_FIELD` on that entry; `local_protocol` is
-  accepted only as `"http"`, the sole mode served. `vrt deploy` accepts
+  accepted only as `"http"`, the sole mode served. `of deploy` accepts
   and drops the table (see the r2 entry above), matching wrangler where
   `[dev]` configures only `wrangler dev`.
 - 2026-11-21: `flagship` is supported — `[[flagship]] {binding, app_id,

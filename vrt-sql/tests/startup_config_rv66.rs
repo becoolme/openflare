@@ -54,7 +54,7 @@ fs = { root = "/tmp/p" }
 }
 
 /// The same-device exemption is dev-only: no shipped deployment config
-/// or example template may enable it (`vrt dev` and the standalone
+/// or example template may enable it (`of dev` and the standalone
 /// compose quick start inject it into the configs they generate;
 /// nothing else does, and no env var enables it). Markdown docs are
 /// excluded on purpose — operator-facing READMEs must be able to name

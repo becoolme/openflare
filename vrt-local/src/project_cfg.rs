@@ -783,7 +783,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
             // and never part of a deployment: accepted and dropped
             // here (mirroring the TS ignore list) so a config `wrangler
             // deploy` accepts stays deployable — `ip = "0.0.0.0"` or an
-            // `inspector_port` must not fail `vrt deploy`. `vrt dev`
+            // `inspector_port` must not fail `of deploy`. `of dev`
             // re-validates it strictly at session start via
             // `parse_dev_table` on the env-resolved config.
             "dev" => {}
@@ -2387,7 +2387,7 @@ fn normalize_limits(value: &Value) -> Result<Value, ProjectConfigError> {
 }
 
 /// CF `[dev]` — wrangler dev-server settings, strictly validated for
-/// `vrt dev` at session start (deploy accepts and drops the table on
+/// `of dev` at session start (deploy accepts and drops the table on
 /// the shared normalize path, so this runs only on the dev entry).
 /// `ip`/`port` pick the loopback ingress listen (CLI `--listen` still
 /// wins); `host` registers an extra hostname for the session and must
@@ -2396,7 +2396,7 @@ fn normalize_limits(value: &Value) -> Result<Value, ProjectConfigError> {
 /// behavior the standalone does not implement — `upstream_protocol`,
 /// `inspector_*`, `remote`/`experimental_remote`, `enable_containers`,
 /// `container_engine`, `generate_types` — fail closed; `local_protocol`
-/// is a no-op only when `http` (the sole mode vrt dev serves).
+/// is a no-op only when `http` (the sole mode of dev serves).
 pub(crate) fn parse_dev_table(
     value: &Value,
 ) -> Result<crate::worker_pkg::DevToml, ProjectConfigError> {
@@ -2420,7 +2420,7 @@ pub(crate) fn parse_dev_table(
                         .map_err(|_| invalid("dev.ip", "must be an IP address or 'localhost'"))?
                 };
                 if !ip.is_loopback() {
-                    return Err(invalid("dev.ip", "vrt dev binds loopback only"));
+                    return Err(invalid("dev.ip", "of dev binds loopback only"));
                 }
                 out.ip = Some(ip.to_string());
             }
@@ -2452,7 +2452,7 @@ pub(crate) fn parse_dev_table(
                 if s != "http" {
                     return Err(unsupported(
                         "dev.local_protocol",
-                        Some("vrt dev serves http only"),
+                        Some("of dev serves http only"),
                     ));
                 }
             }
@@ -2463,7 +2463,7 @@ pub(crate) fn parse_dev_table(
 }
 
 /// Read the env-resolved `[dev]` table of a wrangler project for
-/// `vrt dev` — strict validation, applied only on the dev entry so a
+/// `of dev` — strict validation, applied only on the dev entry so a
 /// deploy never rejects session-only config it would drop anyway.
 /// `None` when the project has no `[dev]` (or ships `vrt.toml`, which
 /// carries `dev` inside `WorkerToml` instead).
@@ -2606,7 +2606,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("quotas") {
         wire.insert("quotas".into(), v.clone());
     }
-    // `[dev]` — dev-server settings, verbatim (consumed by `vrt dev`,
+    // `[dev]` — dev-server settings, verbatim (consumed by `of dev`,
     // never by the desired-state path).
     if let Some(v) = obj.get("dev") {
         wire.insert("dev".into(), v.clone());
@@ -2949,7 +2949,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     // wrangler files never declare secrets — defensive
                     return Err(unsupported(
                         &format!("bindings.{name}"),
-                        Some("secrets are declared via [secrets] in vrt.toml or `vrt secret put`"),
+                        Some("secrets are declared via [secrets] in vrt.toml or `of secret put`"),
                     ));
                 }
                 // W1-r1: a binding type that survives normalize but has
@@ -4058,7 +4058,7 @@ mod tests {
 
     #[test]
     fn parse_dev_table_gates_and_fail_closed() {
-        // The wrangler `[dev]` surface vrt dev consumes: ip/port/host.
+        // The wrangler `[dev]` surface of dev consumes: ip/port/host.
         let full = parse_dev_table(&serde_json::json!({
             "ip": "localhost",
             "port": 9_000,
@@ -4122,10 +4122,10 @@ mod tests {
         }
     }
 
-    /// `vrt deploy` must accept every `[dev]` key `wrangler deploy` accepts:
+    /// `of deploy` must accept every `[dev]` key `wrangler deploy` accepts:
     /// the shared normalize path drops the table instead of validating it,
     /// so `ip = "0.0.0.0"`, `inspector_port` and `remote` cannot fail a
-    /// deploy. Only `vrt dev` re-validates strictly (`parse_dev_table`).
+    /// deploy. Only `of dev` re-validates strictly (`parse_dev_table`).
     #[test]
     fn deploy_projection_drops_dev_table() {
         let dir = wrangler_loader_body(
@@ -4141,7 +4141,7 @@ mod tests {
         // bind stays refused there even though deploy accepted it.
         assert!(
             load_dev_table_for_env(dir.path(), None).is_err(),
-            "vrt dev must still refuse a non-loopback bind"
+            "of dev must still refuse a non-loopback bind"
         );
 
         // A dev-acceptable table resolves on the dev entry.

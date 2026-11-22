@@ -35,18 +35,18 @@ or non-zero-exit service. Compose itself only reports
 shares a device with `dbRoot` (`/data/sql/data`): one disk loss would
 destroy the db and its backup copy together. All Docker named volumes
 live on one device, so this quick-start stack passes
-`vrt init --dev-allow-same-device-durability`, which writes
+`of init --dev-allow-same-device-durability`, which writes
 `persistence.allowSameDeviceDurability = true` into the generated
 `vrt-sql.toml`.
 
-- Both `vrt init` and `vrt-sql` print a warning (“durability is NOT
+- Both `of init` and `vrt-sql` print a warning (“durability is NOT
   guaranteed”); the generated file carries a `DEV ONLY` comment.
 - **Production must not pass this flag.** Put the persistence root on a
   genuinely separate device, or use `backend = "s3"`. Nothing else in
   the repo injects the key (enforced by
   `vrt-sql/tests/startup_config_rv66.rs`).
 - Upgrading a pre-existing volume: the old `vrt-sql.toml` has no
-  exemption, so `vrt init` now reports `config differs on: …` and
+  exemption, so `of init` now reports `config differs on: …` and
   asks for `--reconfigure`. Add `--reconfigure` to the `vrt-init`
   service `command:` once (or recreate the volume) — otherwise
   `vrt-sql` exits with `VRT_SQL_DURABILITY_SAME_DEVICE`.
@@ -71,7 +71,7 @@ WORKERD_SOURCE=file WORKERD_SHA256=$WORKERD_SHA256 \
 It brings the stack up exactly as below (no overlay), deploys
 `examples/standalone-hello` + `examples/standalone-kv-assets`,
 asserts Host-header 200s, KV read/write, assets ETag/304 + SPA
-fallback, `vrt status`, and restart recovery — then `down -v`.
+fallback, `of status`, and restart recovery — then `down -v`.
 Failures dump every service's logs.
 
 ## Smoke (stub runtime — no workerd)
@@ -81,11 +81,11 @@ WORKERD_SOURCE=stub docker compose \
   -f deploy/standalone/docker-compose.yml \
   -f deploy/standalone/docker-compose.stub.yml \
   up --build --wait
-# `vrt init` publishes a SIGNED EMPTY envelope, so all services go
+# `of init` publishes a SIGNED EMPTY envelope, so all services go
 # healthy before the first deploy — deploy whenever ready:
 docker compose -f deploy/standalone/docker-compose.yml \
   -f deploy/standalone/docker-compose.stub.yml exec vrt \
-  vrt status --root /data
+  of status --root /data
 ```
 
 The stub overlay pins `WORKERD_SOURCE=stub` + `--mode stub`; `vrt
@@ -96,7 +96,7 @@ running the wrong runtime.
 To deploy the hello worker, copy `examples/standalone-hello/` into
 the container volume first (the management API takes a server-local
 path), or mount it: add `- ../examples:/examples:ro` under the
-`vrt` service volumes, then `vrt deploy --root /data
+`vrt` service volumes, then `of deploy --root /data
 /examples/standalone-hello`. You can also deploy straight from the
 host — see "Remote deploy over TCP" below.
 
@@ -119,12 +119,12 @@ Or keep your own pinned image with `/usr/local/bin/workerd` and set
 `WORKERD_SOURCE=image` + `WORKERD_IMAGE=ref@sha256:...`.
 
 The image ships `facade/dist` + `facade/manifest.json` under
-`/usr/share/vrt/facade` — `vrt init` seeds system modules from
+`/usr/share/vrt/facade` — `of init` seeds system modules from
 there automatically (manifest digests are verified at seed time;
 bare-metal installs can pass `--facade-dist`).
 
 With the real-workerd stack up, the binding-layer conformance suite
-can run against it — it deploys each case worker through `vrt deploy`
+can run against it — it deploys each case worker through `of deploy`
 inside the `vrt` container and checks responses at the ingress:
 
 ```sh
@@ -141,18 +141,18 @@ and report format.
 
 ```sh
 compose="docker compose -f deploy/standalone/docker-compose.yml exec vrt"
-$compose vrt status --root /data
-$compose vrt deploy --root /data <dir>
-$compose vrt deploy --root /data --env staging <dir>
-$compose vrt rollback --root /data <worker> <version_id>
-$compose vrt hostnames add --root /data <worker> <host>
-printf 's3cret' | $compose vrt secret put --root /data <ref>
-$compose vrt versions --root /data <worker>
-$compose vrt logs --root /data <worker> --follow --since 10m --level error
-$compose vrt doctor --root /data          # add --json or --strict
+$compose of status --root /data
+$compose of deploy --root /data <dir>
+$compose of deploy --root /data --env staging <dir>
+$compose of rollback --root /data <worker> <version_id>
+$compose of hostnames add --root /data <worker> <host>
+printf 's3cret' | $compose of secret put --root /data <ref>
+$compose of versions --root /data <worker>
+$compose of logs --root /data <worker> --follow --since 10m --level error
+$compose of doctor --root /data          # add --json or --strict
 ```
 
-`vrt logs` is a read-only tail of the host log hub (console.log,
+`of logs` is a read-only tail of the host log hub (console.log,
 exceptions, platform codes; secrets are already redacted at ingest).
 It never consumes the cell-controller drain cursor — `--follow`
 polls the `controlListen` endpoint, `--since`/`--level` filter
@@ -168,14 +168,14 @@ state are never regenerated). `vrt-init` compose service: edit its
 ## Remote deploy over TCP
 
 The management API normally lives on the container's unix socket.
-`vrt serve` can additionally bind a TCP listener so a host-side `vrt`
+`of serve` can additionally bind a TCP listener so a host-side `vrt`
 CLI can deploy a local directory without copying it in:
 
 ```sh
 printf '%s' "$(openssl rand -hex 32)" > /etc/vrt-mgmt-token && chmod 600 /etc/vrt-mgmt-token
-docker compose -f deploy/standalone/docker-compose.yml exec vrt   vrt serve --root /data --supervise     --mgmt-tcp-listen 127.0.0.1:9090 --mgmt-tcp-token-file /etc/vrt-mgmt-token
+docker compose -f deploy/standalone/docker-compose.yml exec vrt   of serve --root /data --supervise     --mgmt-tcp-listen 127.0.0.1:9090 --mgmt-tcp-token-file /etc/vrt-mgmt-token
 
-vrt deploy --url http://127.0.0.1:9090 --token-file /etc/vrt-mgmt-token --env staging ./my-worker
+of deploy --url http://127.0.0.1:9090 --token-file /etc/vrt-mgmt-token --env staging ./my-worker
 ```
 
 The client packs the bundle locally (same validation, digests and
@@ -199,25 +199,25 @@ by the flags above:
   in logs, or in error text. `--var KEY:VALUE` is for non-secret
   vars.
 
-`vrt deploy --dry-run` (both modes) prints the pack summary — worker
+`of deploy --dry-run` (both modes) prints the pack summary — worker
 name, module count, bundle bytes/digest, binding list, rejected keys —
 without calling the API.
 
-## Bare-metal dev without compose: `vrt dev`
+## Bare-metal dev without compose: `of dev`
 
 On a machine with the `vrt-*` binaries on PATH (or `--vrt-*-bin`
 flags):
 
 ```sh
-vrt dev ./my-worker                    # 127.0.0.1:8787, watch+redeploy, live logs
-vrt dev ./my-worker --env staging     # select wrangler env.staging
-vrt dev ./my-worker --stub --no-watch  # stub runtime, redeploy by hand
+of dev ./my-worker                    # 127.0.0.1:8787, watch+redeploy, live logs
+of dev ./my-worker --env staging     # select wrangler env.staging
+of dev ./my-worker --stub --no-watch  # stub runtime, redeploy by hand
 ```
 
 State lands in `./my-worker/.vrt` (add it to `.gitignore`), ingress
 is loopback-only, and any `Host` routes to the one deployed worker —
-`vrt dev` writes `ingress.devCatchAll` into the generated config for
-this. The flag exists only to make `vrt dev` work; production
+`of dev` writes `ingress.devCatchAll` into the generated config for
+this. The flag exists only to make `of dev` work; production
 `vrt-host.toml` files must not set it (ingress keeps strict
 exact-Host routing). Ctrl+C SIGTERMs every child
 (vrt-host/provider/sql) before exiting.

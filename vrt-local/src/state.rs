@@ -198,6 +198,12 @@ impl LocalState {
         format!("vrt_{}", &digest[..28])
     }
 
+    /// `of check` reports the version id a real deploy would mint —
+    /// same identity function, no state needed.
+    pub(crate) fn version_id_for_check(pkg: &crate::worker_pkg::PackedWorker) -> String {
+        Self::version_id(pkg)
+    }
+
     /// One stored version record for `pkg` — shared by `version_id`
     /// (identity input) and `apply_deploy` (persisted row) so the two
     /// can never drift.

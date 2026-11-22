@@ -6,7 +6,7 @@
 //! - [`HttpAssetSource`] — platform cells pull `GET {base}/vrt/assets/
 //!   manifests/{digest}` and `…/objects/{digest}` with the scoped cell
 //!   token (same trust model as [`crate::bundle_http`]).
-//! - [`AbsentAssetSource`] — standalone: `vrt deploy --assets` writes
+//! - [`AbsentAssetSource`] — standalone: `of deploy --assets` writes
 //!   the same store layout directly; the sync only VERIFIES presence —
 //!   missing bytes fail closed (`AssembleError::Artifact`), the old
 //!   generation keeps serving (the render-inputs-unavailable pattern).

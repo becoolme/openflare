@@ -1,4 +1,4 @@
-//! `vrt doctor` — environment and service diagnostics.
+//! `of doctor` — environment and service diagnostics.
 //!
 //! Each check returns `{id, status, detail, hint, docs}` with a
 //! stable shape for `--json` consumers. Statuses mirror the
@@ -154,7 +154,7 @@ fn check_workerd() -> Check {
         );
     }
     // `--version` distinguishes a real workerd from the dev stub —
-    // same probe `vrt dev` uses.
+    // same probe `of dev` uses.
     let ver = std::process::Command::new(&path).arg("--version").output();
     let Ok(out) = ver else {
         return Check::fail(
@@ -191,7 +191,7 @@ fn check_root(root: &Path) -> Check {
         return Check::fail(
             id,
             format!("{} does not exist", root.display()),
-            "run `vrt init --root <dir> --cell <id> --tenant <id>`",
+            "run `of init --root <dir> --cell <id> --tenant <id>`",
         )
         .docs("deploy/standalone/README.md");
     }
@@ -209,7 +209,7 @@ fn check_root(root: &Path) -> Check {
 fn check_keys(root: &Path) -> Check {
     let id = "keys";
     if !root.is_dir() {
-        return Check::action(id, "root missing — nothing to check", "run vrt init first");
+        return Check::action(id, "root missing — nothing to check", "run of init first");
     }
     let mut bad: Vec<String> = Vec::new();
     if let Err(e) = crate::keys::load_signing_seed(root) {
@@ -402,7 +402,7 @@ fn check_ports(root: &Path) -> Check {
     let id = "ports";
     let cfg = root.join("config");
     if !cfg.is_dir() {
-        return Check::action(id, "no config dir — nothing to check", "run vrt init first");
+        return Check::action(id, "no config dir — nothing to check", "run of init first");
     }
     let mut seen: Vec<String> = Vec::new();
     let mut problems: Vec<String> = Vec::new();
@@ -460,18 +460,18 @@ fn check_facade(root: &Path) -> Check {
         return Check::ok(id, "no facade manifest seeded (optional)");
     }
     let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
-        return Check::fail(id, "manifest unreadable", "re-run vrt init --facade-dist");
+        return Check::fail(id, "manifest unreadable", "re-run of init --facade-dist");
     };
     let Ok(manifest) = vrt_config::parse_facade_manifest(&raw) else {
         return Check::fail(
             id,
             "manifest fails to parse",
-            "re-run vrt init --facade-dist",
+            "re-run of init --facade-dist",
         );
     };
     let wire: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
-        Err(_) => return Check::fail(id, "manifest is not json", "re-run vrt init"),
+        Err(_) => return Check::fail(id, "manifest is not json", "re-run of init"),
     };
     let dist_root = manifest_path.parent().unwrap_or(root).join("dist");
     let mut checked = 0usize;
@@ -539,13 +539,13 @@ fn service_check(id: &str, what: &str, status: u16, not_running_hint: &str) -> C
 fn check_service_mgmt(root: &Path) -> Check {
     let sock = crate::layout::mgmt_dir(root).join("vrt.sock");
     if !root.is_dir() {
-        return Check::action("service.mgmt", "root missing", "run vrt init first");
+        return Check::action("service.mgmt", "root missing", "run of init first");
     }
     service_check(
         "service.mgmt",
         "mgmt socket /healthz",
         unix_healthz(&sock),
-        "start the control plane: vrt serve --root <dir>",
+        "start the control plane: of serve --root <dir>",
     )
 }
 
@@ -553,7 +553,7 @@ fn check_service_host(root: &Path) -> Check {
     let id = "service.host";
     let cfg = root.join("config/vrt-host.toml");
     if !cfg.is_file() {
-        return Check::action(id, "no vrt-host.toml", "run vrt init first");
+        return Check::action(id, "no vrt-host.toml", "run of init first");
     }
     let Some(addr) = toml_value(&cfg, "controlListen") else {
         return Check::action(
@@ -566,7 +566,7 @@ fn check_service_host(root: &Path) -> Check {
         id,
         "vrt-host control /healthz",
         tcp_healthz(&addr),
-        "vrt-host is not running (vrt serve --root <dir>)",
+        "vrt-host is not running (of serve --root <dir>)",
     )
 }
 
@@ -574,7 +574,7 @@ fn check_service_provider(root: &Path) -> Check {
     let id = "service.provider";
     let cfg = root.join("config/vrt-provider.toml");
     if !cfg.is_file() {
-        return Check::action(id, "no vrt-provider.toml", "run vrt init first");
+        return Check::action(id, "no vrt-provider.toml", "run of init first");
     }
     let Some(addr) = toml_value(&cfg, "metricsListen") else {
         return Check::action(

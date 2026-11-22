@@ -1,4 +1,4 @@
-//! Read-only worker-log tail client (`vrt logs`, `vrt dev` output).
+//! Read-only worker-log tail client (`of logs`, `of dev` output).
 //!
 //! The host log hub (`vrt-host/src/logs.rs`) exposes
 //! `POST /v1/logs/tail` on its loopback/pod control listener —
@@ -145,7 +145,7 @@ pub fn parse_since(s: &str) -> Result<i64, LocalError> {
     Ok(n.saturating_mul(mult))
 }
 
-/// ANSI color per level — `vrt dev` output and `vrt logs` share this.
+/// ANSI color per level — `of dev` output and `of logs` share this.
 fn level_color(level: &str, color: bool) -> (&'static str, &'static str) {
     if !color {
         return ("", "");
@@ -198,7 +198,7 @@ pub fn since_matches(r: &TailRecord, cutoff_ms: i64) -> bool {
     r.ts_ms >= cutoff_ms
 }
 
-/// `vrt logs` / dev-output options.
+/// `of logs` / dev-output options.
 #[derive(Debug, Clone)]
 pub struct LogsOpts {
     /// Keep polling (until killed / `max_polls`).
@@ -213,8 +213,8 @@ pub struct LogsOpts {
     pub color: bool,
     /// Interval between follow polls.
     pub poll: std::time::Duration,
-    /// Cooperative stop for embedded callers (`vrt dev` sets this on
-    /// session shutdown; `vrt logs` leaves it `None` — Ctrl+C exits).
+    /// Cooperative stop for embedded callers (`of dev` sets this on
+    /// session shutdown; `of logs` leaves it `None` — Ctrl+C exits).
     pub stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Test knob — bound the follow loop so it terminates.
     pub max_polls: Option<u64>,
@@ -235,8 +235,8 @@ impl Default for LogsOpts {
     }
 }
 
-/// The shared print+poll loop — `vrt logs` runs it on the main
-/// thread, `vrt dev` on a std::thread. `max_polls` bounds it in
+/// The shared print+poll loop — `of logs` runs it on the main
+/// thread, `of dev` on a std::thread. `max_polls` bounds it in
 /// tests; production callers pass `None` and rely on Ctrl+C.
 pub fn logs_run(
     out: &mut dyn Write,

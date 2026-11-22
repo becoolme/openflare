@@ -156,8 +156,8 @@ fn observability_is_part_of_version_identity() {
     );
 }
 
-/// P3c-2-r2: `vrt worker-id` / `vrt do-key` typed resolution — the
-/// e2e used to grep `vrt status` JSON positionally and died silently
+/// P3c-2-r2: `of worker-id` / `of do-key` typed resolution — the
+/// e2e used to grep `of status` JSON positionally and died silently
 /// (alphabetical serialization puts `versions` between `name` and
 /// `workerId`). Name OR workerId both resolve — same convention as
 /// `versions`/`rollback`.
@@ -202,7 +202,7 @@ fn do_class_key_resolves_declared_class() {
     ));
 }
 
-/// P3c-2-r2 regression: the REAL `vrt status` pretty output observed
+/// P3c-2-r2 regression: the REAL `of status` pretty output observed
 /// in compose — serde_json::Value serializes map keys ALPHABETICALLY,
 /// so `versions` sits between `name` and `workerId`. A positional
 /// `"name":"X","workerId":"Y"` grep can never match this shape; any
@@ -1207,7 +1207,7 @@ fn do_script_name_resolves_same_tenant_only() {
     assert!(missing.is_err());
 }
 
-/// Per-worker quotas diagnostics: `vrt status` reports the declared
+/// Per-worker quotas diagnostics: `of status` reports the declared
 /// quotas AND whether this root's host actually renders them
 /// (`render.quotas`). A declared limit with no known host capability
 /// reads `quotasEnforced: false` — never a silent "looks enforced".

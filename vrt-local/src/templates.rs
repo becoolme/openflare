@@ -1,4 +1,4 @@
-//! Render helpers shared by `vrt init` and `vrt dev`.
+//! Render helpers shared by `of init` and `of dev`.
 
 /// Inject the dev-only `persistence.allowSameDeviceDurability = true`
 /// exemption into a rendered `vrt-sql.toml`.
@@ -6,7 +6,7 @@
 /// The durability guard (`VRT_SQL_DURABILITY_SAME_DEVICE`) is
 /// fail-closed on purpose: the fs persistence root must live on a
 /// different device from the SQLite db so that losing one disk cannot
-/// destroy both copies. Single-machine dev stacks (`vrt dev`, the
+/// destroy both copies. Single-machine dev stacks (`of dev`, the
 /// `deploy/standalone` compose quick start, CI) place both under one
 /// device by construction, so they opt out explicitly and loudly.
 ///
@@ -15,7 +15,7 @@
 pub fn dev_allow_same_device_durability(sql_toml: &str) -> String {
     const ANCHOR: &str = "[persistence]\n";
     const INJECT: &str = "[persistence]\n\
-        # DEV ONLY (vrt dev / deploy-standalone quick start): single device,\n\
+        # DEV ONLY (of dev / deploy-standalone quick start): single device,\n\
         # no disaster recovery. Production must leave this unset and keep the\n\
         # persistence root on a separate device (or use the s3 backend).\n\
         allowSameDeviceDurability = true\n";

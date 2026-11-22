@@ -9,5 +9,5 @@ GREETING = "hello from a var"
 
 [secrets]
 # Binding name → secretRef. Values never live in this file — put them
-# with `vrt secret put --root <root> greeting-secret` (stdin).
+# with `of secret put --root <root> greeting-secret` (stdin).
 GREETING_SECRET = "greeting-secret"

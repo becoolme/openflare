@@ -32,12 +32,12 @@ COPY . .
 # the feature; the stub alone with it (only the stub stage needs it).
 RUN set -eux; \
     cargo build --release --locked \
-      -p vrt-local --bin vrt \
+      -p vrt-local --bin of \
       -p vrt-host --bin vrt-host \
       -p vrt-provider --bin vrt-provider \
       -p vrt-sql --bin vrt-sql; \
     mkdir -p /out; \
-    cp target/release/vrt target/release/vrt-host target/release/vrt-provider \
+    cp target/release/of target/release/vrt-host target/release/vrt-provider \
        target/release/vrt-sql /out/
 
 FROM ${RUST_IMAGE} AS stub-builder
@@ -99,7 +99,7 @@ RUN set -eux; \
     useradd --system --uid "${VRT_UID}" --gid vrt --home-dir /data vrt; \
     install -d -o vrt -g vrt -m 0700 /data /tmp /data/objstore
 
-COPY --from=builder /out/vrt /out/vrt-host /out/vrt-provider /out/vrt-sql /usr/local/bin/
+COPY --from=builder /out/of /out/vrt-host /out/vrt-provider /out/vrt-sql /usr/local/bin/
 # Unique runtime layout: workerd ALWAYS lands at /usr/local/bin/workerd
 # (or nowhere under WORKERD_SOURCE=none). Nothing else may install a
 # second workerd path — compose and `vrt init` share this contract.
@@ -121,7 +121,7 @@ COPY facade/dist /usr/share/vrt/facade/dist
 USER vrt
 WORKDIR /data
 VOLUME ["/data"]
-CMD ["/usr/local/bin/vrt"]
+CMD ["/usr/local/bin/of"]
 
 # ---------- runtime-stub ----------
 # T25/L10: stub-profile image — identical runtime PLUS a vrt-host that
@@ -132,4 +132,4 @@ FROM runtime AS runtime-stub
 USER root
 COPY --from=stub-builder /out/vrt-host-devstub /usr/local/bin/vrt-host
 USER vrt
-CMD ["/usr/local/bin/vrt"]
+CMD ["/usr/local/bin/of"]

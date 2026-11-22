@@ -8,7 +8,7 @@
 //! `miniflare:zod` outage).
 //!
 //! The check is driven by `config/vrt-host.toml` — the same document
-//! `vrt init` writes for the host — so it can never drift from the
+//! `of init` writes for the host — so it can never drift from the
 //! host's real inputs:
 //!   - file absent          → not a standalone host root: skip
 //!                            (library/test usage)
@@ -336,7 +336,7 @@ fn read_host_config(root: &Path) -> Result<Option<HostCfg>, LocalError> {
     let doc: toml::Value = raw
         .parse()
         .map_err(|_| LocalError::Op("deploy check", "vrt-host.toml parse".into()))?;
-    // Only a render-capable host root opts in: `vrt init` always
+    // Only a render-capable host root opts in: `of init` always
     // writes `[render]`; a toml without it (stub, serve-only, custom)
     // is not a capnp host config — skip rather than guess.
     let Some(render) = doc.get("render") else {

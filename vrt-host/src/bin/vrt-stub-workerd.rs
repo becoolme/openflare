@@ -60,7 +60,7 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--version" => {
-                // Identity marker — `vrt init` uses this to detect the
+                // Identity marker — `of init` uses this to detect the
                 // stub runtime and refuse stub/real-mode mismatches.
                 println!("vrt-stub-workerd {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);

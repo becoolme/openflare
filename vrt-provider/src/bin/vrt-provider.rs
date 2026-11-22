@@ -92,7 +92,7 @@ async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // T25/L8: `cursorSecretFile` (vrt init's keys/cursor.secret, 0600)
+    // T25/L8: `cursorSecretFile` (of init's keys/cursor.secret, 0600)
     // is the only source when configured; otherwise fall back to the
     // legacy env var (platform mode). Never both, never plaintext.
     let cursor_secret = match &config.cursor_secret_file {
