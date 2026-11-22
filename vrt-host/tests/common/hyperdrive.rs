@@ -177,7 +177,7 @@ pub fn http_get(port: u16, path: &str) -> (u16, String) {
     (status, body)
 }
 
-fn response_complete(buf: &[u8]) -> bool {
+pub fn response_complete(buf: &[u8]) -> bool {
     let Some(hdr_end) = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4) else {
         return false;
     };
