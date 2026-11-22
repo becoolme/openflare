@@ -64,8 +64,10 @@ reads the value from stdin only — never argv.
 
 ## Unsupported keys and error shape
 
-- `secrets_store_secrets` (Secrets Store bindings) →
-  `VRT_CONFIG_UNSUPPORTED_FIELD`, as does any other per-entry key there.
+- `secrets_store_secrets` is a separate binding — see
+  [Secrets Store](secrets-store.md) (`env.<binding>.get()`, value
+  resolved from the tenant secret map under the derived
+  `secrets-store:{store_id}:{secret_name}` ref).
 - Values are redacted from TOML error messages — a secret-looking
   `vars` value cannot leak into an error.
 

@@ -432,6 +432,15 @@ pub enum BindingDesired {
     /// as a `wrapped` binding over the `cloudflare-internal:flagship`
     /// module.
     Flagship(FlagshipBinding),
+    /// `{"type":"secretsStore"}` — CF Secrets Store binding:
+    /// `env.<name>` is a `SecretsStoreSecret` RPC stub whose `get()`
+    /// resolves to the secret's value (read-only, as on Cloudflare).
+    /// Rendered as a service binding to the per-worker `secrets-store`
+    /// bundled-module worker (`/workerd/secrets-store.js`); the VALUE
+    /// never enters the config — it rides a `fromEnvironment`
+    /// `env:<secret_name>` binding on that worker, resolved from the
+    /// tenant's secret map by `secret_ref`.
+    SecretsStore(SecretsStoreBinding),
 }
 
 /// `{"type":"flagship"}` — see [`BindingDesired::Flagship`].
@@ -464,6 +473,29 @@ pub struct SecretBinding {
     pub name: String,
     /// Reference into encrypted secret storage.
     pub secret_ref: String,
+}
+
+/// `{"type":"secretsStore"}` — see [`BindingDesired::SecretsStore`].
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecretsStoreBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// CF `store_id` — names the account-level Secrets Store.
+    pub store_id: String,
+    /// CF `secret_name` — names the secret inside the store; also the
+    /// `env:<secret_name>` key the bundled worker resolves.
+    pub secret_name: String,
+    /// Reference into the tenant's secret map (derived
+    /// `secrets-store:{store_id}:{secret_name}` at pack time).
+    pub secret_ref: String,
+}
+
+/// The secret-map ref a Secrets Store binding resolves —
+/// `secrets-store:{store_id}:{secret_name}` (one derivation shared by
+/// pack, render and docs).
+pub fn secrets_store_secret_ref(store_id: &str, secret_name: &str) -> String {
+    format!("secrets-store:{store_id}:{secret_name}")
 }
 
 /// Access grant for a binding that has a provider data plane
@@ -1661,6 +1693,21 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.secretRef"));
                     }
                 }
+                BindingDesired::SecretsStore(ss) => {
+                    // `secret_name` becomes the `env:<name>` binding on
+                    // the bundled worker and part of the derived ref —
+                    // hold it to the identifier charset so both stay
+                    // well-formed.
+                    if !valid_identifier(&ss.store_id, MAX_IDENTIFIER_LEN) {
+                        return Err(DesiredError::Identifier("bindings.storeId"));
+                    }
+                    if !valid_identifier(&ss.secret_name, MAX_IDENTIFIER_LEN) {
+                        return Err(DesiredError::Identifier("bindings.secretName"));
+                    }
+                    if !valid_identifier(&ss.secret_ref, MAX_REF_LEN) {
+                        return Err(DesiredError::Identifier("bindings.secretRef"));
+                    }
+                }
                 BindingDesired::Kv(kv) => {
                     if !valid_identifier(&kv.namespace_id, MAX_IDENTIFIER_LEN) {
                         return Err(DesiredError::Identifier("bindings.namespaceId"));
@@ -2062,6 +2109,7 @@ impl BindingDesired {
             Self::AnalyticsEngine(b) => &b.name,
             Self::UnsafeEval(b) => &b.name,
             Self::Flagship(b) => &b.name,
+            Self::SecretsStore(b) => &b.name,
         }
     }
 
@@ -2088,7 +2136,7 @@ impl BindingDesired {
             | Self::WorkerLoader(_)
             | Self::Images(_)
             | Self::AnalyticsEngine(_)
-            | Self::UnsafeEval(_) | Self::Flagship(_) => None,
+            | Self::UnsafeEval(_) | Self::Flagship(_) | Self::SecretsStore(_) => None,
         }
     }
 }

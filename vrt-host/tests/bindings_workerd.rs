@@ -43,7 +43,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use snapshot_protocol::compute_desired::TenantDesired;
 use vrt_config::{
-    render_tenant_config, DeployManifest, EmbedKind, TenantRenderInput, VersionBundle,
+    render_tenant_config, DeployManifest, EmbedKind, SecretValue, TenantRenderInput,
+    VersionBundle,
 };
 
 /// Tenant worker exercising each provider-backed wrapped binding on a
@@ -121,6 +122,16 @@ const USER_MODULE: &str = r#"export default {
           banner: det.value, variant: det.variant, reason: det.reason,
           missing,
         });
+      }
+      if (p === "/secrets") {
+        const value = await env.SECRET.get();
+        let missing = "no-error";
+        try {
+          await env.OTHER.get();
+        } catch (e) {
+          missing = "err:" + e.message;
+        }
+        return Response.json({ value, missing });
       }
       return new Response("ok");
     } catch (e) {
@@ -202,6 +213,7 @@ fn render_and_write(
     port: u16,
     bindings: serde_json::Value,
     flagship_apps: serde_json::Value,
+    secrets: &[(&str, &str)],
     needles: &[&str],
 ) -> PathBuf {
     let worker_id = "wsmoke";
@@ -235,7 +247,13 @@ fn render_and_write(
         "flagshipApps": flagship_apps
     }))
     .unwrap();
-    let params = smoke_params();
+    let mut params = smoke_params();
+    {
+        let t = params.secrets.entry("team-smoke".to_string()).or_default();
+        for (r, v) in secrets {
+            t.insert((*r).to_string(), SecretValue::new(*v));
+        }
+    }
     let input = TenantRenderInput {
         tenant: &tenant,
         revision: 1,
@@ -447,6 +465,7 @@ fn vectorize_binding_traverses_shim_end_to_end() {
             "permissions": {"read": true, "write": true}
         }]),
         json!([]),
+        &[],
         &[
             "moduleName = \"cloudflare-internal:vectorize-api\"",
             "(name = \"indexId\", text = \"abcdefghijklmnopqrstuvwxyz\")",
@@ -499,6 +518,7 @@ fn send_email_binding_traverses_shim_end_to_end() {
             "permissions": {"read": false, "write": true}
         }]),
         json!([]),
+        &[],
         &["moduleName = \"cloudflare-internal:send-email\""],
     );
     let proc = spawn(&bin, &cfg, &dir);
@@ -544,6 +564,7 @@ fn k2_binding_traverses_shim_end_to_end() {
             "permissions": {"read": false, "write": true}
         }]),
         json!([]),
+        &[],
         &["moduleName = \"cloudflare-internal:k2\""],
     );
     let proc = spawn(&bin, &cfg, &dir);
@@ -610,6 +631,7 @@ fn flagship_binding_evaluates_in_isolate() {
             "type": "flagship", "name": "FLAGS", "appId": "app-smoke"
         }]),
         json!([{"appId": "app-smoke", "config": app_config}]),
+        &[],
         &[
             "moduleName = \"cloudflare-internal:flagship\"",
             "name = \"config\"",
@@ -633,5 +655,69 @@ fn flagship_binding_evaluates_in_isolate() {
     assert_eq!(
         v["missing"], "err:FLAG_NOT_FOUND",
         "get() without default must surface the typed code: {v}"
+    );
+}
+
+/// `env.SECRET.get()` traverses the bundled `/workerd/secrets-store.js`
+/// worker: the tenant binding is a service binding carrying the CF
+/// `{store_id, secret_name}` props and the `SecretsStoreSecret`
+/// entrypoint; the VALUE arrives through the service worker's
+/// `env:<secret_name>` `fromEnvironment` binding (never the config).
+/// `OTHER` declares a name whose `env:` variable the launch env does
+/// not carry — `get()` surfaces upstream's `Secret "<name>" not found`.
+/// Bundled modules ship in the pinned binary, so this asserts strictly
+/// (no fork shim involved).
+#[test]
+#[ignore = "needs VRT_WORKERD_BIN"]
+fn secrets_store_binding_serves_env_backed_value() {
+    let Some(bin) = workerd_bin() else {
+        eprintln!("SKIP: VRT_WORKERD_BIN unset — real workerd required");
+        return;
+    };
+    let Some(dir) = smoke_root("vrt-bindings-smoke") else {
+        return;
+    };
+    let port = free_port();
+    let cfg = render_and_write(
+        &dir,
+        port,
+        json!([
+            {
+                "type": "secretsStore", "name": "SECRET",
+                "storeId": "default", "secretName": "api-key",
+                "secretRef": "secrets-store:default:api-key"
+            },
+            {
+                "type": "secretsStore", "name": "OTHER",
+                "storeId": "default", "secretName": "other-key",
+                "secretRef": "secrets-store:default:other-key"
+            }
+        ]),
+        json!([]),
+        &[
+            ("secrets-store:default:api-key", "hunter42"),
+            ("secrets-store:default:other-key", "other-value"),
+        ],
+        &[
+            "bundled = \"/workerd/secrets-store.js\"",
+            "entrypoint = \"SecretsStoreSecret\"",
+            "name = \"env:api-key\"",
+            "name = \"env:other-key\"",
+        ],
+    );
+    // `env:api-key` resolves against the process env — inject only
+    // SECRET's; `env:other-key` stays unset to prove the not-found path.
+    std::env::set_var(
+        vrt_config::secret_env_name("wsmoke", "secrets-store:api-key"),
+        "hunter42",
+    );
+    let proc = spawn(&bin, &cfg, &dir);
+    assert!(wait_ready(port), "workerd did not start:\n{}", log_text(&proc));
+
+    let v = http_json(port, "/secrets");
+    assert_eq!(v["value"], "hunter42", "get() resolves the env value: {v}");
+    assert_eq!(
+        v["missing"], "err:Secret \"other-key\" not found",
+        "unset env var must surface upstream's not-found: {v}"
     );
 }
