@@ -117,6 +117,7 @@ fn env(files: &[(&str, &[u8])], not_found: &str, store_tenant: &str) -> Env {
         body_read_timeout: std::time::Duration::from_secs(30),
         d1: None,
         queue: None,
+        k2: None,
         pg: None,
     });
     Env {
@@ -884,6 +885,7 @@ async fn route_index_over_limit_returns_too_large_flag() {
         body_read_timeout: std::time::Duration::from_secs(30),
         d1: None,
         queue: None,
+        k2: None,
         pg: None,
     });
     let app = tenant_router(svc);

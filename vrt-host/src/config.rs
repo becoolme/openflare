@@ -2524,6 +2524,8 @@ pub fn params_json_from_manifest(
             // guarantees presence — an old manifest without it fails
             // closed at parse_facade_manifest).
             "queue": endpoint(&manifest.facades.queue),
+            // K2: facade-k2 endpoint (REQUIRED_FACADES).
+            "k2": endpoint(&manifest.facades.k2),
             // MIG-16: facade-ratelimit endpoint (REQUIRED_FACADES).
             "ratelimit": endpoint(&manifest.facades.ratelimit),
         },
@@ -2671,6 +2673,7 @@ struct FacadeRefsToml {
     pg: ServiceEndpointToml,
     d1: ServiceEndpointToml,
     queue: ServiceEndpointToml,
+    k2: ServiceEndpointToml,
     ratelimit: ServiceEndpointToml,
 }
 
@@ -2683,6 +2686,7 @@ impl From<FacadeRefsToml> for vrt_config::FacadeRefs {
             pg: v.pg.into(),
             d1: v.d1.into(),
             queue: v.queue.into(),
+            k2: v.k2.into(),
             ratelimit: v.ratelimit.into(),
         }
     }

@@ -70,7 +70,14 @@ fn registry(root: PathBuf, p: Arc<Persister>) -> EngineRegistry {
         queue_root_for(&root),
         vrt_sql::paths::ResourceKind::Queue,
     ));
-    EngineRegistry::new(root).with_persisters(PersisterPair { d1: p, queue })
+    let k2 = Arc::new(Persister::new(
+        p.store().clone(),
+        p.config().clone(),
+        p.clock().clone(),
+        vrt_sql::paths::k2_root_for(&root),
+        vrt_sql::paths::ResourceKind::K2,
+    ));
+    EngineRegistry::new(root).with_persisters(PersisterPair { d1: p, queue, k2 })
 }
 
 fn row_count(path: &std::path::Path) -> i64 {

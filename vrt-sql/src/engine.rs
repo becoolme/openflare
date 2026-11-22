@@ -1948,6 +1948,7 @@ pub struct EngineRegistry {
     db_root: PathBuf,
     /// T37r: Queue local root (`.../queues`, derived as a sibling of db_root).
     queue_root: PathBuf,
+    k2_root: PathBuf,
     /// T36/T37r: object-store persistence surface -- one Persister per kind
     /// (object-key prefix and local root each bound), assembled when `[persistence]` != none.
     persist: Option<PersisterPair>,
@@ -1981,9 +1982,12 @@ pub struct TombstoneGcReport {
 }
 
 #[derive(Clone)]
+/// One Persister per resource kind -- D1 writes `db/{id}`/`dbs/`, Queue
+/// `q/{id}`/`queues/`, K2 `s/{id}`/`streams/` (structural namespace separation).
 pub struct PersisterPair {
     pub d1: std::sync::Arc<crate::persist::Persister>,
     pub queue: std::sync::Arc<crate::persist::Persister>,
+    pub k2: std::sync::Arc<crate::persist::Persister>,
 }
 
 impl PersisterPair {
@@ -1994,6 +1998,7 @@ impl PersisterPair {
         match kind {
             crate::paths::ResourceKind::D1 => &self.d1,
             crate::paths::ResourceKind::Queue => &self.queue,
+            crate::paths::ResourceKind::K2 => &self.k2,
         }
     }
 }
@@ -2011,6 +2016,8 @@ impl EngineRegistry {
         // affect Queue).
         paths::sweep_trash(&db_root);
         paths::sweep_trash(&queue_root);
+        let k2_root = paths::k2_root_for(&db_root);
+        paths::sweep_trash(&k2_root);
         let tombstones: HashSet<EngineKey> = paths::scan_dropped_ids(&db_root)
             .into_iter()
             .map(|id| (crate::paths::ResourceKind::D1, id))
@@ -2018,6 +2025,11 @@ impl EngineRegistry {
                 paths::scan_dropped_ids(&queue_root)
                     .into_iter()
                     .map(|id| (crate::paths::ResourceKind::Queue, id)),
+            )
+            .chain(
+                paths::scan_dropped_ids(&k2_root)
+                    .into_iter()
+                    .map(|id| (crate::paths::ResourceKind::K2, id)),
             )
             .collect();
         Self {
@@ -2031,6 +2043,7 @@ impl EngineRegistry {
             })),
             db_root,
             queue_root,
+            k2_root,
             persist: None,
             restore_backoff_base: RESTORE_BACKOFF_BASE,
             restore_backoff_max: RESTORE_BACKOFF_MAX,
@@ -2080,6 +2093,7 @@ impl EngineRegistry {
         match kind {
             crate::paths::ResourceKind::D1 => &self.db_root,
             crate::paths::ResourceKind::Queue => &self.queue_root,
+            crate::paths::ResourceKind::K2 => &self.k2_root,
         }
     }
 
@@ -2481,6 +2495,7 @@ impl EngineRegistry {
         'outer: for kind in [
             crate::paths::ResourceKind::D1,
             crate::paths::ResourceKind::Queue,
+            crate::paths::ResourceKind::K2,
         ] {
             let root = self.root_for(kind);
             for id in crate::paths::scan_gc_pending_ids(root) {

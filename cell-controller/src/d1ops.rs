@@ -167,6 +167,28 @@ pub fn is_d1_kind(kind: &str) -> bool {
     matches!(kind, "EXECUTE" | "MIGRATIONS_APPLY" | "DROP")
 }
 
+/// K2 stream data ops on the generic channel — payload
+/// `{op, args}` forwarded to `/streams/{resourceKey}/{op}`.
+pub fn is_k2_kind(kind: &str) -> bool {
+    kind == "K2_OP"
+}
+
+/// vrt-sql `/streams/{id}/<op>` surface the cell may forward — the
+/// produce path is worker-binding traffic (provider), not ops. Ops
+/// never reach `produce`/`drop` here; drop stays a dedicated kind.
+const K2_OPS: &[&str] = &[
+    "subscribe",
+    "subscriptions",
+    "unsubscribe",
+    "consume",
+    "ack",
+    "nack",
+    "extend",
+    "config",
+    "configure",
+    "reap",
+];
+
 impl D1Op {
     /// Adapt a generic-channel op row — `resourceKey` carries the
     /// databaseId. Returns None for non-D1 kinds (caller routes first).
@@ -233,6 +255,17 @@ fn valid_database_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// K2 stream ids are server-minted `^[0-9a-f]{32}$` (the vrt-sql
+/// storage identity) — NOT the 26-char ULID shape D1/queue ids use.
+/// A DROP whose payload kind is `k2` must be validated against this
+/// shape or it can never reach `/streams/{id}/drop`.
+fn valid_k2_stream_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Engine seq derivation: op_seq << 12 | call_idx. One dedup key is
@@ -390,13 +423,19 @@ impl D1OpsExecutor {
         .await
         .map_err(|_| "request timeout".to_string())?
         .map_err(|e| format!("transport: {e}"))?;
+        Self::read_engine_body(resp).await
+    }
+
+    /// Shared engine response handling for the D1 and K2 namespaces:
+    /// a typed `{success:false,...}` body is an OUTCOME, not a
+    /// transport failure — its `code`/`retryable` semantics must reach
+    /// the control plane (VRT_UNAVAILABLE rides HTTP 503; RV-R68).
+    /// Oversize bodies collapse to a `{truncated,bytes}` marker;
+    /// untyped bodies stay fail-closed.
+    async fn read_engine_body(resp: reqwest::Response) -> Result<serde_json::Value, String> {
         let status = resp.status();
         let bytes = resp.bytes().await.map_err(|e| format!("read body: {e}"))?;
         if !status.is_success() {
-            // A typed `{success:false,...}` body is still an engine
-            // OUTCOME, not a transport failure — its `code`/`retryable`
-            // semantics must reach the control plane (VRT_UNAVAILABLE
-            // rides HTTP 503; RV-R68). Untyped bodies stay fail-closed.
             if bytes.len() <= MAX_RESULT_BYTES {
                 if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                     if body.get("success") == Some(&serde_json::json!(false)) {
@@ -412,6 +451,103 @@ impl D1OpsExecutor {
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| "vrt-sql non-JSON response".to_string())?;
         Ok(normalize_execute_body(body))
+    }
+
+    /// K2 stream op: `POST /streams/{id}/{op}` — same signed data
+    /// plane, kind-scoped path (never `/dbs/`). `op` is allowlisted by
+    /// the caller; the body is the op's `args` verbatim.
+    async fn k2_call(
+        &self,
+        op_seq: i64,
+        chan: u64,
+        stream_id: &str,
+        k2op: &str,
+        body: &[u8],
+    ) -> Result<serde_json::Value, String> {
+        let path = format!("/streams/{stream_id}/{k2op}");
+        let url = format!("{}{}", self.endpoint, path);
+        let seq = engine_seq(op_seq, 0, chan);
+        let auth = self.signer.sign("POST", &path, body, 1, seq);
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.http
+                .post(&url)
+                .header(vrt_provider::d1::SQL_AUTH_HEADER, auth)
+                .header(vrt_provider::d1::SQL_EPOCH_HEADER, "1")
+                .header(vrt_provider::d1::SQL_SEQ_HEADER, seq.to_string())
+                .header("content-type", "application/json")
+                .body(body.to_vec())
+                .send(),
+        )
+        .await
+        .map_err(|_| "request timeout".to_string())?
+        .map_err(|e| format!("transport: {e}"))?;
+        Self::read_engine_body(resp).await
+    }
+
+    /// Generic-channel entry for `K2_OP` rows — payload
+    /// `{op:<allowlisted vrt-sql stream op>, args:{…}}`, resourceKey is
+    /// the 32-hex streamId. Same deadline rule as D1 ops.
+    pub async fn execute_k2_cell(&self, op: &crate::execset::CellOp) -> D1OpAck {
+        let fail_with = |msg: &str| D1OpAck {
+            seq: op.seq,
+            status: "FAILED",
+            result: None,
+            error: Some(msg.to_string()),
+        };
+        if op.kind != "K2_OP" {
+            return fail_with("unknown op kind");
+        }
+        if !valid_k2_stream_id(&op.resource_key) {
+            return fail_with("invalid resourceId");
+        }
+        if let Some(deadline) = op.expires_at {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if now >= deadline {
+                return D1OpAck {
+                    seq: op.seq,
+                    status: "EXPIRED",
+                    result: None,
+                    error: Some("dispatch deadline passed".into()),
+                };
+            }
+        }
+        let Some(k2op) = op.payload.get("op").and_then(|v| v.as_str()) else {
+            return fail_with("k2 op payload missing op");
+        };
+        if !K2_OPS.contains(&k2op) {
+            return fail_with("k2 op not allowed");
+        }
+        let args = op
+            .payload
+            .get("args")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        if !args.is_object() {
+            return fail_with("k2 op args must be an object");
+        }
+        let body = args.to_string();
+        match self
+            .k2_call(
+                op.seq,
+                CELL_OPS_SEQ_FLAG,
+                &op.resource_key,
+                k2op,
+                body.as_bytes(),
+            )
+            .await
+        {
+            Ok(v) => D1OpAck {
+                seq: op.seq,
+                status: "DONE",
+                result: Some(v),
+                error: None,
+            },
+            Err(e) => fail_with(&e),
+        }
     }
 
     /// Read-only stats fetch for the periodic cell report. Same signed
@@ -474,8 +610,19 @@ impl D1OpsExecutor {
     /// Execute one op end-to-end. Never panics — the result is always
     /// a terminal ack (DONE/FAILED/EXPIRED).
     pub async fn execute(&self, op: &D1Op) -> D1OpAck {
-        if !valid_database_id(&op.database_id) {
-            return fail(op, "invalid databaseId");
+        // Id shape is kind-scoped for DROP: `{"kind":"k2"}` carries a
+        // 32-hex streamId; D1/queue ids keep the 26-char ULID shape.
+        // Unknown/malformed kinds keep the D1 check here and fail
+        // closed inside drop_path (never guess a namespace).
+        let id_ok = match op.kind {
+            D1OpKind::Drop => match op.payload.get("kind").and_then(|v| v.as_str()) {
+                Some("k2") => valid_k2_stream_id(&op.database_id),
+                _ => valid_database_id(&op.database_id),
+            },
+            _ => valid_database_id(&op.database_id),
+        };
+        if !id_ok {
+            return fail(op, "invalid resourceId");
         }
         // T35b: an op past its dispatch deadline is never executed —
         // the caller already saw a failure for it. Report EXPIRED so the
@@ -613,7 +760,8 @@ impl D1OpsExecutor {
 }
 
 /// Drop path selection (T37r): payload `{"kind":"queue"}` → `/queues/…`,
-/// absent/`"d1"` → `/dbs/…` (legacy in-flight ops), anything else → Err.
+/// `{"kind":"k2"}` → `/streams/…`, absent/`"d1"` → `/dbs/…` (legacy
+/// in-flight ops), anything else → Err.
 fn drop_path(database_id: &str, payload: &serde_json::Value) -> Result<String, String> {
     match payload.get("kind") {
         // Absent → legacy in-flight D1 ops (pre-T37r payloads were {}).
@@ -622,6 +770,7 @@ fn drop_path(database_id: &str, payload: &serde_json::Value) -> Result<String, S
         Some(v) => match v.as_str() {
             Some("d1") => Ok(format!("/dbs/{database_id}/drop")),
             Some("queue") => Ok(format!("/queues/{database_id}/drop")),
+            Some("k2") => Ok(format!("/streams/{database_id}/drop")),
             Some(other) => Err(format!("drop payload kind '{other}' unknown")),
             None => Err("drop payload kind must be a string".to_string()),
         },
@@ -967,7 +1116,7 @@ mod tests {
             ))
             .await;
         assert_eq!(ack.status, "FAILED");
-        assert_eq!(ack.error.as_deref(), Some("invalid databaseId"));
+        assert_eq!(ack.error.as_deref(), Some("invalid resourceId"));
     }
 
     #[tokio::test]
@@ -1164,6 +1313,41 @@ mod tests {
         assert!(ack.error.unwrap().contains("transport"));
     }
 
+    #[tokio::test]
+    async fn k2_drop_op_reaches_transport_with_32hex_id() {
+        // Regression: execute() used to run valid_database_id (26-char
+        // ULID) before kind dispatch — a K2 streamId (32-hex) was
+        // rejected as "invalid databaseId" and could never reach
+        // /streams/{id}/drop. Transport-level failure proves the op
+        // passed the kind-scoped id gate into drop_db.
+        let dir = tempfile::tempdir().unwrap();
+        let exec = exec_at_unused_port(&dir);
+        let sid = "a".repeat(32);
+        let ack = exec
+            .execute(&op(
+                7,
+                D1OpKind::Drop,
+                &sid,
+                serde_json::json!({"kind":"k2"}),
+            ))
+            .await;
+        assert_eq!(ack.status, "FAILED");
+        let err = ack.error.unwrap();
+        assert!(err.contains("transport"), "unexpected error: {err}");
+        // And a malformed k2 id still fails closed at the id gate
+        // ('g' is outside [0-9a-f]).
+        let ack = exec
+            .execute(&op(
+                8,
+                D1OpKind::Drop,
+                &"g".repeat(32),
+                serde_json::json!({"kind":"k2"}),
+            ))
+            .await;
+        assert_eq!(ack.status, "FAILED");
+        assert_eq!(ack.error.as_deref(), Some("invalid resourceId"));
+    }
+
     #[test]
     fn drop_path_selects_kind_namespace() {
         let id = "a".repeat(26);
@@ -1179,6 +1363,12 @@ mod tests {
         assert_eq!(
             drop_path(&id, &serde_json::json!({"kind":"queue"})).unwrap(),
             format!("/queues/{id}/drop")
+        );
+        // K2 streams share the drop channel — 32-hex stream ids.
+        let sid = "a".repeat(32);
+        assert_eq!(
+            drop_path(&sid, &serde_json::json!({"kind":"k2"})).unwrap(),
+            format!("/streams/{sid}/drop")
         );
         // Unknown / non-string kinds fail closed — never guess.
         assert!(drop_path(&id, &serde_json::json!({"kind":"kv"})).is_err());

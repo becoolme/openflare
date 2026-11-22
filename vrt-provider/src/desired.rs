@@ -164,6 +164,9 @@ fn binding_resource(binding: &BindingDesired) -> BindingResource {
         BindingDesired::Queue(b) => BindingResource::Queue {
             id: b.queue_id.clone(),
         },
+        BindingDesired::K2(b) => BindingResource::K2Stream {
+            id: b.stream_id.clone(),
+        },
         // Var/secret/service bindings have no provider-backed resource;
         // they never reach this protocol, so map them to a sentinel
         // that always mismatches on resource comparison.

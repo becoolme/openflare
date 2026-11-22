@@ -379,6 +379,9 @@ pub enum BindingDesired {
     D1(D1Binding),
     /// Queue producer binding (vrt-sql QueueBackend, T37).
     Queue(QueueBinding),
+    /// K2 durable event-log produce binding (vrt-sql K2Backend) —
+    /// `env.<name>.send(records)` per the CF K2 public contract.
+    K2(K2Binding),
     /// Durable Object namespace binding (P3c-1) — `env.<name>` is the
     /// stub factory (`idFromName`/`get`); the namespace's SQLite
     /// storage lives under the declaring worker's `localDisk` dir.
@@ -664,6 +667,22 @@ pub struct QueueBinding {
     /// drop a declared delay).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_delay_seconds: Option<u32>,
+}
+
+/// `{"type":"k2"}` — server-assigned K2 stream produce binding.
+/// `streamId` is minted by the control plane (CF `^[0-9a-f]{32}$`
+/// shape); routing always uses it, never a request-supplied name.
+/// The binding is produce-only (`send`): consume rides the platform's
+/// subscription surface, not a worker binding — `write` grants produce.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct K2Binding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
+    /// Platform K2 stream id (`^[0-9a-f]{32}$`).
+    pub stream_id: String,
+    /// Access grant for this binding.
+    pub permissions: BindingPermissions,
 }
 
 /// `{"type":"durableObject"}` (P3c-1) — binds one DO class. The class
@@ -1695,6 +1714,17 @@ impl WorkerDesired {
                         return Err(DesiredError::Identifier("bindings.deliveryDelaySeconds"));
                     }
                 }
+                BindingDesired::K2(k) => {
+                    // streamId is server-minted — CF `^[0-9a-f]{32}$`.
+                    if k.stream_id.len() != 32
+                        || !k
+                            .stream_id
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                    {
+                        return Err(DesiredError::Identifier("bindings.streamId"));
+                    }
+                }
                 // WorkerLoader carries no resource reference — `name`
                 // (validated as a binding name at the match head) is
                 // the only field.
@@ -1894,6 +1924,7 @@ impl BindingDesired {
             Self::Assets(b) => &b.name,
             Self::D1(b) => &b.name,
             Self::Queue(b) => &b.name,
+            Self::K2(b) => &b.name,
             Self::DurableObject(b) => &b.name,
             Self::WorkerLoader(b) => &b.name,
             Self::AnalyticsEngine(b) => &b.name,
@@ -1914,6 +1945,7 @@ impl BindingDesired {
             Self::Assets(b) => Some(&b.permissions),
             Self::D1(b) => Some(&b.permissions),
             Self::Queue(b) => Some(&b.permissions),
+            Self::K2(b) => Some(&b.permissions),
             Self::Var(_)
             | Self::Secret(_)
             | Self::Service(_)

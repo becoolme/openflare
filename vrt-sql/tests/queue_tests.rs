@@ -36,7 +36,7 @@ fn backend(tmp: &TempDir) -> (Arc<EngineRegistry>, SqliteQueueBackend) {
     (reg, be)
 }
 
-/// T37r: D1+Queue dual Persister (same store/cfg/clock; each with its own root facet).
+/// T37r: D1+Queue+K2 Persister trio (same store/cfg/clock; each with its own root facet).
 fn pair(
     store: Arc<MemoryStore>,
     cfg: PersistConfig,
@@ -52,11 +52,18 @@ fn pair(
             ResourceKind::D1,
         )),
         queue: Arc::new(Persister::new(
+            store.clone(),
+            cfg.clone(),
+            clock.clone(),
+            queue_root_for(dbs),
+            ResourceKind::Queue,
+        )),
+        k2: Arc::new(Persister::new(
             store,
             cfg,
             clock,
-            queue_root_for(dbs),
-            ResourceKind::Queue,
+            vrt_sql::paths::k2_root_for(dbs),
+            ResourceKind::K2,
         )),
     }
 }

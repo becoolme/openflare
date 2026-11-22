@@ -183,6 +183,10 @@ pub(crate) struct BindingsToml {
     /// queue-level default send delay.
     #[serde(default)]
     pub(crate) queue: BTreeMap<String, QueueTargetToml>,
+    /// K2: `name -> user-side stream name` (streamId derived at pack time
+    /// from `vrt-k2:{tenant}:{name}` — first 32 hex chars of sha256).
+    #[serde(default)]
+    pub(crate) k2: BTreeMap<String, String>,
     #[serde(default)]
     pub(crate) pg: BTreeMap<String, String>,
     /// `binding name -> vrt database tenant name`; credentials are resolved
@@ -1146,6 +1150,21 @@ pub fn assemble(
                 },
             ));
         }
+        for (binding, stream_name) in &b.k2 {
+            // K2 streamId derivation — first 32 hex chars of
+            // sha256("vrt-k2:{tenant}:{name}"). The produce-only
+            // binding carries the write grant (send is a write);
+            // consume rides the platform subscription surface, not
+            // this binding.
+            let stream_id = derive_stream_id(tenant_id, stream_name)?;
+            bindings.push(BindingDesired::K2(
+                snapshot_protocol::compute_desired::K2Binding {
+                    name: binding.clone(),
+                    stream_id,
+                    permissions: read_write.clone(),
+                },
+            ));
+        }
         for (binding, db) in &b.pg {
             // P1: `name → logical tenant id` — the provider resolves
             // credentials from `secrets/pg-credentials.json` under
@@ -1991,6 +2010,27 @@ pub fn derive_queue_id(tenant_id: &str, queue_name: &str) -> Result<String, Loca
     Ok(digest[..26].to_string())
 }
 
+/// CF K2 `^[0-9a-f]{32}$` stream id: first 32 hex chars of
+/// sha256("vrt-k2:{tenant}:{stream}") — same derivation rule as
+/// `derive_queue_id` (hex is a subset of the id charset; the signed
+/// snapshot covers the derived value).
+pub fn derive_stream_id(tenant_id: &str, stream_name: &str) -> Result<String, LocalError> {
+    if stream_name.is_empty()
+        || stream_name.len() > 256
+        || !stream_name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    {
+        return Err(LocalError::Worker(
+            "stream name must be 1-256 chars of [A-Za-z0-9_-]",
+        ));
+    }
+    let digest = hex::encode(sha2::Sha256::digest(
+        format!("vrt-k2:{tenant_id}:{stream_name}").as_bytes(),
+    ));
+    Ok(digest[..32].to_string())
+}
+
 /// Modules → pack-format JSON: explicit `[modules]` type override
 /// wins, else the extension rule; unknown extensions, absent
 /// declared files, over-cap totals, non-UTF8 text, and bad JSON all
@@ -2140,6 +2180,9 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
         }
         for name in b.queue.keys() {
             bindings.push(format!("queue:{name}"));
+        }
+        for name in b.k2.keys() {
+            bindings.push(format!("k2:{name}"));
         }
         for name in b.pg.keys() {
             bindings.push(format!("pg:{name}"));

@@ -187,22 +187,35 @@ async fn run() -> ExitCode {
                 // T37: queue and d1 share the same vrt-sql downstream/secret.
                 vrt_provider::queue::QueueClient::new(
                     sql.addr.clone(),
-                    secret,
+                    secret.clone(),
                     std::time::Duration::from_millis(sql.timeout_ms),
                 )
-                .map(|q| (d1, q))
                 .map_err(|_| ())
+                .and_then(|q| {
+                    // K2 shares the same downstream/secret as well.
+                    vrt_provider::k2::K2Client::new(
+                        sql.addr.clone(),
+                        secret,
+                        std::time::Duration::from_millis(sql.timeout_ms),
+                    )
+                    .map(|k| (d1, q, k))
+                    .map_err(|_| ())
+                })
             }) {
-                Ok((d1, q)) => (Some(Arc::new(d1)), Some(Arc::new(q))),
+                Ok((d1, q, k)) => (
+                    Some(Arc::new(d1)),
+                    Some(Arc::new(q)),
+                    Some(Arc::new(k)),
+                ),
                 Err(_) => {
                     tracing::error!("vrtSql.addr invalid");
                     return ExitCode::FAILURE;
                 }
             }
         }
-        None => (None, None),
+        None => (None, None, None),
     };
-    let (d1_client, queue_client) = d1_client;
+    let (d1_client, queue_client, k2_client) = d1_client;
     // P1: PG backend is a pure credential-file reader — constructing it
     // never touches the network (lazy egress per request).
     let pg_backend = config.pg.as_ref().map(|pg| {
@@ -470,6 +483,7 @@ async fn run() -> ExitCode {
                 body_read_timeout,
                 d1: d1.clone(),
                 queue: queue_client.clone(),
+                k2: k2_client.clone(),
                 pg: pg.clone(),
             });
             // RV-R67: one quota per listener (bounded by live tenants).

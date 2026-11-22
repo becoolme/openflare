@@ -137,6 +137,25 @@ const config :Workerd.Config = (
       ],
       globalOutbound = (name = "vrt-no-network", entrypoint = "DenyAll"),
     )),
+    (name = "facade-k2", worker = (
+      compatibilityDate = "2026-09-08",
+      compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
+      modules = [
+        (name = "facade/facade-k2.js", esModule = embed "sys/750307159dcd7355ec31898877e4ae955a8a5302cb51a8a9a058f0bf0ab4f33c"),
+        (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
+        (name = "facade/k2-wire.js", esModule = embed "sys/cfb93e89e9ef7632aa6e714389e7a01d17e3622bbb1d6db85a059ab13d1f8df8"),
+        (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
+        (name = "facade/queue-wire.js", esModule = embed "sys/03e39f43d67f734985a7ac5681d6c01f5790b568fddace60c9f0f4c6c0f72290"),
+        (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
+        (name = "third_party/open-compute/facade/loader/python-snapshot.js", esModule = embed "sys/97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"),
+        (name = "third_party/open-compute/facade/loader/shared.js", esModule = embed "sys/ad6ec6871acd01776f6fe414510e0126266f15f95480ce1172c3fa34babfef6e"),
+        (name = "third_party/open-compute/facade/loader/snapshot.js", esModule = embed "sys/197e8b61660cae5b8829f707ea091adbc206f9ceec3a2bdb105ecbd65cde0a58"),
+      ],
+      bindings = [
+        (name = "BINDING_BACKEND", service = "binding-backend"),
+      ],
+      globalOutbound = (name = "vrt-no-network", entrypoint = "DenyAll"),
+    )),
     (name = "facade-kv", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],

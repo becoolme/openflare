@@ -414,7 +414,10 @@ fn default_drain_ms() -> u64 {
     30_000
 }
 fn default_body_max() -> usize {
-    1024 * 1024
+    // Covers the largest legal wire body across all resource surfaces:
+    // K2 produce = hex(5MB batch) + headers + envelope ~10.5MB (D1 SQL text is
+    // separately bounded by SQLITE_LIMIT_SQL_LENGTH, queue by QUEUE_BODY_MAX).
+    12 * 1024 * 1024
 }
 
 impl ServiceConfig {

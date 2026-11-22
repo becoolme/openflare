@@ -704,11 +704,18 @@ fn build_persister(
         .with_time_travel_retention(config.persistence.time_travel_retention_ms),
     );
     let queue_persister = Arc::new(vrt_sql::persist::Persister::new(
+        store.clone(),
+        cfg.clone(),
+        clock.clone(),
+        vrt_sql::paths::queue_root_for(&config.db_root),
+        vrt_sql::paths::ResourceKind::Queue,
+    ));
+    let k2_persister = Arc::new(vrt_sql::persist::Persister::new(
         store,
         cfg,
         clock,
-        vrt_sql::paths::queue_root_for(&config.db_root),
-        vrt_sql::paths::ResourceKind::Queue,
+        vrt_sql::paths::k2_root_for(&config.db_root),
+        vrt_sql::paths::ResourceKind::K2,
     ));
     // T36b/P0-B: startup self-check -- a write/read/delete probe on the object store; failure refuses startup
     // (container volume ownership/permission errors surface here as a clear startup error, rather than every
@@ -748,5 +755,6 @@ fn build_persister(
     Ok(Some(vrt_sql::engine::PersisterPair {
         d1: persister,
         queue: queue_persister,
+        k2: k2_persister,
     }))
 }

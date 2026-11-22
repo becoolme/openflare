@@ -103,6 +103,7 @@ fn svc_with_queue(queue_client: Option<Arc<QueueClient>>, f: &Fixture) -> Arc<Te
         body_read_timeout: std::time::Duration::from_secs(30),
         d1: None,
         queue: queue_client,
+        k2: None,
         pg: None,
     })
 }
@@ -367,6 +368,7 @@ async fn permission_denied_read_only_binding() {
         body_read_timeout: std::time::Duration::from_secs(30),
         d1: None,
         queue: Some(client),
+        k2: None,
         pg: None,
     });
     let (st, _) = call(

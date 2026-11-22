@@ -269,6 +269,10 @@ fn assemble_test_params(sys_digest: String) -> vrt_config::RuntimeParams {
                 service: "sys".into(),
                 entrypoint: "Entrypoint".into(),
             },
+            k2: vrt_config::ServiceEndpoint {
+                service: "sys".into(),
+                entrypoint: "Entrypoint".into(),
+            },
             ratelimit: vrt_config::ServiceEndpoint {
                 service: "sys".into(),
                 entrypoint: "Entrypoint".into(),
@@ -689,6 +693,7 @@ fn experimental_params(sys_digest: &str) -> vrt_config::RuntimeParams {
                 service: "facade-queue".into(),
                 entrypoint: "QueueFacade".into(),
             },
+            k2: endpoint(),
             ratelimit: endpoint(),
         },
         system_workers: vec![vrt_config::SystemWorkerRef {
@@ -933,6 +938,7 @@ fn binding_backend_dir_derives_per_tenant_socket() {
             pg: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
             d1: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
             queue: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
+            k2: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
             ratelimit: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
         },
         system_workers: vec![vrt_config::SystemWorkerRef {
@@ -1037,6 +1043,7 @@ fn binding_backend_dir_rekeys_fingerprint() {
                         pg: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
                         d1: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
                         queue: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
+                        k2: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
                         ratelimit: vrt_config::ServiceEndpoint { service: "sys".into(), entrypoint: "Entrypoint".into() },
                     },
                     system_workers: vec![],

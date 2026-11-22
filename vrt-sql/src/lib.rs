@@ -10,6 +10,7 @@ pub mod clock;
 pub mod do_snap;
 pub mod engine;
 pub mod follower;
+pub mod k2;
 pub mod metrics;
 pub mod paths;
 pub mod persist;

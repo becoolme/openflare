@@ -200,6 +200,13 @@ pub struct AckCapabilities {
     /// claim it. Omitted while false (rolling upgrade).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flagship: bool,
+    /// `{"type":"k2"}` bindings render a `wrapped` binding over
+    /// `cloudflare-internal:k2` routed through `facade-k2` — a cell
+    /// predating either fails the snapshot parse or the whole config
+    /// load, so the control plane only admits K2 bindings onto cells
+    /// that claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub k2: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

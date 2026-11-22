@@ -715,6 +715,21 @@ pub async fn wfops_tick(
                     Some(x) => x.execute(op).await,
                     None => continue,
                 },
+                // K2 stream data ops — same signed data plane as D1
+                // (one endpoint, one signer), kind-scoped /streams/*
+                // path. No d1 executor → stays PENDING (fail closed).
+                k if crate::d1ops::is_k2_kind(k) => match d1_exec {
+                    Some(d) => {
+                        let a = d.execute_k2_cell(op).await;
+                        CellOpAck {
+                            seq: a.seq,
+                            status: a.status,
+                            result: a.result,
+                            error: a.error,
+                        }
+                    }
+                    None => continue,
+                },
                 _ => match wf_exec {
                     Some(w) => w.execute(op, desired).await,
                     None => continue,

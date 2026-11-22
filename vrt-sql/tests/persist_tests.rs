@@ -75,6 +75,13 @@ fn pair(root: &std::path::Path, d1: Arc<Persister>) -> vrt_sql::engine::Persiste
             queue_root_for(root),
             ResourceKind::Queue,
         )),
+        k2: Arc::new(Persister::new(
+            d1.store().clone(),
+            d1.config().clone(),
+            d1.clock().clone(),
+            vrt_sql::paths::k2_root_for(root),
+            ResourceKind::K2,
+        )),
     }
 }
 
