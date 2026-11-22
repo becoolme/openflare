@@ -74,6 +74,26 @@ pub struct WorkerRecord {
     pub active_version_id: Option<String>,
 }
 
+/// Lifecycle of one stored version.
+///
+/// Only one version per worker may be `Active`; `Preview` versions
+/// are uploaded but not selected by `activeVersionId`, and `Archived`
+/// versions are historical. The status is deliberately NOT part of
+/// version identity (see [`LocalState::version_id`]), so previewing a
+/// version and later promoting it cannot mint a second id.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum VersionStatus {
+    /// Historical version that is neither active nor being previewed.
+    #[default]
+    Archived,
+    /// Uploaded by `deploy --preview`; never served until promoted.
+    Preview,
+    /// The version selected by `activeVersionId` and projected into
+    /// the signed desired document.
+    Active,
+}
+
 /// One immutable version — code identity PLUS everything that decides
 /// runtime behavior (platform `VrtWorkerVersion` parity, F2).
 ///
@@ -91,6 +111,25 @@ pub struct VersionRecord {
     pub compatibility_date: String,
     #[serde(default)]
     pub compatibility_flags: Vec<String>,
+    /// Lifecycle status. Missing on state files written before the
+    /// versioning MVP; `read` normalizes the active record to
+    /// [`VersionStatus::Active`] and older non-active records to
+    /// [`VersionStatus::Archived`].
+    #[serde(default)]
+    pub status: VersionStatus,
+    /// Creation time (unix ms). Metadata only — excluded from version
+    /// identity, so redeploying the same input keeps the same id.
+    #[serde(default)]
+    pub created_at_unix_ms: u64,
+    /// Creator identity when the caller can provide one. Standalone
+    /// mode has no authenticated principal, so this is `None` today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// Hash of the behavior/config half of the version record
+    /// (`cfg_<sha256-prefix>`). Included for diagnostics; the bundle
+    /// itself stays content-addressed by `artifact_digest`.
+    #[serde(default)]
+    pub config_hash: String,
     /// Desired bindings resolved at deploy time (var refs are
     /// content-hash scoped — see `worker_pkg`).
     #[serde(default)]
@@ -134,12 +173,6 @@ pub struct VersionRecord {
     /// it), so `version_id` does NOT strip it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub tag: String,
-    /// Version-record creation instant (unix ms) — the CF
-    /// `versionMetadata.timestamp` source. Excluded from version
-    /// identity (`version_id` strips `createdAtUnixMs`): record
-    /// metadata, not behavior — a deduped re-deploy keeps the original.
-    #[serde(default)]
-    pub created_at_unix_ms: u64,
     pub quotas: WorkerQuotas,
 }
 
@@ -168,10 +201,10 @@ impl LocalState {
         self.max_versions_per_worker.clamp(1, MAX_VERSIONS_CEILING) as usize
     }
 
-    /// Semantic version identity — the canonical serialization of the
-    /// [`VersionRecord`] this deploy would store, minus the two fields
-    /// that describe the record rather than the behavior (`versionId`
-    /// and `createdAtUnixMs`).
+    /// Canonical behavior half of a version record — the input to both
+    /// `versionId` and `configHash`. Lifecycle metadata (`versionId`,
+    /// timestamps, status, creator, config hash itself) is removed so
+    /// a lifecycle transition can never change content identity.
     ///
     /// Deriving the input from the record's own struct (instead of a
     /// hand-maintained `json!` list) makes every version-scoped field
@@ -182,31 +215,55 @@ impl LocalState {
     /// bugs (`queueConsumers`, `tailConsumers`, `observability`,
     /// `streamingTailConsumers`): a pure config change "deployed"
     /// successfully but never reached desired.
+    fn identity_value(record: &VersionRecord) -> serde_json::Value {
+        let mut canonical = serde_json::to_value(record).unwrap_or_default();
+        if let Some(obj) = canonical.as_object_mut() {
+            for metadata in [
+                "versionId",
+                "createdAtUnixMs",
+                "createdBy",
+                "status",
+                "configHash",
+            ] {
+                obj.remove(metadata);
+            }
+        }
+        canonical
+    }
+
+    /// Semantic version identity — `vrt_<sha256-prefix>` over the
+    /// canonical behavior half of the record.
     ///
     /// Absent/skipped fields keep their old canonical bytes, so
     /// workers that never declared the newer fields retain their
-    /// pre-feature version ids (no churn on upgrade).
+    /// pre-feature version ids (no churn on upgrade). The lifecycle
+    /// fields added by the versioning MVP are removed above, so ids
+    /// minted before it remain byte-identical.
     fn version_id(pkg: &crate::worker_pkg::PackedWorker) -> String {
         let record = Self::version_record(pkg, String::new());
-        let mut canonical = serde_json::to_value(&record).unwrap_or_default();
-        if let Some(obj) = canonical.as_object_mut() {
-            obj.remove("versionId");
-            obj.remove("createdAtUnixMs");
-        }
-        let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+        let bytes = serde_json::to_vec(&Self::identity_value(&record)).unwrap_or_default();
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
         format!("vrt_{}", &digest[..28])
     }
 
+    fn config_hash(record: &VersionRecord) -> String {
+        let bytes = serde_json::to_vec(&Self::identity_value(record)).unwrap_or_default();
+        let digest = hex::encode(sha2::Sha256::digest(&bytes));
+        format!("cfg_{}", &digest[..28])
+    }
+
     /// One stored version record for `pkg` — shared by `version_id`
-    /// (identity input) and `apply_deploy` (persisted row) so the two
-    /// can never drift.
+    /// (identity input) and `apply_deploy`/`apply_preview` (persisted
+    /// row) so the two can never drift.
     fn version_record(pkg: &crate::worker_pkg::PackedWorker, version_id: String) -> VersionRecord {
-        VersionRecord {
+        let mut record = VersionRecord {
             version_id,
             artifact_digest: pkg.digest.clone(),
             compatibility_date: pkg.compatibility_date.clone(),
             compatibility_flags: pkg.compatibility_flags.clone(),
+            status: VersionStatus::Archived,
+            created_by: None,
+            config_hash: String::new(),
             bindings: pkg.bindings.clone(),
             var_values: pkg.var_values.clone(),
             crons: pkg.crons.clone(),
@@ -219,51 +276,144 @@ impl LocalState {
             tag: pkg.tag.clone(),
             created_at_unix_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
             quotas: pkg.quotas.clone(),
-        }
+        };
+        record.config_hash = Self::config_hash(&record);
+        record
     }
 
-    /// Apply a packed worker dir: dedup identical versions by content
-    /// identity, evict the oldest NON-ACTIVE versions past the cap,
-    /// activate the new version. Returns `(version_id, artifact_digest)`.
-    pub fn apply_deploy(
-        &mut self,
-        pkg: &crate::worker_pkg::PackedWorker,
-    ) -> Result<(String, String), &'static str> {
-        let max = self.max_versions();
-        let record = self
-            .workers
+    fn worker_entry(&mut self, pkg: &crate::worker_pkg::PackedWorker) -> &mut WorkerRecord {
+        self.workers
             .entry(pkg.name.clone())
             .or_insert_with(|| WorkerRecord {
                 worker_id: format!("w_{}", &pkg.first_deploy_id),
                 hostnames: Vec::new(),
                 versions: Vec::new(),
                 active_version_id: None,
-            });
-        // Hostnames remain worker-level (platform parity — routes are
-        // not versioned); redeployable, newest non-empty wins.
-        if !pkg.hostnames.is_empty() {
-            record.hostnames = pkg.hostnames.clone();
-        }
+            })
+    }
+
+    /// Record one immutable version. `activate` selects whether the
+    /// new version becomes the worker's active pointer (deploy) or
+    /// stays a preview (deploy --preview).
+    ///
+    /// Activation keeps the legacy F4 behavior: identical content is
+    /// deduped and the oldest NON-ACTIVE version is evicted past the
+    /// cap. Preview never evicts (the MVP intentionally has no
+    /// retention policy for previews) and never touches hostnames or
+    /// `activeVersionId`.
+    fn apply_packaged(
+        &mut self,
+        pkg: &crate::worker_pkg::PackedWorker,
+        now_unix_ms: u64,
+        activate: bool,
+    ) -> Result<(String, String), &'static str> {
+        let max = self.max_versions();
         let version_id = Self::version_id(pkg);
-        if !record.versions.iter().any(|v| v.version_id == version_id) {
-            // F4: never refuse — evict oldest non-active first.
-            while record.versions.len() >= max {
-                let pos = record
-                    .versions
-                    .iter()
-                    .position(|v| record.active_version_id.as_ref() != Some(&v.version_id))
-                    .ok_or("versions")?;
-                record.versions.remove(pos);
+        let record = self.worker_entry(pkg);
+        if activate {
+            // Hostnames remain worker-level (platform parity — routes
+            // are not versioned); redeployable, newest non-empty wins.
+            // Preview deliberately skips this: a preview must not
+            // change the live route map.
+            if !pkg.hostnames.is_empty() {
+                record.hostnames = pkg.hostnames.clone();
             }
-            record
+            let mut new_record = Self::version_record(pkg, version_id.clone());
+            new_record.status = VersionStatus::Active;
+            new_record.created_at_unix_ms = now_unix_ms;
+            if !record.versions.iter().any(|v| v.version_id == version_id) {
+                // F4: never refuse — evict oldest non-active first.
+                while record.versions.len() >= max {
+                    let pos = record
+                        .versions
+                        .iter()
+                        .position(|v| record.active_version_id.as_ref() != Some(&v.version_id))
+                        .ok_or("versions")?;
+                    record.versions.remove(pos);
+                }
+                record.versions.push(new_record);
+            } else if let Some(existing) = record
                 .versions
-                .push(Self::version_record(pkg, version_id.clone()));
+                .iter_mut()
+                .find(|v| v.version_id == version_id)
+            {
+                existing.status = VersionStatus::Active;
+                if existing.created_at_unix_ms == 0 {
+                    existing.created_at_unix_ms = now_unix_ms;
+                }
+            }
+            for v in record.versions.iter_mut() {
+                if v.version_id != version_id && v.status == VersionStatus::Active {
+                    v.status = VersionStatus::Archived;
+                }
+            }
+            record.active_version_id = Some(version_id.clone());
+        } else {
+            let mut new_record = Self::version_record(pkg, version_id.clone());
+            new_record.status = VersionStatus::Preview;
+            new_record.created_at_unix_ms = now_unix_ms;
+            match record
+                .versions
+                .iter_mut()
+                .find(|v| v.version_id == version_id)
+            {
+                Some(existing) => {
+                    // Re-previewing the active version leaves it active;
+                    // re-previewing an archived version marks it preview.
+                    if record.active_version_id.as_deref() != Some(version_id.as_str()) {
+                        existing.status = VersionStatus::Preview;
+                    }
+                    if existing.created_at_unix_ms == 0 {
+                        existing.created_at_unix_ms = now_unix_ms;
+                    }
+                }
+                None => record.versions.push(new_record),
+            }
         }
-        record.active_version_id = Some(version_id.clone());
         Ok((version_id, pkg.digest.clone()))
     }
 
-    pub fn rollback(&mut self, worker: &str, version_id: &str) -> Result<(), LocalError> {
+    /// Apply a normal deploy: activate the version (see
+    /// [`LocalState::apply_packaged`]).
+    pub fn apply_deploy(
+        &mut self,
+        pkg: &crate::worker_pkg::PackedWorker,
+        now_unix_ms: u64,
+    ) -> Result<(String, String), &'static str> {
+        self.apply_packaged(pkg, now_unix_ms, true)
+    }
+
+    /// Store a preview version without changing `activeVersionId`.
+    pub fn apply_preview(
+        &mut self,
+        pkg: &crate::worker_pkg::PackedWorker,
+        now_unix_ms: u64,
+    ) -> Result<(String, String), &'static str> {
+        self.apply_packaged(pkg, now_unix_ms, false)
+    }
+
+    /// Look up one stored version on one worker.
+    pub fn version(&self, worker: &str, version_id: &str) -> Option<&VersionRecord> {
+        self.workers
+            .get(worker)
+            .and_then(|w| w.versions.iter().find(|v| v.version_id == version_id))
+    }
+
+    fn mark_active(record: &mut WorkerRecord, version_id: &str) {
+        for v in record.versions.iter_mut() {
+            if v.version_id == version_id {
+                v.status = VersionStatus::Active;
+            } else if v.status == VersionStatus::Active {
+                v.status = VersionStatus::Archived;
+            }
+        }
+        record.active_version_id = Some(version_id.to_string());
+    }
+
+    /// Point one worker at `version_id`. Returns `true` when the
+    /// active pointer changed. A repeated promote of the current
+    /// version is a no-op (`false`) and never errors.
+    pub fn promote(&mut self, worker: &str, version_id: &str) -> Result<bool, LocalError> {
         let record = self
             .workers
             .get_mut(worker)
@@ -271,8 +421,15 @@ impl LocalState {
         if !record.versions.iter().any(|v| v.version_id == version_id) {
             return Err(LocalError::NotFound("version"));
         }
-        record.active_version_id = Some(version_id.to_string());
-        Ok(())
+        let changed = record.active_version_id.as_deref() != Some(version_id);
+        Self::mark_active(record, version_id);
+        Ok(changed)
+    }
+
+    /// Backwards-compatible rollback entry point; identical pointer
+    /// semantics to promote.
+    pub fn rollback(&mut self, worker: &str, version_id: &str) -> Result<(), LocalError> {
+        self.promote(worker, version_id).map(|_| ())
     }
 
     pub fn set_hostname(
@@ -340,10 +497,16 @@ impl LocalState {
         }
         let mut workers = Vec::with_capacity(self.workers.len());
         for (name, w) in &self.workers {
+            // A preview-only worker has versions but no active pointer.
+            // It must not enter the desired document (nothing may serve
+            // it yet); a dangling pointer still fails closed below.
+            let Some(active_id) = w.active_version_id.as_ref() else {
+                continue;
+            };
             let active = w
-                .active_version_id
-                .as_ref()
-                .and_then(|id| w.versions.iter().find(|v| &v.version_id == id))
+                .versions
+                .iter()
+                .find(|v| &v.version_id == active_id)
                 .ok_or(LocalError::State("activeVersion"))?;
             // Version metadata fields ride the wire only when the
             // version declares the binding — `deny_unknown_fields`
@@ -405,6 +568,28 @@ impl LocalState {
         })
     }
 
+    /// Enforce the lifecycle invariant on load: exactly the record
+    /// selected by `activeVersionId` is `Active`; every other record
+    /// can never be `Active`. State files written before the versioning
+    /// MVP have no `status` field, so their active version decodes as
+    /// `Archived` and is corrected here. This runs in memory only; the
+    /// normalized form is persisted by the next mutating op.
+    fn normalize_lifecycle(&mut self) {
+        for w in self.workers.values_mut() {
+            let active = w.active_version_id.clone();
+            for v in w.versions.iter_mut() {
+                if active.as_deref() == Some(v.version_id.as_str()) {
+                    v.status = VersionStatus::Active;
+                } else if v.status == VersionStatus::Active {
+                    v.status = VersionStatus::Archived;
+                }
+                if v.config_hash.is_empty() {
+                    v.config_hash = Self::config_hash(v);
+                }
+            }
+        }
+    }
+
     pub fn worker_status(&self, quotas_enforced: bool) -> Vec<WorkerStatus> {
         self.workers
             .iter()
@@ -434,10 +619,12 @@ impl LocalState {
 pub fn read(root: &Path) -> Result<LocalState, LocalError> {
     let raw = std::fs::read(crate::layout::state_dir(root).join("state.json"))
         .map_err(|_| LocalError::Layout("state"))?;
-    let st: LocalState = serde_json::from_slice(&raw).map_err(|_| LocalError::State("decode"))?;
+    let mut st: LocalState =
+        serde_json::from_slice(&raw).map_err(|_| LocalError::State("decode"))?;
     if st.schema_version != STATE_SCHEMA_VERSION {
         return Err(LocalError::State("schemaVersion"));
     }
+    st.normalize_lifecycle();
     Ok(st)
 }
 
@@ -584,5 +771,135 @@ mod tests {
         let rec: VersionRecord =
             serde_json::from_slice(&raw).expect("unknown version field must be ignored");
         assert_eq!(rec.version_id, "vrt_test");
+    }
+
+    #[test]
+    fn preview_does_not_activate_or_evict() {
+        let mut st = LocalState::new("local", "local");
+        st.max_versions_per_worker = 1;
+        let active = pkg();
+        let active_id = LocalState::version_id(&active);
+        st.apply_deploy(&active, 1).unwrap();
+        let mut preview = pkg();
+        preview.observability = Some(obs(500_000));
+        let preview_id = LocalState::version_id(&preview);
+        assert_ne!(active_id, preview_id);
+        st.apply_preview(&preview, 2).unwrap();
+        let w = &st.workers["svc"];
+        assert_eq!(w.active_version_id.as_deref(), Some(active_id.as_str()));
+        assert_eq!(w.versions.len(), 2, "preview is stored, not discarded");
+        assert_eq!(
+            w.versions
+                .iter()
+                .find(|v| v.version_id == active_id)
+                .unwrap()
+                .status,
+            VersionStatus::Active
+        );
+        assert_eq!(
+            w.versions
+                .iter()
+                .find(|v| v.version_id == preview_id)
+                .unwrap()
+                .status,
+            VersionStatus::Preview
+        );
+        // Preview does not publish a worker without an active version.
+        let mut only_preview = LocalState::new("local", "local");
+        only_preview.revision = 1;
+        only_preview.apply_preview(&preview, 3).unwrap();
+        assert_eq!(
+            only_preview.to_desired().unwrap().tenants[0].workers.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn promote_is_idempotent_and_keeps_one_active() {
+        let mut st = LocalState::new("local", "local");
+        let first = pkg();
+        let first_id = LocalState::version_id(&first);
+        st.apply_deploy(&first, 1).unwrap();
+        let mut second = pkg();
+        second.observability = Some(obs(250_000));
+        let second_id = LocalState::version_id(&second);
+        st.apply_preview(&second, 2).unwrap();
+
+        assert!(st.promote("svc", &second_id).unwrap());
+        assert!(!st.promote("svc", &second_id).unwrap(), "idempotent replay");
+        let w = &st.workers["svc"];
+        assert_eq!(w.active_version_id.as_deref(), Some(second_id.as_str()));
+        assert_eq!(
+            w.versions
+                .iter()
+                .filter(|v| v.status == VersionStatus::Active)
+                .count(),
+            1,
+            "exactly one active version"
+        );
+        assert_eq!(
+            w.versions
+                .iter()
+                .find(|v| v.version_id == first_id)
+                .unwrap()
+                .status,
+            VersionStatus::Archived
+        );
+        // Cross-worker promote fails closed.
+        assert!(matches!(
+            st.promote("other", &second_id),
+            Err(LocalError::NotFound("worker"))
+        ));
+        assert!(matches!(
+            st.promote("svc", "vrt_missing"),
+            Err(LocalError::NotFound("version"))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_metadata_is_not_version_identity() {
+        let rec = LocalState::version_record(&pkg(), "vrt_a".into());
+        let canonical = LocalState::identity_value(&rec);
+        let mut changed = rec.clone();
+        changed.version_id = "vrt_b".into();
+        changed.status = VersionStatus::Active;
+        changed.created_at_unix_ms = 42;
+        changed.created_by = Some("someone".into());
+        changed.config_hash = "cfg_other".into();
+        assert_eq!(canonical, LocalState::identity_value(&changed));
+        // Same input still yields the same id after a lifecycle edit.
+        assert_eq!(
+            LocalState::version_id(&pkg()),
+            LocalState::version_id(&pkg())
+        );
+    }
+
+    #[test]
+    fn legacy_state_normalizes_lifecycle() {
+        let mut st = LocalState::new("local", "local");
+        let p = pkg();
+        let id = LocalState::version_id(&p);
+        st.apply_deploy(&p, 1).unwrap();
+        // Simulate a pre-versioning state file: no status field on the
+        // record, so decode defaults to Archived.
+        let mut value = serde_json::to_value(&st).unwrap();
+        value["workers"]["svc"]["versions"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        let mut decoded: LocalState = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.workers["svc"].versions[0].status,
+            VersionStatus::Archived
+        );
+        decoded.normalize_lifecycle();
+        assert_eq!(
+            decoded.workers["svc"].versions[0].status,
+            VersionStatus::Active
+        );
+        assert_eq!(
+            decoded.workers["svc"].active_version_id.as_deref(),
+            Some(id.as_str())
+        );
     }
 }

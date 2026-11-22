@@ -2416,6 +2416,10 @@ pub struct DeployUpload {
     /// (`versionMetadata.tag`; `None` = untagged).
     #[serde(default)]
     pub tag: Option<String>,
+    /// `true` for `deploy --preview`: store the immutable version
+    /// without changing the worker's active version.
+    #[serde(default)]
+    pub preview: bool,
     /// Flagship app definitions gathered client-side
     /// (`flagship.json`) — re-validated server-side with the same
     /// wire-boundary flag-model proof before state application.

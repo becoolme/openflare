@@ -391,6 +391,8 @@ fn session_dev_table(
         crate::project_cfg::MetaSource::Wrangler(_) => {
             crate::project_cfg::load_dev_table_for_env(worker_dir, env_name)
         }
+        // The `cf` programmatic format has no `[dev]` table.
+        crate::project_cfg::MetaSource::CfConfig(_) => Ok(None),
     }
 }
 

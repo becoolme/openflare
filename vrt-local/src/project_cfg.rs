@@ -7,8 +7,13 @@
 //!
 //! Standalone extras vs the platform path:
 //!   * `vrt.toml` keeps precedence — it is the native standalone config;
-//!   * `cloudflare.config.ts` / `wrangler.config.ts` are never executed —
-//!     they fail closed telling the user to convert via the platform CLI;
+//!   * `cloudflare.config.ts` / `.js` (the `cf` CLI programmatic format) are
+//!     evaluated by Cloudflare's official `@cloudflare/config` loader in a
+//!     restricted Node child process (`scripts/load-cloudflare-config.mjs`),
+//!     converted to the wrangler shape, then normalized by the exact same
+//!     path as a wrangler file — no second mapping table;
+//!   * `wrangler.config.ts` / `.js` are a different, wrangler-specific format
+//!     and still fail closed telling the user to convert via the platform CLI;
 //!   * a wrangler `service` entrypoint is validated and missing KV/R2 ids are
 //!     derived at the WorkerToml conversion boundary (documented).
 
@@ -18,7 +23,6 @@ use serde_json::{Map, Value};
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::path::Path;
-#[cfg(test)]
 use std::path::PathBuf;
 
 use crate::worker_pkg::WorkerToml;
@@ -28,6 +32,52 @@ use crate::LocalError;
 /// e2e assertions so the candidate set has a single source of truth.
 pub const WRANGLER_CANDIDATES: [&str; 3] = ["wrangler.json", "wrangler.jsonc", "wrangler.toml"];
 const CANDIDATES: [&str; 3] = WRANGLER_CANDIDATES;
+/// Cloudflare's programmatic config (`cf` CLI format), in selection order.
+/// These are evaluated, never parsed as JSON/TOML, and take precedence over
+/// the wrangler family when both are present.
+pub const CLOUDFLARE_CONFIG_CANDIDATES: [&str; 2] =
+    ["cloudflare.config.ts", "cloudflare.config.js"];
+/// Wrangler's own programmatic config format — not evaluated (out of scope).
+const WRANGLER_TS_CANDIDATES: [&str; 2] = ["wrangler.config.ts", "wrangler.config.js"];
+/// Node helper that evaluates a `cloudflare.config.*` through the official
+/// loader and prints `{raw, dependencies}`. Resolved next to the `vrt`
+/// executable (repo `target/<profile>/vrt` → repo root) or overridden with
+/// `VRT_CF_CONFIG_LOADER`.
+const CF_CONFIG_LOADER_SCRIPT: &str = "scripts/load-cloudflare-config.mjs";
+const CF_CONFIG_LOADER_ENV: &str = "VRT_CF_CONFIG_LOADER";
+const CF_NODE_ENV: &str = "VRT_NODE_BIN";
+/// Test/ops knob for the child-process deadline (bounded; default 60 s).
+const CF_CONFIG_LOADER_TIMEOUT_ENV: &str = "VRT_CF_CONFIG_LOADER_TIMEOUT_MS";
+const CF_CONFIG_LOADER_TIMEOUT_MS: u64 = 60_000;
+const CF_CONFIG_LOADER_TIMEOUT_RANGE_MS: std::ops::RangeInclusive<u64> = 100..=600_000;
+/// Hard caps on what the helper may hand back — the raw config itself is
+/// capped at `MAX_CONFIG_BYTES`, the converted JSON is a small multiple.
+const CF_CONFIG_MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const CF_CONFIG_MAX_STDERR_BYTES: usize = 64 * 1024;
+/// Environment variables a `cloudflare.config.*` may rely on in the child.
+/// Everything else — `NODE_OPTIONS`, `NODE_PATH`, `NODE_EXTRA_CA_CERTS`,
+/// cloud credentials, `VRT_*` — is cleared, so the loader cannot be
+/// redirected into arbitrary code or inherited secrets.
+const CF_CHILD_ENV_ALLOW: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_CACHE_HOME",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+];
 const MAX_CONFIG_BYTES: usize = 256 * 1024;
 /// Mirrors IGNORED_TOP_LEVEL in wranglerSource.ts.
 const IGNORED_TOP_LEVEL: &[&str] = &[
@@ -136,18 +186,23 @@ fn invalid_code(code: &'static str, field: &str, what: &str) -> ProjectConfigErr
 pub enum MetaSource {
     VrtToml,
     Wrangler(String),
+    /// A `cloudflare.config.ts`/`.js` evaluated by the official loader.
+    CfConfig(String),
 }
 
-/// Load the worker meta for `worker_dir`: `vrt.toml` wins; else the
-/// wrangler family in packer order. Programmatic configs (.ts/.js) fail
-/// closed — standalone has no JS evaluator by design.
+/// Load the worker meta for `worker_dir`: `vrt.toml` wins; then
+/// Cloudflare's programmatic `cloudflare.config.*`; then the wrangler
+/// family in packer order. `wrangler.config.*` (a wrangler-specific
+/// programmatic format) still fails closed.
 pub fn load_worker_meta(worker_dir: &Path) -> Result<(WorkerToml, MetaSource), LocalError> {
     load_worker_meta_for_env(worker_dir, None)
 }
 
-/// Load worker meta from `vrt.toml` or Wrangler config, selecting the
-/// requested Wrangler named environment before normalization. `vrt.toml`
-/// has no environment blocks and rejects an explicit selection.
+/// Load worker meta from `vrt.toml`, `cloudflare.config.*`, or a wrangler
+/// config. `--env` selects a wrangler named environment, and doubles as the
+/// evaluation `mode` for `cloudflare.config.*` (that format has no env
+/// blocks — the mode is its environment selector). `vrt.toml` has no
+/// environment blocks and rejects an explicit selection.
 pub fn load_worker_meta_for_env(
     worker_dir: &Path,
     env_name: Option<&str>,
@@ -185,17 +240,24 @@ pub fn load_worker_meta_for_env(
         return Ok((meta, MetaSource::VrtToml));
     }
 
-    for programmatic in [
-        "cloudflare.config.ts",
-        "wrangler.config.ts",
-        "cloudflare.config.js",
-        "wrangler.config.js",
-    ] {
+    if let Some(cf) = CLOUDFLARE_CONFIG_CANDIDATES
+        .iter()
+        .copied()
+        .find(|c| worker_dir.join(c).exists())
+    {
+        let (config, _resolved, _shadowed) = load_cf_project_config(worker_dir, cf, env_name)
+            .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
+        let meta = wrangler_config_to_worker_toml(&config)
+            .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
+        return Ok((meta, MetaSource::CfConfig(cf.to_string())));
+    }
+
+    for programmatic in WRANGLER_TS_CANDIDATES {
         if worker_dir.join(programmatic).exists() {
             return Err(LocalError::Worker(
-                // standalone intentionally ships no JS evaluator —
-                // convert programmatic configs with the platform CLI.
-                "programmatic config file — convert to wrangler.toml/json/jsonc (or vrt.toml) with the platform CLI",
+                // wrangler's own TS format has no stable contract; only the
+                // `cf` format is evaluated (see load_cf_project_config).
+                "programmatic config file — wrangler.config.ts/.js is not evaluated; convert it to wrangler.toml/json/jsonc (or vrt.toml) with the platform CLI",
             ));
         }
     }
@@ -231,6 +293,480 @@ pub fn is_config_basename(name: &str) -> bool {
                 | "cloudflare.config.js"
                 | "wrangler.config.js"
         )
+}
+
+// ── cloudflare.config.ts/.js (cf CLI programmatic format) ─────────────
+//
+// The config is JavaScript/TypeScript, so it has to be evaluated. Instead
+// of shipping an evaluator, `vrt` runs Cloudflare's own loader
+// (`@cloudflare/config`) in a restricted Node child process and consumes
+// the wrangler-shaped document it prints. From there the value takes the
+// exact same `resolve_env` → `normalize_wrangler_config` path as a
+// wrangler file, so there is one mapping table, not two.
+//
+// Security posture (documented in docs/wrangler-config.md): the child has
+// a fixed cwd, a cleared environment (allowlist below), a wall-clock
+// deadline, and bounded stdout/stderr. It is NOT a sandbox — the config
+// executes arbitrary Node code with the invoking user's filesystem and
+// network access. A real sandbox is tracked as follow-up work; nothing
+// here claims otherwise.
+
+/// Resolve the loader script: `VRT_CF_CONFIG_LOADER` override, then a
+/// `scripts/` directory found by walking up from the `vrt` executable
+/// (repo `target/<profile>/vrt` → repo root), then the crate's own repo
+/// root (works when the loader is driven from tests).
+fn cf_config_loader_script() -> Result<PathBuf, ProjectConfigError> {
+    if let Ok(v) = std::env::var(CF_CONFIG_LOADER_ENV) {
+        let p = PathBuf::from(v);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            "configLoader",
+            &format!("{} does not point at a file", CF_CONFIG_LOADER_ENV),
+        ));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            let cand = anc.join(CF_CONFIG_LOADER_SCRIPT);
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let cand = repo.join(CF_CONFIG_LOADER_SCRIPT);
+    if cand.is_file() {
+        return Ok(cand);
+    }
+    Err(invalid_code(
+        "VRT_CONFIG_LOADER_FAILED",
+        "configLoader",
+        &format!(
+            "cannot find {CF_CONFIG_LOADER_SCRIPT} next to the vrt executable — install it or set {CF_CONFIG_LOADER_ENV}"
+        ),
+    ))
+}
+
+/// Node binary: `VRT_NODE_BIN` override (must be a file), else `node` from
+/// the child's allowlisted `PATH`.
+fn cf_node_bin() -> Result<std::ffi::OsString, ProjectConfigError> {
+    if let Ok(v) = std::env::var(CF_NODE_ENV) {
+        if v.is_empty() {
+            return Err(invalid_code(
+                "VRT_CONFIG_LOADER_FAILED",
+                "nodeBin",
+                &format!("{CF_NODE_ENV} is empty"),
+            ));
+        }
+        let p = PathBuf::from(&v);
+        if !p.is_file() {
+            return Err(invalid_code(
+                "VRT_CONFIG_LOADER_FAILED",
+                "nodeBin",
+                &format!("{CF_NODE_ENV} does not point at a file"),
+            ));
+        }
+        return Ok(p.into_os_string());
+    }
+    Ok(std::ffi::OsString::from("node"))
+}
+
+fn cf_config_loader_timeout() -> std::time::Duration {
+    let ms = std::env::var(CF_CONFIG_LOADER_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| CF_CONFIG_LOADER_TIMEOUT_RANGE_MS.contains(ms))
+        .unwrap_or(CF_CONFIG_LOADER_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Put the child in its own session/process group so a deadline kill takes
+/// the whole config-evaluation tree, not just the `node` process. The config
+/// may spawn helpers of its own; without this a killed `node` can leave them
+/// behind (and keep the pipes open).
+#[cfg(unix)]
+fn cf_child_new_process_group(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is async-signal-safe and runs in the forked child
+    // between fork and exec; it only changes that child's session. Returning
+    // an error here aborts the spawn instead of exec'ing the helper.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn cf_child_new_process_group(_cmd: &mut std::process::Command) {}
+
+/// Kill the child's process group (Unix) and reap the direct child.
+fn cf_kill_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        // SAFETY: `pid` is the child we just spawned as its own session
+        // leader, so `-pid` names exactly that new group; killing it cannot
+        // reach the parent's group.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Read at most `cap` bytes; `true` when the source had more to give.
+/// The reader is dropped after the cap so an oversized helper cannot
+/// fill the pipe (it gets EPIPE instead of blocking the parent).
+fn read_capped<R: std::io::Read>(mut reader: R, cap: usize) -> (Vec<u8>, bool) {
+    let mut buf = Vec::with_capacity(cap.min(64 * 1024));
+    let mut chunk = [0u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if buf.len() + n > cap {
+                    buf.extend_from_slice(&chunk[..cap - buf.len()]);
+                    truncated = true;
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    (buf, truncated)
+}
+
+/// The helper writes one JSON payload line to stdout, but a config may
+/// `console.log()` while it is evaluated (it runs in the same process), so
+/// the payload is the last parseable JSON object line rather than the whole
+/// stream. User output is never interpreted: only `raw`/`dependencies` are
+/// read, and the value still goes through the wrangler normalization.
+fn cf_loader_payload(stdout: &[u8]) -> Option<Value> {
+    let text = String::from_utf8_lossy(stdout);
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if v.is_object() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// The helper's stable stderr contract: `{error, message, issues?}` on a
+/// single line. Falls back to the (bounded, whitespace-collapsed) text.
+fn cf_helper_failure(stderr: &[u8]) -> (Option<String>, String) {
+    let text = String::from_utf8_lossy(stderr);
+    let line = text.lines().rev().find(|l| !l.trim().is_empty());
+    if let Some(line) = line {
+        if let Ok(v) = serde_json::from_str::<Value>(line.trim()) {
+            let code = v.get("error").and_then(|e| e.as_str()).map(str::to_string);
+            let msg = v
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("config evaluation failed");
+            return (code, msg.to_string());
+        }
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !collapsed.is_empty() {
+            return (None, collapsed.chars().take(512).collect());
+        }
+    }
+    (None, "config evaluation failed without a diagnostic".into())
+}
+
+/// Run the Node helper for `config_file` inside `project_dir` and return
+/// the raw (wrangler-shaped) config object.
+fn run_cf_config_loader(
+    project_dir: &Path,
+    config_file: &str,
+    env_name: Option<&str>,
+) -> Result<Value, ProjectConfigError> {
+    use std::process::{Command, Stdio};
+
+    let config_path = std::fs::canonicalize(project_dir.join(config_file)).map_err(|_| {
+        invalid_code(
+            "VRT_CONFIG_NOT_FOUND",
+            config_file,
+            "cannot resolve config file path",
+        )
+    })?;
+    let script = cf_config_loader_script()?;
+    let node = cf_node_bin()?;
+    let timeout = cf_config_loader_timeout();
+
+    let mut cmd = Command::new(&node);
+    cmd.arg(&script).arg(&config_path);
+    if let Some(name) = env_name {
+        cmd.arg("--mode").arg(name);
+    }
+    cmd.current_dir(project_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear();
+    for key in CF_CHILD_ENV_ALLOW {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    cf_child_new_process_group(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            &format!(
+                "cannot start node ({e}) — Node.js is required to evaluate {config_file}; install Node and/or set {CF_NODE_ENV}"
+            ),
+        )
+    })?;
+    let Some(stdout_pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            "loader stdout unavailable",
+        ));
+    };
+    let Some(stderr_pipe) = child.stderr.take() else {
+        let _ = child.kill();
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            "loader stderr unavailable",
+        ));
+    };
+    // Readers drain both pipes concurrently (a full stderr pipe would
+    // otherwise block the child) and report over a channel: results are
+    // awaited with a bound, so a config that leaks an inherited pipe cannot
+    // hang `vrt deploy`.
+    let (out_tx, out_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = out_tx.send(read_capped(stdout_pipe, CF_CONFIG_MAX_STDOUT_BYTES));
+    });
+    let (err_tx, err_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = err_tx.send(read_capped(stderr_pipe, CF_CONFIG_MAX_STDERR_BYTES));
+    });
+    let pipe_drain_timeout = std::time::Duration::from_secs(5);
+
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    cf_kill_child(&mut child);
+                    return Err(invalid_code(
+                        "VRT_CONFIG_LOADER_TIMEOUT",
+                        config_file,
+                        &format!(
+                            "evaluating {} exceeded {} ms — set {CF_CONFIG_LOADER_TIMEOUT_ENV} to raise the deadline",
+                            config_file,
+                            timeout.as_millis()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => {
+                cf_kill_child(&mut child);
+                return Err(invalid_code(
+                    "VRT_CONFIG_LOADER_FAILED",
+                    config_file,
+                    &format!("cannot wait for the config loader: {e}"),
+                ));
+            }
+        }
+    };
+    let (stdout, stdout_truncated) = out_rx.recv_timeout(pipe_drain_timeout).map_err(|_| {
+        invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            "loader stdout did not close — a spawned process may be holding it",
+        )
+    })?;
+    // stderr is diagnostic only; a drain timeout there must not mask the
+    // exit status we already have.
+    let stderr = err_rx
+        .recv_timeout(pipe_drain_timeout)
+        .map(|(bytes, _)| bytes)
+        .unwrap_or_default();
+
+    if stdout_truncated {
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            &format!("loader output exceeds {CF_CONFIG_MAX_STDOUT_BYTES} bytes"),
+        ));
+    }
+    if !status.success() {
+        let (_helper_code, message) = cf_helper_failure(&stderr);
+        // Exit 2 is the helper's "zod rejected the config" contract; every
+        // other failure (missing package, thrown import, unsupported Node)
+        // is an environment/loader problem.
+        let code = if status.code() == Some(2) {
+            "VRT_CONFIG_INVALID"
+        } else {
+            "VRT_CONFIG_LOADER_FAILED"
+        };
+        let status = status
+            .code()
+            .map(|c| format!("exit {c}"))
+            .unwrap_or_else(|| "killed by signal".into());
+        return Err(invalid_code(
+            code,
+            config_file,
+            &format!("{message} ({status})"),
+        ));
+    }
+
+    let doc: Value = cf_loader_payload(&stdout).ok_or_else(|| {
+        invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            "loader produced invalid JSON: no JSON object line on stdout",
+        )
+    })?;
+    let raw = doc
+        .get("raw")
+        .filter(|v| v.is_object())
+        .cloned()
+        .ok_or_else(|| {
+            invalid_code(
+                "VRT_CONFIG_LOADER_FAILED",
+                config_file,
+                "loader output has no `raw` object",
+            )
+        })?;
+    if let Some(deps) = doc.get("dependencies") {
+        if !deps
+            .as_array()
+            .map(|a| a.iter().all(|d| d.as_str().is_some()))
+            .unwrap_or(false)
+        {
+            return Err(invalid_code(
+                "VRT_CONFIG_LOADER_FAILED",
+                config_file,
+                "loader `dependencies` must be an array of strings",
+            ));
+        }
+    }
+    if !is_json_value(&raw) {
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            "loader output is not representable as JSON",
+        ));
+    }
+    Ok(raw)
+}
+
+/// `convertToWranglerConfig` reports `cf-worker` entrypoints as absolute
+/// paths anchored at the config file. The packer works in project-relative
+/// paths, so rebase `main` onto the worker directory and fail closed on
+/// anything that resolves outside it (a symlink or `../` must not widen
+/// what a config can package).
+fn rebase_cf_main(
+    raw: &mut Value,
+    project_dir: &Path,
+    config_file: &str,
+) -> Result<(), ProjectConfigError> {
+    let Some(main) = raw.get("main").and_then(|m| m.as_str()) else {
+        return Ok(());
+    };
+    let main = main.trim().to_string();
+    if main.is_empty() {
+        // normalize_wrangler_config reports the empty `main`.
+        return Ok(());
+    }
+    let resolved = Path::new(&main);
+    let relative = if resolved.is_absolute() {
+        let canonical = std::fs::canonicalize(resolved).map_err(|_| {
+            invalid(
+                "main",
+                "entrypoint does not exist or cannot be resolved (see `worker.entrypoint`)",
+            )
+        })?;
+        let root = std::fs::canonicalize(project_dir).unwrap_or_else(|_| project_dir.to_path_buf());
+        let rel = canonical.strip_prefix(&root).map_err(|_| {
+            unsupported(
+                "main",
+                Some("worker.entrypoint must resolve inside the worker directory"),
+            )
+        })?;
+        rel.to_string_lossy().replace('\\', "/")
+    } else {
+        main.strip_prefix("./").unwrap_or(&main).to_string()
+    };
+    if relative.is_empty()
+        || relative.starts_with('/')
+        || relative
+            .split('/')
+            .any(|s| s.is_empty() || s == "." || s == "..")
+    {
+        return Err(invalid(
+            "main",
+            &format!("{config_file}: worker.entrypoint must be a project-relative file path"),
+        ));
+    }
+    if let Some(obj) = raw.as_object_mut() {
+        obj.insert("main".into(), Value::from(relative));
+    }
+    Ok(())
+}
+
+/// Evaluate a `cloudflare.config.*` and run it through the shared wrangler
+/// normalization. `env_name` is passed to the loader as `--mode`; the
+/// format has no `[env.*]` blocks, so env resolution runs in pass-through
+/// mode. Returns (normalized config, resolved raw object, shadowed files).
+pub fn load_cf_project_config(
+    project_dir: &Path,
+    config_file: &str,
+    env_name: Option<&str>,
+) -> Result<(Value, Value, Vec<String>), ProjectConfigError> {
+    if !CLOUDFLARE_CONFIG_CANDIDATES.contains(&config_file) {
+        return Err(invalid_code(
+            "VRT_CONFIG_INVALID",
+            "configFile",
+            &format!(
+                "expected one of {} (got '{config_file}')",
+                CLOUDFLARE_CONFIG_CANDIDATES.join(", ")
+            ),
+        ));
+    }
+    if !project_dir.join(config_file).exists() {
+        return Err(invalid_code(
+            "VRT_CONFIG_NOT_FOUND",
+            "configFile",
+            &format!("config file not found in project: {config_file}"),
+        ));
+    }
+    let mut raw = run_cf_config_loader(project_dir, config_file, env_name)?;
+    rebase_cf_main(&mut raw, project_dir, config_file)?;
+    let resolved = resolve_env(&raw, None, config_file)?;
+    let config = normalize_wrangler_config(&resolved, config_file)?;
+    let shadowed = CANDIDATES
+        .iter()
+        .filter(|c| project_dir.join(c).exists())
+        .map(|s| s.to_string())
+        .collect();
+    Ok((config, resolved, shadowed))
 }
 
 // ── parsing ──────────────────────────────────────────────────────────
@@ -2474,6 +3010,14 @@ pub(crate) fn load_dev_table_for_env(
     if worker_dir.join("vrt.toml").exists() {
         return Ok(None);
     }
+    // `cloudflare.config.*` has no `[dev]` table (the `cf` format keeps dev
+    // settings elsewhere); there is nothing to parse for `vrt dev`.
+    if CLOUDFLARE_CONFIG_CANDIDATES
+        .iter()
+        .any(|c| worker_dir.join(c).exists())
+    {
+        return Ok(None);
+    }
     let (_config, resolved, _shadowed) =
         load_wrangler_project_config(worker_dir, None, env_name)
             .map_err(|e| LocalError::Worker(Box::leak(e.to_string().into_boxed_str())))?;
@@ -3188,10 +3732,448 @@ mod tests {
         assert_eq!(src, MetaSource::VrtToml);
     }
 
-    #[test]
-    fn programmatic_config_rejected() {
+    // ── cloudflare.config.ts/.js (loader-backed) ─────────────────────
+    //
+    // Every test here mutates process-global env vars (`VRT_CF_CONFIG_LOADER`,
+    // ...) that the loader resolution reads, so they serialize on one lock.
+    // Tests that never create a `cloudflare.config.*` are unaffected by the
+    // override.
+    static CF_LOADER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn cf_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        CF_LOADER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// A directory that looks like a `cf`-format project plus a stub helper
+    /// standing in for `scripts/load-cloudflare-config.mjs`.
+    fn cf_stub_project(body: &str) -> (tempfile::TempDir, EnvVarGuard) {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("cloudflare.config.ts"), "export default {}").unwrap();
+        fs::write(
+            dir.path().join("cloudflare.config.ts"),
+            "export default {};\n",
+        )
+        .unwrap();
+        let stub = dir.path().join("stub-loader.mjs");
+        fs::write(&stub, body).unwrap();
+        let guard = EnvVarGuard::set(CF_CONFIG_LOADER_ENV, stub.to_str().unwrap());
+        (dir, guard)
+    }
+
+    /// The workspace Rust suite must not require Node for unrelated tests, so
+    /// the loader tests skip (loudly) when no `node` is on PATH.
+    fn require_node(test: &str) -> bool {
+        let ok = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping {test}: node not found on PATH");
+        }
+        ok
+    }
+
+    fn raw_ok(raw: &Value) -> String {
+        format!("process.stdout.write(JSON.stringify({{raw:{raw},dependencies:[]}}));\n")
+    }
+
+    #[test]
+    fn cf_config_loader_matches_wrangler_normalization() {
+        if !require_node("cf_config_loader_matches_wrangler_normalization") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        // Same document the official `convertToWranglerConfig` emits for a
+        // `defineConfig` worker (snake_case wrangler keys).
+        let raw = serde_json::json!({
+            "name": "w",
+            "main": "m.js",
+            "compatibility_date": "2025-01-01",
+            "compatibility_flags": ["nodejs_compat"],
+            "vars": {"A": "x", "N": 42},
+            "kv_namespaces": [{"binding": "K", "id": "ns"}],
+            "r2_buckets": [{"binding": "B", "bucket_name": "bucket"}],
+            "observability": {"enabled": false, "logs": {"head_sampling_rate": 0.25}},
+            "limits": {"cpu_ms": 50}
+        });
+        let (dir, _guard) = cf_stub_project(&raw_ok(&raw));
+        let (meta, src) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(src, MetaSource::CfConfig("cloudflare.config.ts".into()));
+
+        let wrangler_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            wrangler_dir.path().join("wrangler.json"),
+            serde_json::to_string(&raw).unwrap(),
+        )
+        .unwrap();
+        let (wrangler_meta, _) = load_worker_meta(wrangler_dir.path()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&meta).unwrap(),
+            serde_json::to_value(&wrangler_meta).unwrap(),
+            "cf config must normalize exactly like the equivalent wrangler file"
+        );
+        assert_eq!(meta.main_module, "m.js");
+        assert_eq!(meta.vars.get("N").map(String::as_str), Some("42"));
+    }
+
+    #[test]
+    fn cf_config_loader_passes_env_as_mode() {
+        if !require_node("cf_config_loader_passes_env_as_mode") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let body = r#"
+const args = process.argv.slice(2);
+const i = args.indexOf("--mode");
+const mode = i === -1 ? "none" : args[i + 1];
+process.stdout.write(JSON.stringify({
+  raw: {name: "w", main: "m.js", compatibility_date: "2025-01-01", vars: {MODE: mode}},
+  dependencies: [],
+}));
+"#;
+        let (dir, _guard) = cf_stub_project(body);
+        let (meta, _) = load_worker_meta_for_env(dir.path(), Some("staging")).unwrap();
+        assert_eq!(meta.vars.get("MODE").map(String::as_str), Some("staging"));
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.vars.get("MODE").map(String::as_str), Some("none"));
+    }
+
+    #[test]
+    fn cf_config_cf_worker_entrypoint_is_rebased() {
+        if !require_node("cf_config_cf_worker_entrypoint_is_rebased") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/index.js"), "export default {};\n").unwrap();
+        fs::write(
+            dir.path().join("cloudflare.config.ts"),
+            "export default {};\n",
+        )
+        .unwrap();
+        // `convertToWranglerConfig` returns an absolute `main` for a
+        // `cf-worker` import; the stub mimics that.
+        let body = r#"
+import { fileURLToPath } from "node:url";
+const here = fileURLToPath(new URL(".", import.meta.url));
+process.stdout.write(JSON.stringify({
+  raw: {name: "w", main: here + "src/index.js", compatibility_date: "2025-01-01"},
+  dependencies: [here + "cloudflare.config.ts"],
+}));
+"#;
+        let stub = dir.path().join("stub-loader.mjs");
+        fs::write(&stub, body).unwrap();
+        let _guard = EnvVarGuard::set(CF_CONFIG_LOADER_ENV, stub.to_str().unwrap());
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.main_module, "src/index.js");
+    }
+
+    #[test]
+    fn cf_config_entrypoint_outside_project_is_rejected() {
+        if !require_node("cf_config_entrypoint_outside_project_is_rejected") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("index.js"), "export default {};\n").unwrap();
+        let main = outside.path().join("index.js");
+        let raw = serde_json::json!({
+            "name": "w",
+            "main": main.to_str().unwrap(),
+            "compatibility_date": "2025-01-01"
+        });
+        let (dir, _guard) = cf_stub_project(&raw_ok(&raw));
+        let err = load_worker_meta(dir.path()).expect_err("must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("VRT_CONFIG_UNSUPPORTED_FIELD") && msg.contains("worker directory"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cf_config_parse_failure_is_config_invalid() {
+        if !require_node("cf_config_parse_failure_is_config_invalid") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let body = r#"
+process.stderr.write(JSON.stringify({
+  error: "VRT_CONFIG_INVALID",
+  message: "worker.name: Invalid input: expected string, received number",
+}) + "\n");
+process.exit(2);
+"#;
+        let (dir, _guard) = cf_stub_project(body);
+        let err = load_worker_meta(dir.path()).expect_err("must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("VRT_CONFIG_INVALID"),
+            "unexpected error: {msg}"
+        );
+        assert!(msg.contains("worker.name"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn cf_config_invalid_helper_json_fails_closed() {
+        if !require_node("cf_config_invalid_helper_json_fails_closed") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let (dir, _guard) = cf_stub_project("process.stdout.write(\"not json\");\n");
+        let err = load_worker_meta(dir.path()).expect_err("must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("VRT_CONFIG_LOADER_FAILED") && msg.contains("invalid JSON"),
+            "unexpected error: {msg}"
+        );
+
+        let (dir, _guard) = cf_stub_project("process.stdout.write(JSON.stringify({ok:true}));\n");
+        let err = load_worker_meta(dir.path()).expect_err("must fail");
+        assert!(format!("{err}").contains("no `raw` object"));
+    }
+
+    #[test]
+    fn cf_config_loader_timeout_fails_closed() {
+        if !require_node("cf_config_loader_timeout_fails_closed") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        // The stub also leaks a child that inherits stdout/stderr: the
+        // deadline must still return promptly and must not wait on a pipe
+        // that another process is holding open.
+        let body = r#"
+import { spawn } from "node:child_process";
+spawn("sleep", ["30"], { stdio: "inherit" });
+setInterval(() => {}, 1000);
+"#;
+        let (dir, _guard) = cf_stub_project(body);
+        let timeout = EnvVarGuard::set(CF_CONFIG_LOADER_TIMEOUT_ENV, "150");
+        let started = std::time::Instant::now();
+        let err = load_worker_meta(dir.path()).expect_err("must fail");
+        drop(timeout);
+        assert!(format!("{err}").contains("VRT_CONFIG_LOADER_TIMEOUT"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn cf_config_loader_child_env_is_cleared() {
+        if !require_node("cf_config_loader_child_env_is_cleared") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let body = r#"
+process.stdout.write(JSON.stringify({
+  raw: {
+    name: "w", main: "m.js", compatibility_date: "2025-01-01",
+    vars: {
+      NODE_OPTIONS: process.env.NODE_OPTIONS ?? "unset",
+      NODE_PATH: process.env.NODE_PATH ?? "unset",
+      CF_TEST_SECRET: process.env.CF_TEST_SECRET ?? "unset",
+    },
+  },
+  dependencies: [],
+}));
+"#;
+        let (dir, _guard) = cf_stub_project(body);
+        let _node_options = EnvVarGuard::set("NODE_OPTIONS", "--require=/tmp/evil.js");
+        let _node_path = EnvVarGuard::set("NODE_PATH", "/tmp/evil-modules");
+        // A secret the parent has and the config evaluator must not inherit.
+        let _secret = EnvVarGuard::set("CF_TEST_SECRET", "hunter2");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        for (key, value) in [
+            ("NODE_OPTIONS", "unset"),
+            ("NODE_PATH", "unset"),
+            ("CF_TEST_SECRET", "unset"),
+        ] {
+            assert_eq!(
+                meta.vars.get(key).map(String::as_str),
+                Some(value),
+                "{key} leaked into the config evaluator"
+            );
+        }
+    }
+
+    #[test]
+    fn cf_config_loader_tolerates_config_stdout() {
+        let _lock = cf_env_lock();
+        // A config that logs while it is evaluated shares this process's
+        // stdout; the payload is the last JSON object line, so the noise is
+        // skipped rather than corrupting the contract.
+        let body = r#"
+console.log("cloudflare.config.ts loaded");
+console.log(JSON.stringify({note: "not the payload"}));
+process.stdout.write(JSON.stringify({
+  raw: {name: "w", main: "m.js", compatibility_date: "2025-01-01"},
+  dependencies: [],
+}) + "\n");
+console.log("after the payload");
+"#;
+        let (dir, _guard) = cf_stub_project(body);
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.name, "w");
+    }
+
+    #[test]
+    fn cf_config_loader_script_missing_fails_closed() {
+        if !require_node("cf_config_loader_script_missing_fails_closed") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("cloudflare.config.ts"),
+            "export default {};\n",
+        )
+        .unwrap();
+        let _guard = EnvVarGuard::set(CF_CONFIG_LOADER_ENV, "/nonexistent/loader.mjs");
+        let err = load_worker_meta(dir.path()).expect_err("must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("VRT_CONFIG_LOADER_FAILED") && msg.contains("VRT_CF_CONFIG_LOADER"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cf_config_takes_precedence_over_wrangler_files() {
+        if !require_node("cf_config_takes_precedence_over_wrangler_files") {
+            return;
+        }
+        let _lock = cf_env_lock();
+        let raw = serde_json::json!({
+            "name": "from-cf",
+            "main": "m.js",
+            "compatibility_date": "2025-01-01"
+        });
+        let (dir, _guard) = cf_stub_project(&raw_ok(&raw));
+        fs::write(
+            dir.path().join("wrangler.json"),
+            r#"{"name":"from-wrangler","main":"m.js","compatibility_date":"2025-01-01"}"#,
+        )
+        .unwrap();
+        let (meta, src) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(src, MetaSource::CfConfig("cloudflare.config.ts".into()));
+        assert_eq!(meta.name, "from-cf");
+    }
+
+    /// Real-fixture test: skipped unless Node is new enough for
+    /// `module.registerHooks` + TS type stripping and the workspace has
+    /// `@cloudflare/config` installed (`pnpm install`). The stub tests
+    /// above cover the wiring everywhere else.
+    #[test]
+    fn cf_config_real_fixture_loads() {
+        let _lock = cf_env_lock();
+        let package = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../node_modules/@cloudflare/config/package.json");
+        let node_version = std::process::Command::new("node")
+            .arg("--version")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok());
+        let node_ok = node_version
+            .as_deref()
+            .map(|v| {
+                let mut parts = v.trim().trim_start_matches('v').split('.');
+                let major = parts
+                    .next()
+                    .and_then(|p| p.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let minor = parts
+                    .next()
+                    .and_then(|p| p.parse::<u32>().ok())
+                    .unwrap_or(0);
+                major > 22 || (major == 22 && minor >= 18)
+            })
+            .unwrap_or(false);
+        if !package.is_file() || !node_ok {
+            eprintln!(
+                "skipping cf_config_real_fixture_loads: @cloudflare/config installed={} node={:?}",
+                package.is_file(),
+                node_version
+            );
+            return;
+        }
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cf-config");
+
+        let (meta, src) = load_worker_meta_for_env(&fixture, Some("staging")).unwrap();
+        assert_eq!(src, MetaSource::CfConfig("cloudflare.config.ts".into()));
+        assert_eq!(meta.name, "cf-config-fixture");
+        // The `cf-worker` entrypoint is a synthetic specifier, so `main`
+        // arrives absolute and is rebased onto the fixture directory.
+        assert_eq!(meta.main_module, "src/index.js");
+        assert_eq!(meta.compatibility_date, "2026-09-17");
+        assert_eq!(meta.vars.get("GREETING").map(String::as_str), Some("hello"));
+        assert_eq!(meta.vars.get("STAGE").map(String::as_str), Some("staging"));
+
+        // Without `--env` the mode is undefined, so the branch is absent.
+        let (meta, _) = load_worker_meta(&fixture).unwrap();
+        assert!(!meta.vars.contains_key("STAGE"));
+
+        // And the whole pipeline packs: the fixture's entrypoint is a plain
+        // `.js` module, so the cf-config worker is deployable as-is.
+        let overrides = crate::worker_pkg::DeployOverrides {
+            name: None,
+            env_name: Some("staging".into()),
+            bindings: Vec::new(),
+            hostnames: Vec::new(),
+            vars: BTreeMap::new(),
+        };
+        let pkg = crate::worker_pkg::pack(&fixture, &overrides, "tenant").unwrap();
+        assert_eq!(pkg.name, "cf-config-fixture");
+        assert_eq!(pkg.compatibility_date, "2026-09-17");
+        assert!(
+            pkg.var_values.values().any(|v| v == "hello"),
+            "text bindings pack as vars"
+        );
+
+        // A project without `@cloudflare/config` installed fails with an
+        // actionable loader error instead of a silent fallback.
+        let bare = tempfile::tempdir().unwrap();
+        fs::write(
+            bare.path().join("cloudflare.config.ts"),
+            "import { defineConfig } from \"@cloudflare/config\";\n\
+             export default defineConfig({ worker: { name: \"w\", compatibilityDate: \"2026-01-01\" } });\n",
+        )
+        .unwrap();
+        let err = load_worker_meta(bare.path()).expect_err("must fail closed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("VRT_CONFIG_LOADER_FAILED") && msg.contains("@cloudflare/config"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn wrangler_config_ts_still_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("wrangler.config.ts"), "export default {}").unwrap();
         let err = load_worker_meta(dir.path()).expect_err("must fail");
         assert!(format!("{err:?}").contains("programmatic config"));
     }
