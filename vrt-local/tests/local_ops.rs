@@ -260,17 +260,18 @@ fn status_pretty_output_worker_id_lookup_is_order_independent() {
         .keys()
         .map(String::as_str)
         .collect();
-    // Alphabetical: `versions` interposes between `name`/`workerId`.
+    // Struct-declaration order (serde_json preserve_order): `versions`
+    // interposes between `name`/`workerId`.
     assert_eq!(
         keys,
         [
-            "activeVersionId",
-            "hostnames",
             "name",
-            "quotas",
-            "quotasEnforced",
+            "workerId",
+            "activeVersionId",
             "versions",
-            "workerId"
+            "hostnames",
+            "quotas",
+            "quotasEnforced"
         ]
     );
 }
@@ -1461,9 +1462,11 @@ fn flagship_bindings_and_flag_store_deploy() {
 }
 
 /// CF `rules`/`base_dir` — a wrangler project carries them into the
-/// pack: globs type gathered files against the `base_dir` root, the
-/// entry is never retyped, and unmatched files keep the extension
-/// table. Deployed end-to-end through `pack_with_resolver`.
+/// pack: globs type additional-module files against the `base_dir`
+/// root, the entry is never retyped. With `find_additional_modules`
+/// the unimported rule-matched files ship as wire modules (the
+/// bundler otherwise only ships what the import graph references —
+/// CF ships nothing else either).
 #[test]
 fn wrangler_rules_classify_pack_modules() {
     let root = root();
@@ -1473,14 +1476,15 @@ fn wrangler_rules_classify_pack_modules() {
     std::fs::write(dir.join("src/readme.md"), "# hi\n").unwrap();
     std::fs::write(dir.join("src/page.html"), "<p/>\n").unwrap();
     std::fs::write(dir.join("src/blob.wasm"), [0u8, 97, 115, 109]).unwrap();
-    // Root-level file: outside the `src/` rule root — no glob sees it
-    // (not even the implicit defaults); the extension table types it.
+    // Root-level file: outside the `src/` rule root — never an
+    // additional-module candidate (CF traverses below `base_dir`).
     std::fs::write(dir.join("notes.txt"), "x\n").unwrap();
     std::fs::write(
         dir.join("wrangler.toml"),
         "name = \"rules-svc\"\nmain = \"src/index.mjs\"\n\
          compatibility_date = \"2025-01-01\"\n\
          base_dir = \"src\"\n\
+         find_additional_modules = true\n\
          rules = [{type = \"Text\", globs = [\"**/*.md\"], fallthrough = true},\n\
          {type = \"Data\", globs = [\"*.wasm\"]}]\n",
     )
@@ -1489,31 +1493,28 @@ fn wrangler_rules_classify_pack_modules() {
     let pkg = vrt_local::pack_with_resolver(&dir, &DeployOverrides::default(), "local", &|_| None)
         .unwrap();
     let doc: serde_json::Value = serde_json::from_slice(&pkg.stored_document).unwrap();
-    let ty_of = |name: &str| -> String {
+    let ty_of = |name: &str| -> Option<String> {
         doc["modules"]
             .as_array()
             .unwrap()
             .iter()
             .find(|m| m["name"] == name)
-            .unwrap_or_else(|| panic!("module {name} missing"))["type"]
-            .as_str()
-            .unwrap()
-            .to_string()
+            .map(|m| m["type"].as_str().unwrap().to_string())
     };
     // `readme.md` → user Text rule; `blob.wasm` → user Data rule
     // (first match wins over the implicit CompiledWasm default);
     // entry stays esModule despite the `*.wasm` glob.
-    assert_eq!(ty_of("src/readme.md"), "text");
+    assert_eq!(ty_of("src/readme.md").as_deref(), Some("text"));
     assert_eq!(
-        ty_of("src/blob.wasm"),
-        "data",
+        ty_of("src/blob.wasm").as_deref(),
+        Some("data"),
         "user Data rule shadows the implicit CompiledWasm default"
     );
-    assert_eq!(ty_of("src/index.mjs"), "esModule");
+    assert_eq!(ty_of("src/index.mjs").as_deref(), Some("esModule"));
     // `page.html` inside `src/` hits the implicit Text default (kept
     // alive by the user's `fallthrough = true`).
-    assert_eq!(ty_of("src/page.html"), "text");
-    // `notes.txt` sits outside `src/` — rule-invisible, typed by the
-    // extension table like before.
-    assert_eq!(ty_of("notes.txt"), "text");
+    assert_eq!(ty_of("src/page.html").as_deref(), Some("text"));
+    // `notes.txt` sits outside `src/` — no rule sees it, so it is not
+    // an additional module either (CF ships nothing under it).
+    assert_eq!(ty_of("notes.txt"), None);
 }

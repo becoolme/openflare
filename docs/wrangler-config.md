@@ -90,6 +90,12 @@ environment blocks.
 | `env` | supported — environment blocks resolved before normalization | `project_cfg.rs:1349`, env resolution earlier in the file |
 | `rules` | supported — ordered `{ type, globs, fallthrough? }` module-typing rules (wrangler `Rule` shape, `additionalProperties: false`). Types: `ESModule`, `CommonJS`, `CompiledWasm`, `Text`, `Data`; `PythonModule`/`PythonRequirement` fail closed (no Python runtime). At pack time every gathered file under the rule root evaluates rules in order — user rules first, then the wrangler built-ins (`Text: **/*.txt,html,sql`, `Data: **/*.bin`, `CompiledWasm: **/*.wasm[?module]`), then the extension fallback; a matched non-`fallthrough` rule prunes every LATER rule of the same type (wrangler `parseRules`). The entrypoint is never retyped by a rule | `project_cfg.rs` `normalize_module_rules`; `worker_pkg.rs` `effective_module_rules` |
 | `base_dir` | supported — the directory rule globs evaluate against (wrangler `moduleRoot`; default = the `main` directory). Files outside the root are not rule candidates and keep extension-fallback typing. Must be a clean relative dir inside the project (no absolute/traversal/`\\`/`:`) | `project_cfg.rs` `validate_base_dir`; `worker_pkg.rs` `module_root` |
+| `no_bundle` | supported — `false` (default) bundles `main` + its import graph into one esModule via rolldown (the Rust bundler behind rolldown-vite), matching wrangler's esbuild step: `cloudflare:*`/`node:*` specifiers, bare Node builtins under `nodejs_compat`, and rule-typed files stay external and ship as wire modules; dynamic `import()` code-splits into lazily loaded esModule chunks. `true` keeps the directory-scan module table (wrangler's unbundled upload shape) | `project_cfg.rs`; `bundle.rs`; `worker_pkg.rs` `gather_bundled` |
+| `find_additional_modules` | supported — when bundling, unimported files matching `rules` under `base_dir` also ship as wire modules (CF default: `true` under `no_bundle`, `false` otherwise; here it must be explicit when bundling is on) | `project_cfg.rs`; `worker_pkg.rs` `gather_bundled` |
+| `minify` | supported — forwarded to the bundler's minifier | `bundle.rs` |
+| `keep_names` | supported — forwarded to the bundler (default `true`, like wrangler) | `bundle.rs` |
+| `define` | supported — `{ IDENT: "<js expression>" }` identifier replacement at bundle time; values are code snippets, never secrets | `project_cfg.rs`; `bundle.rs` |
+| `jsx_factory`, `jsx_fragment` | supported — classic JSX pragma forwarded to the transform (wrangler/esbuild semantics; without them the transform keeps automatic-runtime JSX) | `bundle.rs` |
 
 ## Accepted and ignored
 
@@ -97,16 +103,13 @@ Mirrors wrangler's own ignore list — present keys do not fail the deploy
 but change nothing (`IGNORED_TOP_LEVEL`, `project_cfg.rs:31–57`):
 
 `account_id`, `workers_dev`, `send_metrics`, `keep_vars`, `build`,
-`alias`, `tsconfig`, `jsx_factory`, `jsx_fragment`,
-`no_bundle`, `minify`, `keep_names`, `find_additional_modules`,
-`preserve_file_names`, `define`, `upload_source_maps`,
+`alias`, `tsconfig`, `preserve_file_names`, `upload_source_maps`,
 `cwd`, `config`, `placement`.
 
-`no_bundle`/`find_additional_modules`/`preserve_file_names` stay ignored
-deliberately: the standalone pack ships the module table unbundled
-already, so there is no bundler for those knobs to steer — `rules` only
-chooses each module's uploaded type here, matching what wrangler's
-`--no-bundle` path does with them.
+`preserve_file_names` stays ignored deliberately: wire modules keep
+deterministic project-relative names — there is no content-hash naming
+step for the knob to steer. `tsconfig` is accepted but not yet wired
+into the bundler's transform.
 
 Also type-checked then dropped inside supported blocks:
 

@@ -38,20 +38,11 @@ const IGNORED_TOP_LEVEL: &[&str] = &[
     "build",
     "alias",
     "tsconfig",
-    "jsx_factory",
-    "jsx_fragment",
-    // `no_bundle`/`find_additional_modules`/`preserve_file_names` are
-    // wrangler bundler knobs: the VRT pack always ships the project
-    // module table unbundled (CF `no_bundle` + additional-modules
-    // semantics already), so they are accepted and ignored —
-    // `rules`/`base_dir` DO carry over (module typing + rule-eval
-    // root) and are normalized below.
-    "no_bundle",
-    "minify",
-    "keep_names",
-    "find_additional_modules",
+    // `preserve_file_names`/`upload_source_maps` are upload-detail
+    // knobs: additional modules keep their project-relative names in
+    // the wire table (deterministic, content-addressed already) and
+    // the bundler emits no sourcemaps — accepted and ignored.
     "preserve_file_names",
-    "define",
     "upload_source_maps",
     "cwd",
     "config",
@@ -511,6 +502,10 @@ fn req_str<'a>(v: &'a Value, field: &str) -> Result<&'a str, ProjectConfigError>
         None => Err(invalid(field, "must be a non-empty string")),
     }
 }
+fn req_bool(v: &Value, field: &str) -> Result<bool, ProjectConfigError> {
+    v.as_bool()
+        .ok_or_else(|| invalid(field, "must be a boolean"))
+}
 fn opt_str<'a>(v: Option<&'a Value>, field: &str) -> Result<Option<&'a str>, ProjectConfigError> {
     match v {
         None | Some(Value::Null) => Ok(None),
@@ -752,6 +747,10 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
     let mut custom_domains: Vec<String> = Vec::new();
     let mut routes_seen = false;
     let mut route_seen = false;
+    // Wrangler bundler knobs fold into one normalized `bundle` doc —
+    // wrangler's default is bundling ON (`no_bundle` absent), so the
+    // doc is always emitted for wrangler sources.
+    let mut bundle: Map<String, Value> = Map::new();
 
     for (key, value) in obj {
         match key.as_str() {
@@ -2281,6 +2280,68 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                     out.insert("tailConsumers".into(), Value::Array(out_arr));
                 }
             }
+            // Wrangler build-step knobs → one `bundle` doc. Semantics
+            // per CF docs: `no_bundle` flips `enabled` off; the rest
+            // pass through to the rolldown step at pack time.
+            "no_bundle" => {
+                bundle.insert(
+                    "enabled".into(),
+                    Value::Bool(!req_bool(value, "no_bundle")?),
+                );
+            }
+            "find_additional_modules" => {
+                bundle.insert(
+                    "findAdditionalModules".into(),
+                    Value::Bool(req_bool(value, "find_additional_modules")?),
+                );
+            }
+            "minify" => {
+                bundle.insert("minify".into(), Value::Bool(req_bool(value, "minify")?));
+            }
+            "keep_names" => {
+                bundle.insert(
+                    "keepNames".into(),
+                    Value::Bool(req_bool(value, "keep_names")?),
+                );
+            }
+            "jsx_factory" => {
+                bundle.insert(
+                    "jsxFactory".into(),
+                    Value::from(req_str(value, "jsx_factory")?),
+                );
+            }
+            "jsx_fragment" => {
+                bundle.insert(
+                    "jsxFragment".into(),
+                    Value::from(req_str(value, "jsx_fragment")?),
+                );
+            }
+            // CF `define` — `{IDENT: "<js expression>"}` identifier
+            // replacement at bundle time. Values are code snippets
+            // (`"\"production\""`, `"42"`), never secrets.
+            "define" => {
+                let defs = value
+                    .as_object()
+                    .ok_or_else(|| invalid("define", "must be a table of name → value"))?;
+                if defs.len() > 64 {
+                    return Err(invalid("define", "must declare at most 64 entries"));
+                }
+                let mut out_defs = Map::new();
+                for (k, v) in defs {
+                    if k.is_empty()
+                        || k.len() > 256
+                        || !k.bytes().all(|b| b.is_ascii() && b != b'\0')
+                    {
+                        return Err(invalid("define", "invalid identifier"));
+                    }
+                    let s = req_str(v, &format!("define.{k}"))?;
+                    if s.len() > 8192 {
+                        return Err(invalid("define", "value too long"));
+                    }
+                    out_defs.insert(k.clone(), Value::from(s));
+                }
+                bundle.insert("define".into(), Value::Object(out_defs));
+            }
             "rules" => {
                 out.insert("moduleRules".into(), normalize_module_rules(value)?);
             }
@@ -2336,6 +2397,14 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
         // vrtHostname claim + async verify), unlike `routeHostnames`
         // which must name already-claimed hostnames.
         out.insert("customDomains".into(), Value::Array(dedup));
+    }
+    // `bundle` materializes only when the config declares a bundler
+    // knob (`no_bundle`, `minify`, …) — the normalized doc then stays
+    // field-for-field identical to the TypeScript normalizer. The
+    // bundle-by-default decision lives with the meta SOURCE at pack:
+    // wrangler → on, vrt.toml → off (`no_bundle` flips it explicitly).
+    if !bundle.is_empty() {
+        out.insert("bundle".into(), Value::Object(bundle));
     }
     Ok(Value::Object(out))
 }
@@ -2623,6 +2692,10 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
     if let Some(v) = obj.get("dev") {
         wire.insert("dev".into(), v.clone());
     }
+    // `bundle` — bundler knobs, consumed by `gather_bundled` at pack.
+    if let Some(v) = obj.get("bundle") {
+        wire.insert("bundle".into(), v.clone());
+    }
     // `rules`/`base_dir` — module-typing rules + the rule-eval root,
     // consumed by `build_pack_json` (already shape-proven above).
     if let Some(v) = obj.get("moduleRules") {
@@ -2749,6 +2822,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         "dev",
         "moduleRules",
         "baseDir",
+        "bundle",
         "bindings",
     ];
     // Normalized-internal keys that legitimately do not carry to the

@@ -36,8 +36,9 @@
 //! published revision (envelope unwritten) or an orphan artifact —
 //! never a half-state desired document.
 
-mod desired;
+mod bundle;
 pub mod check;
+mod desired;
 pub mod dev;
 pub mod devvars;
 pub mod doctor;
