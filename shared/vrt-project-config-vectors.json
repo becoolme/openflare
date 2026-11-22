@@ -1123,6 +1123,145 @@
      "compatibilityDate": "2025-01-01"
     }
    }
+  },
+  {
+   "name": "documented ignore-list entries are dropped",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\naccount_id = \"cf-acct\"\nworkers_dev = true\nkeep_vars = true\nsend_metrics = false\n\n[build]\ncommand = \"npm run build\"\n\n[dev]\nport = 8787\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "schemaVersion": 1,
+     "name": "svc",
+     "main": "src/index.ts",
+     "compatibilityDate": "2025-01-01"
+    }
+   }
+  },
+  {
+   "name": "observability gates and head sampling normalize to effective config",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability]\nenabled = true\nhead_sampling_rate = 0.3\n\n[observability.logs]\ninvocation_logs = false\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "observability": {
+      "enabled": true,
+      "logsEnabled": true,
+      "invocationLogs": false,
+      "headSamplingRatePpm": 300000
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "observability logs.head_sampling_rate wins over absent alias; unsupported keys fail",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability.logs]\nenabled = false\nhead_sampling_rate = 0.5\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "observability": {
+      "enabled": true,
+      "logsEnabled": false,
+      "invocationLogs": true,
+      "headSamplingRatePpm": 500000
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "observability.traces has no counterpart and fails closed",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability.traces]\nenabled = true\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "observability.traces"
+   }
+  },
+  {
+   "name": "observability logs rate wins over top-level alias",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability]\nhead_sampling_rate = 0.5\n\n[observability.logs]\nhead_sampling_rate = 0.25\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "observability": {
+      "enabled": true,
+      "logsEnabled": true,
+      "invocationLogs": true,
+      "headSamplingRatePpm": 250000
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "env inherits top-level observability table",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability]\nenabled = false\n\n[env.production]\ncompatibility_date = \"2025-06-01\"\n"
+   },
+   "envName": "production",
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-06-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "observability": {
+      "enabled": false,
+      "logsEnabled": true,
+      "invocationLogs": true,
+      "headSamplingRatePpm": 1000000
+     },
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "env observability deep-merges inherited gates",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[observability]\nenabled = false\n\n[observability.logs]\ninvocation_logs = false\n\n[env.production.observability]\nhead_sampling_rate = 0.25\n"
+   },
+   "envName": "production",
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "observability": {
+      "enabled": false,
+      "logsEnabled": true,
+      "invocationLogs": false,
+      "headSamplingRatePpm": 250000
+     },
+     "schemaVersion": 1
+    }
+   }
   }
  ]
 }

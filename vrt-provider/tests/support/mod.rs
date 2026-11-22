@@ -111,6 +111,7 @@ pub fn worker(
         durable_object_classes: vec![],
         workflows: vec![],
         tail_consumers: vec![],
+        observability: None,
         quotas: quotas(),
     }
 }
