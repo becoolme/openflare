@@ -16,6 +16,7 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | --- | --- | --- |
 | Workers modules / service-worker syntax | workerd | runs the real workerd `worker` definition |
 | Compatibility dates & flags | workerd | `compatibility_date`, `compatibility_flags` pass through to workerd; generated flags are checked against the pinned binary in CI |
+| Programmatic `cloudflare.config.ts` / `.js` | Partial | evaluated by Node via `@cloudflare/config`, then normalized like a wrangler file — [wrangler-config.md](wrangler-config.md) |
 | KV | Drop-in | [bindings/kv.md](bindings/kv.md) |
 | R2 | Partial | [bindings/r2.md](bindings/r2.md) |
 | D1 | Partial | [bindings/d1.md](bindings/d1.md) |
@@ -137,6 +138,20 @@ These are not tied to one binding.
   `custom_domain` entries (`{ pattern = "host", custom_domain = true }` —
   the bare hostname attaches to the worker; `enabled = false` disables).
   Wildcard custom domains and zone management are not carried.
+- **Programmatic `cloudflare.config.ts` / `.js`** is evaluated by Node
+  through Cloudflare's official `@cloudflare/config` loader: the `cf`
+  format is converted to wrangler keys and then follows the normal table
+  exactly (no second mapping). Requirements and limits: Node >= 22.15
+  with `module.registerHooks` must be installed, and the project must
+  resolve `@cloudflare/config`; `--env` is the config's evaluation
+  `mode` (the format has no `[env.*]` blocks and no `[dev]` table); the
+  loader is a *restricted* child process (fixed cwd, cleared env
+  allowlist, 60 s deadline, capped stdout/stderr) but **not a sandbox** —
+  a config file is arbitrary Node code with the invoking user's
+  filesystem and network access. `cf-worker` entrypoints are never
+  executed by the loader, but `vrt` still ships projects unbundled, so a
+  TypeScript worker entrypoint must be pre-built to JS. `wrangler.config.*`
+  is not evaluated. [`docs/wrangler-config.md`](wrangler-config.md)
 
 ## Unsupported bindings
 
@@ -160,6 +175,12 @@ All deploy-time rejections are typed (`vrt-local/src/project_cfg.rs`):
 
 - `VRT_CONFIG_INVALID` — a supported key with a malformed value.
 - `VRT_CONFIG_UNSUPPORTED_FIELD` — a key OpenFlare does not implement.
+- `VRT_CONFIG_LOADER_FAILED` — the Node helper for
+  `cloudflare.config.*` could not run, exited non-zero for a reason other
+  than a config-parse rejection, or printed an unusable document.
+- `VRT_CONFIG_LOADER_TIMEOUT` — evaluating a `cloudflare.config.*`
+  exceeded the child-process deadline (`VRT_CF_CONFIG_LOADER_TIMEOUT_MS`,
+  default 60 s).
 - `VRT_CONFIG_IO`, `VRT_CONFIG_PARSE`, `VRT_CONFIG_ENV` — file and
   environment resolution failures.
 
@@ -168,6 +189,12 @@ Runtime failures visible at ingress carry platform codes documented in
 
 ## Changelog
 
+- 2026-11-22: `cloudflare.config.ts` / `.js` (the `cf` CLI programmatic
+  format) is evaluated through Cloudflare's `@cloudflare/config` loader
+  and normalized by the same wrangler path; `--env` maps to the loader
+  `mode`, `cf-worker` entrypoints are rebased, and the helper is a
+  restricted (not sandboxed) Node child process. Loader failures surface
+  as `VRT_CONFIG_LOADER_FAILED` / `VRT_CONFIG_LOADER_TIMEOUT`.
 - 2026-11-21: Tail Workers (`tail_consumers`) are supported as native
   workerd `tails` designators; `streaming_tail_consumers` render as
   `streamingTails` designators delivering `tailStream()` events. User
