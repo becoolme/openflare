@@ -33,7 +33,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub r2: Option<FsR2Config>,
     /// T21: content-addressed assets store shared with the host
-    /// materializer / `vrt deploy`. Absent → asset fetches fail
+    /// materializer / `of deploy`. Absent → asset fetches fail
     /// closed (`ASSET_STORAGE_UNAVAILABLE`), bindings still authorize.
     #[serde(default)]
     pub assets: Option<FsAssetsConfig>,
@@ -57,7 +57,7 @@ pub struct ProviderConfig {
     /// delivery). Ignored when `cursor_secret_file` is set.
     #[serde(default = "default_cursor_secret_env")]
     pub cursor_secret_env: String,
-    /// T25/L8: file holding the list-cursor HMAC secret — `vrt init`
+    /// T25/L8: file holding the list-cursor HMAC secret — `of init`
     /// writes `keys/cursor.secret` (0600). When set, this file is the
     /// ONLY accepted secret source: mode must be 0600, content
     /// non-empty (≤4 KiB). Missing/insecure → fail closed.

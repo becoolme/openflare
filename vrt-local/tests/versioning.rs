@@ -271,7 +271,7 @@ fn cli_preview_promote_and_versions_list() {
     let root = root();
     let _local = init(&root);
     let dir = worker_dir(&root, "cli", "export default {cli: true}\n");
-    let exe = env!("CARGO_BIN_EXE_vrt");
+    let exe = env!("CARGO_BIN_EXE_of");
 
     let out = Command::new(exe)
         .arg("deploy")

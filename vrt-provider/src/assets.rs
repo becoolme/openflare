@@ -1,5 +1,5 @@
 //! Static-assets data plane (T21): content-addressed, tenant-scoped
-//! store shared with `vrt-host`/`vrt deploy`, plus the
+//! store shared with `vrt-host`/`of deploy`, plus the
 //! `POST /internal/assets/v1/fetch` resolver.
 //!
 //! Layout under `root`:
@@ -17,7 +17,7 @@
 //! `ASSET_STORAGE_UNAVAILABLE` instead of serving wrong bytes.
 //!
 //! Manifest document (produced by the platform upload API or
-//! `vrt deploy --assets`; canonical JSON — sorted keys):
+//! `of deploy --assets`; canonical JSON — sorted keys):
 //!
 //! ```json
 //! {"schemaVersion":1,

@@ -2,7 +2,7 @@
 //!
 //! One binary: `init`, `serve`, and the day-2 ops (`deploy`,
 //! `rollback`, `hostnames`, `secret`, `status`, `versions`, `renew`).
-//! Ops talk to `vrt serve` over the management unix socket when it is
+//! Ops talk to `of serve` over the management unix socket when it is
 //! live; with serve down they open the root directly (the writer lock
 //! serializes against a running serve). Secret values come from stdin
 //! only — never argv (shell history / ps).
@@ -19,43 +19,44 @@ use vrt_local::{InitParams, LocalError, VrtLocal};
 const DEV_ALLOW_SAME_DEVICE_DURABILITY: &str = "--dev-allow-same-device-durability";
 
 const USAGE: &str = "\
-vrt — standalone Vibeploy Workers runtime control plane
+of — standalone Vibeploy Workers runtime control plane
 
 USAGE:
-  vrt init --root <dir> --cell <id> --tenant <id> [--mode capnp|stub]
+  of init --root <dir> --cell <id> --tenant <id> [--mode capnp|stub]
            [--facade-dist <dir>] [--workerd <path>] [--ingress-listen <addr>]
            [--dev-allow-same-device-durability]
-  vrt serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
+  of serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
            [--vrt-sql-bin <p>] [--mgmt-tcp-listen <addr> --mgmt-tcp-token-file <p>]
-  vrt dev [<worker_dir>] [--env <name>] [--listen <addr>] [--no-watch] [--no-color] [--no-logs]
+  of dev [<worker_dir>] [--env <name>] [--listen <addr>] [--no-watch] [--no-color] [--no-logs]
            [--workerd <p>] [--stub] [--allow-unpinned-workerd]
            [--vrt-host-bin <p>] [--vrt-provider-bin <p>] [--vrt-sql-bin <p>]
            [--facade-dist <dir>]
-  vrt deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--tag <t>] [--preview] [--dry-run] <worker_dir>
-  vrt deploy --url <http://host:port> --token-file <p> [same options] <worker_dir>
-  vrt promote --root <dir> [--worker <name|workerId>] <version_id>
-  vrt logs --root <dir> <worker> [--follow] [--since <dur>] [--level <lvl>] [--json]
-  vrt doctor [--root <dir>] [--env <name>] [--json] [--strict]
-  vrt rollback --root <dir> <worker> <version_id>
-  vrt hostnames add --root <dir> <worker> <hostname>
-  vrt hostnames rm  --root <dir> <worker> <hostname>
-  vrt hostnames ls  --root <dir> <worker>
-  vrt secret put --root <dir> <secret_ref>        (value on stdin)
-  vrt secret rm  --root <dir> <secret_ref>
-  vrt secret ls  --root <dir>
-  vrt status  --root <dir>
-  vrt versions --root <dir> <worker>
-  vrt versions list --root <dir> <worker>
-  vrt renew   --root <dir>
-  vrt key     --root <dir>                        (print trusted public key)
-  vrt health  --root <dir>                        (mgmt /healthz → exit code)
-  vrt probe   --url <http://host:port/path> | --file <path>
-  vrt do-snapshot --root <dir> --worker <name> --class <uniqueKey> --tenant <id>
-  vrt do-migrate  --root <dir> --worker <name> --class <uniqueKey> --tenant <id> --target-epoch <n>
-  vrt worker-id --root <dir> <name|workerId>      (print workerId, one line)
-  vrt do-key    --root <dir> <name|workerId> <className>  (print class uniqueKey)
-  vrt workflows --root <dir> <name|workerId>      (print declared workflows JSON)
-  vrt wfop --root <dir> --worker <name|id> --workflow <name> --op <create|get|action|delete|sendEvent>
+  of deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--tag <t>] [--preview] [--dry-run] <worker_dir>
+  of deploy --url <http://host:port> --token-file <p> [same options] <worker_dir>
+  of check [--env <name>] [--var K:V]… [--tag <t>] <worker_dir>
+  of promote --root <dir> [--worker <name|workerId>] <version_id>
+  of logs --root <dir> <worker> [--follow] [--since <dur>] [--level <lvl>] [--json]
+  of doctor [--root <dir>] [--env <name>] [--json] [--strict]
+  of rollback --root <dir> <worker> <version_id>
+  of hostnames add --root <dir> <worker> <hostname>
+  of hostnames rm  --root <dir> <worker> <hostname>
+  of hostnames ls  --root <dir> <worker>
+  of secret put --root <dir> <secret_ref>        (value on stdin)
+  of secret rm  --root <dir> <secret_ref>
+  of secret ls  --root <dir>
+  of status  --root <dir>
+  of versions --root <dir> <worker>
+  of versions list --root <dir> <worker>
+  of renew   --root <dir>
+  of key     --root <dir>                        (print trusted public key)
+  of health  --root <dir>                        (mgmt /healthz → exit code)
+  of probe   --url <http://host:port/path> | --file <path>
+  of do-snapshot --root <dir> --worker <name> --class <uniqueKey> --tenant <id>
+  of do-migrate  --root <dir> --worker <name> --class <uniqueKey> --tenant <id> --target-epoch <n>
+  of worker-id --root <dir> <name|workerId>      (print workerId, one line)
+  of do-key    --root <dir> <name|workerId> <className>  (print class uniqueKey)
+  of workflows --root <dir> <name|workerId>      (print declared workflows JSON)
+  of wfop --root <dir> --worker <name|id> --workflow <name> --op <create|get|action|delete|sendEvent>
             [--instance <id>] [--action <pause|resume|restart|terminate>]
             [--params <json>] [--event-type <t>] [--payload <json>] [--tenant <id>]
 ";
@@ -75,7 +76,7 @@ async fn main() -> ExitCode {
     match run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("vrt: {e}");
+            eprintln!("of: {e}");
             ExitCode::FAILURE
         }
     }
@@ -136,10 +137,19 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         return Err("missing command".into());
     };
     match cmd {
+        "--version" | "-V" | "version" => {
+            // `OF_RELEASE_TAG` is stamped at release-build time by
+            // .github/workflows/release.yml; source builds fall back
+            // to the crate version.
+            let tag = option_env!("OF_RELEASE_TAG").unwrap_or(env!("CARGO_PKG_VERSION"));
+            println!("of {tag}");
+            Ok(())
+        }
         "init" => cmd_init(&args[1..]),
         "serve" => cmd_serve(&args[1..]).await,
         "dev" => cmd_dev(&args[1..]).await,
         "deploy" => cmd_deploy(&args[1..]),
+        "check" => cmd_check(&args[1..]),
         "logs" => cmd_logs(&args[1..]),
         "doctor" => cmd_doctor(&args[1..]),
         "rollback" => {
@@ -229,7 +239,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         // P3c-2-r2: read-only identity queries — single-line stdout so
-        // scripts never grep `vrt status` JSON positionally (pretty
+        // scripts never grep `of status` JSON positionally (pretty
         // output sorts keys alphabetically; `name` and `workerId` are
         // NOT adjacent → the old shell grep silently no-matched and
         // `set -e` killed the e2e with no diagnostic).
@@ -332,7 +342,7 @@ async fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 /// Open the root and run one library op. The writer lock inside every
-/// op serializes against a live `vrt serve` — same code path as the
+/// op serializes against a live `of serve` — same code path as the
 /// management API.
 fn direct<T, F>(root: &Path, f: F) -> Result<T, String>
 where
@@ -342,7 +352,7 @@ where
     f(&l).map_err(|e| e.to_string())
 }
 
-/// `vrt health` — management /healthz over the unix socket; exit 0
+/// `of health` — management /healthz over the unix socket; exit 0
 /// iff the control plane reports healthy. Compose healthcheck.
 fn cmd_health(root: &Path) -> Result<(), String> {
     let sock = vrt_local::mgmt::socket_path(root);
@@ -358,7 +368,7 @@ fn cmd_health(root: &Path) -> Result<(), String> {
     }
 }
 
-/// `vrt metrics` — Prometheus text off the mgmt socket (queue
+/// `of metrics` — Prometheus text off the mgmt socket (queue
 /// dispatcher + renewal counters; empty registry while serve is down).
 fn cmd_metrics(root: &Path) -> Result<(), String> {
     let sock = vrt_local::mgmt::socket_path(root);
@@ -374,7 +384,7 @@ fn cmd_metrics(root: &Path) -> Result<(), String> {
     }
 }
 
-/// `vrt queue-metrics` — signed `GET /queues/{id}/metrics` on vrt-sql
+/// `of queue-metrics` — signed `GET /queues/{id}/metrics` on vrt-sql
 /// via the provider's [vrtSql] channel (same auth model as the
 /// dispatcher). Prints the raw JSON body — backlog split into
 /// visible/inFlight/delayed/dead for queue-stall diagnosis.
@@ -444,9 +454,9 @@ fn cmd_queue_metrics(root: &Path, queue_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `vrt probe` — liveness for processes without an HTTP endpoint
+/// `of probe` — liveness for processes without an HTTP endpoint
 /// (`--file`: exists + non-empty) or with one (`--url`: 2xx).
-/// W3: `vrt wfop` — operator bridge into the platform wfops channel.
+/// W3: `of wfop` — operator bridge into the platform wfops channel.
 ///
 /// Resolves the real workerId from LOCAL state and verifies the
 /// workflow is declared (local check only), then POSTs `/v1/wfops`
@@ -1021,7 +1031,7 @@ fn mgmt_tcp(args: &[String]) -> Result<Option<vrt_local::serve::MgmtTcpOptions>,
     }))
 }
 
-/// `vrt doctor` — diagnostics. Human output prints one line per
+/// `of doctor` — diagnostics. Human output prints one line per
 /// check (`[status] id — detail` + hint); `--json` emits the stable
 /// `{root, ok, checks[]}` report. Exit non-zero on any fail, and on
 /// any action under --strict.
@@ -1054,7 +1064,7 @@ fn cmd_doctor(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// `vrt logs` — read-only tail of the host log hub for ONE worker
+/// `of logs` — read-only tail of the host log hub for ONE worker
 /// (name or workerId). The cursor lives on the wire as
 /// `(bootId, nextSeq)`; `--follow` polls until Ctrl+C.
 fn cmd_logs(args: &[String]) -> Result<(), String> {
@@ -1097,9 +1107,34 @@ fn cmd_logs(args: &[String]) -> Result<(), String> {
     vrt_local::logtail::logs_run(&mut out, &base, &worker_id, &opts).map_err(|e| e.to_string())
 }
 
-/// `vrt deploy` — two modes:
-///   local   `vrt deploy --root <dir> <worker_dir>` (unchanged)
-///   remote  `vrt deploy --url <http://host:port> --token-file <p>
+/// `of check [--env <name>] [--var K:V]… [--tag <t>] <worker_dir>` —
+/// offline "can this deploy" gate: same normalization/pack/desired
+/// validation a real deploy runs, nothing written, no state needed.
+/// Exit 0 + JSON report on pass; typed error on any deploy-blocking
+/// violation. Unverifiable-offline checks (service-binding targets,
+/// secret values, cell capabilities) stay server-side.
+fn cmd_check(args: &[String]) -> Result<(), String> {
+    use vrt_local::worker_pkg::DeployOverrides;
+    let pos = positional(args);
+    let dir = pos.first().ok_or("worker_dir required")?;
+    let overrides = DeployOverrides {
+        env_name: arg(args, "--env").map(String::from),
+        vars: collect_vars(args)?,
+        tag: arg(args, "--tag").map(String::from),
+        ..Default::default()
+    };
+    let report = vrt_local::check::check_worker(Path::new(dir), &overrides)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// `of deploy` — two modes:
+///   local   `of deploy --root <dir> <worker_dir>` (unchanged)
+///   remote  `of deploy --url <http://host:port> --token-file <p>
 ///            [--secrets-file <path|->] [--var KEY:VALUE]…
 ///            [--name <n>] [--dry-run] <worker_dir>`
 /// Secrets never appear in argv, logs, or error text.
@@ -1122,7 +1157,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
         // Secret values are tenant-level, not versioned: applying them
         // during a preview would change the currently serving version.
         return Err(
-            "--preview cannot apply secret values (use `vrt secret put` or a normal deploy)".into(),
+            "--preview cannot apply secret values (use `of secret put` or a normal deploy)".into(),
         );
     }
     if arg(args, "--url").is_some() && arg(args, "--root").is_some() {
@@ -1342,7 +1377,7 @@ async fn cmd_serve(args: &[String]) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// `vrt dev` — one-command local development: init `.vrt/`, supervise
+/// `of dev` — one-command local development: init `.vrt/`, supervise
 /// host/provider/sql, deploy, watch, redeploy. See `vrt_local::dev`.
 async fn cmd_dev(args: &[String]) -> Result<(), String> {
     let pos = positional(args);
@@ -1472,7 +1507,7 @@ async fn cmd_secret(args: &[String]) -> Result<(), String> {
     }
 }
 
-/// P3c-2: `vrt do-snapshot|do-migrate` — standalone admin triggers
+/// P3c-2: `of do-snapshot|do-migrate` — standalone admin triggers
 /// for the DO placement/snapshot/migration control endpoints on the
 /// vrt-host loopback control listener (same trust model as cron:
 /// loopback-only listener; idempotency header mirrors the body's

@@ -273,7 +273,7 @@ fn wrangler_and_vrt_toml_produce_identical_records() {
 fn standalone_example_dir_deploys_and_queries_workflow() {
     // The real e2e fixture — wrangler.toml `[[workflows]]` must reach
     // the deploy record through the full chain (previously dropped
-    // at the wire projection → `vrt workflows` returned []).
+    // at the wire projection → `of workflows` returned []).
     let example = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../deploy/standalone/examples/standalone-workflow");
     let example = if example.exists() {

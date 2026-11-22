@@ -1,4 +1,4 @@
-//! `vrt dev` — one-command local development.
+//! `of dev` — one-command local development.
 //!
 //! Runs the full standalone stack (vrt-local control plane + vrt-host
 //! + vrt-provider + vrt-sql) against `<worker_dir>/.vrt` and serves
@@ -39,7 +39,7 @@ const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 /// workerd against it unless `--allow-unpinned-workerd` is passed.
 pub(crate) const WORKERD_LOCK: &str = include_str!("../../deploy/docker/workerd.lock");
 
-/// `vrt dev` options.
+/// `of dev` options.
 #[derive(Debug, Default)]
 pub struct DevOptions {
     /// Project directory holding vrt.toml / wrangler config + modules.
@@ -87,7 +87,7 @@ struct DevRuntime {
     pinned: bool,
 }
 
-/// What the running session looks like — printed by `vrt dev` and
+/// What the running session looks like — printed by `of dev` and
 /// asserted on by tests.
 #[derive(Debug)]
 pub struct DevSummary {
@@ -111,7 +111,7 @@ pub struct DevSummary {
     pub runtime: String,
 }
 
-/// A live `vrt dev` session. Dropping without `shutdown` still stops
+/// A live `of dev` session. Dropping without `shutdown` still stops
 /// children — the serve task owns kill-on-drop supervision.
 pub struct DevSession {
     /// The printed summary (url, bindings, ready timing).
@@ -136,7 +136,7 @@ impl DevSession {
     }
 }
 
-/// `vrt dev` entry: start, print the summary, wait for shutdown.
+/// `of dev` entry: start, print the summary, wait for shutdown.
 pub async fn run(opts: DevOptions) -> Result<DevSession, LocalError> {
     start(opts).await
 }
@@ -803,7 +803,7 @@ impl DevPorts {
         if !listen_addr.ip().is_loopback() {
             return Err(LocalError::Op(
                 "dev",
-                "vrt dev binds loopback only — use 127.0.0.1:<port>".into(),
+                "of dev binds loopback only — use 127.0.0.1:<port>".into(),
             ));
         }
         let probe = std::net::TcpListener::bind(listen_addr)
@@ -830,7 +830,7 @@ fn ephemeral_addr() -> Result<String, LocalError> {
         .to_string())
 }
 
-/// Render dev configs from the SAME standalone templates `vrt init`
+/// Render dev configs from the SAME standalone templates `of init`
 /// uses, with dev-only deltas: catch-all ingress routing, ephemeral
 /// internal listeners, and stub render mode when applicable.
 fn write_dev_configs(
@@ -869,7 +869,7 @@ fn write_dev_configs(
     // Dev-only: any Host routes to the single deployed worker.
     host = host.replacen(
         "[ingress]\n",
-        "[ingress]\n# `vrt dev` only — never set in production.\ndevCatchAll = true\n",
+        "[ingress]\n# `of dev` only — never set in production.\ndevCatchAll = true\n",
         1,
     );
     let provider = PROVIDER_T

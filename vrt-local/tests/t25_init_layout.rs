@@ -439,7 +439,7 @@ fn init_without_facade_still_publishes_envelope() {
 
 #[test]
 fn generated_config_paths_all_exist() {
-    // L4/L6 cross-check: after `vrt init --facade-dist <repo>/facade`,
+    // L4/L6 cross-check: after `of init --facade-dist <repo>/facade`,
     // every file/dir the rendered host+provider configs name must
     // exist inside the root. This is the exact contract that B8 broke
     // (facadeManifest pointed at a file init never wrote).

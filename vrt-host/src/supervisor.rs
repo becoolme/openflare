@@ -3278,7 +3278,7 @@ impl Actor {
             ),
         }
         // M2: last_error carries the reason even without a stderr
-        // tail — `vrt status` must never read a bare None.
+        // tail — `of status` must never read a bare None.
         self.runtime.set_last_error(Some(match &failure.detail {
             Some(d) => format!("{}: {}", failure.reason, d),
             None => failure.reason.to_string(),

@@ -140,6 +140,29 @@ fn scan(sources: &str) -> Scan {
                 sc.class_bases.insert(n, base);
             }
         }
+        // `var|let|const N = class [M] [extends B]` — bundler-lowered
+        // class declaration (rolldown emits `var N = class extends B`
+        // for an exported class).
+        if matches!(ident(&toks[i]), Some("var" | "let" | "const"))
+            && toks.get(i + 2) == Some(&Tok::Punct('='))
+            && toks.get(i + 3).and_then(ident) == Some("class")
+        {
+            if let Some(n) = toks.get(i + 1).and_then(ident).map(|s| s.to_string()) {
+                let mut j = i + 4;
+                // Skip an optional class-expression name.
+                if let Some(t) = toks.get(j).and_then(ident) {
+                    if t != "extends" {
+                        j += 1;
+                    }
+                }
+                let base = if toks.get(j).and_then(ident) == Some("extends") {
+                    toks.get(j + 1).and_then(ident).unwrap_or("").to_string()
+                } else {
+                    String::new()
+                };
+                sc.class_bases.insert(n, base);
+            }
+        }
         // `export …`
         if ident(&toks[i]) == Some("export") {
             match toks.get(i + 1) {

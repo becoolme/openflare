@@ -276,7 +276,7 @@ pub struct DrainResponse {
     pub dropped: DropCounters,
 }
 
-/// Read-only tail response (`vrt logs` / dev output) — the mirror
+/// Read-only tail response (`of logs` / dev output) — the mirror
 /// of drain minus the ack: `next_seq` is the caller's cursor for
 /// the next poll; buffered records are never consumed.
 #[derive(Debug, Serialize)]
@@ -985,8 +985,8 @@ pub fn router(hub: Arc<LogHub>) -> Router {
     Router::new()
         .route("/v1/logs/ingest", post(ingest_handler))
         .route("/v1/logs/drain", post(drain_handler))
-        // A3: `/v1/logs/tail` is READ-ONLY — many readers (vrt logs,
-        // vrt dev) share the buffer without touching drain's cursor.
+        // A3: `/v1/logs/tail` is READ-ONLY — many readers (of logs,
+        // of dev) share the buffer without touching drain's cursor.
         .route("/v1/logs/tail", post(tail_handler))
         .layer(DefaultBodyLimit::max(INGEST_BODY_LIMIT))
         .with_state(hub)

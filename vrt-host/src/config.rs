@@ -33,7 +33,7 @@ pub struct HostConfig {
     pub control_listen: Option<String>,
     /// B12: Prometheus text exposition listener (`GET /metrics`).
     /// Optional — when unset no metrics port is opened (the control
-    /// listener still serves `/metrics` for `vrt serve`/standalone).
+    /// listener still serves `/metrics` for `of serve`/standalone).
     /// Binding 0.0.0.0 is an operator choice guarded by NetworkPolicy
     /// (k8s) — the endpoint itself is read-only and leaks no secrets.
     #[serde(default)]
@@ -925,7 +925,7 @@ pub struct RenderConfig {
     pub facade_manifest: Option<PathBuf>,
     /// `binding-backend` unix socket path (facadeManifest mode) —
     /// VERBATIM single path, emitted to every tenant. Single-tenant
-    /// contract only (standalone `vrt init` renders it for THE
+    /// contract only (standalone `of init` renders it for THE
     /// tenant): vrt-provider binds `<listenerDir>/<seg(tenant)>.sock`
     /// per tenant and treats the socket name as the tenant identity,
     /// so a shared static path would route every tenant through ONE
@@ -1419,7 +1419,7 @@ pub struct IngressConfig {
     /// optional; an absent section keeps the built-in defaults.
     #[serde(default)]
     pub websocket: WebsocketConfig,
-    /// `vrt dev` only: route requests with an unmatched Host to the
+    /// `of dev` only: route requests with an unmatched Host to the
     /// desired doc's single worker (any Host). Absent/false keeps the
     /// strict exact-host routing production requires. Not settable to
     /// true by accident — validation rejects it when the desired doc

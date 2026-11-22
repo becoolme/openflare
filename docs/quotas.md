@@ -110,7 +110,7 @@ Fail-closed layers, in order:
 
 ## Diagnostics
 
-`vrt status` reports, per worker:
+`of status` reports, per worker:
 
 ```json
 "workers": [
@@ -131,7 +131,7 @@ Fail-closed layers, in order:
   did not happen.
 
 `vrt-host` writes the pod-level flag to `<workDir>/host-status.json` as
-`quotasEnforced`, which `vrt status` merges under `host.status`.
+`quotasEnforced`, which `of status` merges under `host.status`.
 
 ## Testing
 
@@ -139,7 +139,7 @@ Fail-closed layers, in order:
 | --- | --- |
 | render | `cargo test -p vrt-config` — golden (`tests/golden/tenant.capnp`), declared-dimension emit, 0/default omission, out-of-bounds and `outboundConnections` rejection, capability gate |
 | host | `cargo test -p vrt-host --lib`; `tests/assemble.rs::quotas_capability_off_fails_closed` |
-| standalone | `cargo test -p vrt-local` — wrangler `limits` normalization, partial `[quotas]`, `vrt status` diagnostics |
+| standalone | `cargo test -p vrt-local` — wrangler `limits` normalization, partial `[quotas]`, `of status` diagnostics |
 | cell | `cargo test -p cell-controller` — ACK `quotas` bit (omit while false) |
 
 Real-workerd enforcement (CPU 1102 / subrequest / isolate OOM) lives in the

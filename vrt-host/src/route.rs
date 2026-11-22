@@ -37,7 +37,7 @@ pub struct RouteTarget {
 pub struct RouteTable {
     map: Arc<HashMap<String, RouteTarget>>,
     /// Dev-only catch-all target — populated when the desired doc
-    /// contains exactly ONE worker (the `vrt dev` shape). The ingress
+    /// contains exactly ONE worker (the `of dev` shape). The ingress
     /// consults it only when its `devCatchAll` switch is on, so
     /// production routing is byte-identical to before.
     catch_all: Option<RouteTarget>,

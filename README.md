@@ -21,7 +21,7 @@ The standalone mode runs the whole stack with one `docker compose up`.
 | Good for | local development, CI, a single owner on one machine | multi-cell, production deployments |
 | Control plane | `vrt-local` in this repo (`vrt` CLI, `docker compose`) | [`openflare-control`](https://github.com/becoolme/openflare-control): signed desired snapshots, Postgres store, cell API |
 | State | a local directory or S3 | Postgres plus S3/filesystem |
-| Deploy | `docker compose up` or `vrt dev` | kustomize manifests from the control repository |
+| Deploy | `docker compose up` or `of dev` | kustomize manifests from the control repository |
 | Trust | one trusted owner | one owner per control plane; cells verify Ed25519-signed snapshots |
 
 Both modes run the same `vrt-host`, `vrt-provider`, `vrt-sql` and
@@ -29,7 +29,7 @@ Both modes run the same `vrt-host`, `vrt-provider`, `vrt-sql` and
 
 - **Standalone** — the fastest way to try the runtime: `docker compose -f
   deploy/standalone/docker-compose.yml up --build --wait` (see
-  [Quick start](#quick-start-docker-standalone)), or `vrt dev` for a
+  [Quick start](#quick-start-docker-standalone)), or `of dev` for a
   no-container loop.
 - **Kubernetes** — a Postgres-backed control plane publishes signed
   `compute.desired` documents to one or more cells. Manifests, the reference
@@ -85,7 +85,7 @@ bindings) is in [`docs/bindings/README.md`](docs/bindings/README.md).
 | [Rate limiting](docs/bindings/rate-limiting.md) | 🟡 Partial | `[[ratelimits]]` fixed-window counter in the per-tenant process; approximate, not shared across hosts. |
 | [Static assets](docs/bindings/static-assets.md) | 🟡 Partial | All four `html_handling` modes, `not_found_handling`, `run_worker_first`; content-addressed store; Cloudflare-aligned 20,000 files / 25 MiB each, plus a configurable total guard. |
 | [WebSockets](docs/bindings/websockets.md) | 🟡 Partial | HTTP/1.1 upgrades to workers and DOs; 300 s idle, 4 h max, 4096 per ingress, 256 per tenant. |
-| [Vars and secrets](docs/bindings/vars-and-secrets.md) | 🟡 Partial | Vars are `text` bindings (non-strings arrive JSON-encoded); secrets are `vrt secret put` name→ref maps. |
+| [Vars and secrets](docs/bindings/vars-and-secrets.md) | 🟡 Partial | Vars are `text` bindings (non-strings arrive JSON-encoded); secrets are `of secret put` name→ref maps. |
 | [Tail Workers](docs/bindings/tail-workers.md) | 🟡 Partial | `tail_consumers` render as native workerd `tails`; same-tenant, best effort, no streaming tails. |
 | [Worker loaders](docs/bindings/worker-loaders.md) | 🟡 Partial | Native `WorkerLoader` (`get`/`load`, named caches, dynamic entrypoints, DO facets); quota-bounded per loader. |
 
@@ -112,6 +112,26 @@ limits) are documented in [`docs/compatibility.md`](docs/compatibility.md).
 | `deploy/` | Dockerfiles and the standalone Docker Compose stack (Kubernetes manifests live in `openflare-control`) |
 | `examples/` | example workers: hello, KV + assets, D1, R2, queues, cron, Durable Objects, workflows, wrangler projects |
 
+## Install the `of` CLI
+
+Prebuilt binaries for linux-x64/arm64 and macOS x64/arm64 are on the
+[releases page](https://github.com/becoolme/openflare/releases)
+(`of-v*` tags; per-binary sha256 in `manifest.json`):
+
+```sh
+curl -fLO https://github.com/becoolme/openflare/releases/latest/download/of-macos-arm64
+shasum -a256 of-macos-arm64   # compare against manifest.json
+install -m0755 of-macos-arm64 /usr/local/bin/of
+of --version
+```
+
+Or build from source (Rust stable):
+
+```sh
+cargo build --release -p vrt-local --bin of
+install -m0755 target/release/of /usr/local/bin/of
+```
+
 ## Quick start (Docker, standalone)
 
 workerd is never downloaded by the image build. You supply a pinned binary
@@ -137,7 +157,7 @@ WORKERD_SOURCE=file WORKERD_SHA256=$WORKERD_SHA256 \
 
 The compose stack is a single-machine quick start (dev/CI), not the
 production topology. Because Docker named volumes share one device, it
-passes the dev-only `vrt init --dev-allow-same-device-durability`
+passes the dev-only `of init --dev-allow-same-device-durability`
 exemption; production must keep the D1 object store on a separate device
 or use the s3 backend. Use `deploy/standalone/up.sh` in place of the bare
 compose command to get per-service logs when the stack fails to boot.
@@ -151,8 +171,8 @@ declares a secret binding, so seed the secret before deploying:
 dc="docker compose -f deploy/standalone/docker-compose.yml"
 $dc exec vrt mkdir -p /tmp/examples
 $dc cp examples/standalone-hello vrt:/tmp/examples/
-printf 'my-secret' | $dc exec -T vrt vrt secret put --root /data greeting-secret
-$dc exec vrt vrt deploy --root /data /tmp/examples/standalone-hello
+printf 'my-secret' | $dc exec -T vrt of secret put --root /data greeting-secret
+$dc exec vrt of deploy --root /data /tmp/examples/standalone-hello
 curl -H 'Host: hello.vrt.local' http://127.0.0.1:8080/
 ```
 
@@ -170,15 +190,15 @@ and the end-to-end acceptance script `deploy/standalone/e2e.sh`.
 
 ## Local development and remote deploy
 
-`vrt dev` runs the whole stack (vrt-local + vrt-host + vrt-provider +
+`of dev` runs the whole stack (vrt-local + vrt-host + vrt-provider +
 vrt-sql) directly on your machine — no compose — with state under
 `<worker_dir>/.vrt` (add it to your `.gitignore`). It deploys on
 start, redeploys on file changes, streams worker logs to the terminal,
 and binds a loopback ingress where any `Host` routes to your worker:
 
 ```sh
-vrt dev examples/standalone-hello        # real workerd on PATH / VRT_WORKERD / --workerd
-vrt dev examples/standalone-hello --stub # vrt-stub-workerd, no binary needed
+of dev examples/standalone-hello        # real workerd on PATH / VRT_WORKERD / --workerd
+of dev examples/standalone-hello --stub # vrt-stub-workerd, no binary needed
 curl http://127.0.0.1:8787/              # dev catch-all routes any Host
 ```
 
@@ -188,9 +208,9 @@ platforms without a pinned digest need the explicit
 picked up as secrets/vars. `--no-watch`, `--no-logs`, `--no-color`,
 `--listen <addr>` are supported; Ctrl+C shuts every child down.
 
-`vrt deploy --url <http://host:port> --token-file <path> <worker_dir>`
+`of deploy --url <http://host:port> --token-file <path> <worker_dir>`
 deploys a local project to a remote management endpoint without
-copying it first. The listener is off by default — `vrt serve`
+copying it first. The listener is off by default — `of serve`
 enables it with `--mgmt-tcp-listen <addr>
 --mgmt-tcp-token-file <path>` (0600, 64-hex token, bearer auth,
 request-size cap, per-source-IP rate limit). Bind loopback and reach
@@ -199,13 +219,13 @@ only. `--secrets-file <f|->` (dotenv), `--var KEY:VALUE`, `--name`,
 and `--dry-run` work in both modes:
 
 ```sh
-vrt deploy --root /data --dry-run ./my-worker      # pack + validate only
-vrt deploy --url http://127.0.0.1:9090 --token-file ~/.vrt-mgmt-token ./my-worker
+of deploy --root /data --dry-run ./my-worker      # pack + validate only
+of deploy --url http://127.0.0.1:9090 --token-file ~/.vrt-mgmt-token ./my-worker
 ```
 
-Other operator commands: `vrt logs --root <dir> <worker> [--follow]
+Other operator commands: `of logs --root <dir> <worker> [--follow]
 [--since 5m] [--level error] [--json]` (read-only tail, never consumes
-the drain cursor) and `vrt doctor [--root <dir>] [--json] [--strict]`
+the drain cursor) and `of doctor [--root <dir>] [--json] [--strict]`
 (workerd pin, root/key permissions, disk, ports, facade manifest,
 service health, project config).
 

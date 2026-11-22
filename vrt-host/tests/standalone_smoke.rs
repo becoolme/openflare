@@ -1,6 +1,6 @@
 //! T17 standalone end-to-end smoke — the REAL path, in-process:
 //!
-//!   vrt init → `vrt_local::serve` (unix mgmt API) → deploy via API →
+//!   of init → `vrt_local::serve` (unix mgmt API) → deploy via API →
 //!   FileDesiredStore (verify+fence) → FileRenderInputs (hot reload) →
 //!   DirBundleSource → SupervisorHost + vrt-stub-workerd → ingress.
 //!

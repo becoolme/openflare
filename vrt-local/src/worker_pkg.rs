@@ -18,7 +18,7 @@
 //!                                  # — values are part of VERSION identity (F2)
 //!
 //! [secrets]                        # binding name → secretRef (values
-//! API_KEY = "api-key-ref"          #   via `vrt secret put`, never here)
+//! API_KEY = "api-key-ref"          #   via `of secret put`, never here)
 //!
 //! [bindings]                       # resource bindings
 //! kv = { CACHE = "ns-1" }
@@ -144,13 +144,69 @@ pub struct WorkerToml {
     #[serde(default)]
     pub(crate) assets: Option<AssetsToml>,
     /// CF `[dev]` — wrangler dev-server settings (`ip`/`port`/`host`),
-    /// consumed by `vrt dev` for the loopback ingress; never part of
+    /// consumed by `of dev` for the loopback ingress; never part of
     /// the desired state (dev-tooling config, not runtime semantics).
     #[serde(default)]
     pub(crate) dev: Option<DevToml>,
+    /// `[bundle]` — wrangler bundler semantics normalized: `main` +
+    /// import graph compiled to a single esModule at gather time.
+    /// `None` (native vrt.toml default) keeps the historical
+    /// dir-scan module table; wrangler sources always carry it
+    /// (`no_bundle = true` normalizes to `enabled: false`).
+    #[serde(default)]
+    pub(crate) bundle: Option<BundleToml>,
 }
 
-/// `[dev]` — wrangler dev-server settings (`vrt dev` only).
+/// `[bundle]` — the wrangler build-step knobs normalized. `enabled`
+/// defaults true so a bare `[bundle]` opts a native project in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BundleToml {
+    /// `!no_bundle` — compile `main` + deps into one esModule.
+    #[serde(default = "default_true")]
+    pub(crate) enabled: bool,
+    /// CF `find_additional_modules` — also ship every rule-matched
+    /// file under `base_dir` as a module (default false when bundling;
+    /// wrangler defaults it to `no_bundle`, which is our dir-scan path
+    /// already — the scan includes everything).
+    #[serde(default)]
+    pub(crate) find_additional_modules: bool,
+    /// CF `minify`.
+    #[serde(default)]
+    pub(crate) minify: Option<bool>,
+    /// CF `keep_names` (esbuild keepNames; CF default true).
+    #[serde(default)]
+    pub(crate) keep_names: Option<bool>,
+    /// CF `define` — build-time identifier replacement.
+    #[serde(default)]
+    pub(crate) define: std::collections::BTreeMap<String, String>,
+    /// CF `jsx_factory` / `jsx_fragment` (esbuild jsxFactory/jsxFragment).
+    #[serde(default)]
+    pub(crate) jsx_factory: Option<String>,
+    #[serde(default)]
+    pub(crate) jsx_fragment: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for BundleToml {
+    fn default() -> Self {
+        // Same default as serde — `enabled` is opt-out, not opt-in.
+        Self {
+            enabled: true,
+            find_additional_modules: false,
+            minify: None,
+            keep_names: None,
+            define: BTreeMap::new(),
+            jsx_factory: None,
+            jsx_fragment: None,
+        }
+    }
+}
+
+/// `[dev]` — wrangler dev-server settings (`of dev` only).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DevToml {
@@ -967,7 +1023,7 @@ pub struct Gathered {
 /// self-contained-file scan (symlinks rejected), module-byte cap
 /// (pre-read), and the `[assets] dir` scan. Type assignment and
 /// everything downstream live in [`assemble`] — the single
-/// validation path shared by `vrt deploy --root` and remote uploads.
+/// validation path shared by `of deploy --root` and remote uploads.
 pub fn gather_dir(worker_dir: &Path) -> Result<Gathered, LocalError> {
     gather_dir_for_env(worker_dir, None)
 }
@@ -1038,6 +1094,23 @@ pub fn gather_dir_for_env_preview(
         },
         &mut |rel| skipped.push(rel.to_string()),
     )?;
+    // Wrangler bundler semantics: `main` + its import graph compile
+    // to ONE esModule; rule-typed imports stay external wire modules;
+    // `find_additional_modules` adds the rest of the rule-matched
+    // tree. Bundling is ON for wrangler-sourced meta unless a
+    // `bundle` doc flips it off (`no_bundle`); native vrt.toml stays
+    // unbundled unless it opts in via `[bundle]`. Everything else the
+    // scan collected is bundler input, not a module — reported via
+    // `skipped`.
+    let mut meta = meta;
+    let mut files = files;
+    let bundle_on = meta.bundle.as_ref().map(|b| b.enabled).unwrap_or(matches!(
+        _meta_source,
+        crate::project_cfg::MetaSource::Wrangler(_)
+    ));
+    if bundle_on {
+        files = gather_bundled(worker_dir, &mut meta, files, &mut skipped)?;
+    }
     let pending_assets = match &meta.assets {
         Some(decl) => Some(scan_assets_dir(worker_dir, decl)?),
         None => None,
@@ -1049,6 +1122,103 @@ pub fn gather_dir_for_env_preview(
         pending_assets,
         flagship_apps: gather_flagship_apps(worker_dir)?,
     })
+}
+
+/// Bundle mode: compile `main` with rolldown (wrangler esbuild
+/// semantics), then rebuild the module set = `{main: bundled ESM}` +
+/// external rule-typed files + `find_additional_modules` extras.
+/// Scanned leftovers are bundler inputs — moved to `skipped`.
+fn gather_bundled(
+    worker_dir: &Path,
+    meta: &mut WorkerToml,
+    mut scanned: BTreeMap<String, Vec<u8>>,
+    skipped: &mut Vec<String>,
+) -> Result<BTreeMap<String, Vec<u8>>, LocalError> {
+    let b = meta.bundle.clone().unwrap_or_default();
+    // Same rule table `build_pack_json` evaluates — globs see paths
+    // relative to `module_root` (`base_dir` ?? `main` dir).
+    let rules = effective_module_rules(&meta.module_rules)?;
+    let root = module_root(meta)?;
+    let root_prefix = if root.is_empty() {
+        String::new()
+    } else {
+        format!("{root}/")
+    };
+    let rule_globs: Vec<String> = rules
+        .iter()
+        .flat_map(|(_, globs)| globs.iter().cloned())
+        .collect();
+    let rule_prefix_c = root_prefix.clone();
+    let is_rule: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> =
+        std::sync::Arc::new(move |rel: &str| {
+            rel.strip_prefix(&rule_prefix_c).is_some_and(|eval| {
+                rules
+                    .iter()
+                    .any(|(_, globs)| globs.iter().any(|g| glob_match(g, eval)))
+            })
+        });
+    let main = meta.main_module.clone();
+    if !scanned.contains_key(&main) {
+        return Err(LocalError::Worker("main"));
+    }
+    let main_dir = main
+        .rfind('/')
+        .map(|i| main[..i].to_string())
+        .unwrap_or_default();
+    let bundled = crate::bundle::bundle_sync(
+        worker_dir.to_path_buf(),
+        main.clone(),
+        main_dir,
+        rule_globs,
+        root_prefix,
+        crate::bundle::BundleOpts {
+            minify: b.minify,
+            keep_names: b.keep_names,
+            define: b.define,
+            jsx_factory: b.jsx_factory,
+            jsx_fragment: b.jsx_fragment,
+            nodejs_compat: meta
+                .compatibility_flags
+                .iter()
+                .any(|f| f == "nodejs_compat"),
+        },
+    )?;
+    let mut out = BTreeMap::new();
+    out.insert(main.clone(), bundled.main_source.into_bytes());
+    // Code-split chunks ride along as sibling esModules — dynamic
+    // `import()` stays lazy, same shape wrangler's multi-file upload.
+    for (name, code) in bundled.chunks {
+        if out.insert(name.clone(), code.into_bytes()).is_some() {
+            return Err(LocalError::Worker("module name collision"));
+        }
+        meta.modules.insert(name, "esModule".into());
+    }
+    for (name, rel) in bundled.externals {
+        let bytes = match scanned.remove(&rel) {
+            Some(b) => b,
+            // External resolved inside a scan-excluded tree
+            // (`node_modules/`) — read it straight off disk.
+            None => std::fs::read(worker_dir.join(&rel))
+                .map_err(|_| LocalError::Worker("external module"))?,
+        };
+        // Two different files emitted under the same specifier would
+        // silently overwrite — fail closed instead.
+        if out.insert(name.clone(), bytes).is_some() {
+            return Err(LocalError::Worker("module name collision"));
+        }
+    }
+    for (rel, bytes) in scanned {
+        if b.find_additional_modules && is_rule(&rel) {
+            out.insert(rel, bytes);
+        } else {
+            skipped.push(rel);
+        }
+    }
+    // The entry is never rule/extension-typed — the bundled output is
+    // always the single esModule main (wrangler ships the bundle under
+    // `main`'s name).
+    meta.modules.insert(main, "esModule".into());
+    Ok(out)
 }
 
 /// `flagship.json` cap — a standalone flag store stays small;
@@ -1891,103 +2061,7 @@ fn module_root(meta: &WorkerToml) -> Result<String, LocalError> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum GlobTok {
-    Lit(char),
-    /// `*` — any run of non-`/` chars.
-    Star,
-    /// `**` between `/`s or string ends — any run incl. `/`, but it may
-    /// only stop at a segment boundary (mirrors
-    /// `((?:[^/]*(?:/|$))*)`).
-    Globstar,
-}
-
-/// Mirror of wrangler's `glob-to-regexp` ({globstar:true}, no
-/// `extended`): `*`/`**` are the only wildcards — `?`, `[...]`,
-/// `{a,b}` are LITERAL characters; `\` escapes the next char into a
-/// literal. Whole-string anchored match, memoized so `**` chains
-/// cannot backtrack exponentially.
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let mut toks: Vec<GlobTok> = Vec::with_capacity(p.len());
-    let mut i = 0usize;
-    while i < p.len() {
-        match p[i] {
-            '*' => {
-                let start = i;
-                while p.get(i + 1) == Some(&'*') {
-                    i += 1;
-                }
-                let prev = if start == 0 { None } else { Some(p[start - 1]) };
-                let next = p.get(i + 1).copied();
-                if i + 1 - start > 1
-                    && (prev.is_none() || prev == Some('/'))
-                    && (next.is_none() || next == Some('/'))
-                {
-                    toks.push(GlobTok::Globstar);
-                    if next == Some('/') {
-                        i += 1;
-                    }
-                } else {
-                    toks.push(GlobTok::Star);
-                }
-            }
-            '\\' => {
-                i += 1;
-                toks.push(GlobTok::Lit(p.get(i).copied().unwrap_or('\\')));
-            }
-            c => toks.push(GlobTok::Lit(c)),
-        }
-        i += 1;
-    }
-    let s: Vec<char> = path.chars().collect();
-    let mut memo: std::collections::HashMap<(usize, usize), bool> =
-        std::collections::HashMap::new();
-    fn m(
-        toks: &[GlobTok],
-        ti: usize,
-        s: &[char],
-        si: usize,
-        memo: &mut std::collections::HashMap<(usize, usize), bool>,
-    ) -> bool {
-        if let Some(&v) = memo.get(&(ti, si)) {
-            return v;
-        }
-        let v = match toks.get(ti) {
-            None => si == s.len(),
-            Some(GlobTok::Lit(c)) => s.get(si) == Some(c) && m(toks, ti + 1, s, si + 1, memo),
-            Some(GlobTok::Star) => {
-                let mut k = si;
-                let mut ok = false;
-                loop {
-                    if m(toks, ti + 1, s, k, memo) {
-                        ok = true;
-                        break;
-                    }
-                    match s.get(k) {
-                        Some(&ch) if ch != '/' => k += 1,
-                        _ => break,
-                    }
-                }
-                ok
-            }
-            Some(GlobTok::Globstar) => {
-                let mut ok = m(toks, ti + 1, s, si, memo);
-                let mut k = si + 1;
-                while !ok && k <= s.len() {
-                    if k == s.len() || s[k - 1] == '/' {
-                        ok = m(toks, ti + 1, s, k, memo);
-                    }
-                    k += 1;
-                }
-                ok
-            }
-        };
-        memo.insert((ti, si), v);
-        v
-    }
-    m(&toks, 0, &s, 0, &mut memo)
-}
+use crate::glob::glob_match;
 
 /// Recursive scan; skips `vrt.toml`, dotfiles, `node_modules`
 /// (reported via `skipped` so `--dry-run` can list them).
@@ -2299,7 +2373,7 @@ fn build_pack_json(
     ))
 }
 
-/// `vrt deploy --dry-run` output — pack-side facts only: worker name,
+/// `of deploy --dry-run` output — pack-side facts only: worker name,
 /// module count, bundle bytes, declared bindings, scan-skipped paths.
 /// Server-side derivations (service target ids, DO/workflow unique
 /// keys) are listed as declared, never resolved — the dry run proves
@@ -2406,7 +2480,7 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
     })
 }
 
-/// Remote-upload wire body (`vrt deploy --url`): the client
+/// Remote-upload wire body (`of deploy --url`): the client
 /// materializes meta + module bytes + `[assets]` content locally and
 /// the server re-validates everything through [`assemble`]. Secret
 /// values travel only inside this body — never in argv, logs, or

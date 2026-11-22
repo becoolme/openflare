@@ -918,7 +918,7 @@ pub async fn metrics_handler(
     )
 }
 
-/// Router fragment for the control listener (`vrt serve` /
+/// Router fragment for the control listener (`of serve` /
 /// standalone reach the same handler there).
 pub fn router(reg: Arc<TenantRegistry>) -> axum::Router {
     axum::Router::new()

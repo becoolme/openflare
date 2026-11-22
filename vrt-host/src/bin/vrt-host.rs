@@ -255,7 +255,7 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     };
     // T21: `[assets]` configured → materializer bound to the shared
     // store; pull source only when baseUrl+tokenFile are set
-    // (standalone relies on `vrt deploy` pre-materialization). Absent
+    // (standalone relies on `of deploy` pre-materialization). Absent
     // config → ASSETS bindings fail closed at assemble.
     let asset_sync = match &config.assets {
         Some(a) => {
@@ -560,7 +560,7 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
     if let Some(hub) = &log_hub {
         ingress_state.set_log_hub(hub.clone());
     }
-    // `vrt dev` only: unmatched-Host fallback to a single-worker
+    // `of dev` only: unmatched-Host fallback to a single-worker
     // route table (`ingress.devCatchAll`, default off).
     if config.ingress.dev_catch_all {
         ingress_state.set_dev_catch_all(true);
@@ -748,7 +748,7 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
                 converge_once(&mut host, desired_source2.as_ref(), &assembler, &ingress_state, &ctx);
                 host.reap_finished();
                 // T25/M2: snapshot the live tenant states to
-                // <workDir>/host-status.json so `vrt status` can see
+                // <workDir>/host-status.json so `of status` can see
                 // supervisor state, last failure reasons and circuit
                 // state without reaching the control listener.
                 vrt_host::status::write_status_file(

@@ -53,7 +53,7 @@ services:
         VRT_GID: ${VRT_GID:-10001}
     pull_policy: build
     restart: "no"
-    entrypoint: ["/usr/local/bin/vrt"]
+    entrypoint: ["/usr/local/bin/of"]
     command:
       - init
       - --root
@@ -62,7 +62,7 @@ services:
       - ${VRT_CELL:-local}
       - --tenant
       - ${VRT_TENANT:-local}
-      # D5: no --mode — vrt init detects the runtime kind from
+      # D5: no --mode — of init detects the runtime kind from
       # `workerd --version`; an explicit --mode must AGREE with it.
       # The path is the unique runtime layout (/usr/local/bin/workerd);
       # WORKERD_SOURCE=none leaves it absent → init fails closed.
@@ -96,23 +96,23 @@ services:
       # T37b-r4: the netns owner must exist before `vrt` joins it.
       vrt-host:
         condition: service_started
-    # T37b-r4: `vrt serve` (queue dispatcher + cron) dials vrt-host's
+    # T37b-r4: `of serve` (queue dispatcher + cron) dials vrt-host's
     # control listener, which is LOOPBACK-only by design (config.rs
     # rejects non-loopback controlListen — it is unauthenticated).
     # In the split-container topology loopback only resolves if `vrt`
     # shares vrt-host's network namespace — the same reachability the
-    # bare-metal single-host layout has for free. `vrt serve` binds no
+    # bare-metal single-host layout has for free. `of serve` binds no
     # TCP listener — its mgmt is a unix socket under /data — so the shared
     # netns exposes nothing extra. Caveat: `force-recreate` of
     # vrt-host orphans this netns — recreate `vrt` with it.
     network_mode: "service:vrt-host"
-    entrypoint: ["/usr/local/bin/vrt"]
+    entrypoint: ["/usr/local/bin/of"]
     # Control plane only in compose mode — the host/provider run in
     # their own containers (supervision happens per-container).
     command: [serve, --root, /data]
     healthcheck:
       # Unix-socket healthz via the CLI's own probe endpoint.
-      test: ["CMD", "/usr/local/bin/vrt", "health", "--root", "/data"]
+      test: ["CMD", "/usr/local/bin/of", "health", "--root", "/data"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -128,7 +128,7 @@ services:
     ports:
       - "${VRT_BIND:-127.0.0.1}:${VRT_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "/usr/local/bin/vrt", "probe", "--url", "http://127.0.0.1:9091/healthz"]
+      test: ["CMD", "/usr/local/bin/of", "probe", "--url", "http://127.0.0.1:9091/healthz"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -143,7 +143,7 @@ services:
     command: ["--config", "/data/config/vrt-provider.toml"]
     healthcheck:
       # D8: connect every listener socket — liveness, not file-exists.
-      test: ["CMD", "/usr/local/bin/vrt", "probe", "--dir-sockets", "/data/provider/listeners"]
+      test: ["CMD", "/usr/local/bin/of", "probe", "--dir-sockets", "/data/provider/listeners"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -170,7 +170,7 @@ services:
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=64m
     healthcheck:
-      test: ["CMD", "/usr/local/bin/vrt", "probe", "--url", "http://127.0.0.1:8090/healthz"]
+      test: ["CMD", "/usr/local/bin/of", "probe", "--url", "http://127.0.0.1:8090/healthz"]
       interval: 10s
       timeout: 3s
       retries: 6

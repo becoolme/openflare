@@ -340,6 +340,12 @@ impl LocalState {
         format!("vrt_{}", &digest[..28])
     }
 
+    /// `of check` reports the version id a real deploy would mint —
+    /// same identity function, no state needed.
+    pub(crate) fn version_id_for_check(pkg: &crate::worker_pkg::PackedWorker) -> String {
+        Self::version_id(pkg)
+    }
+
     fn config_hash(record: &VersionRecord) -> String {
         let bytes = serde_json::to_vec(&Self::identity_value(record)).unwrap_or_default();
         let digest = hex::encode(sha2::Sha256::digest(&bytes));

@@ -72,7 +72,7 @@ struct RoutesDoc {
 
 /// Parse and validate `_routes.json`. Every deviation is an error —
 /// callers fail closed (503 for routed traffic, deploy-time rejection
-/// for `vrt deploy`).
+/// for `of deploy`).
 pub fn parse_routes(bytes: &[u8]) -> Result<RoutesConfig, String> {
     if bytes.len() > MAX_FILE_BYTES {
         return Err("_routes.json exceeds the 64 KiB cap".into());
