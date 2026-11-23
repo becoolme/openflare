@@ -219,8 +219,8 @@ without calling the API.
 vrt-host ingress — the same shape Dokploy uses:
 
 ```sh
-VRT_TLS_EMAIL=you@example.com \
-  docker compose -f deploy/standalone/docker-compose.yml --profile tls up -d
+docker compose -f deploy/standalone/docker-compose.yml --profile tls up -d
+# VRT_TLS_EMAIL=you@example.com is optional — it only enables LE expiry notices.
 ```
 
 - DNS: point every worker hostname (and `[preview] domain` wildcard)
