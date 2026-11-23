@@ -137,3 +137,106 @@ fn vrt_sql_replicas_are_optional_but_validated() {
         .validate()
         .unwrap();
 }
+
+// ---------------------------------------------- MIG-15 r3 session pool
+
+/// `[pg]` + `[pgProxy]` + `[hyperdrive.pool]` with `body` inside the
+/// pool table — the shape a standalone `vrt-provider.toml` uses.
+fn pool_toml(body: &str) -> String {
+    format!(
+        "[pg]\ncredentialsFile = \"/tmp/pg-credentials.json\"\n\n\
+         [pgProxy]\nlisten = \"127.0.0.1:19543\"\n\n\
+         [hyperdrive.pool]\n{body}"
+    )
+}
+
+#[test]
+fn hyperdrive_pool_defaults_are_bounded_and_valid() {
+    let cfg = parse("", &pool_toml(""));
+    cfg.validate().unwrap();
+    let pool = cfg.hyperdrive.expect("pool configured").pool;
+    assert_eq!(pool.max_connections, 8);
+    assert_eq!(pool.acquire_timeout_ms, 5_000);
+    assert_eq!(pool.idle_timeout_ms, 30_000);
+    assert_eq!(pool.max_lifetime_ms, 1_800_000);
+    assert!(pool.reset_on_return);
+
+    parse(
+        "",
+        &pool_toml(
+            "maxConnections = 1024\nacquireTimeoutMs = 100\nidleTimeoutMs = 100\n\
+             maxLifetimeMs = 2592000000\nresetOnReturn = false",
+        ),
+    )
+    .validate()
+    .unwrap();
+}
+
+#[test]
+fn hyperdrive_pool_rejects_out_of_range_values() {
+    for (body, field) in [
+        ("maxConnections = 0", "hyperdrive.pool.maxConnections"),
+        ("maxConnections = 1025", "hyperdrive.pool.maxConnections"),
+        ("acquireTimeoutMs = 0", "hyperdrive.pool.acquireTimeoutMs"),
+        ("acquireTimeoutMs = 99", "hyperdrive.pool.acquireTimeoutMs"),
+        (
+            "acquireTimeoutMs = 300001",
+            "hyperdrive.pool.acquireTimeoutMs",
+        ),
+        ("idleTimeoutMs = 0", "hyperdrive.pool.idleTimeoutMs"),
+        ("maxLifetimeMs = 0", "hyperdrive.pool.maxLifetimeMs"),
+        ("maxLifetimeMs = 999", "hyperdrive.pool.maxLifetimeMs"),
+        (
+            "maxLifetimeMs = 2592000001",
+            "hyperdrive.pool.maxLifetimeMs",
+        ),
+    ] {
+        let e = err("", &pool_toml(body));
+        assert!(e.contains(field), "{body}: {e}");
+    }
+    // Negative values are not representable: the config fails to parse
+    // rather than wrapping around.
+    for body in [
+        "maxConnections = -1",
+        "acquireTimeoutMs = -5",
+        "maxLifetimeMs = -1",
+    ] {
+        assert!(
+            toml::from_str::<vrt_provider::config::ProviderConfig>(&pool_toml(body)).is_err(),
+            "{body} must not parse"
+        );
+    }
+}
+
+#[test]
+fn hyperdrive_pool_rejects_unknown_keys_and_orphan_sections() {
+    // Unknown pool key (e.g. a transaction-pooling knob that does not
+    // exist) fails closed at parse time.
+    for body in [
+        "maxSessions = 8",
+        "minConnections = 1",
+        "connectionTimeoutMs = 100",
+    ] {
+        assert!(
+            toml::from_str::<vrt_provider::config::ProviderConfig>(&pool_toml(body)).is_err(),
+            "{body} must not parse"
+        );
+    }
+    // `[hyperdrive]` with no pool table is a configuration error, not a
+    // silent no-op.
+    let orphan = "[pg]\ncredentialsFile = \"/tmp/c.json\"\n[pgProxy]\nlisten = \"127.0.0.1:19543\"\n[hyperdrive]\n";
+    assert!(toml::from_str::<vrt_provider::config::ProviderConfig>(orphan).is_err());
+}
+
+#[test]
+fn hyperdrive_pool_requires_the_proxy_and_its_credentials() {
+    let no_proxy =
+        "[pg]\ncredentialsFile = \"/tmp/c.json\"\n[hyperdrive.pool]\nmaxConnections = 4\n";
+    let cfg = parse("", no_proxy);
+    let e = cfg.validate().unwrap_err().to_string();
+    assert!(e.contains("hyperdrive requires pgProxy"), "{e}");
+
+    let no_pg = "[pgProxy]\nlisten = \"127.0.0.1:19543\"\n[hyperdrive.pool]\nmaxConnections = 4\n";
+    let e = parse("", no_pg).validate().unwrap_err().to_string();
+    assert!(e.contains("pgProxy requires pg"), "{e}");
+}
