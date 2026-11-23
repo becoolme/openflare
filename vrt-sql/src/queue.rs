@@ -35,6 +35,10 @@ pub const LEASE_TTL_MAX_MS: i64 = 43_200_000;
 pub const MSG_ID_MAX: usize = 128;
 /// Per-call settlement cap for ack/retry/dead_letter (looser than the batch cap, covering multiple claims).
 pub const SETTLE_MAX: usize = 1_000;
+/// Cloudflare-compatible maximum message retention: four days from enqueue;
+/// dead-letter rows use the same bound from `dead_at`. Expired rows are purged
+/// lazily by queue operations (there is no separate queue storage sweeper).
+pub const MESSAGE_RETENTION_MS: i64 = 4 * 24 * 60 * 60 * 1000;
 /// Internal transaction budget for queue ops (below D1's 30s -- queue statements are bounded small batches).
 pub const OP_BUDGET_MS: u64 = 5_000;
 
@@ -566,7 +570,20 @@ fn validate_msgs(msgs: &[IncomingMsg], now_ms: i64) -> Result<(), QueueError> {
     Ok(())
 }
 
+fn purge_expired(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> Result<(), EngineError> {
+    let cutoff = now_ms.saturating_sub(MESSAGE_RETENTION_MS);
+    tx.execute(
+        "DELETE FROM _vrt_q_messages WHERE created_at <= ?1",
+        [cutoff],
+    )
+    .map_err(EngineError::Sqlite)?;
+    tx.execute("DELETE FROM _vrt_q_dead WHERE dead_at <= ?1", [cutoff])
+        .map_err(EngineError::Sqlite)?;
+    Ok(())
+}
+
 fn metrics_of(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> Result<QueueMetrics, EngineError> {
+    purge_expired(tx, now_ms)?;
     let (backlog_count, backlog_bytes, oldest): (i64, i64, Option<i64>) = tx
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(LENGTH(body)),0), MIN(created_at) \
@@ -633,6 +650,7 @@ impl QueueBackend for SqliteQueueBackend {
             .collect();
         run_internal(engine, ctx, move |tx| {
             ensure_queue_db(tx)?;
+            purge_expired(tx, now_ms)?;
             let mut inserted = 0u32;
             {
                 let mut ins = tx.prepare_cached(
@@ -706,6 +724,7 @@ impl QueueBackend for SqliteQueueBackend {
         let h2 = holder.clone();
         let (dispatch_epoch, messages) = run_internal(engine, ctx, move |tx| {
             ensure_queue_db(tx)?;
+            purge_expired(tx, now_ms)?;
             // Dispatch lease CAS (same transaction) -- insert a placeholder if no row, holder=me renews,
             // expired takeover epoch++; held unexpired by someone else -> DispatchLeaseLost.
             tx.execute(
