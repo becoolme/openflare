@@ -82,8 +82,10 @@ standalone `of serve` loop (1 s cadence).
 - Messages are retained for at most four days from `created_at`, matching
   Cloudflare's maximum retention. Dead-letter rows use four days from
   `dead_at`. Expired rows are purged lazily by `send`, `claim` and
-  `metrics` in the same transaction, so queue visibility never counts an
-  expired message; there is no independent queue-storage sweeper.
+  `metrics` in the same transaction (bounded to 2,000 rows per call),
+  and every read path also filters by the retention cutoff, so a larger
+  expired backlog is never visible or delivered. There is no
+  independent queue-storage sweeper.
 - Backend settlement errors keep the source message leased and apply a
   bounded exponential pause (up to 64 s) before the lane claims more work.
   Only source-queue `ack`/`retry`/`dead-letter` failures pause the lane: a
