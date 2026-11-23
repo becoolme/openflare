@@ -314,6 +314,7 @@ CREATE TABLE IF NOT EXISTS _vrt_q_messages(
   lease_expiry INTEGER
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS _vrt_q_visible ON _vrt_q_messages(visible_at);
+CREATE INDEX IF NOT EXISTS _vrt_q_created ON _vrt_q_messages(created_at);
 CREATE TABLE IF NOT EXISTS _vrt_q_dead(
   id TEXT PRIMARY KEY,
   body BLOB NOT NULL,
@@ -323,6 +324,7 @@ CREATE TABLE IF NOT EXISTS _vrt_q_dead(
   dead_at INTEGER NOT NULL,
   reason TEXT NOT NULL
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS _vrt_q_dead_at ON _vrt_q_dead(dead_at);
 CREATE TABLE IF NOT EXISTS _vrt_q_dispatch(
   id INTEGER PRIMARY KEY CHECK(id=1),
   holder TEXT NOT NULL,
@@ -350,7 +352,9 @@ fn ensure_queue_db(tx: &rusqlite::Transaction<'_>) -> Result<(), EngineError> {
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS _vrt_q_dispatch(\
                  id INTEGER PRIMARY KEY CHECK(id=1), holder TEXT NOT NULL,\
-                 epoch INTEGER NOT NULL, expires_at INTEGER NOT NULL) WITHOUT ROWID;",
+                 epoch INTEGER NOT NULL, expires_at INTEGER NOT NULL) WITHOUT ROWID;\
+                 CREATE INDEX IF NOT EXISTS _vrt_q_created ON _vrt_q_messages(created_at);\
+                 CREATE INDEX IF NOT EXISTS _vrt_q_dead_at ON _vrt_q_dead(dead_at);",
             )
             .map_err(EngineError::Sqlite)?;
             Ok(())
