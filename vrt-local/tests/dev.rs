@@ -170,7 +170,8 @@ async fn dev_start_request_redeploy_cleanup() {
     )
     .unwrap();
     assert!(
-        vars.as_object()
+        vars["local"]
+            .as_object()
             .unwrap()
             .iter()
             .any(|(k, v)| k.ends_with(":DEV_VAR") && *v == "from-dev-vars"),

@@ -198,7 +198,11 @@ async fn upload_roundtrip_idempotent() {
     let vars: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("vars/vars.json")).unwrap()).unwrap();
     assert!(
-        vars.as_object().unwrap().values().any(|v| v == "yes"),
+        vars["local"]
+            .as_object()
+            .unwrap()
+            .values()
+            .any(|v| v == "yes"),
         "uploaded var missing from vars.json: {vars}"
     );
 
