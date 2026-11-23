@@ -160,7 +160,7 @@ fn vars_are_part_of_version_identity() {
     // in vars.json under content-scoped refs (union, F2).
     local.rollback("api", &r1.version_id).unwrap();
     let vars = vars_json(&root);
-    let obj = vars.as_object().unwrap();
+    let obj = vars["local"].as_object().unwrap();
     assert_eq!(obj.len(), 2, "one ref per distinct var set");
     let mut values: Vec<_> = obj.values().map(|v| v.as_str().unwrap()).collect();
     values.sort();
@@ -264,7 +264,7 @@ fn version_cap_evicts_oldest_non_active_and_gcs_objects() {
     // Evicted version's var refs leave vars.json; the union holds
     // only the three retained versions.
     let vars = vars_json(&root);
-    let obj = vars.as_object().unwrap();
+    let obj = vars["local"].as_object().unwrap();
     assert_eq!(obj.len(), 3);
     let mut values: Vec<_> = obj
         .values()

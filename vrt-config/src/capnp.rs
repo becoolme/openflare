@@ -268,8 +268,10 @@ pub struct RuntimeParams {
     pub system_compat_date: String,
     /// `compatibilityFlags` for system workers.
     pub system_compat_flags: Vec<String>,
-    /// `varRef` → plaintext value, resolved out-of-band by the host.
-    pub vars: BTreeMap<String, String>,
+    /// `tenantId → varRef → plaintext value, resolved out-of-band by
+    /// the host. Tenant-scoped like `secrets` (T13/M6): a flat map let
+    /// one tenant's binding resolve another tenant's varRef.
+    pub vars: BTreeMap<String, BTreeMap<String, String>>,
     /// `secretRef` → secret value, resolved from encrypted storage.
     /// Secrets become `fromEnvironment` bindings and are returned via
     /// [`RenderedConfig::env`] for vrt-host's child-process env — never
@@ -1554,7 +1556,11 @@ fn emit_binding(
 ) -> Result<(), ConfigError> {
     match binding {
         BindingDesired::Var(var) => {
-            let value = resolve_var(&input.params.vars, &var.var_ref)?;
+            let value = resolve_var(
+                &input.params.vars,
+                &input.tenant.tenant_id,
+                &var.var_ref,
+            )?;
             out.push_str(&format!(
                 "        (name = {}, text = {}),\n",
                 capnp_text(&var.name),
@@ -2943,12 +2949,19 @@ fn secrets_store_service_name(worker_id: &str) -> String {
 
 /// T17/F1: shared `var` binding resolution — ONE lookup used by both
 /// the capnp emitter and the stub/standalone env path. A missing ref
-/// fails closed, never silently renders empty.
+/// fails closed, never silently renders empty. Tenant-scoped ONLY
+/// (T13/M6, same rule as [`resolve_secret`]): a ref in another
+/// tenant's namespace never resolves.
 pub fn resolve_var<'m>(
-    vars: &'m std::collections::BTreeMap<String, String>,
+    vars: &'m std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, String>,
+    >,
+    tenant_id: &str,
     var_ref: &str,
 ) -> Result<&'m str, ConfigError> {
-    vars.get(var_ref)
+    vars.get(tenant_id)
+        .and_then(|m| m.get(var_ref))
         .map(|v| v.as_str())
         .ok_or(ConfigError::UnresolvedReference("varRef"))
 }
@@ -2976,7 +2989,7 @@ pub fn resolve_secret<'m>(
 /// no config text to fail at launch time).
 pub fn resolve_tenant_env(
     tenant: &snapshot_protocol::compute_desired::TenantDesired,
-    vars: &std::collections::BTreeMap<String, String>,
+    vars: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     secrets: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, SecretValue>>,
 ) -> Result<std::collections::BTreeMap<String, SecretValue>, ConfigError> {
     let mut env = std::collections::BTreeMap::new();
@@ -2984,7 +2997,7 @@ pub fn resolve_tenant_env(
         for binding in &worker.bindings {
             match binding {
                 snapshot_protocol::compute_desired::BindingDesired::Var(var) => {
-                    resolve_var(vars, &var.var_ref)?;
+                    resolve_var(vars, &tenant.tenant_id, &var.var_ref)?;
                 }
                 snapshot_protocol::compute_desired::BindingDesired::Secret(secret) => {
                     let value = resolve_secret(secrets, &tenant.tenant_id, &secret.secret_ref)?;
@@ -3350,12 +3363,17 @@ fn validate_params(params: &RuntimeParams) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::Identifier("systemCompatibility"));
     }
-    for (key, value) in &params.vars {
-        if !valid_identifier(key, MAX_IDENTIFIER_LEN * 2) {
+    for (tenant_id, map) in &params.vars {
+        if !valid_identifier(tenant_id, MAX_IDENTIFIER_LEN * 2) || map.len() > 4096 {
             return Err(ConfigError::Identifier("vars"));
         }
-        if value.len() > MAX_VALUE_LEN {
-            return Err(ConfigError::Capacity("vars"));
+        for (key, value) in map {
+            if !valid_identifier(key, MAX_IDENTIFIER_LEN * 2) {
+                return Err(ConfigError::Identifier("vars"));
+            }
+            if value.len() > MAX_VALUE_LEN {
+                return Err(ConfigError::Capacity("vars"));
+            }
         }
     }
     for (tenant_id, map) in &params.secrets {

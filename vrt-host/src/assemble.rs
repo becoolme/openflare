@@ -734,7 +734,11 @@ impl Assembler {
         for worker in &tenant.workers {
             for binding in &worker.bindings {
                 if let snapshot_protocol::compute_desired::BindingDesired::Var(var) = binding {
-                    if let Some(value) = inputs.vars.get(&var.var_ref) {
+                    if let Some(value) = inputs
+                        .vars
+                        .get(&tenant.tenant_id)
+                        .and_then(|m| m.get(&var.var_ref))
+                    {
                         spec_env.insert(
                             format!("VRT_VAR_{}", var.name),
                             vrt_config::SecretValue::new(value.clone()),

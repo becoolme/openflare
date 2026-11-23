@@ -134,7 +134,10 @@ pub fn runtime_params() -> RuntimeParams {
             "experimental".into(),
             "service_binding_extra_handlers".into(),
         ],
-        vars: BTreeMap::from([("var:w-alpha-1:log".to_owned(), "info".to_owned())]),
+        vars: BTreeMap::from([(
+            "team-alpha".to_owned(),
+            BTreeMap::from([("var:w-alpha-1:log".to_owned(), "info".to_owned())]),
+        )]),
         secrets: BTreeMap::from([(
             "team-alpha".to_owned(),
             BTreeMap::from([(

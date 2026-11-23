@@ -11,8 +11,9 @@
 //!
 //! The provider is the single typed boundary: platform mode points it
 //! at the control-plane-rendered files, standalone mode at the
-//! `vrt-local`-maintained files — same shape `{varRef: value}` /
-//! `{tenantId: {secretRef: value}}`, same fail-closed checks.
+//! `vrt-local`-maintained files — same shape
+//! `{tenantId: {varRef: value}}` / `{tenantId: {secretRef: value}}`,
+//! same fail-closed checks.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -22,8 +23,10 @@ use vrt_config::SecretValue;
 /// Render inputs resolved per converge tick.
 #[derive(Clone, Debug, Default)]
 pub struct RenderInputs {
-    /// `varRef → plaintext` (non-secret — appears in config text).
-    pub vars: BTreeMap<String, String>,
+    /// `tenantId → varRef → plaintext` (non-secret — appears in config
+    /// text). Tenant-scoped like `secrets`: a flat map let one tenant's
+    /// binding resolve another tenant's varRef.
+    pub vars: BTreeMap<String, BTreeMap<String, String>>,
     /// `tenantId → secretRef → value` (env-only, T13/M6 namespacing).
     pub secrets: BTreeMap<String, BTreeMap<String, SecretValue>>,
 }
@@ -114,8 +117,9 @@ impl RenderInputsProvider for FileRenderInputs {
     fn load(&self) -> Result<RenderInputs, RenderInputsError> {
         if let Some(path) = &self.combined_file {
             let doc: serde_json::Value = read_secure_json(path)?;
-            let vars = serde_json::from_value(doc["vars"].clone())
-                .map_err(|_| RenderInputsError::Parse)?;
+            let vars: BTreeMap<String, BTreeMap<String, String>> =
+                serde_json::from_value(doc["vars"].clone())
+                    .map_err(|_| RenderInputsError::Parse)?;
             let raw: BTreeMap<String, BTreeMap<String, String>> =
                 serde_json::from_value(doc["secrets"].clone())
                     .map_err(|_| RenderInputsError::Parse)?;
@@ -132,7 +136,10 @@ impl RenderInputsProvider for FileRenderInputs {
                 .collect();
             return Ok(RenderInputs { vars, secrets });
         }
-        let vars: BTreeMap<String, String> = match &self.vars_file {
+        // vars.json is tenant-scoped too (`{tenantId: {varRef: value}}`,
+        // same shape as the combined file's "vars") — the standalone
+        // writer wraps its single-tenant union itself.
+        let vars: BTreeMap<String, BTreeMap<String, String>> = match &self.vars_file {
             None => BTreeMap::new(),
             Some(path) => serde_json::from_value(read_secure_json(path)?)
                 .map_err(|_| RenderInputsError::Parse)?,
@@ -165,11 +172,15 @@ impl RenderInputsProvider for FileRenderInputs {
 /// changes with the value but can never reveal it.
 pub fn inputs_material(inputs: &RenderInputs, pepper: &[u8; 32], material: &mut Vec<u8>) {
     use sha2::Digest;
-    for (k, v) in &inputs.vars {
-        material.push(0);
-        material.extend_from_slice(k.as_bytes());
-        material.push(0);
-        material.extend_from_slice(v.as_bytes());
+    for (t, map) in &inputs.vars {
+        for (k, v) in map {
+            material.push(0);
+            material.extend_from_slice(t.as_bytes());
+            material.push(0);
+            material.extend_from_slice(k.as_bytes());
+            material.push(0);
+            material.extend_from_slice(v.as_bytes());
+        }
     }
     for (t, map) in &inputs.secrets {
         for (k, v) in map {

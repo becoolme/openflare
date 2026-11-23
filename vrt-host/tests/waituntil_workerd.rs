@@ -142,7 +142,10 @@ fn params(dir: &Path) -> RuntimeParams {
             "experimental".into(),
             "service_binding_extra_handlers".into(),
         ],
-        vars: BTreeMap::from([("v1:wu-marker".to_string(), "present".to_string())]),
+        vars: BTreeMap::from([(
+            "t1".to_string(),
+            BTreeMap::from([("v1:wu-marker".to_string(), "present".to_string())]),
+        )]),
         secrets: BTreeMap::new(),
         do_storage_dir: dir.join("do").display().to_string(),
         wfop_pepper: "wu-pepper".into(),

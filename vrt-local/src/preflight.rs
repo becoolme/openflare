@@ -97,7 +97,10 @@ pub(crate) fn deploy_preflight(
         system_workers: manifest.system_workers,
         system_compat_date: cfg.system_compat_date.clone(),
         system_compat_flags: cfg.system_compat_flags.clone(),
-        vars: st.vars_union(),
+        vars: std::collections::BTreeMap::from([(
+            st.tenant_id().to_string(),
+            st.vars_union(),
+        )]),
         secrets,
         do_storage_dir: do_storage_dir.display().to_string(),
         // W3-r2: per-process pepper — preflight renders wfops

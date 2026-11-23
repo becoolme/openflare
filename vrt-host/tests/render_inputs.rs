@@ -27,11 +27,11 @@ fn tmpfile(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> std::path::Path
 #[test]
 fn file_provider_loads_and_enforces_permissions() {
     let dir = tempfile::tempdir().unwrap();
-    let vars = tmpfile(&dir, "vars.json", br#"{"var:w:vhash:K":"v1"}"#);
+    let vars = tmpfile(&dir, "vars.json", br#"{"t1":{"var:w:vhash:K":"v1"}}"#);
     let secrets = tmpfile(&dir, "secrets.json", br#"{"t1":{"api-key":"s3cr3t"}}"#);
     let provider = FileRenderInputs::new(Some(vars.clone()), Some(secrets.clone()));
     let inputs = provider.load().unwrap();
-    assert_eq!(inputs.vars["var:w:vhash:K"], "v1");
+    assert_eq!(inputs.vars["t1"]["var:w:vhash:K"], "v1");
     assert_eq!(inputs.secrets["t1"]["api-key"].expose(), "s3cr3t");
 
     // 0644 → fail closed on EVERY load (not just startup).
@@ -86,7 +86,7 @@ fn seeded_bundle() -> (Arc<vrt_host::artifact::MemoryBundleSource>, String) {
 #[test]
 fn inputs_change_flips_params_fingerprint() {
     let dir = tempfile::tempdir().unwrap();
-    let vars = tmpfile(&dir, "vars.json", br#"{"var:w:vhash:K":"v1"}"#);
+    let vars = tmpfile(&dir, "vars.json", br#"{"t1":{"var:w:vhash:K":"v1"}}"#);
     let provider: Arc<dyn RenderInputsProvider> =
         Arc::new(FileRenderInputs::new(Some(vars.clone()), None));
     let fx = common::Fixture::new();
@@ -95,7 +95,7 @@ fn inputs_change_flips_params_fingerprint() {
     // Same content → same fingerprint (stable across reloads).
     assert_eq!(asm.params_fingerprint().unwrap(), fp1);
     // Value change → new fingerprint → new expected spec.
-    write_mode(&vars, br#"{"var:w:vhash:K":"v2"}"#, 0o600);
+    write_mode(&vars, br#"{"t1":{"var:w:vhash:K":"v2"}}"#, 0o600);
     let fp2 = asm.params_fingerprint().unwrap();
     assert_ne!(fp1, fp2);
     // Broken file → fingerprint uncomputable (fail closed).
@@ -109,7 +109,7 @@ fn inputs_change_flips_params_fingerprint() {
 #[test]
 fn stub_assemble_resolves_env_from_fresh_inputs() {
     let dir = tempfile::tempdir().unwrap();
-    let vars = tmpfile(&dir, "vars.json", br#"{"var:w:vh:GREETING":"hello"}"#);
+    let vars = tmpfile(&dir, "vars.json", br#"{"t1":{"var:w:vh:GREETING":"hello"}}"#);
     let secrets = tmpfile(&dir, "secrets.json", br#"{"t1":{"api-key":"s3cr3t"}}"#);
     let provider: Arc<dyn RenderInputsProvider> =
         Arc::new(FileRenderInputs::new(Some(vars), Some(secrets)));
@@ -217,4 +217,33 @@ fn converge_marks_render_inputs_unavailable_fail_closed() {
     // Sentinel expected can never equal a real serving digest.
     let expected = rt.expected_digest().unwrap();
     assert!(rt.serving_digest().is_none() || rt.serving_digest() != Some(expected));
+}
+
+#[test]
+fn inputs_material_binds_vars_to_tenant_identity() {
+    // T13/M6: the SAME var value under a different tenant key must
+    // change the params fingerprint — otherwise one tenant's vars
+    // rotation would silently alias another tenant's spec.
+    let pepper = [9u8; 32];
+    let mk = |tenant: &str, value: &str| vrt_host::render_inputs::RenderInputs {
+        vars: std::collections::BTreeMap::from([(
+            tenant.to_string(),
+            std::collections::BTreeMap::from([(
+                "var:w:k".to_string(),
+                value.to_string(),
+            )]),
+        )]),
+        secrets: std::collections::BTreeMap::new(),
+    };
+    let mut m1 = Vec::new();
+    vrt_host::render_inputs::inputs_material(&mk("t1", "v"), &pepper, &mut m1);
+    let mut m2 = Vec::new();
+    vrt_host::render_inputs::inputs_material(&mk("t2", "v"), &pepper, &mut m2);
+    assert_ne!(
+        m1, m2,
+        "tenant identity must be part of the fingerprint material"
+    );
+    let mut m3 = Vec::new();
+    vrt_host::render_inputs::inputs_material(&mk("t1", "v2"), &pepper, &mut m3);
+    assert_ne!(m1, m3, "value changes still move the fingerprint");
 }

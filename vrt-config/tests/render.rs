@@ -544,6 +544,63 @@ fn unresolved_var_and_secret_refs_fail_closed() {
 }
 
 #[test]
+fn vars_are_tenant_scoped_cross_tenant_lookup_fails() {
+    // T13/M6: the same varRef present under ANOTHER tenant's map must
+    // NOT resolve for this tenant — the render skips the worker with
+    // an unresolved-reference reason, identical to the var being
+    // absent entirely.
+    let tenant = tenant();
+    let bs = bundles();
+    let mut params = runtime_params();
+    let value = params
+        .vars
+        .get_mut("team-alpha")
+        .unwrap()
+        .remove("var:w-alpha-1:log")
+        .unwrap();
+    params
+        .vars
+        .entry("team-evil".to_owned())
+        .or_default()
+        .insert("var:w-alpha-1:log".to_owned(), value);
+    let rendered = render_tenant_config(&input(&tenant, &bs, &params)).unwrap();
+    assert_eq!(rendered.skipped_workers, vec!["w-alpha-1".to_string()]);
+    let reason = rendered
+        .skipped_reasons
+        .iter()
+        .find(|r| r.worker_id == "w-alpha-1")
+        .expect("skipped worker must carry a typed reason");
+    assert_eq!(reason.code, "CONFIG_UNRESOLVED_REFERENCE");
+}
+
+#[test]
+fn same_var_ref_resolves_per_tenant() {
+    // Two tenants may declare the same varRef with different values —
+    // each resolves to its own tenant's value, and a tenant with no
+    // map at all fails closed.
+    let vars: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::from([
+        (
+            "t1".to_owned(),
+            BTreeMap::from([("var:w:1:v".to_owned(), "one".to_owned())]),
+        ),
+        (
+            "t2".to_owned(),
+            BTreeMap::from([("var:w:1:v".to_owned(), "two".to_owned())]),
+        ),
+    ]);
+    assert_eq!(resolve_var(&vars, "t1", "var:w:1:v").unwrap(), "one");
+    assert_eq!(resolve_var(&vars, "t2", "var:w:1:v").unwrap(), "two");
+    assert!(matches!(
+        resolve_var(&vars, "t3", "var:w:1:v"),
+        Err(ConfigError::UnresolvedReference("varRef"))
+    ));
+    assert!(matches!(
+        resolve_var(&vars, "t1", "var:w:1:absent"),
+        Err(ConfigError::UnresolvedReference("varRef"))
+    ));
+}
+
+#[test]
 fn bundle_mismatch_fails_closed() {
     let tenant = tenant();
     let params = runtime_params();
@@ -657,10 +714,13 @@ fn injected_values_cannot_break_capnp_structure() {
     // Hostile var value: quotes, newline, `}`, `("`, capnp keywords.
     let params = {
         let mut p = runtime_params();
-        p.vars.insert(
-            "var:w-alpha-1:log".into(),
-            "evil\")),\n(name = \"x\", worker = (modules = []}\"".into(),
-        );
+        p.vars
+            .entry("team-alpha".to_string())
+            .or_default()
+            .insert(
+                "var:w-alpha-1:log".into(),
+                "evil\")),\n(name = \"x\", worker = (modules = []}\"".into(),
+            );
         p.secrets
             .entry("team-alpha".to_string())
             .or_default()
@@ -755,6 +815,8 @@ fn hostile_param_strings_are_rejected_or_escaped() {
     let mut params = runtime_params();
     params
         .vars
+        .entry("team-alpha".to_string())
+        .or_default()
         .insert("var:w-alpha-1:log".into(), "x".repeat(MAX_VALUE_LEN + 1));
     assert_eq!(
         render_tenant_config(&input(&tenant, &bs, &params)),

@@ -20,7 +20,7 @@ fn controller_write_then_host_load_roundtrip_and_fingerprint_moves() {
 
     let provider = FileRenderInputs::new_combined(dir.join(RENDER_INPUTS_FILE));
     let inputs1 = provider.load().unwrap();
-    assert_eq!(inputs1.vars["vrtvar:w:k"], "v1");
+    assert_eq!(inputs1.vars["t1"]["vrtvar:w:k"], "v1");
 
     let pepper = [7u8; 32];
     let mut m1 = Vec::new();
