@@ -413,11 +413,12 @@ async fn standalone_full_lifecycle_smoke() {
     )
     .await;
     assert_eq!(st, 200, "rollback");
-    // vars.json (union of stored versions) must contain v1's ref
-    // with v1's value — keys are `var:{name}:{vhash8}:{binding}`.
+    // vars.json (union of stored versions, scoped by tenant) must
+    // contain v1's ref with v1's value — keys are
+    // `var:{name}:{vhash8}:{binding}` under the tenant object.
     let vars: serde_json::Value =
         serde_json::from_slice(&std::fs::read(sa.root.join("vars/vars.json")).unwrap()).unwrap();
-    let v1_var = vars
+    let v1_var = vars["local"]
         .as_object()
         .unwrap()
         .iter()

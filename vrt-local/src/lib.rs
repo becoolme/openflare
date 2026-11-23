@@ -417,7 +417,7 @@ impl VrtLocal {
             state::write(&staging, &st)?;
             publish_at(&staging, &st, &key)?;
             state::write_secrets(&staging, &Default::default())?;
-            state::write_vars(&staging, &Default::default())?;
+            state::write_vars(&staging, st.tenant_id(), &Default::default())?;
             oplog::append(
                 &staging,
                 &oplog::entry(
@@ -755,7 +755,7 @@ impl VrtLocal {
         // vars.json = union of ALL stored versions' vars (F2 — refs
         // are content-scoped, so a torn publish never strands the
         // live envelope).
-        state::write_vars(&self.root, &st.vars_union())?;
+        state::write_vars(&self.root, st.tenant_id(), &st.vars_union())?;
         // 2. state
         state::write(&self.root, &st)?;
         // 3. signed desired
@@ -846,7 +846,7 @@ impl VrtLocal {
         // previously-loadable version; its artifact is already in
         // objects/, so no pending bytes).
         preflight::deploy_preflight(&self.root, &st, None)?;
-        state::write_vars(&self.root, &st.vars_union())?;
+        state::write_vars(&self.root, st.tenant_id(), &st.vars_union())?;
         state::write(&self.root, &st)?;
         self.publish(&st, &key)?;
         oplog::append(
@@ -959,7 +959,7 @@ impl VrtLocal {
         // The promoted bundle must load before traffic moves; failure
         // leaves both state and the old envelope untouched.
         preflight::deploy_preflight(&self.root, &st, None)?;
-        state::write_vars(&self.root, &st.vars_union())?;
+        state::write_vars(&self.root, st.tenant_id(), &st.vars_union())?;
         state::write(&self.root, &st)?;
         self.publish(&st, &key)?;
         oplog::append(
@@ -1217,7 +1217,7 @@ impl VrtLocal {
             .checked_add(1)
             .ok_or(LocalError::State("revision"))?;
         Self::validate_desired(&st)?;
-        state::write_vars(&self.root, &st.vars_union())?;
+        state::write_vars(&self.root, st.tenant_id(), &st.vars_union())?;
         state::write(&self.root, &st)?;
         self.publish(&st, &key)?;
         // Same artifact GC as deploy: only objects no remaining version

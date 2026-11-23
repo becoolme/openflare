@@ -2558,7 +2558,10 @@ impl RenderParamsFile {
     /// `TryFrom`s — a malformed derived document fails closed here).
     fn into_params(
         self,
-        vars: std::collections::BTreeMap<String, String>,
+        vars: std::collections::BTreeMap<
+            String,
+            std::collections::BTreeMap<String, String>,
+        >,
         secrets: std::collections::BTreeMap<
             String,
             std::collections::BTreeMap<String, vrt_config::SecretValue>,

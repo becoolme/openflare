@@ -772,8 +772,17 @@ pub fn write_secrets(root: &Path, secrets: &SecretMap) -> Result<(), LocalError>
         .map_err(|_| LocalError::Layout("secrets write"))
 }
 
-pub fn write_vars(root: &Path, vars: &BTreeMap<String, String>) -> Result<(), LocalError> {
-    let bytes = serde_json::to_vec(vars).map_err(|_| LocalError::State("vars"))?;
+/// vars.json shape matches the platform combined file's "vars" —
+/// `{tenantId: {varRef: value}}` — so the host resolves var refs inside
+/// the same tenant namespace in both modes. Standalone has exactly one
+/// tenant; the union of its version-scoped refs is still disjoint.
+pub fn write_vars(
+    root: &Path,
+    tenant_id: &str,
+    vars: &BTreeMap<String, String>,
+) -> Result<(), LocalError> {
+    let doc = serde_json::json!({ tenant_id: vars });
+    let bytes = serde_json::to_vec(&doc).map_err(|_| LocalError::State("vars"))?;
     vrt_securefs::atomic_write(&crate::layout::vars_file(root), &bytes, 0o600)
         .map_err(|_| LocalError::Layout("vars write"))
 }

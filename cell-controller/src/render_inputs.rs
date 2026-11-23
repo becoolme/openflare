@@ -2,8 +2,8 @@
 //!
 //! Contract with `vrt-host`'s `FileRenderInputs` (combined mode): ONE
 //! file `render-inputs.json` under a private dir —
-//! `{ "vars": {varRef: value}, "secrets": {tenantId: {secretRef:
-//! value}} }`, 0600, atomically replaced. A single file is the only
+//! `{ "vars": {tenantId: {varRef: value}}, "secrets": {tenantId:
+//! {secretRef: value}} }`, 0600, atomically replaced. A single file is the only
 //! shape giving the host a consistent snapshot: two files written
 //! independently could leave a mixed generation behind (B4).
 //!
@@ -297,8 +297,19 @@ pub fn write_render_inputs(dir: &Path, payload: &RenderInputsPayload) -> Result<
     let mut vars = serde_json::Map::new();
     let mut secrets = serde_json::Map::new();
     for (team, t) in &payload.tenants {
-        for (k, v) in &t.vars {
-            vars.insert(k.clone(), serde_json::Value::String(v.clone()));
+        // Vars live under the tenant id like secrets (T13/M6): a flat
+        // merge let one tenant's binding resolve another tenant's
+        // varRef — same-named keys collided across tenants.
+        if !t.vars.is_empty() {
+            vars.insert(
+                team.clone(),
+                serde_json::Value::Object(
+                    t.vars
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                        .collect(),
+                ),
+            );
         }
         if t.unavailable.is_empty() {
             secrets.insert(
@@ -378,8 +389,11 @@ mod tests {
     use super::*;
 
     fn payload() -> RenderInputsPayload {
+        // t1 and t2 share the SAME varRef key on purpose — the old flat
+        // output let t2's value overwrite t1's (cross-tenant leak);
+        // the scoped shape must keep both.
         serde_json::from_str(
-            r#"{"fingerprint":"abc","tenants":{"t1":{"vars":{"vrtvar:w:k":"val"},"secrets":{"vrtsec:w:s":"pw"}},"t2":{"vars":{},"secrets":{"vrtsec:w2:s2":"x"}}}}"#,
+            r#"{"fingerprint":"abc","tenants":{"t1":{"vars":{"vrtvar:w:k":"val"},"secrets":{"vrtsec:w:s":"pw"}},"t2":{"vars":{"vrtvar:w:k":"val-t2"},"secrets":{"vrtsec:w2:s2":"x"}}}}"#,
         )
         .unwrap()
     }
@@ -397,7 +411,8 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join(RENDER_INPUTS_FILE)).unwrap())
                 .unwrap();
-        assert_eq!(doc["vars"]["vrtvar:w:k"], "val");
+        assert_eq!(doc["vars"]["t1"]["vrtvar:w:k"], "val");
+        assert_eq!(doc["vars"]["t2"]["vrtvar:w:k"], "val-t2");
         assert_eq!(doc["secrets"]["t1"]["vrtsec:w:s"], "pw");
         assert_eq!(doc["secrets"]["t2"]["vrtsec:w2:s2"], "x");
         // exactly ONE file — no vars.json/secrets.json split (B4)
@@ -431,7 +446,7 @@ mod tests {
                 .unwrap();
         assert!(doc["secrets"].get("bad").is_none());
         assert_eq!(doc["secrets"]["good"]["vrtsec:g:s"], "ok");
-        assert_eq!(doc["vars"]["vrtvar:w:k"], "v");
+        assert_eq!(doc["vars"]["bad"]["vrtvar:w:k"], "v");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
