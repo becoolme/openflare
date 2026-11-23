@@ -634,6 +634,11 @@ pub struct DeployOverrides {
     /// unreachable from a normal deploy. Ignored by `vrt.toml`/wrangler
     /// files, which have no preview branch.
     pub is_preview: bool,
+    /// `of deploy --config-sandbox=…`: where a `cloudflare.config.*` is
+    /// evaluated. `Node` is the historical (default) loader child; `Worker`
+    /// evaluates it in a workerd dynamic worker. Ignored by `vrt.toml` and
+    /// wrangler files.
+    pub config_sandbox: crate::project_cfg::ConfigSandbox,
 }
 
 /// Fully packed worker ready for state application.
@@ -983,10 +988,11 @@ fn pack_inner(
     do_ctx: Option<&DoPackCtx<'_>>,
 ) -> Result<PackedWorker, LocalError> {
     assemble(
-        gather_dir_for_env_preview(
+        gather_dir_for_env_preview_sandbox(
             worker_dir,
             overrides.env_name.as_deref(),
             overrides.is_preview,
+            overrides.config_sandbox,
         )?,
         overrides,
         tenant_id,
@@ -1045,10 +1051,26 @@ pub fn gather_dir_for_env_preview(
     env_name: Option<&str>,
     is_preview: bool,
 ) -> Result<Gathered, LocalError> {
+    gather_dir_for_env_preview_sandbox(
+        worker_dir,
+        env_name,
+        is_preview,
+        crate::project_cfg::ConfigSandbox::Node,
+    )
+}
+
+/// [`gather_dir_for_env_preview`] plus the config-evaluation sandbox.
+pub fn gather_dir_for_env_preview_sandbox(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+    is_preview: bool,
+    sandbox: crate::project_cfg::ConfigSandbox,
+) -> Result<Gathered, LocalError> {
     // T31/C4: `vrt.toml` keeps precedence; otherwise the wrangler family
     // (json > jsonc > toml) normalizes into the same meta shape.
-    let (meta, _meta_source) =
-        crate::project_cfg::load_worker_meta_for_env_preview(worker_dir, env_name, is_preview)?;
+    let (meta, _meta_source) = crate::project_cfg::load_worker_meta_for_env_preview_sandbox(
+        worker_dir, env_name, is_preview, sandbox,
+    )?;
     let mut files = BTreeMap::new();
     let mut skipped = Vec::new();
     let mut total: u64 = 0;
@@ -1181,6 +1203,7 @@ fn gather_bundled(
                 .compatibility_flags
                 .iter()
                 .any(|f| f == "nodejs_compat"),
+            alias: BTreeMap::new(),
         },
     )?;
     let mut out = BTreeMap::new();

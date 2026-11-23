@@ -31,9 +31,9 @@ USAGE:
            [--workerd <p>] [--stub] [--allow-unpinned-workerd]
            [--vrt-host-bin <p>] [--vrt-provider-bin <p>] [--vrt-sql-bin <p>]
            [--facade-dist <dir>]
-  of deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--tag <t>] [--preview] [--dry-run] <worker_dir>
+  of deploy --root <dir> [--env <name>] [--secrets-file <f|->] [--var K:V]… [--name <n>] [--tag <t>] [--preview] [--config-sandbox node|worker] [--dry-run] <worker_dir>
   of deploy --url <http://host:port> --token-file <p> [same options] <worker_dir>
-  of check [--env <name>] [--var K:V]… [--tag <t>] <worker_dir>
+  of check [--env <name>] [--var K:V]… [--tag <t>] [--config-sandbox node|worker] <worker_dir>
   of promote --root <dir> [--worker <name|workerId>] <version_id>
   of logs --root <dir> <worker> [--follow] [--since <dur>] [--level <lvl>] [--json]
   of doctor [--root <dir>] [--env <name>] [--json] [--strict]
@@ -116,7 +116,8 @@ fn positional(args: &[String]) -> Vec<String> {
             continue;
         }
         if args[i].starts_with("--") {
-            i += 2;
+            // `--flag=value` is one token; `--flag value` consumes both.
+            i += if args[i].contains('=') { 1 } else { 2 };
             continue;
         }
         out.push(args[i].clone());
@@ -129,6 +130,37 @@ fn root_of(args: &[String]) -> Result<PathBuf, String> {
     arg(args, "--root")
         .map(PathBuf::from)
         .ok_or_else(|| "--root required".to_string())
+}
+
+/// `--config-sandbox node|worker` (also `--config-sandbox=worker`).
+/// Defaults to `node` — the historical loader child — so existing projects
+/// and scripts keep byte-identical behaviour.
+fn config_sandbox(args: &[String]) -> Result<vrt_local::ConfigSandbox, String> {
+    let mut value: Option<&str> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--config-sandbox" {
+            let next = args.get(i + 1).map(String::as_str);
+            match next {
+                Some(v) if !v.starts_with("--") => {
+                    value = Some(v);
+                    i += 2;
+                    continue;
+                }
+                _ => return Err("--config-sandbox requires node|worker".into()),
+            }
+        }
+        if let Some(v) = a.strip_prefix("--config-sandbox=") {
+            value = Some(v);
+        }
+        i += 1;
+    }
+    match value {
+        None => Ok(vrt_local::ConfigSandbox::Node),
+        Some(v) => vrt_local::ConfigSandbox::parse(v)
+            .ok_or_else(|| format!("--config-sandbox must be node|worker (got '{v}')")),
+    }
 }
 
 async fn run(args: Vec<String>) -> Result<(), String> {
@@ -1121,10 +1153,11 @@ fn cmd_check(args: &[String]) -> Result<(), String> {
         env_name: arg(args, "--env").map(String::from),
         vars: collect_vars(args)?,
         tag: arg(args, "--tag").map(String::from),
+        config_sandbox: config_sandbox(args)?,
         ..Default::default()
     };
-    let report = vrt_local::check::check_worker(Path::new(dir), &overrides)
-        .map_err(|e| e.to_string())?;
+    let report =
+        vrt_local::check::check_worker(Path::new(dir), &overrides).map_err(|e| e.to_string())?;
     println!(
         "{}",
         serde_json::to_string_pretty(&report).unwrap_or_default()
@@ -1149,6 +1182,7 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
         vars: collect_vars(args)?,
         tag: arg(args, "--tag").map(String::from),
         is_preview: preview,
+        config_sandbox: config_sandbox(args)?,
         ..Default::default()
     };
     let secrets = collect_secrets(args)?;
@@ -1170,10 +1204,11 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             arg(args, "--token-file").ok_or("--url requires --token-file <path> (0600, 64-hex)")?;
         let token = vrt_local::keys::load_token_file(Path::new(token_path))
             .map_err(|e| format!("token file: {e}"))?;
-        let g = vrt_local::worker_pkg::gather_dir_for_env_preview(
+        let g = vrt_local::worker_pkg::gather_dir_for_env_preview_sandbox(
             Path::new(&dir),
             overrides.env_name.as_deref(),
             preview,
+            overrides.config_sandbox,
         )
         .map_err(|e| e.to_string())?;
         if dry_run {
@@ -1230,10 +1265,11 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
     let root = root_of(args)?;
     let g = if dry_run {
         Some(
-            vrt_local::worker_pkg::gather_dir_for_env_preview(
+            vrt_local::worker_pkg::gather_dir_for_env_preview_sandbox(
                 Path::new(&dir),
                 overrides.env_name.as_deref(),
                 preview,
+                overrides.config_sandbox,
             )
             .map_err(|e| e.to_string())?,
         )

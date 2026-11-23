@@ -50,6 +50,20 @@ const CF_NODE_ENV: &str = "VRT_NODE_BIN";
 const CF_CONFIG_LOADER_TIMEOUT_ENV: &str = "VRT_CF_CONFIG_LOADER_TIMEOUT_MS";
 const CF_CONFIG_LOADER_TIMEOUT_MS: u64 = 60_000;
 const CF_CONFIG_LOADER_TIMEOUT_RANGE_MS: std::ops::RangeInclusive<u64> = 100..=600_000;
+/// Node helper for the `--config-sandbox=worker` path: bundles the config,
+/// evaluates it in a workerd dynamic worker, validates and converts on the
+/// trusted side. Same stdout/stderr contract as the Node loader.
+const CF_CONFIG_SANDBOX_LOADER_SCRIPT: &str = "scripts/load-cloudflare-config-worker.mjs";
+const CF_CONFIG_SANDBOX_LOADER_ENV: &str = "VRT_CF_CONFIG_SANDBOX_LOADER";
+/// Wall-clock deadline for ONE dynamic-worker evaluation (bounded; default
+/// 5 s). The child-process deadline above still bounds the whole helper
+/// (bundle + startup + eval); the sandbox value must stay below it.
+const CF_CONFIG_SANDBOX_TIMEOUT_ENV: &str = "VRT_CF_CONFIG_SANDBOX_TIMEOUT_MS";
+const CF_CONFIG_SANDBOX_TIMEOUT_MS: u64 = 5_000;
+const CF_CONFIG_SANDBOX_TIMEOUT_RANGE_MS: std::ops::RangeInclusive<u64> = 100..=30_000;
+/// Where the sandbox finds workerd. The runtime is already pinned for every
+/// `of serve` deployment; the sandbox reuses the same binary.
+const CF_CONFIG_SANDBOX_WORKERD_ENV: [&str; 2] = ["VRT_WORKERD_BIN", "OF_WORKERD_BIN"];
 /// Hard caps on what the helper may hand back — the raw config itself is
 /// capped at `MAX_CONFIG_BYTES`, the converted JSON is a small multiple.
 const CF_CONFIG_MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
@@ -185,6 +199,39 @@ pub enum MetaSource {
     CfConfig(String),
 }
 
+/// Where a `cloudflare.config.*` is evaluated.
+///
+/// `Node` is the historical default: Cloudflare's own loader runs in a
+/// restricted (but unsandboxed) Node child process. `Worker` runs the same
+/// loader contract inside a workerd dynamic worker (no host filesystem, no
+/// outbound network) and keeps validation/conversion on the trusted side.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConfigSandbox {
+    /// `scripts/load-cloudflare-config.mjs` (default; unchanged behaviour).
+    #[default]
+    Node,
+    /// `scripts/load-cloudflare-config-worker.mjs` + workerd.
+    Worker,
+}
+
+impl ConfigSandbox {
+    /// CLI/env spelling: `node` or `worker`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "node" => Some(Self::Node),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Worker => "worker",
+        }
+    }
+}
+
 /// Load the worker meta for `worker_dir`: `vrt.toml` wins; then
 /// Cloudflare's programmatic `cloudflare.config.*`; then the wrangler
 /// family in packer order. `wrangler.config.*` (a wrangler-specific
@@ -217,6 +264,18 @@ pub fn load_worker_meta_for_env_preview(
     worker_dir: &Path,
     env_name: Option<&str>,
     is_preview: bool,
+) -> Result<(WorkerToml, MetaSource), LocalError> {
+    load_worker_meta_for_env_preview_sandbox(worker_dir, env_name, is_preview, ConfigSandbox::Node)
+}
+
+/// [`load_worker_meta_for_env_preview`] with an explicit config-evaluation
+/// sandbox. Only a `cloudflare.config.*` source is affected; `vrt.toml` and
+/// wrangler files are read, never evaluated.
+pub fn load_worker_meta_for_env_preview_sandbox(
+    worker_dir: &Path,
+    env_name: Option<&str>,
+    is_preview: bool,
+    sandbox: ConfigSandbox,
 ) -> Result<(WorkerToml, MetaSource), LocalError> {
     let vrt_path = worker_dir.join("vrt.toml");
     if vrt_path.exists() {
@@ -257,7 +316,7 @@ pub fn load_worker_meta_for_env_preview(
         .find(|c| worker_dir.join(c).exists())
     {
         let (config, _resolved, _shadowed) =
-            load_cf_project_config(worker_dir, cf, env_name, is_preview)
+            load_cf_project_config(worker_dir, cf, env_name, is_preview, sandbox)
                 .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
         let meta = wrangler_config_to_worker_toml(&config)
             .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
@@ -501,43 +560,34 @@ fn cf_helper_failure(stderr: &[u8]) -> (Option<String>, String) {
     (None, "config evaluation failed without a diagnostic".into())
 }
 
-/// Run the Node helper for `config_file` inside `project_dir` and return
-/// the raw (wrangler-shaped) config object. `is_preview` maps onto the
-/// helper's `--preview` flag (the `isPreview` argument Cloudflare's own
-/// loader hands to `defineConfig`); it is only ever `true` for
-/// `of deploy --preview`.
-fn run_cf_config_loader(
-    project_dir: &Path,
+/// Map a helper exit status + its typed stderr code onto the public error
+/// codes. The helper's own code is only honoured for the three codes this
+/// module defines — anything else is a generic loader failure.
+fn cf_error_code(status: std::process::ExitStatus, helper_code: Option<&str>) -> &'static str {
+    // Exit 2 is the helper's "zod rejected the config" contract (both
+    // helpers use it).
+    if status.code() == Some(2) {
+        return "VRT_CONFIG_INVALID";
+    }
+    match helper_code {
+        Some("VRT_CONFIG_LOADER_TIMEOUT") => "VRT_CONFIG_LOADER_TIMEOUT",
+        Some("VRT_CONFIG_INVALID") => "VRT_CONFIG_INVALID",
+        _ => "VRT_CONFIG_LOADER_FAILED",
+    }
+}
+
+/// Spawn a config-loader child in its own process group, drain stdout/stderr
+/// with caps, and enforce the child-process deadline. Shared by the Node
+/// loader and the worker sandbox so their timeout/kill behaviour is one
+/// implementation.
+fn run_cf_loader_child(
+    mut cmd: std::process::Command,
     config_file: &str,
-    env_name: Option<&str>,
-    is_preview: bool,
-) -> Result<Value, ProjectConfigError> {
-    use std::process::{Command, Stdio};
+    timeout: std::time::Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>, bool), ProjectConfigError> {
+    use std::process::Stdio;
 
-    let config_path = std::fs::canonicalize(project_dir.join(config_file)).map_err(|_| {
-        invalid_code(
-            "VRT_CONFIG_NOT_FOUND",
-            config_file,
-            "cannot resolve config file path",
-        )
-    })?;
-    let script = cf_config_loader_script()?;
-    let node = cf_node_bin()?;
-    let timeout = cf_config_loader_timeout();
-
-    let mut cmd = Command::new(&node);
-    cmd.arg(&script).arg(&config_path);
-    if let Some(name) = env_name {
-        cmd.arg("--mode").arg(name);
-    }
-    if is_preview {
-        // `defineConfig(({ isPreview }) => …)` — the production deploy
-        // never passes this, so its branch can never be selected by
-        // accident (the helper's flag is additive, not a default).
-        cmd.arg("--preview");
-    }
-    cmd.current_dir(project_dir)
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
@@ -629,36 +679,13 @@ fn run_cf_config_loader(
         .recv_timeout(pipe_drain_timeout)
         .map(|(bytes, _)| bytes)
         .unwrap_or_default();
+    Ok((status, stdout, stderr, stdout_truncated))
+}
 
-    if stdout_truncated {
-        return Err(invalid_code(
-            "VRT_CONFIG_LOADER_FAILED",
-            config_file,
-            &format!("loader output exceeds {CF_CONFIG_MAX_STDOUT_BYTES} bytes"),
-        ));
-    }
-    if !status.success() {
-        let (_helper_code, message) = cf_helper_failure(&stderr);
-        // Exit 2 is the helper's "zod rejected the config" contract; every
-        // other failure (missing package, thrown import, unsupported Node)
-        // is an environment/loader problem.
-        let code = if status.code() == Some(2) {
-            "VRT_CONFIG_INVALID"
-        } else {
-            "VRT_CONFIG_LOADER_FAILED"
-        };
-        let status = status
-            .code()
-            .map(|c| format!("exit {c}"))
-            .unwrap_or_else(|| "killed by signal".into());
-        return Err(invalid_code(
-            code,
-            config_file,
-            &format!("{message} ({status})"),
-        ));
-    }
-
-    let doc: Value = cf_loader_payload(&stdout).ok_or_else(|| {
+/// Parse `{raw, dependencies}` from a helper's stdout, enforcing the wire
+/// shape both helpers share.
+fn cf_loader_document(stdout: &[u8], config_file: &str) -> Result<Value, ProjectConfigError> {
+    let doc: Value = cf_loader_payload(stdout).ok_or_else(|| {
         invalid_code(
             "VRT_CONFIG_LOADER_FAILED",
             config_file,
@@ -697,6 +724,209 @@ fn run_cf_config_loader(
         ));
     }
     Ok(raw)
+}
+
+/// Fail a helper invocation with the helper's typed diagnostic.
+fn cf_loader_status_error(
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+    config_file: &str,
+) -> ProjectConfigError {
+    let (helper_code, message) = cf_helper_failure(stderr);
+    let code = cf_error_code(status, helper_code.as_deref());
+    let status_text = status
+        .code()
+        .map(|c| format!("exit {c}"))
+        .unwrap_or_else(|| "killed by signal".into());
+    invalid_code(code, config_file, &format!("{message} ({status_text})"))
+}
+
+/// Run the Node helper for `config_file` inside `project_dir` and return
+/// the raw (wrangler-shaped) config object. `is_preview` maps onto the
+/// helper's `--preview` flag (the `isPreview` argument Cloudflare's own
+/// loader hands to `defineConfig`); it is only ever `true` for
+/// `of deploy --preview`.
+fn run_cf_config_loader(
+    project_dir: &Path,
+    config_file: &str,
+    env_name: Option<&str>,
+    is_preview: bool,
+) -> Result<Value, ProjectConfigError> {
+    let config_path = std::fs::canonicalize(project_dir.join(config_file)).map_err(|_| {
+        invalid_code(
+            "VRT_CONFIG_NOT_FOUND",
+            config_file,
+            "cannot resolve config file path",
+        )
+    })?;
+    let script = cf_config_loader_script()?;
+    let node = cf_node_bin()?;
+
+    let mut cmd = std::process::Command::new(&node);
+    cmd.arg(&script).arg(&config_path);
+    if let Some(name) = env_name {
+        cmd.arg("--mode").arg(name);
+    }
+    if is_preview {
+        // `defineConfig(({ isPreview }) => …)` — the production deploy
+        // never passes this, so its branch can never be selected by
+        // accident (the helper's flag is additive, not a default).
+        cmd.arg("--preview");
+    }
+    cmd.current_dir(project_dir);
+
+    let (status, stdout, stderr, truncated) =
+        run_cf_loader_child(cmd, config_file, cf_config_loader_timeout())?;
+    if truncated {
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            &format!("loader output exceeds {CF_CONFIG_MAX_STDOUT_BYTES} bytes"),
+        ));
+    }
+    if !status.success() {
+        return Err(cf_loader_status_error(status, &stderr, config_file));
+    }
+    cf_loader_document(&stdout, config_file)
+}
+
+/// Run the worker sandbox helper. It bundles the config, evaluates it in a
+/// workerd dynamic worker, and returns the same `{raw, dependencies}`
+/// document the Node helper prints; validation and conversion happen in the
+/// helper's trusted process, never inside the dynamic worker.
+fn run_cf_config_sandbox(
+    project_dir: &Path,
+    config_file: &str,
+    env_name: Option<&str>,
+    is_preview: bool,
+) -> Result<Value, ProjectConfigError> {
+    let config_path = std::fs::canonicalize(project_dir.join(config_file)).map_err(|_| {
+        invalid_code(
+            "VRT_CONFIG_NOT_FOUND",
+            config_file,
+            "cannot resolve config file path",
+        )
+    })?;
+    let size = std::fs::metadata(&config_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if size as usize > MAX_CONFIG_BYTES {
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            &format!("config file exceeds {MAX_CONFIG_BYTES} bytes"),
+        ));
+    }
+    let script = cf_sandbox_loader_script()?;
+    let node = cf_node_bin()?;
+    let bundler = crate::bundle::bundler_path().map_err(|_| {
+        invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            "of-bundler helper not found (set OF_BUNDLER or install a release build)",
+        )
+    })?;
+    let workerd = cf_sandbox_workerd()?;
+    let timeout = cf_sandbox_timeout();
+
+    let mut cmd = std::process::Command::new(&node);
+    cmd.arg(&script).arg(&config_path);
+    if let Some(name) = env_name {
+        cmd.arg("--mode").arg(name);
+    }
+    if is_preview {
+        cmd.arg("--preview");
+    }
+    cmd.arg("--timeout-ms").arg(timeout.as_millis().to_string());
+    cmd.arg("--bundler").arg(&bundler);
+    cmd.arg("--workerd").arg(&workerd);
+    cmd.current_dir(project_dir);
+
+    // The bundle (<=30 s), workerd startup (<=15 s) and the evaluation
+    // deadline are phases inside this child; keep the outer deadline above
+    // their sum unless the operator set a larger one explicitly.
+    let outer = cf_config_loader_timeout()
+        .max(timeout + std::time::Duration::from_millis(45_000));
+    let (status, stdout, stderr, truncated) = run_cf_loader_child(cmd, config_file, outer)?;
+    if truncated {
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            config_file,
+            &format!("loader output exceeds {CF_CONFIG_MAX_STDOUT_BYTES} bytes"),
+        ));
+    }
+    if !status.success() {
+        return Err(cf_loader_status_error(status, &stderr, config_file));
+    }
+    cf_loader_document(&stdout, config_file)
+}
+
+fn cf_sandbox_loader_script() -> Result<PathBuf, ProjectConfigError> {
+    if let Ok(v) = std::env::var(CF_CONFIG_SANDBOX_LOADER_ENV) {
+        let p = PathBuf::from(v);
+        if p.is_file() {
+            return Ok(p);
+        }
+        return Err(invalid_code(
+            "VRT_CONFIG_LOADER_FAILED",
+            "configSandboxLoader",
+            &format!("{CF_CONFIG_SANDBOX_LOADER_ENV} does not point at a file"),
+        ));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            let cand = anc.join(CF_CONFIG_SANDBOX_LOADER_SCRIPT);
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+    let cand = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(CF_CONFIG_SANDBOX_LOADER_SCRIPT);
+    if cand.is_file() {
+        return Ok(cand);
+    }
+    Err(invalid_code(
+        "VRT_CONFIG_LOADER_FAILED",
+        "configSandboxLoader",
+        &format!(
+            "cannot find {CF_CONFIG_SANDBOX_LOADER_SCRIPT} next to the of executable — install it or set {CF_CONFIG_SANDBOX_LOADER_ENV}"
+        ),
+    ))
+}
+
+fn cf_sandbox_timeout() -> std::time::Duration {
+    let ms = std::env::var(CF_CONFIG_SANDBOX_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| CF_CONFIG_SANDBOX_TIMEOUT_RANGE_MS.contains(ms))
+        .unwrap_or(CF_CONFIG_SANDBOX_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+fn cf_sandbox_workerd() -> Result<PathBuf, ProjectConfigError> {
+    for name in CF_CONFIG_SANDBOX_WORKERD_ENV {
+        if let Ok(v) = std::env::var(name) {
+            let p = PathBuf::from(v);
+            if p.is_file() {
+                return Ok(p);
+            }
+            return Err(invalid_code(
+                "VRT_CONFIG_LOADER_FAILED",
+                "configSandboxWorkerd",
+                &format!("{name} does not point at a file"),
+            ));
+        }
+    }
+    Err(invalid_code(
+        "VRT_CONFIG_LOADER_FAILED",
+        "configSandboxWorkerd",
+        &format!(
+            "the worker config sandbox needs workerd — set {} (or use --config-sandbox=node)",
+            CF_CONFIG_SANDBOX_WORKERD_ENV[0]
+        ),
+    ))
 }
 
 /// `convertToWranglerConfig` reports `cf-worker` entrypoints as absolute
@@ -765,6 +995,7 @@ pub fn load_cf_project_config(
     config_file: &str,
     env_name: Option<&str>,
     is_preview: bool,
+    sandbox: ConfigSandbox,
 ) -> Result<(Value, Value, Vec<String>), ProjectConfigError> {
     if !CLOUDFLARE_CONFIG_CANDIDATES.contains(&config_file) {
         return Err(invalid_code(
@@ -783,7 +1014,14 @@ pub fn load_cf_project_config(
             &format!("config file not found in project: {config_file}"),
         ));
     }
-    let mut raw = run_cf_config_loader(project_dir, config_file, env_name, is_preview)?;
+    let mut raw = match sandbox {
+        ConfigSandbox::Node => {
+            run_cf_config_loader(project_dir, config_file, env_name, is_preview)?
+        }
+        ConfigSandbox::Worker => {
+            run_cf_config_sandbox(project_dir, config_file, env_name, is_preview)?
+        }
+    };
     rebase_cf_main(&mut raw, project_dir, config_file)?;
     let resolved = resolve_env(&raw, None, config_file)?;
     let config = normalize_wrangler_config(&resolved, config_file)?;
@@ -3699,6 +3937,21 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn config_sandbox_defaults_to_node_and_parses_cli_values() {
+        assert_eq!(ConfigSandbox::default(), ConfigSandbox::Node);
+        assert_eq!(ConfigSandbox::parse("node"), Some(ConfigSandbox::Node));
+        assert_eq!(ConfigSandbox::parse("worker"), Some(ConfigSandbox::Worker));
+        assert_eq!(
+            ConfigSandbox::parse(" worker "),
+            Some(ConfigSandbox::Worker)
+        );
+        assert_eq!(ConfigSandbox::parse("wasm"), None);
+        assert_eq!(ConfigSandbox::parse(""), None);
+        assert_eq!(ConfigSandbox::Node.as_str(), "node");
+        assert_eq!(ConfigSandbox::Worker.as_str(), "worker");
+    }
+
     #[derive(Deserialize)]
     struct VectorsFile {
         vectors: Vec<Vector>,
@@ -4328,6 +4581,7 @@ console.log("after the payload");
             vars: BTreeMap::new(),
             tag: None,
             is_preview: false,
+            config_sandbox: Default::default(),
         };
         let pkg = crate::worker_pkg::pack(&fixture, &overrides, "tenant").unwrap();
         assert_eq!(pkg.name, "cf-config-fixture");
@@ -4794,8 +5048,11 @@ console.log("after the payload");
                 vars: BTreeMap::new(),
                 tag: None,
                 is_preview: false,
+                config_sandbox: Default::default(),
             };
-            pack_with_resolver(dir.path(), &overrides, "tenant", &|_| Some("w-target".into()))
+            pack_with_resolver(dir.path(), &overrides, "tenant", &|_| {
+                Some("w-target".into())
+            })
         };
 
         let pkg = pack("props = { a = 1, nested = { b = true } }").unwrap();

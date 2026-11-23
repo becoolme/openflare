@@ -196,6 +196,14 @@ jobs:
           scripts/ci-real-workerd.sh \
             "$GITHUB_WORKSPACE/.ci/workerd/workerd" \
             "$GITHUB_WORKSPACE/.ci/workerd/workerd.capnp"
+      # The config sandbox is Node + workerd + the of-bundler helper. It
+      # runs the two production helpers (Node baseline and the workerd
+      # dynamic-worker path) against parity and hostile-config cases.
+      - name: Config sandbox (workerd dynamic worker) verification
+        env:
+          VRT_WORKERD_BIN: ${{ github.workspace }}/.ci/workerd/workerd
+          OF_BUNDLER: ${{ github.workspace }}/of-bundler/target/debug/of-bundler
+        run: node spike/config-sandbox/verify.mjs --workerd "$VRT_WORKERD_BIN"
       # Tests keep their /tmp/vrt-* roots on panic (announced via
       # stderr) — collect them plus rendered configs and workerd logs.
       - name: Collect test logs on failure

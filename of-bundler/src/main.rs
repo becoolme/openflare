@@ -248,6 +248,19 @@ async fn run(spec: &BundleSpec) -> Result<BundledSpec, String> {
                 "default".into(),
             ]),
             main_fields: Some(vec!["browser".into(), "module".into(), "main".into()]),
+            // Opt-in specifier rewrites (empty for every deploy path).
+            // BTreeMap keeps the emitted order deterministic.
+            alias: if spec.opts.alias.is_empty() {
+                None
+            } else {
+                Some(
+                    spec.opts
+                        .alias
+                        .iter()
+                        .map(|(k, v)| (k.clone(), vec![Some(v.clone())]))
+                        .collect(),
+                )
+            },
             ..Default::default()
         }),
         ..Default::default()
@@ -264,12 +277,25 @@ async fn run(spec: &BundleSpec) -> Result<BundledSpec, String> {
     let mut emitted = BTreeSet::new();
     let mut main_source = None;
     let mut chunks = Vec::new();
-    let entry_name = rel_norm(Path::new("/"), Path::new(entry))
-        .ok_or("module escapes worker dir")?;
+    // Every file-backed module in the graph (entry, relative imports,
+    // JSON modules, `node_modules` packages) — the `dependencies` the
+    // config sandbox reports to its caller.
+    let mut dependencies = BTreeSet::new();
+    let entry_name =
+        rel_norm(Path::new("/"), Path::new(entry)).ok_or("module escapes worker dir")?;
     for asset in out.assets.iter() {
         let Output::Chunk(chunk) = asset else {
             continue;
         };
+        for id in chunk.module_ids.iter().chain(chunk.modules.keys.iter()) {
+            let raw = id.raw_id();
+            // Virtual modules (`\0...`) and builtins are not files the
+            // caller can watch or reload.
+            if raw.starts_with('\0') || !Path::new(raw).is_absolute() {
+                continue;
+            }
+            dependencies.insert(raw.to_string());
+        }
         if chunk.is_entry {
             main_source = Some(chunk.code.clone());
             emitted.insert(entry_name.clone());
@@ -337,22 +363,34 @@ async fn run(spec: &BundleSpec) -> Result<BundledSpec, String> {
         main_source,
         chunks,
         externals: externals.into_iter().collect(),
+        dependencies: dependencies.into_iter().collect(),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::BundleOptsSpec;
     use std::fs;
 
     fn run_spec(dir: &Path, entry: &str, main_dir: &str, globs: &[&str]) -> BundledSpec {
+        run_spec_with(dir, entry, main_dir, globs, BundleOptsSpec::default())
+    }
+
+    fn run_spec_with(
+        dir: &Path,
+        entry: &str,
+        main_dir: &str,
+        globs: &[&str],
+        opts: BundleOptsSpec,
+    ) -> BundledSpec {
         let spec = BundleSpec {
             root: dir.to_string_lossy().into_owned(),
             entry: entry.into(),
             main_dir: main_dir.into(),
             rule_prefix: String::new(),
             rule_globs: globs.iter().map(|s| s.to_string()).collect(),
-            opts: Default::default(),
+            opts,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -365,16 +403,37 @@ mod tests {
     #[test]
     fn ts_dep_bundled_externals_kept() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("helper.ts"), "export const x: number = 1;").unwrap();
+        fs::write(
+            dir.path().join("helper.ts"),
+            "export function helper(x: number): number { return x + 1; }",
+        )
+        .unwrap();
         fs::write(
             dir.path().join("index.ts"),
-            "import { x } from './helper';\nimport { connect } from 'cloudflare:sockets';\nimport crypto from 'node:crypto';\nexport default { fetch() { return new Response(String(x + typeof connect + typeof crypto.randomUUID)) } };",
+            "import { helper } from './helper.ts';\nimport { connect } from 'cloudflare:sockets';\nimport crypto from 'node:crypto';\nexport default { fetch() { return new Response(String(helper(1) + typeof connect + typeof crypto.randomUUID)) } };",
         )
         .unwrap();
         let b = run_spec(dir.path(), "index.ts", "", &[]);
         assert!(b.main_source.contains("node:crypto"));
         assert!(b.main_source.contains("cloudflare:sockets"));
         assert!(b.externals.is_empty());
+        // Both project files are reported as dependencies (absolute,
+        // sorted) — the sandbox needs them for cache invalidation.
+        let root = dir.path().canonicalize().unwrap();
+        let this = root.join("index.ts");
+        let helper = root.join("helper.ts");
+        assert!(
+            b.dependencies
+                .contains(&this.to_string_lossy().into_owned()),
+            "{:?}",
+            b.dependencies
+        );
+        assert!(
+            b.dependencies
+                .contains(&helper.to_string_lossy().into_owned()),
+            "{:?}",
+            b.dependencies
+        );
     }
 
     #[test]
@@ -412,6 +471,68 @@ mod tests {
         assert!(b.chunks[0].0.starts_with("src/"));
         assert!(b.chunks[0].0.ends_with(".js"));
         assert!(b.main_source.contains("import("));
+        assert!(b.externals.is_empty());
+    }
+
+    #[test]
+    fn alias_rewrites_bare_specifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim-public.js");
+        fs::write(&shim, "export const marker = 'from-public-shim';").unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            "import { marker } from '@cloudflare/config';\nexport default { fetch() { return new Response(marker) } };",
+        )
+        .unwrap();
+        let mut alias = BTreeMap::new();
+        alias.insert(
+            "@cloudflare/config$".to_string(),
+            shim.to_string_lossy().into_owned(),
+        );
+        let b = run_spec_with(
+            dir.path(),
+            "index.ts",
+            "",
+            &[],
+            BundleOptsSpec {
+                alias,
+                ..Default::default()
+            },
+        );
+        assert!(b.main_source.contains("from-public-shim"));
+        assert!(!b.main_source.contains("@cloudflare/config"));
+        assert!(b.externals.is_empty());
+    }
+
+    #[test]
+    fn alias_rewrites_relative_specifier() {
+        // `with { type: "cf-worker" }` entrypoints are a specifier, not a
+        // module; aliasing the relative import to a shim exporting the
+        // absolute path mirrors the Node loader's synthetic module.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("entrypoint-shim.js");
+        fs::write(&shim, "export default '/project/src/index.js';").unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            "import * as entrypoint from './src/index.js';\nexport default { fetch() { return new Response(entrypoint.default) } };",
+        )
+        .unwrap();
+        let mut alias = BTreeMap::new();
+        alias.insert(
+            "./src/index.js$".to_string(),
+            shim.to_string_lossy().into_owned(),
+        );
+        let b = run_spec_with(
+            dir.path(),
+            "index.ts",
+            "",
+            &[],
+            BundleOptsSpec {
+                alias,
+                ..Default::default()
+            },
+        );
+        assert!(b.main_source.contains("/project/src/index.js"));
         assert!(b.externals.is_empty());
     }
 }

@@ -208,6 +208,7 @@ fn failed_validation_persists_nothing() {
         vars: Default::default(),
         tag: None,
         is_preview: false,
+        config_sandbox: Default::default(),
     };
     let err = local.deploy(&w2, &bad);
     assert!(err.is_err(), "invalid desired must fail");

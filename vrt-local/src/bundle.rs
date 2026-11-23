@@ -40,6 +40,11 @@ pub struct BundleOpts {
     /// `nodejs_compat` flag — bare Node builtins (`path`, `fs`, …)
     /// stay external for workerd's compat layer.
     pub nodejs_compat: bool,
+    /// Specifier rewrites applied before resolution (`key$` = exact,
+    /// otherwise prefix; values are absolute files). Deploy paths leave
+    /// this empty — it exists for out-of-band tooling such as the
+    /// `cloudflare.config.ts` sandbox spike.
+    pub alias: BTreeMap<String, String>,
 }
 
 /// The compiled mainModule plus lazily loaded code-split chunks and
@@ -94,6 +99,13 @@ fn embedded_path() -> Result<PathBuf, LocalError> {
         let _ = std::fs::remove_file(&tmp);
     }
     Ok(path)
+}
+
+/// Resolve the `of-bundler` helper (`$OF_BUNDLER`, embedded bytes,
+/// in-repo build, then co-installed binary). Also used by the config
+/// sandbox driver, which shells out to the same helper.
+pub fn bundler_path() -> Result<PathBuf, LocalError> {
+    find_bundler()
 }
 
 fn find_bundler() -> Result<PathBuf, LocalError> {
@@ -154,6 +166,7 @@ pub fn bundle_sync(
             jsx_factory: opts.jsx_factory,
             jsx_fragment: opts.jsx_fragment,
             nodejs_compat: opts.nodejs_compat,
+            alias: opts.alias,
         },
     };
     let wire = serde_json::to_vec(&spec).map_err(|_| LocalError::Worker("bundle spec"))?;
@@ -189,5 +202,46 @@ pub fn bundle_sync(
         }),
         (None, Some(e)) => Err(LocalError::WorkerOwned(format!("bundle: {e}"))),
         _ => Err(LocalError::Worker("of-bundler output")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // Aliases exist for out-of-band tooling (the cloudflare.config.ts
+    // sandbox): the deploy path never sets them, but the wire and the
+    // helper's resolve step must honour them.
+    #[test]
+    fn bundle_alias_rewrites_specifier_before_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("config-public.js");
+        fs::write(&shim, "export const marker = 'public-shim';\n").unwrap();
+        fs::write(
+            dir.path().join("main.ts"),
+            "import { marker } from '@cloudflare/config';\nexport default { fetch() { return new Response(marker) } };\n",
+        )
+        .unwrap();
+        let mut alias = BTreeMap::new();
+        alias.insert(
+            "@cloudflare/config$".to_string(),
+            shim.to_string_lossy().into_owned(),
+        );
+        let out = bundle_sync(
+            dir.path().to_path_buf(),
+            "main.ts".to_string(),
+            String::new(),
+            Vec::new(),
+            String::new(),
+            BundleOpts {
+                alias,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(out.main_source.contains("public-shim"), "{}", out.main_source);
+        assert!(!out.main_source.contains("@cloudflare/config"));
+        assert!(out.externals.is_empty());
     }
 }

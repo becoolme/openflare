@@ -15,7 +15,8 @@ of init --root <dir> --cell <id> --tenant <id> [--mode capnp|stub]
 of serve --root <dir> [--supervise] [--vrt-host-bin <p>] [--vrt-provider-bin <p>]
 of deploy --root <dir> <worker_dir>
 of deploy --preview --root <dir> <worker_dir>
-of check [--env <name>] [--var K:V]… [--tag <t>] <worker_dir>
+of deploy [--config-sandbox node|worker] --root <dir> <worker_dir>
+of check [--env <name>] [--var K:V]… [--tag <t>] [--config-sandbox node|worker] <worker_dir>
 of promote --root <dir> [--worker <name|workerId>] <version_id>
 of rollback --root <dir> <worker> <version_id>
 of hostnames add --root <dir> <worker> <hostname>
@@ -53,3 +54,8 @@ list`, preview URLs, and the current MVP limits) are in
 [deploy versions](versioning.md). A preview deploy's JSON output (and
 `/v1/deploy`, `/v1/versions`) carries `previewUrl` — `null` unless the
 host configures `[preview] domain` in `root/config/vrt-host.toml`.
+
+`--config-sandbox=worker` evaluates a `cloudflare.config.*` in a workerd
+dynamic worker instead of the default Node loader; it needs
+`VRT_WORKERD_BIN` and fails closed without one. See
+[config-sandbox-spike.md](config-sandbox-spike.md).
