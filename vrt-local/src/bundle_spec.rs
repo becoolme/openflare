@@ -38,6 +38,13 @@ pub struct BundleOptsSpec {
     pub jsx_fragment: Option<String>,
     #[serde(default)]
     pub nodejs_compat: bool,
+    /// Specifier rewrites applied before resolution: exact key when it
+    /// ends in `$`, otherwise a prefix match (rolldown/oxc
+    /// `resolve.alias` semantics). Values are absolute file paths — the
+    /// config sandbox uses this to swap `@cloudflare/config` for a
+    /// Workers-safe `./public` shim. Empty in every deploy path.
+    #[serde(default)]
+    pub alias: BTreeMap<String, String>,
 }
 
 /// Stdout payload — exactly one of `ok` / `err` is set.

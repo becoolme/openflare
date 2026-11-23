@@ -153,7 +153,10 @@ read the filesystem, open sockets, spawn processes and inherit the
 invoking user's privileges. Only run `cloudflare.config.*` from projects
 you trust, exactly as you would for `wrangler`/`cf`. A real sandbox
 (read-only root, no network, no child processes) is tracked as follow-up
-work; this page does not claim one.
+work; this page does not claim one. A PoC that evaluates the bundled
+config in a workerd dynamic worker and converts on the trusted side is
+documented in [config-sandbox-spike.md](config-sandbox-spike.md) —
+measured, not shipped.
 
 ### Failure mapping
 
@@ -294,6 +297,9 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 
 ## Changelog
 
+- 2026-11-23: spike only — link the `cloudflare.config.*` dynamic-worker
+  evaluation PoC ([config-sandbox-spike.md](config-sandbox-spike.md)).
+  No behavior change: the Node loader path above still evaluates configs.
 - 2026-11-22: `cloudflare.config.ts` / `.js` (the `cf` CLI programmatic
   format) is now evaluated through Cloudflare's official
   `@cloudflare/config` loader in a restricted Node child process and then

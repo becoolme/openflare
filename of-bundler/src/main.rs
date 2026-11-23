@@ -248,6 +248,19 @@ async fn run(spec: &BundleSpec) -> Result<BundledSpec, String> {
                 "default".into(),
             ]),
             main_fields: Some(vec!["browser".into(), "module".into(), "main".into()]),
+            // Opt-in specifier rewrites (empty for every deploy path).
+            // BTreeMap keeps the emitted order deterministic.
+            alias: if spec.opts.alias.is_empty() {
+                None
+            } else {
+                Some(
+                    spec.opts
+                        .alias
+                        .iter()
+                        .map(|(k, v)| (k.clone(), vec![Some(v.clone())]))
+                        .collect(),
+                )
+            },
             ..Default::default()
         }),
         ..Default::default()
@@ -343,16 +356,27 @@ async fn run(spec: &BundleSpec) -> Result<BundledSpec, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::BundleOptsSpec;
     use std::fs;
 
     fn run_spec(dir: &Path, entry: &str, main_dir: &str, globs: &[&str]) -> BundledSpec {
+        run_spec_with(dir, entry, main_dir, globs, BundleOptsSpec::default())
+    }
+
+    fn run_spec_with(
+        dir: &Path,
+        entry: &str,
+        main_dir: &str,
+        globs: &[&str],
+        opts: BundleOptsSpec,
+    ) -> BundledSpec {
         let spec = BundleSpec {
             root: dir.to_string_lossy().into_owned(),
             entry: entry.into(),
             main_dir: main_dir.into(),
             rule_prefix: String::new(),
             rule_globs: globs.iter().map(|s| s.to_string()).collect(),
-            opts: Default::default(),
+            opts,
         };
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -412,6 +436,68 @@ mod tests {
         assert!(b.chunks[0].0.starts_with("src/"));
         assert!(b.chunks[0].0.ends_with(".js"));
         assert!(b.main_source.contains("import("));
+        assert!(b.externals.is_empty());
+    }
+
+    #[test]
+    fn alias_rewrites_bare_specifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("shim-public.js");
+        fs::write(&shim, "export const marker = 'from-public-shim';").unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            "import { marker } from '@cloudflare/config';\nexport default { fetch() { return new Response(marker) } };",
+        )
+        .unwrap();
+        let mut alias = BTreeMap::new();
+        alias.insert(
+            "@cloudflare/config$".to_string(),
+            shim.to_string_lossy().into_owned(),
+        );
+        let b = run_spec_with(
+            dir.path(),
+            "index.ts",
+            "",
+            &[],
+            BundleOptsSpec {
+                alias,
+                ..Default::default()
+            },
+        );
+        assert!(b.main_source.contains("from-public-shim"));
+        assert!(!b.main_source.contains("@cloudflare/config"));
+        assert!(b.externals.is_empty());
+    }
+
+    #[test]
+    fn alias_rewrites_relative_specifier() {
+        // `with { type: "cf-worker" }` entrypoints are a specifier, not a
+        // module; aliasing the relative import to a shim exporting the
+        // absolute path mirrors the Node loader's synthetic module.
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("entrypoint-shim.js");
+        fs::write(&shim, "export default '/project/src/index.js';").unwrap();
+        fs::write(
+            dir.path().join("index.ts"),
+            "import * as entrypoint from './src/index.js';\nexport default { fetch() { return new Response(entrypoint.default) } };",
+        )
+        .unwrap();
+        let mut alias = BTreeMap::new();
+        alias.insert(
+            "./src/index.js$".to_string(),
+            shim.to_string_lossy().into_owned(),
+        );
+        let b = run_spec_with(
+            dir.path(),
+            "index.ts",
+            "",
+            &[],
+            BundleOptsSpec {
+                alias,
+                ..Default::default()
+            },
+        );
+        assert!(b.main_source.contains("/project/src/index.js"));
         assert!(b.externals.is_empty());
     }
 }

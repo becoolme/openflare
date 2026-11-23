@@ -1181,6 +1181,7 @@ fn gather_bundled(
                 .compatibility_flags
                 .iter()
                 .any(|f| f == "nodejs_compat"),
+            alias: BTreeMap::new(),
         },
     )?;
     let mut out = BTreeMap::new();
