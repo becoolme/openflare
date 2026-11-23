@@ -221,6 +221,7 @@ the public codes it defines.
 | bundling (`of-bundler` error, unsupported cf-worker form) | bundle message + `phase: "bundle"` | `VRT_CONFIG_LOADER_FAILED` | 3 |
 | workerd missing / cannot start / never listens | `phase: "startup"` | `VRT_CONFIG_LOADER_FAILED` | 3 |
 | config factory throws / module load error | `phase: "eval"` + capped message | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| workerd aborts during eval (failed allocation, OOM kill) | `phase: "eval"` + exit code/signal + last workerd log line | `VRT_CONFIG_LOADER_FAILED` | 3 |
 | non-200 inner response | status + capped message | `VRT_CONFIG_LOADER_FAILED` | 3 |
 | payload above 512 KiB | `VRT_CONFIG_SANDBOX_PAYLOAD_TOO_LARGE` | `VRT_CONFIG_LOADER_FAILED` | 3 |
 | wall-clock deadline | `VRT_CONFIG_LOADER_TIMEOUT` | `VRT_CONFIG_LOADER_TIMEOUT` | 3 |
@@ -295,12 +296,22 @@ cargo test --manifest-path of-bundler/Cargo.toml
 | invalid config | `VRT_CONFIG_INVALID`, issue path `worker.name` |
 | `while (true)` | `VRT_CONFIG_LOADER_TIMEOUT` within a bounded wall clock, no hang |
 | missing workerd | fail closed with an actionable message |
+| repeat + concurrency | 10 sequential + 2x2 concurrent runs succeed; no `of-cfg-sandbox-*` dir or workerd process left behind |
+| memory exhaustion | an impossible `ArrayBuffer` fails closed with `VRT_CONFIG_LOADER_FAILED` inside the deadline (never succeeds, never hangs) |
+| real example parity | `examples/standalone-config-ts` is deep-equal to the Node path (RawConfig + normalized), incl. routes and `main` |
+
+`vrt-local/tests/config_sandbox.rs` additionally runs the 10x repeat and
+both concurrency shapes (private roots and one shared `TMPDIR`) through
+the real `of check --config-sandbox=worker` CLI, attributing leftover
+workerd processes by the sandbox work dir they run in.
 
 CI: the `real-workerd` job builds `of-bundler`, fetches the pinned
 workerd, runs `cargo test -p vrt-local --test config_sandbox` through
 `scripts/ci-real-workerd.sh`, then runs `verify.mjs`. The sandbox tests
 self-skip when `VRT_WORKERD_BIN` is unset (same convention as the other
-real-workerd suites).
+real-workerd suites), but that script exports `VRT_REQUIRE_WORKERD=1`
+for this target: in CI a missing workerd or `of-bundler` **fails** the
+job instead of turning the suite into silent skips.
 
 ## Known gaps
 
@@ -316,18 +327,38 @@ real-workerd suites).
 - **Dependencies are reported but not consumed.** Watch/reload still
   needs the consumer side; the sandbox exposes the list.
 - **Memory is not capped independently.** The wall-clock deadline and
-  workerd's isolate limits bound CPU; a config that allocates very large
-  structures before the JSON cap is not separately memory-quota tested.
+  workerd's isolate limits bound CPU, and the matrix proves an *impossible*
+  allocation fails closed (a catchable `RangeError` or a workerd abort,
+  both mapped to `VRT_CONFIG_LOADER_FAILED`). workerd exposes no
+  per-isolate memory limit, so a config that commits a large but
+  satisfiable amount of memory is bounded only by the deadline, not by a
+  quota.
 - **Outer-deadline edge case.** The driver kills workerd's process group
   on every normal/timeout path. If the driver itself had to be SIGKILLed
   by the outer helper deadline (90 s+), a detached workerd could outlive
   it; the inner phases (30 s bundle / 15 s startup / 5 s eval) keep that
   path unreachable in practice.
+- **Ephemeral port selection is not reserved.** `freePort()` binds and
+  releases before workerd binds. The readiness probe carries a per-run
+  nonce, so a stolen port fails startup with `VRT_CONFIG_LOADER_FAILED`
+  (bounded by the 15 s startup timeout) instead of POSTing the config into
+  another sandbox; it is still a rare spuriously-failed run rather than a
+  retry.
 - **Output cap is a hard failure.** A config materially larger than
   512 KiB must be split; the sandbox does not stream.
 
 ## Changelog
 
+- 2026-11-23: robustness coverage. Adds an
+  `examples/standalone-config-ts` real project and asserts Node/worker
+  parity on its RawConfig *and* normalized output; adds 10x repeat,
+  private-root and shared-root 2-way concurrency, impossible-allocation
+  fail-closed, and residue checks (temp dirs + workerd processes) to the
+  Rust suite and `verify.mjs`. A workerd crash during eval now reports
+  its exit code/signal and last log line (with an allocation/OOM marker)
+  instead of a bare `fetch failed`. CI's real-workerd job exports
+  `VRT_REQUIRE_WORKERD=1` so this suite fails instead of skipping when
+  the prerequisites are missing.
 - 2026-11-23: implementation. `of deploy` / `of check` gain
   `--config-sandbox=node|worker` (default `node`); the worker path
   bundles with `of-bundler`, evaluates in a workerd dynamic worker with

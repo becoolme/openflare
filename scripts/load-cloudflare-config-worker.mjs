@@ -34,6 +34,9 @@
 //     the only response-time bound;
 //   * the deadline below (--timeout-ms, default 5 s) aborts the request and
 //     SIGKILLs the workerd process *group*; there is no retry.
+//   * the readiness probe is tagged with a per-run nonce, so an ephemeral
+//     port stolen between binding and workerd's listen can only fail
+//     startup (fail closed) — never route a config into another sandbox.
 //
 // The config never runs in this process. This script only executes fixed
 // code (bundler, workerd, zod, convertToWranglerConfig).
@@ -49,6 +52,7 @@ import {
   writeFileSync,
   writeSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -115,6 +119,15 @@ function emitError(error, message, extra = {}) {
   process.exit(error === "VRT_CONFIG_INVALID" ? 2 : 3);
 }
 
+/** Last non-empty line of a bounded workerd log, for crash diagnostics. */
+function lastLogLine(text) {
+  const lines = String(text ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length === 0 ? "" : lines[lines.length - 1];
+}
+
 function usage(message) {
   emitError("VRT_CONFIG_LOADER_USAGE", message);
 }
@@ -178,14 +191,15 @@ function freePort() {
   });
 }
 
-async function waitReady(port, deadline) {
+/** Readiness probe; the nonce proves the port belongs to *this* workerd. */
+async function waitReady(port, deadline, nonce) {
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/`, {
         method: "GET",
         signal: AbortSignal.timeout(500),
       });
-      if (res.ok) return true;
+      if (res.ok && (await res.text()) === nonce) return true;
     } catch {
       // not listening yet
     }
@@ -608,7 +622,7 @@ globalThis.process = Object.freeze({
 `;
 }
 
-function bootstrapSource({ source, chunks, envSource, cpuMs }) {
+function bootstrapSource({ source, chunks, envSource, cpuMs, nonce }) {
   const modules = {
     "eval-config.js": WRAPPER,
     "sandbox-env.js": envSource,
@@ -623,8 +637,11 @@ function bootstrapSource({ source, chunks, envSource, cpuMs }) {
 
 export default {
   async fetch(req, env, ctx) {
-    // Readiness probe: answers without touching the dynamic worker.
-    if (req.method === "GET") return new Response("ready");
+    // Readiness probe: answers with this run's nonce, without touching the
+    // dynamic worker. If the ephemeral port were stolen between freePort()
+    // and bind, the probe can never match and startup fails closed instead
+    // of POSTing this run's config into a sibling sandbox.
+    if (req.method === "GET") return new Response(${JSON.stringify(nonce)});
     const code = {
       compatibilityDate: ${JSON.stringify(COMPAT_DATE)},
       mainModule: "eval-config.js",
@@ -670,7 +687,7 @@ const cfg :Workerd.Config = (
 `;
 }
 
-async function evalInWorkerd({ workDir, workerd, ctx, timeoutMs }) {
+async function evalInWorkerd({ workDir, workerd, ctx, timeoutMs, nonce }) {
   const port = await freePort();
   writeFileSync(join(workDir, "cfg.capnp"), capnp({ port }));
 
@@ -709,7 +726,9 @@ async function evalInWorkerd({ workDir, workerd, ctx, timeoutMs }) {
   try {
     const failed = await Promise.race([
       spawnError,
-      waitReady(port, Date.now() + STARTUP_TIMEOUT_MS).then((ok) => (ok ? null : { ready: false })),
+      waitReady(port, Date.now() + STARTUP_TIMEOUT_MS, nonce).then((ok) =>
+        ok ? null : { ready: false },
+      ),
     ]);
     if (failed?.error) return { ok: false, phase: "startup", error: `cannot start workerd: ${failed.error}` };
     if (failed?.ready === false) {
@@ -733,15 +752,37 @@ async function evalInWorkerd({ workDir, workerd, ctx, timeoutMs }) {
       body = await res.text();
     } catch (e) {
       const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";
+      const logText = Buffer.concat(logs).toString("utf8");
+      if (!timedOut) {
+        // A crashed isolate or process surfaces as a bare transport error
+        // (`fetch failed`). Wait briefly for the exit event so the
+        // diagnostic can name the real cause — an allocation abort or an
+        // OOM kill — instead of only the failed socket.
+        await Promise.race([exited, new Promise((r) => setTimeout(r, 250))]);
+      }
+      const exitedDetail =
+        child.exitCode !== null || child.signalCode !== null
+          ? `workerd exited (code ${child.exitCode}, signal ${child.signalCode ?? "none"})`
+          : "workerd still running";
+      const tail = lastLogLine(logText);
+      // Kernel OOM kills and V8 allocation aborts both land here; the code
+      // stays LOADER_FAILED, the message says which one it was.
+      const outOfMemory = /out of memory|allocation failed|cannot allocate|\bOOM\b|oom[-_]kill/i.test(
+        logText,
+      );
+      const detail = `${truncate(String(e), 200)}; ${exitedDetail}${tail ? `; workerd: ${truncate(tail, 300)}` : ""}`;
       return {
         ok: false,
         phase: "eval",
         timedOut,
         evalMs: ms(started),
+        outOfMemory,
         error: timedOut
           ? `config evaluation exceeded ${timeoutMs} ms; workerd sandbox killed`
-          : `config evaluation failed: ${truncate(String(e), 200)}`,
-        logs: Buffer.concat(logs).toString("utf8"),
+          : outOfMemory
+            ? `config evaluation aborted on a failed memory allocation; ${detail}`
+            : `config evaluation failed: ${detail}`,
+        logs: logText,
       };
     }
     return {
@@ -879,6 +920,9 @@ async function main() {
       });
     }
 
+    // Per-run nonce: the readiness probe identifies *this* workerd, so a
+    // stolen ephemeral port fails closed instead of crossing sandboxes.
+    const nonce = randomUUID();
     writeFileSync(
       join(workDir, "bootstrap.js"),
       bootstrapSource({
@@ -886,6 +930,7 @@ async function main() {
         chunks: bundled.chunks,
         envSource: sandboxEnvSource(ctx),
         cpuMs: args.timeoutMs,
+        nonce,
       }),
     );
 
@@ -894,6 +939,7 @@ async function main() {
       workerd: args.workerd,
       ctx: { mode: args.mode, isPreview: args.preview },
       timeoutMs: args.timeoutMs,
+      nonce,
     });
     if (!evaluated.ok) {
       const timeoutHint =

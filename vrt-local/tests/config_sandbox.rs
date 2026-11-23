@@ -30,27 +30,43 @@ fn workerd() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-fn bundler_ready() -> bool {
+/// The `of-bundler` helper: `OF_BUNDLER` wins, then the in-repo build.
+fn bundler() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("OF_BUNDLER") {
-        if Path::new(&p).is_file() {
-            return true;
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
         }
     }
-    ["debug", "release"].iter().any(|profile| {
-        repo_root()
+    ["debug", "release"].iter().find_map(|profile| {
+        let p = repo_root()
             .join("of-bundler/target")
             .join(profile)
-            .join("of-bundler")
-            .is_file()
+            .join("of-bundler");
+        p.is_file().then_some(p)
     })
 }
 
 fn require_workerd(test: &str) -> bool {
+    if std::env::var_os("VRT_REQUIRE_WORKERD").is_some() {
+        // CI's real-workerd job sets this: a missing binary must fail the
+        // job instead of turning the whole sandbox suite into silent skips.
+        assert!(
+            workerd().is_some(),
+            "{test}: VRT_REQUIRE_WORKERD is set but VRT_WORKERD_BIN is unset or not a file"
+        );
+        assert!(
+            bundler().is_some(),
+            "{test}: VRT_REQUIRE_WORKERD is set but the of-bundler helper is missing \
+             (build of-bundler/Cargo.toml or set OF_BUNDLER)"
+        );
+        return true;
+    }
     if workerd().is_none() {
         eprintln!("SKIP {test}: VRT_WORKERD_BIN unset or not a file");
         return false;
     }
-    if !bundler_ready() {
+    if bundler().is_none() {
         eprintln!("SKIP {test}: of-bundler helper missing (build of-bundler/Cargo.toml)");
         return false;
     }
@@ -90,6 +106,118 @@ fn project(files: &[(&str, &str)]) -> tempfile::TempDir {
     }
     link_config_package(dir.path());
     dir
+}
+
+// ── `of check` children with an attributable temp root ─────────────────
+//
+// The sandbox driver mkdtemps `of-cfg-sandbox-*` inside `os.tmpdir()` and
+// starts workerd with that directory as its cwd. Pointing TMPDIR at a
+// per-test root therefore makes both the temp dirs and any leftover workerd
+// process attributable even when other tests in this binary run in parallel.
+
+/// `of check --config-sandbox=worker` with an isolated TMPDIR and the
+/// real-workerd prerequisites pinned for the child.
+fn of_check_worker(dir: &Path, tmp: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_of"));
+    cmd.args(["check", "--config-sandbox=worker", dir.to_str().unwrap()])
+        .current_dir(repo_root())
+        .env("TMPDIR", tmp)
+        .env("TMP", tmp)
+        .env("TEMP", tmp)
+        .env("VRT_WORKERD_BIN", workerd().expect("workerd"))
+        .env("OF_BUNDLER", bundler().expect("of-bundler"))
+        .env("VRT_CF_CONFIG_SANDBOX_TIMEOUT_MS", "5000");
+    cmd
+}
+
+fn spawn_of_check_worker(dir: &Path, tmp: &Path) -> std::process::Child {
+    of_check_worker(dir, tmp)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn of check")
+}
+
+/// Every entry under the private temp root. The driver creates exactly one
+/// `of-cfg-sandbox-*` dir per run and removes it, so anything left (of any
+/// name) is residue.
+fn leftover_workdirs(root: &Path) -> Vec<String> {
+    let mut names = match std::fs::read_dir(root) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    names
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: &str) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: &str) -> Option<PathBuf> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", pid, "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_cwd(_pid: &str) -> Option<PathBuf> {
+    None
+}
+
+/// Every `workerd` process whose cwd sits under `root`, formatted for a
+/// panic message. workerd is spawned with cwd = the sandbox work dir, so
+/// this attributes leftovers to one test instead of the whole machine.
+fn leftover_workerd(root: &Path) -> Vec<String> {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        let Some((pid, command)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        if !command.contains("workerd") {
+            continue;
+        }
+        let pid = pid.trim();
+        if process_cwd(pid)
+            .map(|cwd| cwd.starts_with(root))
+            .unwrap_or(false)
+        {
+            found.push(format!(
+                "pid {pid} (cwd under {}): {command}",
+                root.display()
+            ));
+        }
+    }
+    found
+}
+
+/// Panic with the full diagnostic set the task asks for: temp root contents,
+/// attributed workerd processes, and the child's stderr.
+fn assert_no_sandbox_residue(root: &Path, context: &str) {
+    let dirs = leftover_workdirs(root);
+    let procs = leftover_workerd(root);
+    assert!(
+        dirs.is_empty() && procs.is_empty(),
+        "{context}: sandbox residue under {}: temp dirs {dirs:?}; workerd processes {procs:#?}",
+        root.display()
+    );
 }
 
 struct EnvGuard {
@@ -430,5 +558,251 @@ export default defineConfig(() => { while (true) {} });
     assert!(
         elapsed < Duration::from_secs(15),
         "timeout took {elapsed:?}; the caller deadline must bound workerd"
+    );
+}
+
+// ── robustness: repeated runs, concurrency, memory, real project parity ─
+
+/// Ten sequential `of check --config-sandbox=worker` runs on one config must
+/// all succeed and leave neither sandbox temp dirs nor workerd processes
+/// behind. Catches leaks that a single run (or an in-process load) hides.
+#[test]
+fn repeated_worker_sandbox_runs_leave_no_residue() {
+    if !require_workerd("repeated_worker_sandbox_runs_leave_no_residue") {
+        return;
+    }
+    let fixture = repo_root().join("vrt-local/tests/fixtures/cf-config");
+    let root = tempfile::tempdir().unwrap();
+    for run in 1..=10 {
+        let out = of_check_worker(&fixture, root.path())
+            .output()
+            .expect("spawn of check");
+        assert!(
+            out.status.success(),
+            "run {run}/10 failed (status {:?})\nstdout: {}\nstderr: {}\nresidue: {:#?}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+            leftover_workerd(root.path())
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("run {run}/10 printed invalid JSON: {e}"));
+        assert_eq!(report["ok"], true, "run {run}/10 report: {report}");
+        assert!(
+            leftover_workerd(root.path()).is_empty(),
+            "run {run}/10 left workerd running: {:#?}",
+            leftover_workerd(root.path())
+        );
+    }
+    assert_no_sandbox_residue(root.path(), "after 10 sequential runs");
+}
+
+/// Two sandbox runs at the same time must not share state. Each driver
+/// mkdtemps its own work dir and binds an ephemeral port, so:
+///   * distinct TMPDIRs are fully isolated (the required case);
+///   * one shared TMPDIR is *not* a lock either — it must still succeed.
+/// A stolen ephemeral port is the only shared resource; that path fails
+/// closed in the startup phase (`VRT_CONFIG_LOADER_FAILED` within
+/// `STARTUP_TIMEOUT_MS`) instead of hanging, which is why this test asserts
+/// completion under a wall-clock bound rather than "never collides".
+#[test]
+fn concurrent_worker_sandbox_runs_are_isolated() {
+    if !require_workerd("concurrent_worker_sandbox_runs_are_isolated") {
+        return;
+    }
+    let fixture = repo_root().join("vrt-local/tests/fixtures/cf-config");
+    let started = Instant::now();
+
+    // Phase A: the required shape — two runs, two private temp roots.
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let children: Vec<_> = roots
+        .iter()
+        .map(|root| spawn_of_check_worker(&fixture, root.path()))
+        .collect();
+    for (i, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().expect("wait of check");
+        assert!(
+            out.status.success(),
+            "concurrent run {i} failed (status {:?})\nstdout: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    for (i, root) in roots.iter().enumerate() {
+        assert_no_sandbox_residue(root.path(), &format!("concurrent run {i}"));
+    }
+
+    // Phase B: both children share one TMPDIR on purpose. Nothing in the
+    // driver locks or names a path relative to TMPDIR itself, so both must
+    // still succeed; if that ever stops being true this test fails loudly.
+    let shared = tempfile::tempdir().unwrap();
+    let children: Vec<_> = (0..2)
+        .map(|_| spawn_of_check_worker(&fixture, shared.path()))
+        .collect();
+    for (i, child) in children.into_iter().enumerate() {
+        let out = child.wait_with_output().expect("wait of check");
+        assert!(
+            out.status.success(),
+            "shared-root concurrent run {i} failed (status {:?})\nstdout: {}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_no_sandbox_residue(shared.path(), "shared-root concurrent runs");
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "four concurrent sandbox runs took {elapsed:?}; a run must never hang"
+    );
+    eprintln!("concurrency: 2x distinct roots + 2x shared root in {elapsed:?}");
+}
+
+/// A config that asks for an impossible allocation must fail closed inside a
+/// bounded wall clock with `VRT_CONFIG_LOADER_FAILED`, never succeed and
+/// never hang.
+///
+/// `2 ** 52` bytes (~4 PiB) is above the address space of every supported
+/// 64-bit host but below V8's max ArrayBuffer length (`2 ** 53 - 1`), so V8
+/// *attempts* the allocation and fails — this is a real allocation failure,
+/// not an invalid-length range check. It reserves nothing, so the test
+/// cannot pressure the CI runner's memory the way `new Array(2e8).fill(0)`
+/// (which succeeds on a 16 GiB runner) would.
+#[test]
+fn huge_allocation_fails_closed() {
+    if !require_workerd("huge_allocation_fails_closed") {
+        return;
+    }
+    let dir = project(&[(
+        "cloudflare.config.ts",
+        r#"import { bindings, defineConfig } from "@cloudflare/config";
+export default defineConfig(() => {
+  // ~4 PiB: V8 attempts the allocation, the host cannot back it.
+  const buffer = new ArrayBuffer(2 ** 52);
+  return { worker: { name: "oom", compatibilityDate: "2026-09-17", env: { N: bindings.text(String(buffer.byteLength)) } } };
+});
+"#,
+    )]);
+    let root = tempfile::tempdir().unwrap();
+    let started = Instant::now();
+    let out = of_check_worker(dir.path(), root.path())
+        .output()
+        .expect("spawn of check");
+    let elapsed = started.elapsed();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    eprintln!(
+        "huge allocation: {} in {elapsed:?}; stderr: {}",
+        out.status,
+        stderr.trim()
+    );
+
+    assert!(
+        !out.status.success(),
+        "an impossible allocation must not succeed; stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("VRT_CONFIG_LOADER_FAILED"),
+        "expected VRT_CONFIG_LOADER_FAILED, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("VRT_CONFIG_INVALID") && !stderr.contains("VRT_CONFIG_UNSUPPORTED_FIELD"),
+        "an allocation failure must not be reported as a config/schema error: {stderr}"
+    );
+    // Either the worker catches the allocation error (message names it) or
+    // workerd dies outright and the driver reports the exit. Both are a
+    // fail-closed OOM mapping; a bare socket error with no cause is not.
+    assert!(
+        stderr.contains("allocation")
+            || stderr.contains("out of memory")
+            || stderr.contains("OOM")
+            || stderr.contains("workerd exited")
+            || stderr.contains("ran out of memory"),
+        "diagnostic does not identify the memory failure: {stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "memory failure took {elapsed:?}; the wall-clock deadline must bound it"
+    );
+    assert_no_sandbox_residue(root.path(), "after the OOM run");
+}
+
+/// The checked-in `examples/standalone-config-ts` project must normalize
+/// identically through the Node loader and the worker sandbox. This is the
+/// real-project counterpart to the synthetic fixture matrix: entrypoint,
+/// triggers (routes), vars, and the mode/isPreview branches all cross the
+/// sandbox boundary.
+#[test]
+fn config_ts_example_matches_the_node_loader() {
+    if !require_workerd("config_ts_example_matches_the_node_loader") {
+        return;
+    }
+    let example = repo_root().join("examples/standalone-config-ts");
+    assert!(
+        example.join("cloudflare.config.ts").is_file(),
+        "example project missing: {}",
+        example.display()
+    );
+
+    let mut checked = 0;
+    for (env, preview) in [
+        (None, false),
+        (Some("staging"), false),
+        (None, true),
+        (Some("staging"), true),
+    ] {
+        let (node_norm, node_raw) = vrt_local::load_cf_project_config(
+            &example,
+            "cloudflare.config.ts",
+            env,
+            preview,
+            ConfigSandbox::Node,
+        )
+        .map(|(norm, raw, _)| (norm, raw))
+        .unwrap_or_else(|e| panic!("node path failed (mode={env:?} preview={preview}): {e}"));
+        let (worker_norm, worker_raw) = vrt_local::load_cf_project_config(
+            &example,
+            "cloudflare.config.ts",
+            env,
+            preview,
+            ConfigSandbox::Worker,
+        )
+        .map(|(norm, raw, _)| (norm, raw))
+        .unwrap_or_else(|e| panic!("worker path failed (mode={env:?} preview={preview}): {e}"));
+        assert_eq!(
+            worker_raw, node_raw,
+            "RawConfig differs for examples/standalone-config-ts (mode={env:?} preview={preview})"
+        );
+        assert_eq!(
+            worker_norm, node_norm,
+            "normalized config differs for examples/standalone-config-ts (mode={env:?} preview={preview})"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 4);
+
+    // Guard against a vacuous parity: the example must actually carry the
+    // fields both paths are supposed to agree on.
+    let raw = vrt_local::load_cf_project_config(
+        &example,
+        "cloudflare.config.ts",
+        Some("staging"),
+        false,
+        ConfigSandbox::Worker,
+    )
+    .map(|(_, raw, _)| raw)
+    .expect("worker path failed");
+    assert_eq!(raw["name"], "config-ts", "{raw}");
+    assert_eq!(raw["vars"]["GREETING"], "hello from cloudflare.config.ts");
+    assert_eq!(raw["vars"]["STAGE"], "staging");
+    assert_eq!(raw["routes"][0], "config-ts.vrt.local/*");
+    assert!(
+        raw["main"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("src/index.js"),
+        "entrypoint was not carried into main: {raw}"
     );
 }

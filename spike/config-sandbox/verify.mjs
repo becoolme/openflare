@@ -17,17 +17,19 @@
 // Exit 1 means an assertion failed. Missing prerequisites abort with exit 2
 // instead of silently passing.
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  readlinkSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -229,6 +231,63 @@ function makeProject(files) {
     join(dir, "node_modules/@cloudflare/config"),
   );
   return dir;
+}
+
+/**
+ * cwd of `pid`, used to attribute a workerd process to one sandbox root:
+ * the driver starts workerd with cwd = its `of-cfg-sandbox-*` work dir.
+ * Linux reads /proc, macOS asks lsof; both are best-effort (a zombie or a
+ * process we cannot inspect yields undefined).
+ */
+function processCwd(pid) {
+  try {
+    if (process.platform === "linux") return readlinkSync(`/proc/${pid}/cwd`);
+    const out = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5_000,
+    });
+    const line = out.split("\n").find((l) => l.startsWith("n"));
+    return line ? line.slice(1) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `workerd` processes whose cwd is under `root`, formatted for a report. */
+function workerdUnder(root) {
+  let listing;
+  try {
+    listing = execFileSync("ps", ["-axo", "pid=,command="], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+  } catch {
+    return [];
+  }
+  const found = [];
+  for (const line of listing.split("\n")) {
+    const match = line.trim().match(/^(\d+)\s+(.*)$/);
+    if (!match || !match[2].includes("workerd")) continue;
+    const cwd = processCwd(match[1]);
+    if (cwd === root || (cwd && cwd.startsWith(root + sep))) {
+      found.push(`pid ${match[1]} (cwd under ${root}): ${match[2]}`);
+    }
+  }
+  return found;
+}
+
+/** Assert one run left neither `of-cfg-sandbox-*` dirs nor workerd behind. */
+function assertNoResidue(runCase, label, root) {
+  const dirs = readdirSync(root).filter((name) => name.startsWith("of-cfg-sandbox-"));
+  const procs = workerdUnder(root);
+  if (dirs.length > 0 || procs.length > 0) {
+    runCase.fail(
+      `${label}: residue under ${root}: temp dirs ${JSON.stringify(dirs)}, workerd ${JSON.stringify(procs)}`,
+    );
+  } else {
+    runCase.pass(`${label}: no sandbox temp dirs or workerd processes left`);
+  }
 }
 
 /** Assert the Node and worker helpers produced the same RawConfig. */
@@ -534,6 +593,146 @@ export default defineConfig(() => { while (true) {} });
       code: "VRT_CONFIG_LOADER_FAILED",
       contains: "workerd",
     });
+    cases.push(c);
+  }
+
+  // 12. repeated + concurrent runs succeed and leave no residue
+  {
+    const c = { name: "repeat + concurrency", checks: [] };
+    c.pass = (m) => c.checks.push({ ok: true, message: m });
+    c.fail = (m) => c.checks.push({ ok: false, message: m });
+    const configPath = join(FIXTURE, "cloudflare.config.ts");
+    const isolatedEnv = (root) => ({ TMPDIR: root, TMP: root, TEMP: root });
+
+    // 12a. the same config ten times in a row; every run must clean up.
+    const repeatRoot = mkdtempSync(join(tmpdir(), "of-cfg-repeat-"));
+    cleanups.push(repeatRoot);
+    const startedAt = Date.now();
+    let firstFailure;
+    for (let i = 0; i < 10; i++) {
+      const result = await runWorker(configPath, [], { env: isolatedEnv(repeatRoot) });
+      if (result.code !== 0) {
+        firstFailure = `run ${i + 1}/10: ${result.stderr.trim()}`;
+        break;
+      }
+      const raw = parseStdout(result)?.raw;
+      if (raw?.name !== "cf-config-fixture") {
+        firstFailure = `run ${i + 1}/10: unexpected RawConfig ${JSON.stringify(raw)}`;
+        break;
+      }
+    }
+    if (firstFailure) c.fail(firstFailure);
+    else c.pass(`10 sequential runs succeeded in ${Date.now() - startedAt} ms`);
+    assertNoResidue(c, "10 sequential runs", repeatRoot);
+
+    // 12b. two runs at once, two private temp roots (no shared port or dir).
+    const roots = ["a", "b"].map(() =>
+      mkdtempSync(join(tmpdir(), "of-cfg-concurrent-")),
+    );
+    cleanups.push(...roots);
+    const parallel = await Promise.all(
+      roots.map((root) => runWorker(configPath, [], { env: isolatedEnv(root) })),
+    );
+    parallel.forEach((result, i) => {
+      if (result.code !== 0) {
+        c.fail(`concurrent run ${i} (root ${roots[i]}): ${result.stderr.trim()}`);
+      }
+    });
+    if (parallel.every((result) => result.code === 0)) {
+      c.pass(
+        `2 concurrent runs on private roots succeeded (${parallel.map((r) => `${r.elapsedMs} ms`).join(", ")})`,
+      );
+    }
+    roots.forEach((root, i) => assertNoResidue(c, `concurrent run ${i}`, root));
+
+    // 12c. one shared TMPDIR is not a lock: each driver mkdtemps a private
+    // subdir and binds an ephemeral port, so both must still succeed.
+    const sharedRoot = mkdtempSync(join(tmpdir(), "of-cfg-shared-"));
+    cleanups.push(sharedRoot);
+    const shared = await Promise.all(
+      [0, 1].map(() => runWorker(configPath, [], { env: isolatedEnv(sharedRoot) })),
+    );
+    shared.forEach((result, i) => {
+      if (result.code !== 0) {
+        c.fail(`shared-root concurrent run ${i}: ${result.stderr.trim()}`);
+      }
+    });
+    if (shared.every((result) => result.code === 0)) {
+      c.pass("2 concurrent runs sharing one TMPDIR succeeded (no lock, no port clash)");
+    }
+    assertNoResidue(c, "shared-root concurrent runs", sharedRoot);
+    cases.push(c);
+  }
+
+  // 13. a config that asks for an impossible allocation fails closed
+  {
+    const c = { name: "memory exhaustion", checks: [] };
+    c.pass = (m) => c.checks.push({ ok: true, message: m });
+    c.fail = (m) => c.checks.push({ ok: false, message: m });
+    // 2 ** 52 bytes (~4 PiB) is above every supported host's address space
+    // but below V8's max ArrayBuffer length, so V8 attempts a real
+    // allocation and fails. Nothing is committed, so this cannot pressure
+    // the CI runner the way `new Array(2e8).fill(0)` would.
+    const oom = makeProject({
+      "cloudflare.config.ts": `import { bindings, defineConfig } from "@cloudflare/config";
+export default defineConfig(() => {
+  const buffer = new ArrayBuffer(2 ** 52);
+  return { worker: { name: "oom", compatibilityDate: "${COMPAT}", env: { N: bindings.text(String(buffer.byteLength)) } } };
+});
+`,
+    });
+    const root = mkdtempSync(join(tmpdir(), "of-cfg-oom-"));
+    cleanups.push(oom, root);
+    const startedAt = Date.now();
+    const result = await runWorker(join(oom, "cloudflare.config.ts"), ["--timeout-ms", "8000"], {
+      env: { TMPDIR: root, TMP: root, TEMP: root },
+      timeoutMs: 30_000,
+    });
+    const elapsed = Date.now() - startedAt;
+    const message = result.diagnostic?.message ?? "";
+    if (result.timedOut) {
+      c.fail(`huge allocation hung and was killed after ${elapsed} ms`);
+    } else if (result.code === 0) {
+      c.fail(`huge allocation succeeded; expected a fail-closed error`);
+    } else if (result.diagnostic?.error !== "VRT_CONFIG_LOADER_FAILED") {
+      c.fail(`expected VRT_CONFIG_LOADER_FAILED, got ${JSON.stringify(result.diagnostic)}`);
+    } else if (!/allocation|out of memory|\bOOM\b|workerd exited/i.test(message)) {
+      c.fail(`diagnostic does not identify the memory failure: ${result.stderr.trim()}`);
+    } else if (elapsed > 20_000) {
+      c.fail(`memory failure took ${elapsed} ms (limit 20000 ms)`);
+    } else {
+      c.pass(`failed closed in ${elapsed} ms: ${message}`);
+    }
+    assertNoResidue(c, "huge allocation", root);
+    cases.push(c);
+  }
+
+  // 14. the checked-in real example project is parity-identical
+  {
+    const example = join(REPO, "examples/standalone-config-ts");
+    const c = { name: "real example parity", checks: [] };
+    c.pass = (m) => c.checks.push({ ok: true, message: m });
+    c.fail = (m) => c.checks.push({ ok: false, message: m });
+    const configPath = join(example, "cloudflare.config.ts");
+    await assertParity(c, "examples/standalone-config-ts", configPath);
+    await assertParity(c, "examples/standalone-config-ts --mode staging", configPath, [
+      "--mode",
+      "staging",
+    ]);
+    await assertParity(c, "examples/standalone-config-ts --preview", configPath, ["--preview"]);
+    const staging = await runWorker(configPath, ["--mode", "staging"]);
+    const raw = parseStdout(staging)?.raw;
+    if (raw?.name !== "config-ts") {
+      c.fail(`example RawConfig has no name: ${staging.stderr.trim() || JSON.stringify(raw)}`);
+    } else if (raw?.vars?.GREETING !== "hello from cloudflare.config.ts" || raw?.vars?.STAGE !== "staging") {
+      c.fail(`example vars are not resolved: ${JSON.stringify(raw?.vars)}`);
+    } else if (raw?.routes?.[0] !== "config-ts.vrt.local/*") {
+      c.fail(`example trigger did not become a route: ${JSON.stringify(raw?.routes)}`);
+    } else if (!String(raw?.main).endsWith("src/index.js")) {
+      c.fail(`example entrypoint did not become main: ${JSON.stringify(raw?.main)}`);
+    } else {
+      c.pass("example fields (name/vars/routes/main) survived both paths");
+    }
     cases.push(c);
   }
 

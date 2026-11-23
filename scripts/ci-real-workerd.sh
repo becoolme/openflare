@@ -96,8 +96,12 @@ cargo test --locked -p vrt-local --test preflight \
   -- --test-threads="$THREADS" --nocapture
 
 # `cloudflare.config.*` worker sandbox: parity, nested factories, env
-# injection, hostile configs (host FS / network / oversized / while(true)).
-cargo test --locked -p vrt-local --test config_sandbox \
+# injection, hostile configs (host FS / network / oversized / while(true)),
+# plus repeat/concurrency/memory robustness and the checked-in example
+# parity. VRT_REQUIRE_WORKERD makes a missing prerequisite fail this job
+# instead of skipping the whole suite.
+env VRT_REQUIRE_WORKERD=1 \
+  cargo test --locked -p vrt-local --test config_sandbox \
   -- --test-threads="$THREADS" --nocapture
 
 if [ -n "$CAPNP" ]; then

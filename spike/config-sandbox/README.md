@@ -13,10 +13,12 @@ pnpm install
 
 # full matrix: parity, nested factories, env injection, cf-worker,
 # dependencies, host FS, network, oversized payload, invalid config,
-# while(true) timeout, missing workerd
+# while(true) timeout, missing workerd, 10x repeat + concurrency,
+# impossible-allocation fail-closed, real-example parity
 node spike/config-sandbox/verify.mjs --workerd /path/to/workerd
 
-# Rust integration matrix (self-skips without VRT_WORKERD_BIN)
+# Rust integration matrix (self-skips without VRT_WORKERD_BIN; CI sets
+# VRT_REQUIRE_WORKERD=1 so the real-workerd job fails instead of skipping)
 VRT_WORKERD_BIN=/path/to/workerd \
   cargo test -p vrt-local --test config_sandbox
 ```
