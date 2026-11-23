@@ -156,6 +156,12 @@ enables the backend; absent → ops fail closed (`code: 3100`).
 
 ## Known differences from Cloudflare
 
+- **Index deletion does not purge provider data.** The control plane
+  deletes the index metadata only; the runtime has no Vectorize purge op,
+  so the local `<tenant>/<indexId>.vec.db` can remain on disk. A
+  re-created index always gets a new per-incarnation `indexId`, so stale
+  vectors are never rebound to the new index. Reclaiming the file
+  requires an explicit runtime/storage purge.
 - **Exact KNN, not ANN.** Recall is 1.0 — a strict superset of the
   recall Cloudflare's approximate index returns. Result *order* and
   score values follow CF's metric semantics exactly.
