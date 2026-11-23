@@ -213,6 +213,31 @@ by the flags above:
 name, module count, bundle bytes/digest, binding list, rejected keys —
 without calling the API.
 
+## Public TLS: the `tls` profile
+
+`--profile tls` adds Traefik owning `:80`/`:443` in front of the
+vrt-host ingress — the same shape Dokploy uses:
+
+```sh
+VRT_TLS_EMAIL=you@example.com \
+  docker compose -f deploy/standalone/docker-compose.yml --profile tls up -d
+```
+
+- DNS: point every worker hostname (and `[preview] domain` wildcard)
+  at this host. Traefik issues one **Let's Encrypt cert per SNI
+  hostname at first handshake** — `of hostnames add` and preview
+  subdomains need no reloads, no extra config.
+- The catch-all router (`deploy/standalone/traefik/dynamic/vrt-ingress.yml`)
+  forwards any Host to `vrt-host:8080`, which keeps doing the
+  hostname→worker routing itself. To restrict certificate issuance to
+  your own base domain, narrow the rule to
+  `HostSuffix(`.apps.example.com`)`.
+- `VRT_TLS_CA=https://acme-staging-v02.api.letsencrypt.org/directory`
+  exercises the flow against the LE staging CA.
+- vrt-host's own port stays on `VRT_BIND=127.0.0.1` for local
+  `of`/conformance; the public path is Traefik → 443 → ingress.
+- Certs + the LE account key persist in the `traefik-acme` volume.
+
 ## Bare-metal dev without compose: `of dev`
 
 On a machine with the `vrt-*` binaries on PATH (or `--vrt-*-bin`
