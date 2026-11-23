@@ -18,17 +18,21 @@ export class RateLimitStore {
     get size() {
         return this.total;
     }
-    hit(params, key) {
+    hit(params, key, delta = 1) {
+        if (!Number.isSafeInteger(delta) || delta < 1) {
+            throw new TypeError("limit() delta must be a positive integer");
+        }
         const periodMs = params.periodSec * 1000;
         const t = this.now();
         const windowStart = Math.floor(t / periodMs) * periodMs;
         const { scope } = params;
         const cur = this.scopes.get(scope)?.get(key);
         if (cur !== undefined && cur.windowStart === windowStart) {
-            if (cur.count >= params.limit) return false;
-            cur.count += 1;
+            if (cur.count + delta > params.limit) return false;
+            cur.count += delta;
             return true;
         }
+        if (delta > params.limit) return false;
         if (cur !== undefined) this.remove(scope, key);
         else this.makeRoom(scope, t);
         let m = this.scopes.get(scope);
@@ -38,7 +42,7 @@ export class RateLimitStore {
         }
         m.set(key, {
             windowStart,
-            count: 1,
+            count: delta,
             periodMs
         });
         this.total += 1;
@@ -86,6 +90,21 @@ export class RateLimitStore {
         const oldest = m.keys().next();
         if (!oldest.done) this.remove(scope, oldest.value);
     }
+}
+export function validateRateLimitOptions(options) {
+    const key = validateRateLimitKey(options);
+    const delta = options.delta;
+    if (delta === undefined) return {
+        key,
+        delta: 1
+    };
+    if (typeof delta !== "number" || !Number.isSafeInteger(delta) || delta < 1) {
+        throw new TypeError("limit() options.delta must be a positive integer");
+    }
+    return {
+        key,
+        delta
+    };
 }
 export function validateRateLimitKey(options) {
     if (options === null || typeof options !== "object") {

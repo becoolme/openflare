@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "generatedBy": "facade/tools/gen-manifest.mjs",
-  "nodeVersion": "24",
+  "nodeVersion": "22",
   "externals": {
     "cloudflare:sockets": "workerd-provided external",
     "cloudflare:workers": "workerd-provided external"
@@ -766,15 +766,15 @@
           "name": "facade/facade-ratelimit.js",
           "dist": "facade/dist/facade/facade-ratelimit.js",
           "source": "facade/facade-ratelimit.ts",
-          "sourceSha256": "239c7aac9d3e751405968c56d5b6f333b62b2c3f08846e4fe9ff02a9ce6bcaf1",
-          "sha256": "f461934cce694d59dc08783881e04a1b9f61e52a1c2a5db50999294849f7e244"
+          "sourceSha256": "a2fecf5e259c6f919662195db922dc302f2ee770f54b610db7b16a750ace393e",
+          "sha256": "53c094769f9a3e67e86a2ca4b72399ee05c86a4bcdb1ab691262f1b71457fd7e"
         },
         {
           "name": "facade/ratelimit-core.js",
           "dist": "facade/dist/facade/ratelimit-core.js",
           "source": "facade/ratelimit-core.ts",
-          "sourceSha256": "0a37a0a434374d2a5be52b270eba951aa84f5a64a1b4009dec55467b4bbddec2",
-          "sha256": "b320e26f1354a5f92d12abee57283c43693274e4df618f92e8823f7f2812cd7f"
+          "sourceSha256": "46190524c63f36208d36946ed72655d51c960c0b021c18693adae17f2623d5c9",
+          "sha256": "3553c417246ebca24419c689ac0357e133c1ce15512a0205ae678cbe26c1bb6e"
         },
         {
           "name": "third_party/open-compute/facade/bindings/json-body.js",

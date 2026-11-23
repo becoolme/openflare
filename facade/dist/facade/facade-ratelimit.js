@@ -1,5 +1,5 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
-import { RateLimitStore, ratelimitParams, validateRateLimitKey } from "./ratelimit-core.js";
+import { RateLimitStore, ratelimitParams, validateRateLimitOptions } from "./ratelimit-core.js";
 const store = new RateLimitStore();
 export class RateLimiter extends WorkerEntrypoint {
     #params;
@@ -8,9 +8,9 @@ export class RateLimiter extends WorkerEntrypoint {
         this.#params = ratelimitParams(ctx?.props);
     }
     async limit(options) {
-        const key = validateRateLimitKey(options);
+        const { key, delta } = validateRateLimitOptions(options);
         return {
-            success: store.hit(this.#params, key)
+            success: store.hit(this.#params, key, delta)
         };
     }
 }

@@ -55,18 +55,23 @@ export class RateLimitStore {
   }
 
   /** Returns true when the call is within the limit. */
-  hit(params: RateLimitParams, key: string): boolean {
+  hit(params: RateLimitParams, key: string, delta = 1): boolean {
+    if (!Number.isSafeInteger(delta) || delta < 1) {
+      throw new TypeError("limit() delta must be a positive integer");
+    }
     const periodMs = params.periodSec * 1000;
     const t = this.now();
     const windowStart = Math.floor(t / periodMs) * periodMs;
     const { scope } = params;
     const cur = this.scopes.get(scope)?.get(key);
     if (cur !== undefined && cur.windowStart === windowStart) {
-      if (cur.count >= params.limit) return false;
-      cur.count += 1;
+      if (cur.count + delta > params.limit) return false;
+      cur.count += delta;
       return true;
     }
-    // New key or rolled-over window: (re)insert at the young end.
+    // New key or rolled-over window: (re)insert at the young end. A single
+    // call whose delta already exceeds the limit never creates a counter.
+    if (delta > params.limit) return false;
     if (cur !== undefined) this.remove(scope, key);
     else this.makeRoom(scope, t);
     let m = this.scopes.get(scope);
@@ -74,7 +79,7 @@ export class RateLimitStore {
       m = new Map();
       this.scopes.set(scope, m);
     }
-    m.set(key, { windowStart, count: 1, periodMs });
+    m.set(key, { windowStart, count: delta, periodMs });
     this.total += 1;
     return true;
   }
@@ -132,6 +137,16 @@ export class RateLimitStore {
     const oldest = m.keys().next();
     if (!oldest.done) this.remove(scope, oldest.value);
   }
+}
+
+export function validateRateLimitOptions(options: unknown): { key: string; delta: number } {
+  const key = validateRateLimitKey(options);
+  const delta = (options as { delta?: unknown }).delta;
+  if (delta === undefined) return { key, delta: 1 };
+  if (typeof delta !== "number" || !Number.isSafeInteger(delta) || delta < 1) {
+    throw new TypeError("limit() options.delta must be a positive integer");
+  }
+  return { key, delta };
 }
 
 export function validateRateLimitKey(options: unknown): string {

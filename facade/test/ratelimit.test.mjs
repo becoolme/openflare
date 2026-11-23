@@ -5,7 +5,7 @@ import { facadeModule } from "./helpers.mjs";
 
 const core = await import(facadeModule("ratelimit-core.js"));
 const { RateLimiter } = await import(facadeModule("facade-ratelimit.js"));
-const { RateLimitStore, validateRateLimitKey, ratelimitParams } = core;
+const { RateLimitStore, validateRateLimitKey, validateRateLimitOptions, ratelimitParams } = core;
 
 const P = { scope: "t1\u0001w1\u00011001", limit: 3, periodSec: 60 };
 
