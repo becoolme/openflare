@@ -53,6 +53,7 @@ mod oplog;
 mod preflight;
 pub mod preview;
 mod project_cfg;
+pub mod retention;
 pub use project_cfg::{
     load_cf_project_config, load_worker_meta, load_worker_meta_for_env,
     load_worker_meta_for_env_preview, load_worker_meta_for_env_preview_sandbox, ConfigSandbox,
@@ -61,6 +62,7 @@ pub use project_cfg::{
 pub use worker_pkg::WorkerToml;
 pub mod serve;
 mod state;
+pub use retention::{PreviewRetention, PruneReason, PrunedVersion, RetentionUpdate};
 pub use state::preview_instance_id;
 pub use state::VersionStatus;
 pub mod templates;
@@ -271,6 +273,41 @@ pub struct PromoteResult {
     pub revision: u64,
     /// `false` when the version was already active and the desired
     /// document was already current.
+    pub changed: bool,
+}
+
+/// `of versions prune` request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PruneRequest {
+    /// Worker display name OR `workerId`; `None` = every worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// Report the candidates without touching state.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// One-off overrides of the stored policy (never persisted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_days: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_count: Option<u32>,
+}
+
+/// Outcome of a prune pass. `removed` is the audit list: exactly the
+/// records this pass deleted (or WOULD delete for `dryRun`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PruneResult {
+    /// Policy actually applied (stored policy + request overrides).
+    pub policy: PreviewRetention,
+    pub dry_run: bool,
+    /// Removed (or, for a dry run, removable) versions, newest first per
+    /// worker.
+    pub removed: Vec<PrunedVersion>,
+    /// State revision after the pass (unchanged when nothing was
+    /// removed or for a dry run).
+    pub revision: u64,
+    /// `true` exactly when the stored state changed.
     pub changed: bool,
 }
 
@@ -641,6 +678,26 @@ impl VrtLocal {
             st.apply_deploy(&pkg, now_unix_ms)
         }
         .map_err(LocalError::Worker)?;
+        // Preview retention: the preview path never evicts on its own, so
+        // every successful deploy runs one policy pass BEFORE the desired
+        // document is validated/published. Removing records here (not
+        // after publish) guarantees the published snapshot never
+        // references a pruned version. A malformed policy file fails the
+        // deploy closed instead of silently skipping GC.
+        let retention_policy = retention::read(&self.root)?;
+        let auto_pruned = if retention_policy.enabled {
+            // The version this deploy just produced is never a candidate,
+            // even in the same-millisecond edge case where another
+            // preview still sorts as "newest": returning a URL/id for a
+            // record this same pass deleted would be a false success.
+            let plan: Vec<_> = retention::plan(&st, None, retention_policy, now_unix_ms)
+                .into_iter()
+                .filter(|p| p.version_id != version_id)
+                .collect();
+            retention::apply(&mut st, &plan)
+        } else {
+            Vec::new()
+        };
         // F3: NOTHING is persisted before the desired doc validates —
         // a rejected state must leave every file byte-identical. A
         // preview-only worker is skipped by `to_desired`, so this stays
@@ -674,14 +731,14 @@ impl VrtLocal {
         state::write(&self.root, &st)?;
         // 3. signed desired
         self.publish(&st, &key)?;
-        // F4: GC objects no version references (evicted bundles and
-        // stale uploads); system modules survive via `system_objects`.
-        // Still under the writer lock; a failed delete leaves an
-        // orphan (harmless), never a broken reference. Preview never
-        // evicts versions, so it has nothing to collect.
-        if !preview {
-            self.gc_objects(&st);
-        }
+        // F4: GC objects no version references (evicted bundles,
+        // retention-pruned previews and stale uploads); system modules
+        // survive via `system_objects`. Still under the writer lock; a
+        // failed delete leaves an orphan (harmless), never a broken
+        // reference. Runs for preview deploys too: the retention pass can
+        // prune records, and every remaining reference is recomputed from
+        // the just-written state.
+        self.gc_objects(&st);
         // PREVIEW URL (display): resolved from the host config while the
         // name is still owned here — the oplog entry below consumes it.
         let preview_url = if preview {
@@ -699,6 +756,23 @@ impl VrtLocal {
                 }),
             ),
         )?;
+        // One audit event per non-empty automatic pass, separate from the
+        // deploy event so retention is queryable on its own.
+        if !auto_pruned.is_empty() {
+            oplog::append(
+                &self.root,
+                &oplog::entry(
+                    "versions-prune",
+                    serde_json::json!({
+                        "trigger": "deploy",
+                        "worker": pkg.name,
+                        "policy": retention_policy,
+                        "removed": auto_pruned,
+                        "revision": st.revision,
+                    }),
+                ),
+            )?;
+        }
         Ok(DeployResult {
             preview_url,
             version_id,
@@ -924,6 +998,126 @@ impl VrtLocal {
             worker_id: record.worker_id.clone(),
             active_version_id: record.active_version_id.clone(),
             versions,
+        })
+    }
+
+    /// Stored preview retention policy (defaults when no policy file
+    /// exists). Read-only.
+    pub fn retention(&self) -> Result<PreviewRetention, LocalError> {
+        retention::read(&self.root)
+    }
+
+    /// Apply a partial retention-policy update and persist it. The
+    /// policy is control-plane-local (it never rides the signed
+    /// desired document), so this does not bump the state revision;
+    /// the change is audited in `state/oplog.jsonl` like every other
+    /// mutating op.
+    pub fn set_retention(&self, update: &RetentionUpdate) -> Result<PreviewRetention, LocalError> {
+        let _lock = lock::StateLock::acquire(&self.root)?;
+        let current = retention::read(&self.root)?;
+        let next = current.patched(update)?;
+        if next == current {
+            return Ok(next);
+        }
+        retention::write(&self.root, &next)?;
+        oplog::append(
+            &self.root,
+            &oplog::entry(
+                "versions-retention",
+                serde_json::json!({
+                    "previous": current,
+                    "policy": next,
+                }),
+            ),
+        )?;
+        Ok(next)
+    }
+
+    /// Prune preview versions under the stored policy (optionally
+    /// overridden per call). Runs under the same writer lock as
+    /// deploy/promote, so a version can never be removed between
+    /// "promote observed it" and "promote committed": either promote
+    /// wins first (the record is `Active` and protected) or prune wins
+    /// first (promote fails closed with `not found: version`).
+    ///
+    /// `enabled = false` only disables the AUTOMATIC pass; an explicit
+    /// `of versions prune` always runs.
+    pub fn prune_versions(&self, request: &PruneRequest) -> Result<PruneResult, LocalError> {
+        let _lock = lock::StateLock::acquire(&self.root)?;
+        let mut st = state::read(&self.root)?;
+        if let Some(worker) = request.worker.as_deref() {
+            if !st
+                .workers
+                .iter()
+                .any(|(n, w)| n == worker || w.worker_id == worker)
+            {
+                return Err(LocalError::NotFound("worker"));
+            }
+        }
+        let mut policy = retention::read(&self.root)?;
+        if let Some(days) = request.max_age_days {
+            policy.max_age_days = days;
+        }
+        if let Some(count) = request.max_count {
+            policy.max_count = count;
+        }
+        policy.validate()?;
+
+        let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let candidates = retention::plan(&st, request.worker.as_deref(), policy, now_unix_ms);
+        if request.dry_run || candidates.is_empty() {
+            return Ok(PruneResult {
+                policy,
+                dry_run: request.dry_run,
+                removed: candidates,
+                revision: st.revision,
+                changed: false,
+            });
+        }
+        let key = keys::load_signing_key(&self.root)?;
+        let removed = retention::apply(&mut st, &candidates);
+        if removed.is_empty() {
+            // A stale plan cannot happen under the lock; keep the write
+            // path untouched rather than publishing a no-op revision.
+            return Ok(PruneResult {
+                policy,
+                dry_run: false,
+                removed: Vec::new(),
+                revision: st.revision,
+                changed: false,
+            });
+        }
+        st.revision = st
+            .revision
+            .checked_add(1)
+            .ok_or(LocalError::State("revision"))?;
+        Self::validate_desired(&st)?;
+        state::write_vars(&self.root, &st.vars_union())?;
+        state::write(&self.root, &st)?;
+        self.publish(&st, &key)?;
+        // Same artifact GC as deploy: only objects no remaining version
+        // references are removed (a digest shared with a retained
+        // version, another worker or a system module survives).
+        self.gc_objects(&st);
+        oplog::append(
+            &self.root,
+            &oplog::entry(
+                "versions-prune",
+                serde_json::json!({
+                    "trigger": "manual",
+                    "worker": request.worker,
+                    "policy": policy,
+                    "removed": removed,
+                    "revision": st.revision,
+                }),
+            ),
+        )?;
+        Ok(PruneResult {
+            policy,
+            dry_run: false,
+            removed,
+            revision: st.revision,
+            changed: true,
         })
     }
 

@@ -47,6 +47,8 @@ USAGE:
   of status  --root <dir>
   of versions --root <dir> <worker>
   of versions list --root <dir> <worker>
+  of versions prune --root <dir> [<worker>] [--dry-run] [--max-age-days <n>] [--max-count <n>]
+  of versions retention --root <dir> [--auto|--no-auto] [--max-age-days <n>] [--max-count <n>]
   of renew   --root <dir>
   of key     --root <dir>                        (print trusted public key)
   of health  --root <dir>                        (mgmt /healthz → exit code)
@@ -89,6 +91,28 @@ fn arg<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+/// Numeric `--flag <n>` / `--flag=<n>` value, typed and parse-checked.
+/// A malformed value is a hard error (never "fall back to the policy
+/// default", which would prune with unexpected limits).
+fn num_flag<T>(args: &[String], name: &str) -> Result<Option<T>, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let prefix = format!("{name}=");
+    let raw = args
+        .iter()
+        .find_map(|a| a.strip_prefix(prefix.as_str()))
+        .or_else(|| arg(args, name));
+    match raw {
+        Some(value) => value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| format!("{name}: {e}")),
+        None => Ok(None),
+    }
+}
+
 /// Flags that take NO value — `positional` must not consume the arg
 /// after one (a `--no-watch dir` bug would silently drop `dir`).
 const BARE_FLAGS: &[&str] = &[
@@ -103,6 +127,8 @@ const BARE_FLAGS: &[&str] = &[
     "--follow",
     "--strict",
     "--preview",
+    "--auto",
+    "--no-auto",
 ];
 
 /// Positional args (everything not consumed as a `--flag value` pair
@@ -250,25 +276,74 @@ async fn run(args: Vec<String>) -> Result<(), String> {
         "versions" => {
             let root = root_of(&args[1..])?;
             let pos = positional(&args[1..]);
-            // `versions list <worker>` and the legacy `versions <worker>`
-            // are the same read-only query.
-            let rest = if pos.first().is_some_and(|p| p == "list") {
-                &pos[1..]
-            } else {
-                &pos[..]
-            };
-            let worker = match rest.first() {
-                Some(worker) => worker.clone(),
-                None => arg(&args[1..], "--worker")
-                    .ok_or("worker required")?
-                    .to_string(),
-            };
-            let v = direct(&root, |l| l.versions(&worker))?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&v).unwrap_or_default()
-            );
-            Ok(())
+            match pos.first().map(String::as_str) {
+                // Preview retention GC. `prune [<worker>]` accepts a
+                // worker OR nothing (every worker); `--dry-run` lists
+                // candidates without writing. Policy overrides are
+                // one-off and never persisted.
+                Some("prune") => {
+                    let request = vrt_local::PruneRequest {
+                        worker: pos
+                            .get(1)
+                            .cloned()
+                            .or_else(|| arg(&args[1..], "--worker").map(str::to_string)),
+                        dry_run: args.iter().any(|a| a == "--dry-run"),
+                        max_age_days: num_flag(&args[1..], "--max-age-days")?,
+                        max_count: num_flag(&args[1..], "--max-count")?,
+                    };
+                    let result = direct(&root, |l| l.prune_versions(&request))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).unwrap_or_default()
+                    );
+                    Ok(())
+                }
+                // Stored policy: print it, or apply a partial update.
+                Some("retention") => {
+                    let update = vrt_local::RetentionUpdate {
+                        enabled: if args.iter().any(|a| a == "--no-auto") {
+                            Some(false)
+                        } else if args.iter().any(|a| a == "--auto") {
+                            Some(true)
+                        } else {
+                            None
+                        },
+                        max_age_days: num_flag(&args[1..], "--max-age-days")?,
+                        max_count: num_flag(&args[1..], "--max-count")?,
+                    };
+                    let policy = if update.is_empty() {
+                        direct(&root, |l| l.retention())?
+                    } else {
+                        direct(&root, |l| l.set_retention(&update))?
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&policy).unwrap_or_default()
+                    );
+                    Ok(())
+                }
+                _ => {
+                    // `versions list <worker>` and the legacy
+                    // `versions <worker>` are the same read-only query.
+                    let rest = if pos.first().is_some_and(|p| p == "list") {
+                        &pos[1..]
+                    } else {
+                        &pos[..]
+                    };
+                    let worker = match rest.first() {
+                        Some(worker) => worker.clone(),
+                        None => arg(&args[1..], "--worker")
+                            .ok_or("worker required")?
+                            .to_string(),
+                    };
+                    let v = direct(&root, |l| l.versions(&worker))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&v).unwrap_or_default()
+                    );
+                    Ok(())
+                }
+            }
         }
         // P3c-2-r2: read-only identity queries — single-line stdout so
         // scripts never grep `of status` JSON positionally (pretty

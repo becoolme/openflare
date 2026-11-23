@@ -17,6 +17,8 @@ Cloudflare's full version and preview-routing model.
 of deploy --preview --root <dir> [--name <n>] <worker_dir>
 of promote --root <dir> [--worker <name|workerId>] <version_id>
 of versions list --root <dir> <worker>
+of versions prune --root <dir> [<worker>] [--dry-run] [--max-age-days <n>] [--max-count <n>]
+of versions retention --root <dir> [--auto|--no-auto] [--max-age-days <n>] [--max-count <n>]
 ```
 
 The legacy `of versions <worker>` form is an alias for
@@ -46,7 +48,7 @@ worker has `versions: [VersionRecord]` plus `activeVersionId`.
 | `artifactDigest` | Content-addressed bundle under `objects/<digest>`. |
 | `configHash` | `cfg_<sha256-prefix>` over the same canonical behavior record. Diagnostic only; identity lives in `versionId`. |
 | `status` | `preview`, `active`, or `archived`. |
-| `createdAtUnixMs` | Creation time. `0` for records written before this MVP. |
+| `createdAtUnixMs` | Creation time. Refreshed when an existing record is re-previewed, so "newest preview" means the last preview a client asked for. `0` for records written before this MVP. |
 | `createdBy` | Creator when the caller has an identity. Standalone `of` has no authenticated principal, so this is `null` today. |
 | bindings / vars / crons / consumers / observability / DO classes / workflows / quotas | The complete behavior of this version, replayed by `to_desired` and rollback. |
 
@@ -173,6 +175,116 @@ without parsing its Host header. The ingress strips worker-supplied
 `x-vrt-*` response headers and re-adds them itself, so a production
 worker cannot forge preview status.
 
+## Preview retention and GC
+
+`deploy --preview` never evicts on its own, so the preview history of a
+worker would grow forever. Retention is an explicit, stored policy — not
+a hidden default buried in the deploy path.
+
+### Policy
+
+Stored in `state/retention.json` (a separate file, not inside
+`state.json`: a build that predates retention must still be able to read
+and rewrite the state document):
+
+```json
+{ "enabled": true, "maxAgeDays": 7, "maxCount": 4 }
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Run the automatic pass at the end of every deploy. A manual `of versions prune` always runs. |
+| `maxAgeDays` | `7` | Remove preview versions older than this many days. `0` = no age limit. |
+| `maxCount` | `4` | Keep at most this many previews per worker, newest first. `0` = no count limit. Matches the `MAX_PREVIEWS_PER_WORKER` render cap, so a stored preview is normally also a servable one. |
+| | | An ENABLED policy must set at least one of the two limits; a policy that can never remove anything is refused. |
+
+An absent file means the defaults. A malformed or out-of-bounds file
+fails closed: deploys and `of versions prune` refuse to run instead of
+guessing limits. `maxAgeDays` is capped at 3650 and `maxCount` at 256.
+
+The policy applies to `preview` records only. Active and archived
+versions are unaffected; archived history keeps following
+`maxVersionsPerWorker` eviction on normal deploys.
+
+### What is protected
+
+- The worker's ACTIVE version, always. The mutation re-checks this, so
+  a stale plan can never delete a version a concurrent promote just
+  activated.
+- The NEWEST preview of each worker, even when it is past `maxAgeDays`:
+  the build an operator just created stays inspectable. Create a newer
+  preview or promote it to retire it. Re-previewing a stored version
+  refreshes its `createdAtUnixMs`, so it becomes the newest preview
+  again (kept by retention and projected by the renderer). The version
+  produced by the deploy that is running the automatic pass is never a
+  candidate, even in a same-millisecond tie.
+- Every artifact digest still referenced by ANY stored version of ANY
+  worker, or by an init-seeded system module. Bundles are
+  content-addressed and shared: pruning a version never deletes an
+  object another version still needs.
+
+"Newest" is ordered by `createdAtUnixMs` and then by insertion order in
+`state.json` (versions are append-only). This is the SAME order
+`to_desired` uses to pick the previews it renders, so GC can never drop a
+preview the renderer would serve, and a deploy that created its version
+in the same millisecond as an older one still counts as newer.
+
+### When it runs
+
+- **Automatic**: after every successful deploy/preview, BEFORE the
+  desired document is validated and published. The signed snapshot
+  therefore never references a pruned record, and a failure in the pass
+  leaves the old version serving.
+- **Manual**: `of versions prune [<worker>] [--dry-run]
+  [--max-age-days <n>] [--max-count <n>]`. Worker is optional (all
+  workers by default); CLI overrides are one-off and never persisted.
+  `--dry-run` lists candidates and writes nothing.
+- **Disable**: `of versions retention --no-auto` (or
+  `"enabled": false`). With automatic pruning off nothing is deleted
+  automatically; run `of versions prune` or re-enable the policy.
+
+Policy edits are not versioned state: `of versions retention` writes the
+policy file and appends a `versions-retention` oplog event, but does not
+bump the signed-desired revision (nothing in the snapshot changes).
+
+### Concurrency, idempotency and audit
+
+- Prune takes the same `state/lock` writer flock as deploy, preview,
+  promote and rollback. A prune and a promote of the same version are
+  serialized: either promote commits first (the record becomes `active`
+  and is protected) or prune commits first (promote then fails closed
+  with `not found: version`). Neither order can produce a dangling
+  `activeVersionId` or a stored version whose `objects/<digest>` is
+  missing.
+- A second pass over unchanged state removes nothing, does not bump the
+  revision and does not republish the envelope (idempotent replay).
+- Every non-empty pass appends a `versions-prune` event to
+  `state/oplog.jsonl` with the trigger (`deploy`/`manual`), the policy
+  used, and each removed version's worker, version id, artifact digest,
+  creation time and reason (`age` or `count`). Dry runs write nothing.
+- After the state write and publish, the existing object GC removes only
+  digests no version references any more. A failed delete leaves an
+  orphan file (harmless), never a broken reference.
+
+Example:
+
+```text
+$ of versions retention --max-age-days 3 --max-count 2
+{ "enabled": true, "maxAgeDays": 3, "maxCount": 2 }
+
+$ of versions prune --dry-run
+{
+  "policy": { "enabled": true, "maxAgeDays": 3, "maxCount": 2 },
+  "dryRun": true,
+  "removed": [
+    { "worker": "edge-api", "versionId": "vrt_9f2c…", "artifactDigest": "ab12…",
+      "createdAtUnixMs": 1763…, "reason": "count" }
+  ],
+  "revision": 41,
+  "changed": false
+}
+```
+
 ## Transaction boundaries
 
 All mutating operations hold the single writer `flock` on
@@ -182,7 +294,14 @@ All mutating operations hold the single writer `flock` on
 2. write `vars.json` (union of every stored version's var values);
 3. write `state.json` atomically;
 4. sign and write `desired/envelope.json`;
-5. append `state/oplog.jsonl`.
+5. append `state/oplog.jsonl`;
+6. collect artifact objects no remaining version references (after the
+   publish, still under the writer lock).
+
+The preview retention pass runs after the deploy record is applied and
+before the desired document is validated, so the state that gets
+persisted already has the pruned records removed; object GC then runs at
+step 6 for every deploy, preview included.
 
 `deploy --preview` writes a `preview` record, keeps `activeVersionId`
 and worker hostnames unchanged, and re-publishes the worker set
@@ -308,10 +427,9 @@ real browsers needs, in addition:
 - Preview access control (signed preview tokens / passwords).
 - Per-preview processes (previews share the tenant workerd process).
 - Durable Object and Workflow previews.
-- Automatic GC and retention policy for versions. Normal deploys keep
-  the existing `maxVersionsPerWorker` eviction behavior; the preview
-  path does not evict anything. This MVP does not delete versions on
-  its own.
+- Pinning individual preview versions against retention. Promote the
+  version to make it active, or create a newer preview; there is no
+  per-version "keep" flag yet.
 - Code/config diffs and per-version metrics beyond the preview
   instance's own worker label.
 - Versioned routes/hostnames. Production hostnames remain worker-level;
@@ -353,6 +471,13 @@ write the active pointer.
   cross-worker rejection, missing artifact rejection, concurrent
   promote invariant, `previewUrl` from the host config, DO/workflow
   preview refusal.
+- Retention tests in `vrt-local/src/retention.rs` (policy bounds,
+  newest/active protection, count and age boundaries, idempotent
+  mutation) and `vrt-local/tests/retention.rs` (aged preview pruned
+  with its artifact, protected active/newest, dry run writes nothing,
+  shared content-addressed artifact survives, automatic pass at deploy,
+  disabled policy, policy file round-trip/fail-closed, concurrent
+  prune+promote invariant, CLI `versions prune` / `versions retention`).
 - Control-plane HTTP tests in `vrt-host/tests/versioning_http.rs`: a
   real management listener (loopback TCP, bearer auth) drives deploy /
   preview / promote / versions, and the same root is converged through
@@ -375,6 +500,17 @@ write the active pointer.
 
 ## Changelog
 
+- 2026-11-22: re-previewing a stored version refreshes its recency
+  (`createdAtUnixMs`) so it is the newest preview: it is projected again
+  and survives the same deploy's retention pass. The deploy's own
+  version is excluded from the automatic pass.
+- 2026-11-22: preview retention/GC. Explicit policy in
+  `state/retention.json` (defaults: enabled, 7 days, 4 previews per
+  worker), automatic pass at the end of every deploy, `of versions
+  prune` (with `--dry-run`) and `of versions retention`, protected
+  active/newest previews, reference-counted artifact GC shared with
+  normal deploy eviction, and `versions-prune` / `versions-retention`
+  oplog events.
 - 2026-11-22: versioned preview URLs
   (`https://<versionId>--<worker>.<previewDomain>/`), host
   `[preview] domain` config (default off), preview instances in the
