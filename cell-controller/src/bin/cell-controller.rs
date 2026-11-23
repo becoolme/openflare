@@ -104,6 +104,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // rejecting the field, and the control plane gates on this bit.
         workflows_cross_worker: true,
         storage_purge: storage_purge_exec.is_some(),
+        vectorize_purge: storage_purge_exec
+            .as_ref()
+            .is_some_and(|e| e.has_vectorize()),
         // KV bindings are admitted only when a KV backend was actually built.
         kv: storage_purge_exec.as_ref().is_some_and(|e| e.has_kv()),
         // R2 object data ops: only when an R2 backend was actually built.

@@ -176,6 +176,7 @@ fn desired_ack_fixture() {
             d1_cell_ops: true,
             workflows_cross_worker: true,
             storage_purge: true,
+            vectorize_purge: false,
             kv: false,
             r2: false,
             service_entrypoint: true,
@@ -289,6 +290,14 @@ fn kv_capability_wire_shape() {
     .unwrap();
     assert_eq!(r2_on["r2"], serde_json::json!(true));
     assert!(r2_on.get("kv").is_none());
+    // Vectorize purge: same omit-while-false shape.
+    assert!(off.get("vectorizePurge").is_none());
+    let vx_on = serde_json::to_value(AckCapabilities {
+        vectorize_purge: true,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(vx_on["vectorizePurge"], serde_json::json!(true));
     // Named service entrypoints: same omit-while-false shape.
     assert!(off.get("serviceEntrypoint").is_none());
     let ep_on = serde_json::to_value(AckCapabilities {

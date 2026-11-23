@@ -11,8 +11,10 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, Once};
+
+use crate::purge::PurgeOutcome;
 
 /// CF caps: vectors per insert/upsert batch, vector id, metadata blob.
 pub const MAX_VECTORS_PER_BATCH: usize = 1000;
@@ -74,6 +76,43 @@ struct Index {
     conn: Connection,
     dims: u32,
     metric: Metric,
+}
+
+/// Remove one index's SQLite files (db + WAL/SHM) with a bounded
+/// pass. `complete` is true only when all three paths are absent after
+/// the pass; a missing index is a clean complete purge. Validation is
+/// the same as the other purge targets: identity, never a caller-chosen
+/// path. A live provider connection may keep the unlinked inode until
+/// it closes; the control plane only dispatches this after every
+/// version reference is gone.
+pub fn purge_index_files(
+    root: &Path,
+    tenant: &str,
+    index_id: &str,
+    max_files: usize,
+) -> Result<PurgeOutcome, crate::error::ProviderError> {
+    if !crate::purge::valid_purge_tenant(tenant)
+        || !crate::purge::valid_purge_target_id(index_id)
+        || max_files == 0
+    {
+        return Err(crate::error::ProviderError::Protocol);
+    }
+    let dir = root.join(tenant);
+    let base = format!("{index_id}.vec.db");
+    let names = [base.clone(), format!("{base}-wal"), format!("{base}-shm")];
+    let mut deleted = 0u64;
+    for name in &names {
+        if deleted as usize >= max_files {
+            break;
+        }
+        match std::fs::remove_file(dir.join(name)) {
+            Ok(()) => deleted += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(crate::error::ProviderError::ResourceUnavailable),
+        }
+    }
+    let complete = names.iter().all(|name| !dir.join(name).exists());
+    Ok(PurgeOutcome { deleted, complete })
 }
 
 /// Per-tenant store: lazily-opened sqlite files keyed `tenant/indexId`.
@@ -904,6 +943,33 @@ mod tests {
         assert_eq!(s, 200);
         assert_eq!(out["vectorCount"], 1);
         assert_eq!(out["dimensions"], 3);
+    }
+
+
+    #[test]
+    fn purge_index_files_is_bounded_and_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("vx");
+        let tenant = root.join("t1");
+        std::fs::create_dir_all(&tenant).unwrap();
+        for name in ["abcdefghijklmnopqrstuvwxyz.vec.db", "abcdefghijklmnopqrstuvwxyz.vec.db-wal", "abcdefghijklmnopqrstuvwxyz.vec.db-shm"] {
+            std::fs::write(tenant.join(name), b"x").unwrap();
+        }
+        std::fs::write(tenant.join("keep.vec.db"), b"x").unwrap();
+
+        let first = purge_index_files(&root, "t1", "abcdefghijklmnopqrstuvwxyz", 2).unwrap();
+        assert_eq!(first.deleted, 2);
+        assert!(!first.complete);
+        assert!(tenant.join("keep.vec.db").exists());
+        let second = purge_index_files(&root, "t1", "abcdefghijklmnopqrstuvwxyz", 2).unwrap();
+        assert_eq!(second.deleted, 1);
+        assert!(second.complete);
+        assert!(tenant.join("keep.vec.db").exists());
+        assert!(purge_index_files(&root, "t1", "abcdefghijklmnopqrstuvwxyz", 2)
+            .unwrap()
+            .complete);
+        assert!(purge_index_files(&root, "../t1", "abcdefghijklmnopqrstuvwxyz", 2).is_err());
+        assert!(purge_index_files(&root, "t1", "../abcdefghijklmnopqrstuvwxyz", 2).is_err());
     }
 
     #[test]
