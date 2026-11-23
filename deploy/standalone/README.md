@@ -123,6 +123,14 @@ The image ships `facade/dist` + `facade/manifest.json` under
 there automatically (manifest digests are verified at seed time;
 bare-metal installs can pass `--facade-dist`).
 
+It also co-installs the `of-bundler` helper at
+`/usr/local/bin/of-bundler`, beside `of`. `of deploy` bundles each
+worker project by shelling out to that helper (rolldown); release
+binaries embed it, but a source-built `of` does not, so the image — not
+the host — provides it. Nothing here needs an `OF_BUNDLER` override or
+a host `of-bundler/target/` build directory, and the image build fails
+closed if the helper is ever missing from that path.
+
 With the real-workerd stack up, the binding-layer conformance suite
 can run against it — it deploys each case worker through `of deploy`
 inside the `vrt` container and checks responses at the ingress:

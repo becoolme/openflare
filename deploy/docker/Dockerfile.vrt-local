@@ -15,10 +15,19 @@
 #                         (never a silent stub). Compose must not use it.
 # Unknown WORKERD_SOURCE values fail the build (no such stage).
 #
-# Toolchain floor: Cargo.lock's highest declared rust-version is
-# uuid 1.28.0 → 1.89 (cargo metadata/registry manifests); the pin below
-# matches the toolchain this workspace is verified on.
-ARG RUST_IMAGE=rust:1.93.0-bookworm
+# Toolchain floor: the main workspace's Cargo.lock declares rust-version
+# 1.89 at most (uuid 1.28.0 and friends), but the `of-bundler` helper's
+# own lock is higher — rolldown 1.3.2 / oxc 0.158 declare 1.97. ONE
+# toolchain builds both trees, so the pin follows the higher floor; CI
+# and release.yml already build with current stable.
+#
+# `of` bundles worker projects by shelling out to the `of-bundler`
+# helper (rolldown, its own cargo workspace). Release binaries embed
+# it (release.yml sets OF_EMBED_BUNDLER); this image instead CO-INSTALLS
+# it next to `of` in /usr/local/bin, which is the documented resolution
+# order's last step. Nothing at runtime may depend on a host build
+# directory or an OF_BUNDLER override.
+ARG RUST_IMAGE=rust:1.97.0-bookworm
 ARG WORKERD_IMAGE=debian:bookworm-slim
 ARG WORKERD_SOURCE=stub
 
@@ -30,6 +39,11 @@ COPY . .
 # building it in the same command as the real binaries is a hard
 # error (required-features gate). Two commands: release bins without
 # the feature; the stub alone with it (only the stub stage needs it).
+#
+# `rm -rf target` after each build keeps the multi-GB cargo directory
+# OUT of the image layer — otherwise the layer (and the builder's own
+# disk usage) carries the whole target tree, and two heavy trees in
+# parallel can exceed the runner's free disk.
 RUN set -eux; \
     cargo build --release --locked \
       -p vrt-local --bin of \
@@ -38,7 +52,19 @@ RUN set -eux; \
       -p vrt-sql --bin vrt-sql; \
     mkdir -p /out; \
     cp target/release/of target/release/vrt-host target/release/vrt-provider \
-       target/release/vrt-sql /out/
+       target/release/vrt-sql /out/; \
+    rm -rf target
+
+# The `of-bundler` helper: its own cargo workspace (rolldown's
+# serde_json features must not leak into the main graph), so it is a
+# separate `cargo build` — sequentially after the main one, in the same
+# stage, so the two target trees never exist at the same time. It
+# `#[path]`-includes two vrt-local sources (the wire types and the
+# rule-glob predicate) that `COPY . .` already placed in the context.
+RUN set -eux; \
+    cargo build --release --locked --manifest-path of-bundler/Cargo.toml; \
+    install -D -m 0755 of-bundler/target/release/of-bundler /out/of-bundler; \
+    rm -rf of-bundler/target
 
 FROM ${RUST_IMAGE} AS stub-builder
 WORKDIR /build
@@ -51,7 +77,8 @@ RUN set -eux; \
       -p vrt-host --bin vrt-stub-workerd --bin vrt-host --features dev-stub; \
     mkdir -p /out; \
     cp target/release/vrt-stub-workerd /out/; \
-    cp target/release/vrt-host /out/vrt-host-devstub
+    cp target/release/vrt-host /out/vrt-host-devstub; \
+    rm -rf target
 
 # ---------- workerd sources (only the selected stage builds) ----------
 FROM debian:bookworm-slim AS workerd-stub
@@ -100,6 +127,13 @@ RUN set -eux; \
     install -d -o vrt -g vrt -m 0700 /data /tmp /data/objstore
 
 COPY --from=builder /out/of /out/vrt-host /out/vrt-provider /out/vrt-sql /usr/local/bin/
+# Co-install the bundler helper next to `of`: resolution step 4 of
+# vrt-local/src/bundle.rs, so `of deploy` bundles with no OF_BUNDLER
+# and no in-repo target dir. Fail the BUILD (not the first deploy) if
+# the helper ever goes missing from this layout.
+COPY --from=builder /out/of-bundler /usr/local/bin/of-bundler
+RUN set -eux; \
+    test -x /usr/local/bin/of-bundler || { echo "FATAL: of-bundler helper missing"; exit 1; }
 # Unique runtime layout: workerd ALWAYS lands at /usr/local/bin/workerd
 # (or nowhere under WORKERD_SOURCE=none). Nothing else may install a
 # second workerd path — compose and `vrt init` share this contract.
