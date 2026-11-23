@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "generatedBy": "facade/tools/gen-manifest.mjs",
-  "nodeVersion": "22",
+  "nodeVersion": "24",
   "externals": {
     "cloudflare:sockets": "workerd-provided external",
     "cloudflare:workers": "workerd-provided external"
