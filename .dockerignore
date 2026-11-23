@@ -1,5 +1,9 @@
 # Build context must stay small — target/ alone is multi-GB.
 target/
+# of-bundler is its own cargo workspace, so its build dir is nested
+# (not covered by the root `target/` above); the image compiles the
+# helper itself in bundler-builder.
+of-bundler/target/
 **/node_modules/
 **/.git/
 deploy/standalone/vrt-data/
