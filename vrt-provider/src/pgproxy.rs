@@ -10,30 +10,34 @@
 //! `GSSENC`, `CancelRequest`, `replication` params and non-3.x startup
 //! variants are typed rejections. Client `user`/`database` are ignored
 //! — upstream identity comes from the credential-file `tcp` payload
-//! (provider-held, rotated via render-inputs). Upstream auth supports
-//! AuthenticationOk, cleartext and SCRAM-SHA-256; md5/GSS fail closed.
-//! After upstream ReadyForQuery the session is a transparent
-//! bidirectional relay bounded by idle/session timeouts and byte
-//! accounting. Sessions whose binding vanishes from desired state are
-//! aborted by the sweeper within one sweep interval.
+//! (provider-held, rotated via render-inputs). After upstream
+//! ReadyForQuery the session is a transparent bidirectional relay
+//! bounded by idle/session timeouts and byte accounting. Sessions whose
+//! binding vanishes from desired state are aborted by the sweeper
+//! within one sweep interval.
+//!
+//! MIG-15 r3: with `[hyperdrive.pool]` configured, backend connections
+//! come from a per-process session pool ([`crate::pgpool`]) keyed by
+//! `(tenant, endpoint, user, database)`; without it every session owns a
+//! fresh connection. A session is only returned to the pool when the
+//! relay stopped on a clean ReadyForQuery boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::config::PgProxyConfig;
+use crate::config::{PgProxyConfig, PoolConfig};
 use crate::desired_file::FileDesiredStore;
 use crate::metrics::reg;
+use crate::pgpool::{AcquireError, Checkin, ConnectionPool, PoolKey};
+use crate::pgwire::{self, RelayState, WireError};
 
 const SSL_REQUEST: u32 = 808_771_03;
 const GSSENC_REQUEST: u32 = 808_771_04;
@@ -42,7 +46,6 @@ const PROTO_V3: u32 = 196_608;
 /// Startup frame cap — a tenant cannot grow work/memory via the packet.
 const STARTUP_MAX: u32 = 16 * 1024;
 const PREAMBLE_MAX: usize = 128;
-const PG_MESSAGE_MAX: u32 = 16 * 1024 * 1024;
 const SWEEP_MS: u64 = 5_000;
 
 /// Typed session denial reasons — metric label + wire code suffix.
@@ -68,6 +71,9 @@ pub enum Deny {
     IdleTimeout,
     SessionDeadline,
     BindingRevoked,
+    /// MIG-15 r3: `maxConnections` stayed saturated for the whole
+    /// `acquireTimeoutMs` — the queue is bounded, never unbounded.
+    PoolExhausted,
 }
 
 impl Deny {
@@ -86,6 +92,7 @@ impl Deny {
             Self::IdleTimeout => "PG_IDLE_TIMEOUT",
             Self::SessionDeadline => "PG_SESSION_DEADLINE",
             Self::BindingRevoked => "PG_BINDING_REVOKED",
+            Self::PoolExhausted => "PG_CONNECTION_LIMIT",
         }
     }
 }
@@ -95,6 +102,9 @@ type SessionMap = Mutex<HashMap<String, HashMap<u64, tokio::sync::oneshot::Sende
 
 pub struct PgProxy {
     cfg: PgProxyConfig,
+    /// `[hyperdrive.pool]` — `None` keeps the pre-r3 one-connection-per-
+    /// session shape.
+    pool: Option<Arc<ConnectionPool>>,
     creds: Arc<crate::pg::PgCredentialStore>,
     desired: Arc<FileDesiredStore>,
     sessions: SessionMap,
@@ -109,11 +119,14 @@ pub struct PgProxy {
 impl PgProxy {
     pub fn new(
         cfg: PgProxyConfig,
+        pool: Option<PoolConfig>,
         creds: Arc<crate::pg::PgCredentialStore>,
         desired: Arc<FileDesiredStore>,
     ) -> Arc<Self> {
+        let io_timeout = Duration::from_millis(cfg.connect_timeout_ms);
         Arc::new(Self {
             global: Arc::new(Semaphore::new(cfg.max_sessions)),
+            pool: pool.map(|p| ConnectionPool::new(p, io_timeout)),
             cfg,
             creds,
             desired,
@@ -124,6 +137,11 @@ impl PgProxy {
             #[cfg(test)]
             test_routes: Mutex::new(None),
         })
+    }
+
+    /// Pool handle (reaper / readiness), `None` when pooling is off.
+    pub fn pool(&self) -> Option<&Arc<ConnectionPool>> {
+        self.pool.as_ref()
     }
 
     fn push_active(&self) {
@@ -140,7 +158,12 @@ impl PgProxy {
     /// Snapshot failure returns an empty map — fail closed.
     fn routes(&self) -> HashMap<String, (String, String)> {
         #[cfg(test)]
-        if let Some(r) = self.test_routes.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        if let Some(r) = self
+            .test_routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
             return r;
         }
         let mut out = HashMap::new();
@@ -199,8 +222,18 @@ impl PgProxy {
                     false
                 });
             }
+            // MIG-15 r3: idle pooled sockets follow the same lifecycle —
+            // a revoked binding must not keep a backend session alive.
+            if let Some(pool) = &self.pool {
+                let tenants: HashSet<String> =
+                    live.values().map(|(tenant, _)| tenant.clone()).collect();
+                pool.evict_tenants(&tenants);
+            }
             if killed > 0 {
-                info!(killed, "pgproxy: sessions aborted — binding left desired state");
+                info!(
+                    killed,
+                    "pgproxy: sessions aborted — binding left desired state"
+                );
             }
         }
     }
@@ -242,6 +275,7 @@ impl PgProxy {
                 Deny::UpstreamAuth => "upstream_auth",
                 Deny::MigrationReadOnly => "migration_read_only",
                 Deny::HandshakeTimeout => "handshake_timeout",
+                Deny::PoolExhausted => "connection_limit",
             });
             warn!(code = d.code(), label = %label.unwrap_or_default(), "pgproxy session denied");
         }
@@ -274,12 +308,17 @@ impl PgProxy {
         sock: TcpStream,
         id: u64,
     ) -> Result<(), (Deny, Option<String>)> {
-        // MIG-15 r2: ONE deadline covers the entire accept→ReadyForQuery
+        // MIG-15 r2: ONE deadline covers the whole accept→client-startup
         // phase — preamble, route/credential resolution, client startup
-        // frames AND upstream auth. A client that stalls anywhere inside
-        // releases the global permit + per-binding slot on timeout; the
-        // dropped future closes the socket.
-        let parts = match tokio::time::timeout(
+        // frames. A client that stalls anywhere inside releases the
+        // global permit + per-binding slot on timeout; the dropped future
+        // closes the socket.
+        //
+        // MIG-15 r3: backend acquisition (pool queue + dial/auth) is OUT
+        // of that deadline on purpose — a saturated pool must answer with
+        // its own typed denial after `acquireTimeoutMs` instead of being
+        // pre-empted by the handshake timeout.
+        let admitted = match tokio::time::timeout(
             Duration::from_millis(self.cfg.connect_timeout_ms),
             self.pre_relay(sock, id),
         )
@@ -288,14 +327,16 @@ impl PgProxy {
             Err(_) => return Err((Deny::HandshakeTimeout, None)),
             Ok(v) => v?,
         };
-        let mut rd = parts.rd;
-        let mut wr = parts.wr;
-        let mut urd = parts.urd;
-        let mut uwr = parts.uwr;
-        let label = parts.label;
-        let mut kill_rx = parts.kill_rx;
-        let _active = parts.active;
-        let _release = parts.release;
+        let parts = self.attach_upstream(admitted).await?;
+        let PreRelay {
+            rd: mut client_rd,
+            wr: mut client_wr,
+            mut conn,
+            label,
+            mut kill_rx,
+            active: _active,
+            release: _release,
+        } = parts;
 
         // Bidirectional relay bounded by idle + session deadlines and
         // by the revocation kill channel; all bytes are metered.
@@ -303,39 +344,57 @@ impl PgProxy {
         // last-activity); any side ending (EOF/IO/idle) ends BOTH.
         let idle = Duration::from_millis(self.cfg.idle_timeout_ms);
         let deadline = Duration::from_millis(self.cfg.max_session_ms);
+        let (up_rd, up_wr) = conn.halves();
         let relay = async {
             tokio::select! {
-                _ = &mut kill_rx => (0u64, 0u64, PumpEnd::Idle),
-                v = pump_both(&mut rd, &mut uwr, &mut urd, &mut wr, idle) => v,
+                _ = &mut kill_rx => RelayOutcome::killed(),
+                v = relay_both(&mut client_rd, up_wr, up_rd, &mut client_wr, idle) => v,
             }
         };
-        let (c2u_b, u2c_b, end) = match tokio::time::timeout(deadline, relay).await {
-            Err(_) => {
-                return Err((Deny::SessionDeadline, Some(label)));
-            }
+        let outcome = match tokio::time::timeout(deadline, relay).await {
+            Err(_) => return Err((Deny::SessionDeadline, Some(label))),
             Ok(v) => v,
         };
-        reg().add("vrt_provider_pgproxy_bytes_total", &[("dir", "up")], c2u_b as f64);
-        reg().add("vrt_provider_pgproxy_bytes_total", &[("dir", "down")], u2c_b as f64);
+        reg().add(
+            "vrt_provider_pgproxy_bytes_total",
+            &[("dir", "up")],
+            outcome.c2u as f64,
+        );
+        reg().add(
+            "vrt_provider_pgproxy_bytes_total",
+            &[("dir", "down")],
+            outcome.u2c as f64,
+        );
         if kill_rx.is_terminated() {
+            // Revoked binding: the socket must not come back to the pool.
             return Err((Deny::BindingRevoked, Some(label)));
         }
-        if end == PumpEnd::Idle {
+        // MIG-15 r3: only a connection that stopped exactly on a
+        // ReadyForQuery boundary with no client request outstanding may
+        // be reset and reused.
+        let reusable =
+            matches!(outcome.end, PumpEnd::ClientEof | PumpEnd::Idle) && outcome.state.reusable();
+        conn.finish(Checkin {
+            reusable,
+            ready_status: outcome.state.ready_status(),
+        })
+        .await;
+        if outcome.end == PumpEnd::Idle {
             return Err((Deny::IdleTimeout, Some(label)));
         }
         Ok(())
     }
 
-    /// Everything between accept and the first ReadyForQuery —
-    /// preamble → route → admission → credential → client startup →
-    /// upstream connect + auth → client_ready. Runs under the outer
-    /// `connect_timeout_ms` deadline in `session`; guards inside
-    /// `PreRelay` keep slots/permits until dropped.
+    /// Client half of the admission: preamble → route → admission →
+    /// credential → client startup frames. Runs under the
+    /// `connect_timeout_ms` deadline in `session`; the guards it returns
+    /// keep the per-binding slot, registry entry and active counter until
+    /// the whole session (or a cancel) drops them.
     async fn pre_relay(
         self: &Arc<Self>,
         mut sock: TcpStream,
         id: u64,
-    ) -> Result<PreRelay, (Deny, Option<String>)> {
+    ) -> Result<Admitted, (Deny, Option<String>)> {
         let label = read_preamble(&mut sock)
             .await
             .map_err(|_| (Deny::BadPreamble, None))?;
@@ -364,10 +423,16 @@ impl PgProxy {
             let mut reg = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
             reg.entry(label.clone()).or_default().insert(id, kill_tx);
         }
-        reg().add("vrt_provider_pgproxy_sessions_total", &[("binding", "bound")], 1.0);
+        reg().add(
+            "vrt_provider_pgproxy_sessions_total",
+            &[("binding", "bound")],
+            1.0,
+        );
         self.active.fetch_add(1, Ordering::Relaxed);
         self.push_active();
-        let active = ActiveGuard { proxy: Arc::clone(self) };
+        let active = ActiveGuard {
+            proxy: Arc::clone(self),
+        };
         let release = ReleaseGuard {
             proxy: Arc::clone(self),
             label: label.clone(),
@@ -431,39 +496,88 @@ impl PgProxy {
             }
         }
 
-        // Upstream connect + auth (provider-held identity).
-        let started = Instant::now();
-        let upstream = match tokio::time::timeout(
-            Duration::from_millis(self.cfg.connect_timeout_ms),
-            TcpStream::connect((tcp.host.as_str(), tcp.port)),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => {
-                send_error_w(&mut wr, Deny::UpstreamConnect.code()).await;
-                return Err((Deny::UpstreamConnect, Some(label)));
+        Ok(Admitted {
+            rd,
+            wr,
+            tcp,
+            team,
+            label,
+            kill_rx,
+            active,
+            release,
+        })
+    }
+
+    /// Backend half of the admission: pooled checkout or a direct dial,
+    /// then the synthetic client_ready.
+    ///
+    /// MIG-15 r3: deliberately outside the `connect_timeout_ms`
+    /// handshake deadline — a saturated pool answers with the typed
+    /// `PG_CONNECTION_LIMIT` after `acquireTimeoutMs` instead of being
+    /// pre-empted by the handshake timeout.
+    async fn attach_upstream(
+        self: &Arc<Self>,
+        admitted: Admitted,
+    ) -> Result<PreRelay, (Deny, Option<String>)> {
+        let Admitted {
+            rd,
+            mut wr,
+            tcp,
+            team,
+            label,
+            kill_rx,
+            active,
+            release,
+        } = admitted;
+        // Upstream connection (provider-held identity): pooled session
+        // reuse, or a per-session connection when pooling is off.
+        let conn = match &self.pool {
+            Some(pool) => {
+                let key = PoolKey::new(&team, &tcp);
+                match pool.acquire(&key, &tcp).await {
+                    Ok(conn) => SessionConn::Pooled {
+                        pool: Arc::clone(pool),
+                        conn,
+                    },
+                    Err(AcquireError::Timeout) => {
+                        let _ = wr.write_all(&pool_limit_frame()).await;
+                        return Err((Deny::PoolExhausted, Some(label)));
+                    }
+                    Err(AcquireError::Upstream(e)) => {
+                        let deny = upstream_deny(e);
+                        send_error_w(&mut wr, deny.code()).await;
+                        return Err((deny, Some(label)));
+                    }
+                }
+            }
+            None => {
+                let started = Instant::now();
+                match pgwire::connect(&tcp, Duration::from_millis(self.cfg.connect_timeout_ms))
+                    .await
+                {
+                    Ok(conn) => {
+                        reg().observe(
+                            "vrt_provider_pgproxy_upstream_connect_ms",
+                            &[],
+                            started.elapsed().as_secs_f64() * 1000.0,
+                        );
+                        SessionConn::Direct(conn)
+                    }
+                    Err(e) => {
+                        let deny = upstream_deny(e);
+                        send_error_w(&mut wr, deny.code()).await;
+                        return Err((deny, Some(label)));
+                    }
+                }
             }
         };
-        let _ = upstream.set_nodelay(true);
-        reg().observe(
-            "vrt_provider_pgproxy_upstream_connect_ms",
-            &[],
-            started.elapsed().as_secs_f64() * 1000.0,
-        );
-        let (mut urd, mut uwr) = upstream.into_split();
-        if let Err(d) = upstream_handshake(&mut urd, &mut uwr, &tcp).await {
-            send_error_w(&mut wr, Deny::UpstreamAuth.code()).await;
-            return Err((d, Some(label)));
-        }
         // Client is admitted on the already-authenticated channel:
         // AuthenticationOk + minimal parameters + ReadyForQuery.
         let _ = wr.write_all(&client_ready(&tcp.user)).await;
         Ok(PreRelay {
             rd,
             wr,
-            urd,
-            uwr,
+            conn,
             label,
             kill_rx,
             active,
@@ -472,14 +586,65 @@ impl PgProxy {
     }
 }
 
+/// Map an upstream wire failure onto the typed session denial.
+fn upstream_deny(err: WireError) -> Deny {
+    match err {
+        WireError::Auth => Deny::UpstreamAuth,
+        WireError::Connect | WireError::Protocol => Deny::UpstreamConnect,
+    }
+}
+
+/// Backend connection of one session: either straight from
+/// [`pgwire::connect`] or checked out of the pool (and returned on a
+/// clean boundary).
+enum SessionConn {
+    Direct(pgwire::PgConn),
+    Pooled {
+        pool: Arc<ConnectionPool>,
+        conn: crate::pgpool::PooledConn,
+    },
+}
+
+impl SessionConn {
+    /// Backend read/write halves — one call so both borrows stay
+    /// disjoint.
+    fn halves(&mut self) -> (&mut OwnedReadHalf, &mut OwnedWriteHalf) {
+        match self {
+            Self::Direct(conn) => (&mut conn.rd, &mut conn.wr),
+            Self::Pooled { conn, .. } => conn.halves(),
+        }
+    }
+
+    /// Hand the backend socket back: pooled connections are reset and
+    /// parked, direct ones simply close.
+    async fn finish(self, outcome: Checkin) {
+        match self {
+            Self::Direct(_) => {}
+            Self::Pooled { pool, conn } => pool.checkin(conn, outcome).await,
+        }
+    }
+}
+
+/// Client half of an admitted session, handed from `pre_relay` to
+/// `attach_upstream`.
+struct Admitted {
+    rd: OwnedReadHalf,
+    wr: OwnedWriteHalf,
+    tcp: crate::pg::PgTcpCredential,
+    team: String,
+    label: String,
+    kill_rx: tokio::sync::oneshot::Receiver<()>,
+    active: ActiveGuard,
+    release: ReleaseGuard,
+}
+
 /// Pieces handed from `pre_relay` to the relay phase; guards keep the
 /// per-binding slot, registry entry and active counter until the whole
 /// session (or a handshake timeout cancel) drops them.
 struct PreRelay {
     rd: OwnedReadHalf,
     wr: OwnedWriteHalf,
-    urd: OwnedReadHalf,
-    uwr: OwnedWriteHalf,
+    conn: SessionConn,
     label: String,
     kill_rx: tokio::sync::oneshot::Receiver<()>,
     active: ActiveGuard,
@@ -508,7 +673,11 @@ impl Drop for ReleaseGuard {
 }
 
 fn deny_metric(reason: &'static str) {
-    reg().add("vrt_provider_pgproxy_denied_total", &[("reason", reason)], 1.0);
+    reg().add(
+        "vrt_provider_pgproxy_denied_total",
+        &[("reason", reason)],
+        1.0,
+    );
 }
 
 /// First bytes from the facade: `VRT-PG1 <label>\n`.
@@ -527,7 +696,12 @@ async fn read_preamble(sock: &mut TcpStream) -> std::io::Result<String> {
         .strip_prefix("VRT-PG1 ")
         .ok_or(std::io::ErrorKind::InvalidData)?;
     // Label charset mirrors compute_desired validation: [a-z0-9].
-    if label.is_empty() || label.len() > 28 || !label.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+    if label.is_empty()
+        || label.len() > 28
+        || !label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    {
         return Err(std::io::ErrorKind::InvalidData.into());
     }
     Ok(label.to_string())
@@ -549,8 +723,7 @@ async fn read_frame(rd: &mut OwnedReadHalf, max: u32) -> std::io::Result<(u32, V
 }
 
 fn startup_is_replication(body: &[u8]) -> bool {
-    body.split(|b| *b == 0)
-        .any(|k| k == b"replication")
+    body.split(|b| *b == 0).any(|k| k == b"replication")
 }
 
 async fn send_error(sock: &mut TcpStream, code: &str) {
@@ -562,9 +735,22 @@ async fn send_error_w(wr: &mut OwnedWriteHalf, code: &str) {
 
 /// FATAL ErrorResponse with the typed code — no tenant data, no creds.
 fn error_frame(code: &str) -> Vec<u8> {
-    let msg = format!("vrt pgproxy {}", code);
-    let mut body = Vec::with_capacity(32 + msg.len());
-    body.extend_from_slice(b"SERROR\0VFATAL\0C0A000\0M");
+    error_frame_detail("0A000", &format!("vrt pgproxy {}", code))
+}
+
+/// MIG-15 r3: pool exhaustion is a capacity answer, not a protocol
+/// rejection — SQLSTATE 53300 (`too_many_connections`) is what clients
+/// already understand, and the message names the feature.
+fn pool_limit_frame() -> Vec<u8> {
+    error_frame_detail("53300", "hyperdrive: connection limit reached")
+}
+
+fn error_frame_detail(sqlstate: &str, msg: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(48 + msg.len());
+    body.extend_from_slice(b"SERROR\0VFATAL\0C");
+    body.extend_from_slice(sqlstate.as_bytes());
+    body.push(0);
+    body.push(b'M');
     body.extend_from_slice(msg.as_bytes());
     body.push(0);
     body.push(0);
@@ -605,255 +791,101 @@ fn client_ready(user: &str) -> Vec<u8> {
 
 #[derive(PartialEq, Debug)]
 enum PumpEnd {
-    Eof,
+    /// The client closed its side — the backend may be reusable.
+    ClientEof,
+    /// The backend ended the connection.
+    UpstreamEof,
+    /// The revocation channel fired.
+    Killed,
     Idle,
     Io,
 }
 
-/// One direction of the relay; idle timeout applies per read.
-async fn pump_both<R1, W1, R2, W2>(
+/// Relay result: byte counters, how it ended and what it learned about
+/// protocol boundaries (used to decide whether the backend connection
+/// may go back to the pool).
+struct RelayOutcome {
+    c2u: u64,
+    u2c: u64,
+    end: PumpEnd,
+    state: RelayState,
+}
+
+impl RelayOutcome {
+    /// Revocation kill: nothing transferred, nothing reusable.
+    fn killed() -> Self {
+        Self {
+            c2u: 0,
+            u2c: 0,
+            end: PumpEnd::Killed,
+            state: RelayState::new(),
+        }
+    }
+}
+
+/// Bidirectional relay; the idle timeout applies to silence in BOTH
+/// directions, and either side ending closes both.
+async fn relay_both<R1, W1, R2, W2>(
     rd: &mut R1,
     uwr: &mut W1,
     urd: &mut R2,
     wr: &mut W2,
     idle: Duration,
-) -> (u64, u64, PumpEnd)
+) -> RelayOutcome
 where
     R1: tokio::io::AsyncRead + Unpin,
     W1: tokio::io::AsyncWrite + Unpin,
     R2: tokio::io::AsyncRead + Unpin,
     W2: tokio::io::AsyncWrite + Unpin,
 {
+    let mut state = RelayState::new();
     let mut c2u = 0u64;
     let mut u2c = 0u64;
     let mut b_c = vec![0u8; 16 * 1024];
     let mut b_u = vec![0u8; 16 * 1024];
     loop {
-        tokio::select! {
+        let end = tokio::select! {
             r = rd.read(&mut b_c) => match r {
-                Ok(0) => return (c2u, u2c, PumpEnd::Eof),
-                Err(_) => return (c2u, u2c, PumpEnd::Io),
+                Ok(0) => Some(PumpEnd::ClientEof),
+                Err(_) => Some(PumpEnd::Io),
                 Ok(n) => {
                     c2u += n as u64;
-                    if uwr.write_all(&b_c[..n]).await.is_err() {
-                        return (c2u, u2c, PumpEnd::Io);
+                    // A Terminate frame ends the session and is NOT
+                    // forwarded: the backend socket survives the client
+                    // for the next session of the same key.
+                    let forwarded = state.feed_client(&b_c[..n]).unwrap_or(n);
+                    if uwr.write_all(&b_c[..forwarded]).await.is_err() {
+                        Some(PumpEnd::Io)
+                    } else if forwarded < n {
+                        Some(PumpEnd::ClientEof)
+                    } else {
+                        None
                     }
                 }
             },
             r = urd.read(&mut b_u) => match r {
-                Ok(0) => return (c2u, u2c, PumpEnd::Eof),
-                Err(_) => return (c2u, u2c, PumpEnd::Io),
+                Ok(0) => Some(PumpEnd::UpstreamEof),
+                Err(_) => Some(PumpEnd::Io),
                 Ok(n) => {
                     u2c += n as u64;
+                    state.feed_upstream(&b_u[..n]);
                     if wr.write_all(&b_u[..n]).await.is_err() {
-                        return (c2u, u2c, PumpEnd::Io);
+                        Some(PumpEnd::Io)
+                    } else {
+                        None
                     }
                 }
             },
-            _ = tokio::time::sleep(idle) => return (c2u, u2c, PumpEnd::Idle),
-        }
-    }
-}
-
-type HmacSha = Hmac<Sha256>;
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut m = <HmacSha as Mac>::new_from_slice(key).expect("hmac key");
-    m.update(data);
-    m.finalize().into_bytes().into()
-}
-fn pbkdf2(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
-    // PBKDF2-HMAC-SHA256, dkLen == 32 → single block.
-    let mut block = hmac_sha256(password, &[salt, &1u32.to_be_bytes()].concat());
-    let mut out = block;
-    for _ in 1..iters {
-        block = hmac_sha256(password, &block);
-        for (o, b) in out.iter_mut().zip(block.iter()) {
-            *o ^= b;
-        }
-    }
-    out
-}
-
-/// Upstream startup + auth. Fails closed on any unsupported mode.
-async fn upstream_handshake(
-    urd: &mut OwnedReadHalf,
-    uwr: &mut OwnedWriteHalf,
-    tcp: &crate::pg::PgTcpCredential,
-) -> Result<(), Deny> {
-    let mut start = Vec::with_capacity(128);
-    let mut params = Vec::new();
-    for (k, v) in [("user", tcp.user.as_str()), ("database", tcp.database.as_str()), ("application_name", "vrt-hyperdrive-proxy")] {
-        params.extend_from_slice(k.as_bytes());
-        params.push(0);
-        params.extend_from_slice(v.as_bytes());
-        params.push(0);
-    }
-    params.push(0);
-    start.extend_from_slice(&((params.len() + 8) as u32).to_be_bytes());
-    start.extend_from_slice(&PROTO_V3.to_be_bytes());
-    start.extend_from_slice(&params);
-    uwr.write_all(&start).await.map_err(|_| Deny::UpstreamConnect)?;
-
-    let mut scram: Option<ScramClient> = None;
-    loop {
-        let tag = urd.read_u8().await.map_err(|_| Deny::UpstreamConnect)?;
-        let len = urd.read_u32().await.map_err(|_| Deny::UpstreamConnect)?;
-        if !(4..=PG_MESSAGE_MAX).contains(&len) {
-            return Err(Deny::UpstreamAuth);
-        }
-        let mut body = vec![0u8; (len - 4) as usize];
-        urd.read_exact(&mut body).await.map_err(|_| Deny::UpstreamConnect)?;
-        match tag {
-            b'Z' => return Ok(()),
-            b'S' | b'K' | b'N' => continue,
-            b'E' => return Err(Deny::UpstreamAuth),
-            b'R' => {
-                if body.len() < 4 {
-                    return Err(Deny::UpstreamAuth);
-                }
-                match u32::from_be_bytes(body[..4].try_into().unwrap()) {
-                    0 => continue,
-                    3 => send_password(uwr, &tcp.password).await?,
-                    10 => {
-                        let mechs: Vec<&[u8]> = body[4..].split(|b| *b == 0).filter(|s| !s.is_empty()).collect();
-                        if !mechs.iter().any(|m| *m == b"SCRAM-SHA-256") {
-                            return Err(Deny::UpstreamAuth);
-                        }
-                        let c = ScramClient::new(&tcp.user, &tcp.password);
-                        uwr.write_all(&c.initial_response()).await.map_err(|_| Deny::UpstreamConnect)?;
-                        scram = Some(c);
-                    }
-                    11 => {
-                        let Some(c) = scram.as_mut() else { return Err(Deny::UpstreamAuth) };
-                        let resp = c.server_first(&body[4..]).ok_or(Deny::UpstreamAuth)?;
-                        uwr.write_all(&resp).await.map_err(|_| Deny::UpstreamConnect)?;
-                    }
-                    12 => {
-                        let Some(c) = scram.as_mut() else { return Err(Deny::UpstreamAuth) };
-                        if !c.verify_server_final(&body[4..]) {
-                            return Err(Deny::UpstreamAuth);
-                        }
-                    }
-                    _ => return Err(Deny::UpstreamAuth),
-                }
-            }
-            _ => return Err(Deny::UpstreamAuth),
-        }
-    }
-}
-
-async fn send_password(uwr: &mut OwnedWriteHalf, password: &str) -> Result<(), Deny> {
-    let mut m = Vec::with_capacity(9 + password.len());
-    m.push(b'p');
-    m.extend_from_slice(&((password.len() + 5) as u32).to_be_bytes());
-    m.extend_from_slice(password.as_bytes());
-    m.push(0);
-    uwr.write_all(&m).await.map_err(|_| Deny::UpstreamConnect)
-}
-
-/// SCRAM-SHA-256 client (RFC 5802/7677), channel binding off (`n,,` —
-/// the cluster channel is loopback+service-account, not TLS).
-struct ScramClient {
-    password: String,
-    cnonce: String,
-    client_first_bare: String,
-    server_signature: Option<[u8; 32]>,
-}
-
-impl ScramClient {
-    fn new(user: &str, password: &str) -> Self {
-        let nonce_src = format!(
-            "{}:{}:{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-            "vrt",
-        );
-        let cnonce = hex::encode(Sha256::digest(nonce_src.as_bytes()))[..24].to_string();
-        let client_first_bare = format!("n={},r={}", user, cnonce);
-        Self {
-            password: password.to_string(),
-            cnonce,
-            client_first_bare,
-            server_signature: None,
-        }
-    }
-
-    fn initial_response(&self) -> Vec<u8> {
-        let first = format!("n,,{}", self.client_first_bare);
-        let data = first.as_bytes();
-        let mut body = Vec::with_capacity(24 + data.len());
-        body.extend_from_slice(b"SCRAM-SHA-256\0");
-        body.extend_from_slice(&(data.len() as i32).to_be_bytes());
-        body.extend_from_slice(data);
-        let mut m = Vec::with_capacity(5 + body.len());
-        m.push(b'p');
-        m.extend_from_slice(&((body.len() + 4) as u32).to_be_bytes());
-        m.extend_from_slice(&body);
-        m
-    }
-
-    fn server_first(&mut self, data: &[u8]) -> Option<Vec<u8>> {
-        let s = String::from_utf8_lossy(data);
-        let mut nonce = "";
-        let mut salt64 = "";
-        let mut iters = "";
-        for part in s.split(',') {
-            match &part[..2.min(part.len())] {
-                "r=" => nonce = &part[2..],
-                "s=" => salt64 = &part[2..],
-                "i=" => iters = &part[2..],
-                _ => {}
-            }
-        }
-        if nonce.is_empty() || !nonce.starts_with(&self.cnonce) {
-            return None;
-        }
-        let salt = base64::engine::general_purpose::STANDARD.decode(salt64).ok()?;
-        let iters: u32 = iters.parse().ok()?;
-        // MIG-15 r2: upstream-controlled iteration count — cap it so a
-        // hostile/buggy upstream can't pin the CPU (fail closed →
-        // PG_UPSTREAM_AUTH).
-        if iters == 0 || iters > 100_000 {
-            return None;
-        }
-        let cf_no_proof = format!("c=biws,r={}", nonce);
-        let auth = format!("{},{},{}", self.client_first_bare, s, cf_no_proof);
-        let salted = pbkdf2(self.password.as_bytes(), &salt, iters);
-        let client_key = hmac_sha256(&salted, b"Client Key");
-        let stored = Sha256::digest(client_key);
-        let sig = hmac_sha256(&stored, auth.as_bytes());
-        let proof: Vec<u8> = client_key.iter().zip(sig.iter()).map(|(a, b)| a ^ b).collect();
-        let server_key = hmac_sha256(&salted, b"Server Key");
-        self.server_signature = Some(hmac_sha256(&server_key, auth.as_bytes()));
-        let final_msg = format!(
-            "{},p={}",
-            cf_no_proof,
-            base64::engine::general_purpose::STANDARD.encode(&proof)
-        );
-        let data = final_msg.as_bytes();
-        let mut m = Vec::with_capacity(5 + data.len());
-        m.push(b'p');
-        m.extend_from_slice(&((data.len() + 4) as u32).to_be_bytes());
-        m.extend_from_slice(data);
-        Some(m)
-    }
-
-    fn verify_server_final(&self, data: &[u8]) -> bool {
-        let Some(expected) = self.server_signature else {
-            return false;
+            _ = tokio::time::sleep(idle) => Some(PumpEnd::Idle),
         };
-        let s = String::from_utf8_lossy(data);
-        let Some(v) = s.split(',').find_map(|p| p.strip_prefix("v=")) else {
-            return false;
-        };
-        base64::engine::general_purpose::STANDARD
-            .decode(v)
-            .ok()
-            .map(|b| b == expected.to_vec())
-            .unwrap_or(false)
+        if let Some(end) = end {
+            return RelayOutcome {
+                c2u,
+                u2c,
+                end,
+                state,
+            };
+        }
     }
 }
 
@@ -902,51 +934,17 @@ mod tests {
     }
 
     #[test]
-    fn scram_proof_vector() {
-        // RFC 7677 example: user "user", pass "pencil".
-        let mut c = ScramClient::new("user", "pencil");
-        c.cnonce = "rOprNGfwEbeRWgbNEkqO".into();
-        c.client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO".into();
-        let sf = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096";
-        let resp = c.server_first(sf.as_bytes()).expect("resp");
-        let body = String::from_utf8_lossy(&resp[5..]);
-        assert!(body.contains("p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="));
-        assert!(c.verify_server_final(b"v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="));
-    }
-
-    #[test]
-    fn scram_rejects_bad_nonce_and_signature() {
-        let mut c = ScramClient::new("u", "p");
-        assert!(c.server_first(b"s=eQ==,i=4096").is_none()); // no r=
-        assert!(!c.verify_server_final(b"v=AAAA"));
-    }
-
-    #[test]
     fn preamble_charset() {
         // Charset guard mirrored by compute_desired; test the pure gate.
         assert!("hd0123456789abcdef01234567".len() == 26);
         for bad in ["", "HD1", "hd1.x", "hd_1", "hd-"] {
-            assert!(!bad.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
-                || bad.is_empty()
-                || bad.len() > 28);
+            assert!(
+                !bad.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    || bad.is_empty()
+                    || bad.len() > 28
+            );
         }
-    }
-
-    #[test]
-    fn scram_iters_cap() {
-        // Upstream-controlled iteration count: >100_000 → fail closed.
-        let mut c = ScramClient::new("u", "p");
-        c.cnonce = "abcdef".into();
-        c.client_first_bare = "n=u,r=abcdef".into();
-        for bad in ["i=0", "i=100001", "i=99999999"] {
-            let sf = format!("r=abcdefX,s=AAAA,{}", bad);
-            let mut cc = ScramClient::new("u", "p");
-            cc.cnonce = "abcdef".into();
-            cc.client_first_bare = "n=u,r=abcdef".into();
-            assert!(cc.server_first(sf.as_bytes()).is_none(), "{}", bad);
-        }
-        let ok = "r=abcdefX,s=AAAA,i=4096";
-        assert!(c.server_first(ok.as_bytes()).is_some());
     }
 
     /// Four one-way duplex pairs forming a session: client→relay
@@ -958,7 +956,14 @@ mod tests {
         let (r2u_tx, u_rd) = tokio::io::duplex(1024);
         let (u_tx, u_rx) = tokio::io::duplex(1024);
         Channels {
-            c_tx, c_rx, r2c_tx, c_rd, r2u_tx, u_rd, u_tx, u_rx,
+            c_tx,
+            c_rx,
+            r2c_tx,
+            c_rd,
+            r2u_tx,
+            u_rd,
+            u_tx,
+            u_rx,
         }
     }
 
@@ -974,41 +979,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pump_both_shared_idle() {
+    async fn relay_shared_idle() {
         use tokio::io::AsyncWriteExt;
         let mut ch = chan();
         let idle = Duration::from_millis(60);
-        let fut = pump_both(&mut ch.c_rx, &mut ch.r2u_tx, &mut ch.u_rx, &mut ch.r2c_tx, idle);
+        let fut = relay_both(
+            &mut ch.c_rx,
+            &mut ch.r2u_tx,
+            &mut ch.u_rx,
+            &mut ch.r2c_tx,
+            idle,
+        );
         tokio::pin!(fut);
         // Traffic in EITHER direction resets the shared timer — total
         // elapsed exceeds `idle` without Idling out.
         for _ in 0..3 {
             ch.c_tx.write_all(b"q").await.unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
-            assert!(tokio::time::timeout(Duration::from_millis(10), fut.as_mut()).await.is_err());
-            assert_eq!(tokio::io::AsyncReadExt::read(&mut ch.u_rd, &mut [0u8; 1]).await.unwrap(), 1);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), fut.as_mut())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                tokio::io::AsyncReadExt::read(&mut ch.u_rd, &mut [0u8; 1])
+                    .await
+                    .unwrap(),
+                1
+            );
             ch.u_tx.write_all(b"r").await.unwrap();
             tokio::time::sleep(Duration::from_millis(40)).await;
-            assert!(tokio::time::timeout(Duration::from_millis(10), fut.as_mut()).await.is_err());
-            assert_eq!(tokio::io::AsyncReadExt::read(&mut ch.c_rd, &mut [0u8; 1]).await.unwrap(), 1);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), fut.as_mut())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                tokio::io::AsyncReadExt::read(&mut ch.c_rd, &mut [0u8; 1])
+                    .await
+                    .unwrap(),
+                1
+            );
         }
         // Then silence in both directions → Idle.
-        let (_, _, end) = fut.await;
-        assert_eq!(end, PumpEnd::Idle);
+        let outcome = fut.await;
+        assert_eq!(outcome.end, PumpEnd::Idle);
+        // Raw `q`/`r` bytes are not valid frames, so the tracker can
+        // never vouch for this connection.
+        assert!(!outcome.state.reusable());
     }
 
     #[tokio::test]
-    async fn pump_both_eof_closes_both() {
+    async fn relay_client_eof_closes_both() {
         let mut ch = chan();
         drop(ch.c_tx); // client EOF — relay must end BOTH directions now.
-        let (_c, _u, end) = tokio::time::timeout(
+        let outcome = tokio::time::timeout(
             Duration::from_millis(500),
-            pump_both(&mut ch.c_rx, &mut ch.r2u_tx, &mut ch.u_rx, &mut ch.r2c_tx,
-                      Duration::from_secs(60)),
+            relay_both(
+                &mut ch.c_rx,
+                &mut ch.r2u_tx,
+                &mut ch.u_rx,
+                &mut ch.r2c_tx,
+                Duration::from_secs(60),
+            ),
         )
         .await
         .expect("eof must not hang");
-        assert_eq!(end, PumpEnd::Eof);
+        assert_eq!(outcome.end, PumpEnd::ClientEof);
+        // Nothing was exchanged: the backend is still exactly where the
+        // session found it.
+        assert!(outcome.state.reusable());
         // In a real session the OwnedWriteHalf/OwnedReadHalf drops
         // close the sibling socket; here the writer lives in `ch` —
         // assert the relay returned (no per-direction orphan pump).
@@ -1050,6 +1090,16 @@ mod tests {
         routes: &[(&str, &str, &str)],
         cfg: PgProxyConfig,
     ) -> Arc<PgProxy> {
+        proxy_pooled(dir, creds_json, routes, cfg, None)
+    }
+
+    fn proxy_pooled(
+        dir: &std::path::Path,
+        creds_json: &str,
+        routes: &[(&str, &str, &str)],
+        cfg: PgProxyConfig,
+        pool: Option<PoolConfig>,
+    ) -> Arc<PgProxy> {
         let creds_path = write_creds(dir, creds_json);
         let creds = Arc::new(crate::pg::PgCredentialStore::new(creds_path));
         let desired = Arc::new(FileDesiredStore::new(
@@ -1058,7 +1108,7 @@ mod tests {
             vec![],
             1,
         ));
-        let p = PgProxy::new(cfg, creds, desired);
+        let p = PgProxy::new(cfg, pool, creds, desired);
         p.set_routes(
             routes
                 .iter()
@@ -1082,6 +1132,292 @@ mod tests {
         c
     }
 
+    fn creds_json(port: u16) -> String {
+        format!(
+            r#"{{"tenants":{{"team-a":{{"ref-1":{{"token":"t","endpoint":"http://gw","tenantSlug":"team-a-x","credentialVersion":1,"readOnly":false,"tcp":{{"host":"127.0.0.1","port":{port},"user":"u","password":"p","database":"d"}}}}}}}}}}"#
+        )
+    }
+
+    fn pool_cfg(max: usize, acquire: u64) -> PoolConfig {
+        PoolConfig {
+            max_connections: max,
+            acquire_timeout_ms: acquire,
+            idle_timeout_ms: 60_000,
+            max_lifetime_ms: 300_000,
+            reset_on_return: true,
+        }
+    }
+
+    async fn serve_proxy(proxy: &Arc<PgProxy>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let px = Arc::clone(proxy);
+        tokio::spawn(async move { px.serve(listener).await });
+        addr
+    }
+
+    /// Framed client-side read up to (and including) the next
+    /// ReadyForQuery — the proxy speaks plain pg-wire to the client.
+    async fn read_to_ready(c: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        let mut acc = Vec::new();
+        let mut cursor = 0usize;
+        let mut frames = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf)).await {
+                Ok(Ok(0)) | Err(_) => return frames,
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => return frames,
+            };
+            acc.extend_from_slice(&buf[..n]);
+            while acc.len() >= cursor + 5 {
+                let tag = acc[cursor];
+                let len =
+                    u32::from_be_bytes(acc[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
+                if len < 4 || acc.len() < cursor + 1 + len {
+                    break;
+                }
+                let body = acc[cursor + 5..cursor + 1 + len].to_vec();
+                cursor += 1 + len;
+                frames.push((tag, body));
+                if tag == b'Z' {
+                    return frames;
+                }
+            }
+        }
+    }
+
+    /// Open the session up to `ReadyForQuery` (preamble + v3 startup).
+    async fn open_session(addr: std::net::SocketAddr, label: &str) -> TcpStream {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(format!("VRT-PG1 {label}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        for kv in ["user", "vrt-hd", "database", "vrt"] {
+            body.extend_from_slice(kv.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+        startup.extend_from_slice(&PROTO_V3.to_be_bytes());
+        startup.extend_from_slice(&body);
+        c.write_all(&startup).await.unwrap();
+        let frames = read_to_ready(&mut c).await;
+        assert!(
+            frames.iter().any(|(t, _)| *t == b'Z'),
+            "proxy never admitted the session"
+        );
+        c
+    }
+
+    async fn query(c: &mut TcpStream, sql: &str) -> Vec<(u8, Vec<u8>)> {
+        let mut q = vec![b'Q'];
+        q.extend_from_slice(&((sql.len() + 5) as u32).to_be_bytes());
+        q.extend_from_slice(sql.as_bytes());
+        q.push(0);
+        c.write_all(&q).await.unwrap();
+        read_to_ready(c).await
+    }
+
+    async fn terminate(c: TcpStream) {
+        let mut c = c;
+        let _ = c.write_all(&[b'X', 0, 0, 0, 4]).await;
+        let _ = c.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pooled_sessions_share_one_backend_connection() {
+        let dir = tmpdir("pool-reuse");
+        let (pg_port, mock) = crate::pgmock::backend().await;
+        let proxy = proxy_pooled(
+            &dir,
+            &creds_json(pg_port),
+            &[("lbl1", "team-a", "ref-1")],
+            cfg(2000),
+            Some(pool_cfg(1, 2_000)),
+        );
+        let addr = serve_proxy(&proxy).await;
+
+        let mut c = open_session(addr, "lbl1").await;
+        query(&mut c, "SELECT 42").await;
+        terminate(c).await;
+
+        let mut c = open_session(addr, "lbl1").await;
+        query(&mut c, "SELECT 43").await;
+        terminate(c).await;
+
+        assert_eq!(
+            mock.accepted(),
+            1,
+            "both sessions ran on one backend connection"
+        );
+        let stmts = mock.statements();
+        let reset = stmts.iter().position(|s| s == "DISCARD ALL");
+        let second = stmts.iter().position(|s| s == "SELECT 43");
+        assert_eq!(mock.resets(), 1, "the returned session was reset");
+        assert!(
+            matches!((reset, second), (Some(r), Some(s)) if r < s),
+            "DISCARD ALL must run before the next session: {stmts:?}"
+        );
+        // The client's Terminate is swallowed, never forwarded: the
+        // backend socket outlives the client session.
+        assert!(!stmts.iter().any(|s| s == "X"));
+    }
+
+    #[tokio::test]
+    async fn capacity_denies_the_queued_session_with_the_pool_error() {
+        let dir = tmpdir("pool-deny");
+        let (pg_port, _mock) = crate::pgmock::backend().await;
+        let proxy = proxy_pooled(
+            &dir,
+            &creds_json(pg_port),
+            &[("lbl1", "team-a", "ref-1")],
+            cfg(2000),
+            Some(pool_cfg(1, 150)),
+        );
+        let addr = serve_proxy(&proxy).await;
+
+        // Session A holds the only backend connection.
+        let mut a = open_session(addr, "lbl1").await;
+        query(&mut a, "SELECT 1").await;
+
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        b.write_all(b"VRT-PG1 lbl1\n").await.unwrap();
+        let mut body = Vec::new();
+        for kv in ["user", "vrt-hd", "database", "vrt"] {
+            body.extend_from_slice(kv.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+        startup.extend_from_slice(&PROTO_V3.to_be_bytes());
+        startup.extend_from_slice(&body);
+        b.write_all(&startup).await.unwrap();
+        let frames = read_to_ready(&mut b).await;
+        let error: Vec<u8> = frames
+            .iter()
+            .filter(|(t, _)| *t == b'E')
+            .flat_map(|(_, body)| body.clone())
+            .collect();
+        let text = String::from_utf8_lossy(&error);
+        assert!(
+            text.contains("hyperdrive: connection limit reached"),
+            "want the typed pool denial, got {text:?} ({frames:?})"
+        );
+        assert!(text.contains("53300"), "want SQLSTATE 53300: {text:?}");
+        terminate(a).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_tenant_gets_its_own_backend_connection() {
+        let dir = tmpdir("pool-tenant");
+        let (pg_port, mock) = crate::pgmock::backend().await;
+        let creds = format!(
+            r#"{{"tenants":{{"team-a":{{"ref-1":{{"token":"t","endpoint":"http://gw","tenantSlug":"team-a-x","credentialVersion":1,"readOnly":false,"tcp":{{"host":"127.0.0.1","port":{pg_port},"user":"u","password":"p","database":"d"}}}}}},"team-b":{{"ref-1":{{"token":"t","endpoint":"http://gw","tenantSlug":"team-b-x","credentialVersion":1,"readOnly":false,"tcp":{{"host":"127.0.0.1","port":{pg_port},"user":"u","password":"p","database":"d"}}}}}}}}}}"#
+        );
+        let proxy = proxy_pooled(
+            &dir,
+            &creds,
+            &[("lbla", "team-a", "ref-1"), ("lblb", "team-b", "ref-1")],
+            cfg(2000),
+            Some(pool_cfg(4, 2_000)),
+        );
+        let addr = serve_proxy(&proxy).await;
+
+        let mut a = open_session(addr, "lbla").await;
+        query(&mut a, "SET application_name = 'leak'").await;
+        terminate(a).await;
+
+        let mut b = open_session(addr, "lblb").await;
+        query(&mut b, "SELECT 43").await;
+        terminate(b).await;
+
+        assert_eq!(
+            mock.accepted(),
+            2,
+            "tenant is part of the pool key: no shared session state"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pool_queue_outlives_the_handshake_deadline() {
+        // connect_timeout_ms is deliberately shorter than acquireTimeoutMs:
+        // a saturated pool must answer with the typed pool denial, not
+        // with PG_HANDSHAKE_TIMEOUT.
+        let dir = tmpdir("pool-deadline");
+        let (pg_port, _mock) = crate::pgmock::backend().await;
+        let proxy = proxy_pooled(
+            &dir,
+            &creds_json(pg_port),
+            &[("lbl1", "team-a", "ref-1")],
+            cfg(150),
+            Some(pool_cfg(1, 600)),
+        );
+        let addr = serve_proxy(&proxy).await;
+
+        let mut a = open_session(addr, "lbl1").await;
+        query(&mut a, "SELECT 1").await;
+
+        let started = Instant::now();
+        let mut b = TcpStream::connect(addr).await.unwrap();
+        b.write_all(b"VRT-PG1 lbl1\n").await.unwrap();
+        let mut body = Vec::new();
+        for kv in ["user", "vrt-hd", "database", "vrt"] {
+            body.extend_from_slice(kv.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
+        startup.extend_from_slice(&PROTO_V3.to_be_bytes());
+        startup.extend_from_slice(&body);
+        b.write_all(&startup).await.unwrap();
+        let frames = read_to_ready(&mut b).await;
+        let text: String = frames
+            .iter()
+            .filter(|(t, _)| *t == b'E')
+            .flat_map(|(_, body)| body.clone())
+            .map(char::from)
+            .collect();
+        assert!(
+            text.contains("hyperdrive: connection limit reached"),
+            "want the pool denial, got {text:?}"
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "the queue must run its own acquireTimeoutMs ({:?})",
+            started.elapsed()
+        );
+        terminate(a).await;
+    }
+
+    #[tokio::test]
+    async fn without_a_pool_a_session_still_relays() {
+        let dir = tmpdir("direct");
+        let (pg_port, mock) = crate::pgmock::backend().await;
+        let proxy = proxy_pooled(
+            &dir,
+            &creds_json(pg_port),
+            &[("lbl1", "team-a", "ref-1")],
+            cfg(2_000),
+            None,
+        );
+        assert!(proxy.pool().is_none());
+        let addr = serve_proxy(&proxy).await;
+        for _ in 0..2 {
+            let mut c = open_session(addr, "lbl1").await;
+            let reply = query(&mut c, "SELECT 1").await;
+            assert!(reply.iter().any(|(t, _)| *t == b'Z'));
+            terminate(c).await;
+        }
+        // No pooling: every session dials its own backend connection.
+        assert_eq!(mock.accepted(), 2);
+        assert_eq!(mock.resets(), 0);
+    }
+
     fn slots(proxy: &PgProxy) -> (usize, usize) {
         let pb = proxy.per_binding.lock().unwrap();
         let total: usize = pb.values().sum();
@@ -1092,8 +1428,12 @@ mod tests {
     async fn handshake_stall_after_preamble_releases_slots() {
         let dir = tmpdir("hs-stall");
         let proxy = proxy(&dir, TCP_CREDS, &[("lbl1", "team-a", "ref-1")], cfg(120));
-        let _c = connect_preamble(&proxy, "VRT-PG1 lbl1
-").await;
+        let _c = connect_preamble(
+            &proxy,
+            "VRT-PG1 lbl1
+",
+        )
+        .await;
         // Wait for the slot to be taken… then silence → handshake timeout.
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(slots(&proxy).0, 1);
@@ -1106,17 +1446,27 @@ mod tests {
     async fn handshake_stall_after_sslrequest_releases_slots() {
         let dir = tmpdir("hs-ssl");
         let proxy = proxy(&dir, TCP_CREDS, &[("lbl1", "team-a", "ref-1")], cfg(120));
-        let mut c = connect_preamble(&proxy, "VRT-PG1 lbl1
-").await;
+        let mut c = connect_preamble(
+            &proxy,
+            "VRT-PG1 lbl1
+",
+        )
+        .await;
         // SSLRequest: len=8, code=80877103.
         tokio::io::AsyncWriteExt::write_all(
             &mut c,
-            &8u32.to_be_bytes().into_iter().chain(80877103u32.to_be_bytes()).collect::<Vec<u8>>(),
+            &8u32
+                .to_be_bytes()
+                .into_iter()
+                .chain(80877103u32.to_be_bytes())
+                .collect::<Vec<u8>>(),
         )
         .await
         .unwrap();
         let mut one = [0u8; 1];
-        tokio::io::AsyncReadExt::read_exact(&mut c, &mut one).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut c, &mut one)
+            .await
+            .unwrap();
         assert_eq!(one[0], b'N');
         // Silence → handshake timeout frees slots.
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1132,8 +1482,13 @@ mod tests {
         let uaddr = ul.local_addr().unwrap();
         tokio::spawn(async move {
             loop {
-                let Ok((s, _)) = ul.accept().await else { return };
-                tokio::spawn(async move { let _s = s; tokio::time::sleep(Duration::from_secs(30)).await });
+                let Ok((s, _)) = ul.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let _s = s;
+                    tokio::time::sleep(Duration::from_secs(30)).await
+                });
             }
         });
         let creds = format!(
@@ -1141,15 +1496,21 @@ mod tests {
             uaddr.port()
         );
         let proxy = proxy(&dir, &creds, &[("lbl1", "team-a", "ref-1")], cfg(120));
-        let mut c = connect_preamble(&proxy, "VRT-PG1 lbl1
-").await;
+        let mut c = connect_preamble(
+            &proxy,
+            "VRT-PG1 lbl1
+",
+        )
+        .await;
         // Valid v3 startup frame so we reach upstream_handshake.
         let mut body = b"user\0w\0database\0d\0\0".to_vec();
         let mut fr = Vec::new();
         fr.extend_from_slice(&((body.len() + 8) as u32).to_be_bytes());
         fr.extend_from_slice(&196608u32.to_be_bytes());
         fr.append(&mut body);
-        tokio::io::AsyncWriteExt::write_all(&mut c, &fr).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut c, &fr)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(slots(&proxy).0, 1);
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1162,8 +1523,12 @@ mod tests {
         let dir = tmpdir("hs-mro");
         let creds = r#"{"tenants":{"team-a":{"ref-1":{"token":"t","endpoint":"http://gw","tenantSlug":"team-a-x","credentialVersion":1,"readOnly":true,"tcpBlocked":"migration_read_only"}}}}"#;
         let proxy = proxy(&dir, creds, &[("lbl1", "team-a", "ref-1")], cfg(2000));
-        let mut c = connect_preamble(&proxy, "VRT-PG1 lbl1
-").await;
+        let mut c = connect_preamble(
+            &proxy,
+            "VRT-PG1 lbl1
+",
+        )
+        .await;
         // Deny arrives right after the preamble (before startup).
         let mut got = vec![0u8; 128];
         let mut acc = Vec::new();
@@ -1178,23 +1543,19 @@ mod tests {
                 Ok(Err(_)) | Ok(Ok(0)) => break,
                 Ok(Ok(n)) => acc.extend_from_slice(&got[..n]),
             }
-            if acc.len() > 5 && acc.len() >= 5 + u32::from_be_bytes(acc[1..5].try_into().unwrap()) as usize {
+            if acc.len() > 5
+                && acc.len() >= 5 + u32::from_be_bytes(acc[1..5].try_into().unwrap()) as usize
+            {
                 break;
             }
         }
-        assert!(acc.windows(b"PG_MIGRATION_READ_ONLY".len()).any(|w| w == b"PG_MIGRATION_READ_ONLY"),
-                "want typed deny, got {:?}", String::from_utf8_lossy(&acc));
+        assert!(
+            acc.windows(b"PG_MIGRATION_READ_ONLY".len())
+                .any(|w| w == b"PG_MIGRATION_READ_ONLY"),
+            "want typed deny, got {:?}",
+            String::from_utf8_lossy(&acc)
+        );
         assert_eq!(slots(&proxy).0, 0);
         assert_eq!(slots(&proxy).1, 8);
-    }
-
-    #[test]
-    fn pbkdf2_known() {
-        // PBKDF2-HMAC-SHA256("password","salt",1) = 120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b
-        let k = pbkdf2(b"password", b"salt", 1);
-        assert_eq!(
-            hex::encode(k),
-            "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
-        );
     }
 }

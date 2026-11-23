@@ -44,7 +44,8 @@
 #     tests fail there rather than skip). m17/m18 need a PostgreSQL 16
 #     bin dir via VRT_TEST_PG_BIN (and m18 needs node + the repo's
 #     esbuild/pg/pg-cloudflare deps); both self-skip with a printed
-#     reason when the resources are absent.
+#     reason when the resources are absent. vrt-provider's
+#     `pgproxy_pool` runs in tier 1.5 and uses the same PG16 bin dir.
 
 set -euo pipefail
 
@@ -110,6 +111,14 @@ if [ -n "$CAPNP" ]; then
 else
   echo "skip: no workerd.capnp arg — workerd_schema tests left skipped"
 fi
+
+# MIG-15 r3: Hyperdrive session pooling against a real PostgreSQL 16 —
+# backend reuse, DISCARD ALL reset, maxConnections queue timeout and
+# tenant isolation. Shares the PG16 bin dir the m17/m18 tests use and
+# self-skips (printed) when none is installed.
+echo "== vrt-provider: pg-wire session pool (real PostgreSQL) =="
+cargo test --locked -p vrt-provider --test pgproxy_pool \
+  -- --test-threads="$THREADS" --nocapture
 
 echo "== tier 2: #[ignore]d test binaries (-- --ignored) =="
 # Each binary is invoked on its own: `--ignored` runs only the ignored

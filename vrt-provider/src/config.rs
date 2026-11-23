@@ -53,6 +53,11 @@ pub struct ProviderConfig {
     /// disables the listener (loopback-only anyway).
     #[serde(default)]
     pub pg_proxy: Option<PgProxyConfig>,
+    /// MIG-15 r3: Hyperdrive session pooling (`[hyperdrive.pool]`).
+    /// Absent → no pooling: every session owns a fresh upstream
+    /// connection for its lifetime (the pre-r3 shape).
+    #[serde(default)]
+    pub hyperdrive: Option<HyperdriveConfig>,
     /// Env var holding the list-cursor HMAC secret (legacy/platform
     /// delivery). Ignored when `cursor_secret_file` is set.
     #[serde(default = "default_cursor_secret_env")]
@@ -249,6 +254,94 @@ fn default_pg_max_sessions() -> usize {
 }
 fn default_pg_max_sessions_per_binding() -> usize {
     8
+}
+
+/// MIG-15 r3: `[hyperdrive]` — the pooling half of the Hyperdrive
+/// data plane. The listener itself stays `[pgProxy]`; this section only
+/// exists when pooling is enabled, so `[hyperdrive]` without a
+/// `[hyperdrive.pool]` table is a configuration error rather than a
+/// silent no-op.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HyperdriveConfig {
+    /// Per-process session pool configuration.
+    pub pool: PoolConfig,
+}
+
+/// MIG-15 r3: `[hyperdrive.pool]` — session-pool bounds. Session
+/// pooling only: a client session keeps one backend connection for its
+/// whole life; there is no transaction multiplexing.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PoolConfig {
+    /// Live backend connections this process may hold (idle + in use).
+    #[serde(default = "default_pool_max_connections")]
+    pub max_connections: usize,
+    /// How long an acquisition may queue before it is denied.
+    #[serde(default = "default_pool_acquire_timeout_ms")]
+    pub acquire_timeout_ms: u64,
+    /// Idle socket reclamation horizon.
+    #[serde(default = "default_pool_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+    /// Hard age of a pooled socket, enforced on reuse and by the reaper.
+    #[serde(default = "default_pool_max_lifetime_ms")]
+    pub max_lifetime_ms: u64,
+    /// Run `DISCARD ALL` before an idle socket is reused. Turning this
+    /// off reuses session state (GUCs, temp tables, prepared statements)
+    /// across sessions of the same tenant/database — intended for
+    /// measurement only, never for production.
+    #[serde(default = "default_true")]
+    pub reset_on_return: bool,
+}
+
+/// Ceiling for `maxConnections` — one socket each, per process.
+const POOL_MAX_CONNECTIONS_CAP: usize = 1024;
+
+fn default_pool_max_connections() -> usize {
+    8
+}
+fn default_pool_acquire_timeout_ms() -> u64 {
+    5_000
+}
+fn default_pool_idle_timeout_ms() -> u64 {
+    30_000
+}
+fn default_pool_max_lifetime_ms() -> u64 {
+    1_800_000
+}
+fn default_true() -> bool {
+    true
+}
+
+impl PoolConfig {
+    /// Fail-closed bounds: every value is explicit and bounded, so a
+    /// typo cannot disable the cap or turn the queue into an unbounded
+    /// wait.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        use vrt_securefs::{ensure_range, ensure_timeout_ms};
+        let err = |m: &'static str| Err(ConfigError::Invalid(m));
+        ensure_range!(
+            self.max_connections,
+            "hyperdrive.pool.maxConnections",
+            1,
+            POOL_MAX_CONNECTIONS_CAP,
+            err
+        );
+        ensure_timeout_ms!(
+            self.acquire_timeout_ms,
+            "hyperdrive.pool.acquireTimeoutMs",
+            err
+        );
+        ensure_timeout_ms!(self.idle_timeout_ms, "hyperdrive.pool.idleTimeoutMs", err);
+        ensure_range!(
+            self.max_lifetime_ms,
+            "hyperdrive.pool.maxLifetimeMs",
+            1_000,
+            2_592_000_000,
+            err
+        );
+        Ok(())
+    }
 }
 
 impl PgProxyConfig {
@@ -493,6 +586,19 @@ impl ProviderConfig {
             }
         }
         self.validate_startup_bounds()?;
+        if let Some(hd) = &self.hyperdrive {
+            // Pooling configures the pg-wire listener; without one there
+            // is nothing to pool and the section would silently do
+            // nothing — refuse at startup instead.
+            if self.pg_proxy.is_none() {
+                return Err(ConfigError::Invalid("hyperdrive requires pgProxy"));
+            }
+            hd.pool.validate()?;
+        }
+        if self.pg_proxy.is_some() && self.pg.is_none() {
+            // The proxy resolves upstream credentials from `[pg]`.
+            return Err(ConfigError::Invalid("pgProxy requires pg"));
+        }
         // T13/M2: same bounds as the host — uid 0 is never a tenant
         // and a zero/overflowing span could never host one.
         if let Some(iso) = &self.isolation {
@@ -584,7 +690,9 @@ impl ProviderConfig {
                 ));
             }
             if sql.replicas.len() > 8 {
-                return Err(ConfigError::Invalid("vrtSql.replicas supports at most 8 entries"));
+                return Err(ConfigError::Invalid(
+                    "vrtSql.replicas supports at most 8 entries",
+                ));
             }
             for replica in &sql.replicas {
                 if replica.is_empty()

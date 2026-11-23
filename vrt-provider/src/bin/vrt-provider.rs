@@ -298,7 +298,12 @@ async fn run() -> ExitCode {
                 let creds = std::sync::Arc::new(vrt_provider::pg::PgCredentialStore::new(
                     config.pg.as_ref().unwrap().credentials_file.clone(),
                 ));
-                let proxy = vrt_provider::pgproxy::PgProxy::new(px, creds, desired.clone());
+                let proxy = vrt_provider::pgproxy::PgProxy::new(
+                    px,
+                    config.hyperdrive.map(|hd| hd.pool),
+                    creds,
+                    desired.clone(),
+                );
                 tokio::spawn({
                     let proxy = proxy.clone();
                     async move { proxy.serve(l).await }
@@ -308,6 +313,17 @@ async fn run() -> ExitCode {
                     let shutdown_rx = shutdown_rx.clone();
                     async move { proxy.sweep(shutdown_rx).await }
                 });
+                if let Some(pool) = proxy.pool() {
+                    tokio::spawn({
+                        let pool = pool.clone();
+                        let shutdown_rx = shutdown_rx.clone();
+                        async move { pool.sweep(shutdown_rx).await }
+                    });
+                    tracing::info!(
+                        max_connections = pool.config().max_connections,
+                        "pg-proxy session pool enabled"
+                    );
+                }
                 tracing::info!("pg-proxy listener bound");
             }
             Err(e) => {
