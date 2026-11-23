@@ -36,7 +36,11 @@ pub mod limits;
 pub mod listeners;
 pub mod metrics;
 pub mod pg;
+#[cfg(test)]
+pub(crate) mod pgmock;
+pub mod pgpool;
 pub mod pgproxy;
+pub mod pgwire;
 pub mod purge;
 pub mod queue;
 pub mod quota;

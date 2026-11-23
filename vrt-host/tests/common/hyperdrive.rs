@@ -637,6 +637,7 @@ pub fn spawn_pgproxy(
             max_sessions: 16,
             max_sessions_per_binding: 8,
         },
+        None,
         creds,
         desired,
     );

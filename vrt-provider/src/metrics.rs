@@ -83,6 +83,41 @@ pub(crate) fn reg() -> &'static Registry {
             "PG proxy upstream TCP connect latency.",
             &[50.0, 200.0, 1_000.0, 5_000.0],
         );
+        // MIG-15 r3: Hyperdrive session-pool accounting. No labels —
+        // the pool is per process and `PoolKey` never becomes a label.
+        r.declare_gauge(
+            "vrt_provider_pgproxy_pool_in_use",
+            "Pooled backend connections currently owned by a session.",
+        );
+        r.declare_gauge(
+            "vrt_provider_pgproxy_pool_idle",
+            "Pooled backend connections parked and reusable.",
+        );
+        r.declare_histogram(
+            "vrt_provider_pgproxy_pool_acquire_wait_ms",
+            "Time spent acquiring a backend connection (reuse, queue and dial).",
+            &[1.0, 5.0, 25.0, 100.0, 500.0, 2_500.0],
+        );
+        r.declare_counter(
+            "vrt_provider_pgproxy_pool_acquire_timeout_total",
+            "Acquisitions denied because maxConnections stayed saturated.",
+        );
+        r.declare_counter(
+            "vrt_provider_pgproxy_pool_reset_failed_total",
+            "Connections discarded because DISCARD ALL failed.",
+        );
+        r.declare_counter(
+            "vrt_provider_pgproxy_pool_reused_total",
+            "Sessions served from an idle pooled connection.",
+        );
+        r.declare_counter(
+            "vrt_provider_pgproxy_pool_opened_total",
+            "Backend connections dialled by the pool.",
+        );
+        r.declare_counter(
+            "vrt_provider_pgproxy_pool_closed_total",
+            "Pooled connections closed by reason (broken|idle|lifetime|tenant_revoked).",
+        );
         r.declare_gauge("process_resident_memory_bytes", "Self process RSS.");
         r.declare_gauge("process_start_time_seconds", "Self process start epoch.");
         r.declare_gauge("process_open_fds", "Self process open fds.");
