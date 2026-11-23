@@ -2,7 +2,7 @@
 //! `D1OpsExecutor::stats` calls a real `vrt-sql` app with ServiceAuth on,
 //! seeds one D1 table + one queue message, and verifies the returned shape.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use vrt_sql::queue::{IncomingMsg, QueueBackend, QueueId, SqliteQueueBackend};
 use vrt_sql::service::ServiceAuth;
 use vrt_sql::wire::{self, AppState, TrustedCallCtx};
@@ -28,6 +28,10 @@ async fn report_stats_round_trip_through_vrt_sql_auth() {
         assert_eq!(r.status, axum::http::StatusCode::OK, "{:?}", r.body);
     }
     let queue = QueueId::parse(&"q".repeat(26)).unwrap();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
     let backend = SqliteQueueBackend::new(registry);
     backend
         .send(
@@ -39,7 +43,7 @@ async fn report_stats_round_trip_through_vrt_sql_auth() {
                 delay_secs: 0,
                 timestamp_ms: None,
             }],
-            1,
+            now_ms,
         )
         .await
         .unwrap();

@@ -35,6 +35,14 @@ pub const LEASE_TTL_MAX_MS: i64 = 43_200_000;
 pub const MSG_ID_MAX: usize = 128;
 /// Per-call settlement cap for ack/retry/dead_letter (looser than the batch cap, covering multiple claims).
 pub const SETTLE_MAX: usize = 1_000;
+/// Cloudflare-compatible maximum message retention: four days from enqueue;
+/// dead-letter rows use the same bound from `dead_at`. Expired rows are purged
+/// lazily by queue operations (there is no separate queue storage sweeper).
+pub const MESSAGE_RETENTION_MS: i64 = 4 * 24 * 60 * 60 * 1000;
+/// Bounded lazy purge per queue operation: retention must never turn one
+/// request into an unbounded table scan/delete. Read paths still filter by
+/// the cutoff, so a larger expired backlog is not visible or delivered.
+const PURGE_BATCH: usize = 2_000;
 /// Internal transaction budget for queue ops (below D1's 30s -- queue statements are bounded small batches).
 pub const OP_BUDGET_MS: u64 = 5_000;
 
@@ -306,6 +314,7 @@ CREATE TABLE IF NOT EXISTS _vrt_q_messages(
   lease_expiry INTEGER
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS _vrt_q_visible ON _vrt_q_messages(visible_at);
+CREATE INDEX IF NOT EXISTS _vrt_q_created ON _vrt_q_messages(created_at);
 CREATE TABLE IF NOT EXISTS _vrt_q_dead(
   id TEXT PRIMARY KEY,
   body BLOB NOT NULL,
@@ -315,6 +324,7 @@ CREATE TABLE IF NOT EXISTS _vrt_q_dead(
   dead_at INTEGER NOT NULL,
   reason TEXT NOT NULL
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS _vrt_q_dead_at ON _vrt_q_dead(dead_at);
 CREATE TABLE IF NOT EXISTS _vrt_q_dispatch(
   id INTEGER PRIMARY KEY CHECK(id=1),
   holder TEXT NOT NULL,
@@ -342,7 +352,9 @@ fn ensure_queue_db(tx: &rusqlite::Transaction<'_>) -> Result<(), EngineError> {
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS _vrt_q_dispatch(\
                  id INTEGER PRIMARY KEY CHECK(id=1), holder TEXT NOT NULL,\
-                 epoch INTEGER NOT NULL, expires_at INTEGER NOT NULL) WITHOUT ROWID;",
+                 epoch INTEGER NOT NULL, expires_at INTEGER NOT NULL) WITHOUT ROWID;\
+                 CREATE INDEX IF NOT EXISTS _vrt_q_created ON _vrt_q_messages(created_at);\
+                 CREATE INDEX IF NOT EXISTS _vrt_q_dead_at ON _vrt_q_dead(dead_at);",
             )
             .map_err(EngineError::Sqlite)?;
             Ok(())
@@ -566,12 +578,37 @@ fn validate_msgs(msgs: &[IncomingMsg], now_ms: i64) -> Result<(), QueueError> {
     Ok(())
 }
 
+fn retention_cutoff(now_ms: i64) -> i64 {
+    now_ms.saturating_sub(MESSAGE_RETENTION_MS)
+}
+
+fn purge_expired(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> Result<(), EngineError> {
+    let cutoff = retention_cutoff(now_ms);
+    tx.execute(
+        "DELETE FROM _vrt_q_messages WHERE id IN \
+           (SELECT id FROM _vrt_q_messages WHERE created_at <= ?1 \
+            ORDER BY created_at LIMIT ?2)",
+        rusqlite::params![cutoff, PURGE_BATCH as i64],
+    )
+    .map_err(EngineError::Sqlite)?;
+    tx.execute(
+        "DELETE FROM _vrt_q_dead WHERE id IN \
+           (SELECT id FROM _vrt_q_dead WHERE dead_at <= ?1 \
+            ORDER BY dead_at LIMIT ?2)",
+        rusqlite::params![cutoff, PURGE_BATCH as i64],
+    )
+    .map_err(EngineError::Sqlite)?;
+    Ok(())
+}
+
 fn metrics_of(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> Result<QueueMetrics, EngineError> {
+    purge_expired(tx, now_ms)?;
+    let cutoff = retention_cutoff(now_ms);
     let (backlog_count, backlog_bytes, oldest): (i64, i64, Option<i64>) = tx
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(LENGTH(body)),0), MIN(created_at) \
-             FROM _vrt_q_messages",
-            [],
+             FROM _vrt_q_messages WHERE created_at > ?1",
+            [cutoff],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(EngineError::Sqlite)?;
@@ -585,13 +622,17 @@ fn metrics_of(tx: &rusqlite::Transaction<'_>, now_ms: i64) -> Result<QueueMetric
                  THEN 1 ELSE 0 END),0), \
                COALESCE(SUM(CASE WHEN visible_at>?1 AND (lease_id IS NULL OR lease_expiry<=?1) \
                  THEN 1 ELSE 0 END),0) \
-             FROM _vrt_q_messages",
-            [now_ms],
+             FROM _vrt_q_messages WHERE created_at > ?2",
+            rusqlite::params![now_ms, cutoff],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .map_err(EngineError::Sqlite)?;
     let dead: i64 = tx
-        .query_row("SELECT COUNT(*) FROM _vrt_q_dead", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM _vrt_q_dead WHERE dead_at > ?1",
+            [cutoff],
+            |r| r.get(0),
+        )
         .map_err(EngineError::Sqlite)?;
     Ok(QueueMetrics {
         backlog_count,
@@ -633,6 +674,7 @@ impl QueueBackend for SqliteQueueBackend {
             .collect();
         run_internal(engine, ctx, move |tx| {
             ensure_queue_db(tx)?;
+            purge_expired(tx, now_ms)?;
             let mut inserted = 0u32;
             {
                 let mut ins = tx.prepare_cached(
@@ -706,6 +748,7 @@ impl QueueBackend for SqliteQueueBackend {
         let h2 = holder.clone();
         let (dispatch_epoch, messages) = run_internal(engine, ctx, move |tx| {
             ensure_queue_db(tx)?;
+            purge_expired(tx, now_ms)?;
             // Dispatch lease CAS (same transaction) -- insert a placeholder if no row, holder=me renews,
             // expired takeover epoch++; held unexpired by someone else -> DispatchLeaseLost.
             tx.execute(
@@ -755,11 +798,14 @@ impl QueueBackend for SqliteQueueBackend {
                      COALESCE(client_ts, created_at) \
                      FROM _vrt_q_messages \
                      WHERE visible_at<=?3 \
+                       AND created_at>?5 \
                        AND (lease_id IS NULL OR lease_expiry<=?3)\
                      ORDER BY visible_at, created_at, id LIMIT ?4",
             )?;
             let candidates = st
-                .query_map(params![lid, expiry, now_ms, max as i64], |r| {
+                .query_map(
+                    params![lid, expiry, now_ms, max as i64, retention_cutoff(now_ms)],
+                    |r| {
                     Ok((
                         r.get::<_, String>(0)?,
                         r.get::<_, Vec<u8>>(1)?,

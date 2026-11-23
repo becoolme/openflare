@@ -12,7 +12,7 @@ use vrt_sql::paths::ResourceKind::{self, Queue};
 use vrt_sql::persist::{PersistConfig, Persister};
 use vrt_sql::queue::{
     IncomingMsg, QueueBackend, QueueError, QueueId, SqliteQueueBackend, BATCH_MAX_BYTES,
-    BATCH_MAX_MSGS, CLAIM_MAX, DELAY_MAX_SECS, MSG_MAX_BYTES,
+    BATCH_MAX_MSGS, CLAIM_MAX, DELAY_MAX_SECS, MESSAGE_RETENTION_MS, MSG_MAX_BYTES,
 };
 use vrt_sql::wire::{self, AppState};
 
@@ -913,6 +913,86 @@ async fn forged_timestamp_cannot_affect_scheduling_or_metrics() {
     assert_eq!(be.metrics(&q, NOW).await.unwrap().backlog_count, 2);
 }
 
+// ---------- message retention ----------
+
+#[tokio::test]
+async fn message_retention_purges_after_four_days() {
+    let tmp = TempDir::new().unwrap();
+    let (_r, be) = backend(&tmp);
+    let q = qid();
+
+    assert_eq!(
+        be.send(&q, &[msg(b"old", "text")], NOW)
+            .await
+            .unwrap()
+            .inserted,
+        1
+    );
+    let before = NOW + MESSAGE_RETENTION_MS - 1;
+    let c = be
+        .claim(&q, "t", 300_000, 10, None, 60_000, before)
+        .await
+        .unwrap();
+    assert_eq!(
+        c.messages.len(),
+        1,
+        "message is still inside the retention window"
+    );
+    be.ack(&q, &c.lease_id, &[c.messages[0].id.clone()], before)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        be.send(&q, &[msg(b"old2", "text")], NOW)
+            .await
+            .unwrap()
+            .inserted,
+        1
+    );
+    let cutoff = NOW + MESSAGE_RETENTION_MS;
+    let m = be.metrics(&q, cutoff).await.unwrap();
+    assert_eq!(
+        m.backlog_count, 0,
+        "metrics must not count expired messages"
+    );
+    assert_eq!(m.oldest_message_timestamp_ms, None);
+    let c = be
+        .claim(&q, "t", 300_000, 10, None, 60_000, cutoff)
+        .await
+        .unwrap();
+    assert!(
+        c.messages.is_empty(),
+        "expired messages must never be delivered"
+    );
+}
+
+#[tokio::test]
+async fn dead_letter_retention_purges_after_four_days() {
+    let tmp = TempDir::new().unwrap();
+    let (_r, be) = backend(&tmp);
+    let q = qid();
+
+    assert_eq!(
+        be.send(&q, &[msg(b"dead", "text")], NOW)
+            .await
+            .unwrap()
+            .inserted,
+        1
+    );
+    let c = be
+        .claim(&q, "t", 300_000, 10, None, 60_000, NOW)
+        .await
+        .unwrap();
+    be.dead_letter(&q, &c.lease_id, &[c.messages[0].id.clone()], "test", NOW)
+        .await
+        .unwrap();
+
+    let before = NOW + MESSAGE_RETENTION_MS - 1;
+    assert_eq!(be.metrics(&q, before).await.unwrap().dead_count, 1);
+    let cutoff = NOW + MESSAGE_RETENTION_MS;
+    assert_eq!(be.metrics(&q, cutoff).await.unwrap().dead_count, 0);
+}
+
 // ---------- T37r: independent body cap for the queue route ----------
 
 async fn oneshot_raw(
@@ -1012,7 +1092,10 @@ async fn wire_queue_body_max_boundary() {
         d1_padded,
     )
     .await;
-    assert_ne!(code, 413, "the D1 endpoint must not be affected by the queue cap");
+    assert_ne!(
+        code, 413,
+        "the D1 endpoint must not be affected by the queue cap"
+    );
 }
 
 /// `/queues/{id}/drop` only tombstones the queue namespace -- cell-controller
@@ -1378,9 +1461,16 @@ async fn claim_recovers_across_registry_restart() {
             )
             .await
             .unwrap();
-        assert_eq!(r.messages.len(), 3, "claim after restart must see the existing messages");
+        assert_eq!(
+            r.messages.len(),
+            3,
+            "claim after restart must see the existing messages"
+        );
         // Lease CAS: same holder, unexpired -> renew (epoch stays at the first takeover value 1).
-        assert_eq!(r.dispatch_epoch, 1, "renewal by the same holder must not bump the epoch again");
+        assert_eq!(
+            r.dispatch_epoch, 1,
+            "renewal by the same holder must not bump the epoch again"
+        );
     }
     // Process 3 (restart + dispatch lease expired): after takeover epoch++, claim works normally.
     {
@@ -1398,7 +1488,10 @@ async fn claim_recovers_across_registry_restart() {
             )
             .await
             .unwrap();
-        assert_eq!(r.dispatch_epoch, 2, "takeover on expiry must bump the epoch");
+        assert_eq!(
+            r.dispatch_epoch, 2,
+            "takeover on expiry must bump the epoch"
+        );
     }
 }
 
