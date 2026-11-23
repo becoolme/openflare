@@ -151,7 +151,11 @@ These are not tied to one binding.
   filesystem and network access. `cf-worker` entrypoints are never
   executed by the loader, but `of` still ships projects unbundled, so a
   TypeScript worker entrypoint must be pre-built to JS. `wrangler.config.*`
-  is not evaluated. [`docs/wrangler-config.md`](wrangler-config.md)
+  is not evaluated. `of deploy --config-sandbox=worker` optionally moves
+  the evaluation into a workerd dynamic worker (no host FS, no network,
+  5 s wall-clock deadline) with the same `RawConfig`; `node` remains the
+  default. [`docs/wrangler-config.md`](wrangler-config.md) ·
+  [sandbox design](config-sandbox-spike.md)
 
 ## Unsupported bindings
 
@@ -176,12 +180,15 @@ All deploy-time rejections are typed (`vrt-local/src/project_cfg.rs`):
 
 - `VRT_CONFIG_INVALID` — a supported key with a malformed value.
 - `VRT_CONFIG_UNSUPPORTED_FIELD` — a key OpenFlare does not implement.
-- `VRT_CONFIG_LOADER_FAILED` — the Node helper for
-  `cloudflare.config.*` could not run, exited non-zero for a reason other
-  than a config-parse rejection, or printed an unusable document.
+- `VRT_CONFIG_LOADER_FAILED` — the helper for `cloudflare.config.*`
+  could not run, exited non-zero for a reason other than a config-parse
+  rejection, or printed an unusable document. In worker-sandbox mode this
+  also covers bundling, workerd startup, evaluation and payload-size
+  failures.
 - `VRT_CONFIG_LOADER_TIMEOUT` — evaluating a `cloudflare.config.*`
   exceeded the child-process deadline (`VRT_CF_CONFIG_LOADER_TIMEOUT_MS`,
-  default 60 s).
+  default 60 s) or the sandbox's wall-clock deadline
+  (`VRT_CF_CONFIG_SANDBOX_TIMEOUT_MS`, default 5 s).
 - `VRT_CONFIG_IO`, `VRT_CONFIG_PARSE`, `VRT_CONFIG_ENV` — file and
   environment resolution failures.
 
@@ -190,6 +197,11 @@ Runtime failures visible at ingress carry platform codes documented in
 
 ## Changelog
 
+- 2026-11-23: `of deploy --config-sandbox=worker` (default `node`).
+  The worker path evaluates `cloudflare.config.*` in a workerd dynamic
+  worker with a caller-enforced 5 s deadline and the same typed error
+  mapping; semantics and limits are documented in
+  [`config-sandbox-spike.md`](config-sandbox-spike.md).
 - 2026-11-22: `cloudflare.config.ts` / `.js` (the `cf` CLI programmatic
   format) is evaluated through Cloudflare's `@cloudflare/config` loader
   and normalized by the same wrangler path; `--env` maps to the loader

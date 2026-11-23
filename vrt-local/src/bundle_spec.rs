@@ -66,4 +66,12 @@ pub struct BundledSpec {
     /// `(module name, project-relative file)` rule-typed externals.
     #[serde(default)]
     pub externals: Vec<(String, String)>,
+    /// Absolute paths of every file-backed module rolldown pulled into
+    /// the graph (entry, relative imports, JSON modules and
+    /// `node_modules` packages). Virtual modules are omitted. Sorted and
+    /// deduped so callers get a deterministic list; the config sandbox
+    /// reports it as the evaluation's `dependencies` (the Node loader
+    /// contract).
+    #[serde(default)]
+    pub dependencies: Vec<String>,
 }

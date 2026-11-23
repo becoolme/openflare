@@ -277,12 +277,25 @@ async fn run(spec: &BundleSpec) -> Result<BundledSpec, String> {
     let mut emitted = BTreeSet::new();
     let mut main_source = None;
     let mut chunks = Vec::new();
-    let entry_name = rel_norm(Path::new("/"), Path::new(entry))
-        .ok_or("module escapes worker dir")?;
+    // Every file-backed module in the graph (entry, relative imports,
+    // JSON modules, `node_modules` packages) — the `dependencies` the
+    // config sandbox reports to its caller.
+    let mut dependencies = BTreeSet::new();
+    let entry_name =
+        rel_norm(Path::new("/"), Path::new(entry)).ok_or("module escapes worker dir")?;
     for asset in out.assets.iter() {
         let Output::Chunk(chunk) = asset else {
             continue;
         };
+        for id in chunk.module_ids.iter().chain(chunk.modules.keys.iter()) {
+            let raw = id.raw_id();
+            // Virtual modules (`\0...`) and builtins are not files the
+            // caller can watch or reload.
+            if raw.starts_with('\0') || !Path::new(raw).is_absolute() {
+                continue;
+            }
+            dependencies.insert(raw.to_string());
+        }
         if chunk.is_entry {
             main_source = Some(chunk.code.clone());
             emitted.insert(entry_name.clone());
@@ -350,6 +363,7 @@ async fn run(spec: &BundleSpec) -> Result<BundledSpec, String> {
         main_source,
         chunks,
         externals: externals.into_iter().collect(),
+        dependencies: dependencies.into_iter().collect(),
     })
 }
 
@@ -389,16 +403,37 @@ mod tests {
     #[test]
     fn ts_dep_bundled_externals_kept() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("helper.ts"), "export const x: number = 1;").unwrap();
+        fs::write(
+            dir.path().join("helper.ts"),
+            "export function helper(x: number): number { return x + 1; }",
+        )
+        .unwrap();
         fs::write(
             dir.path().join("index.ts"),
-            "import { x } from './helper';\nimport { connect } from 'cloudflare:sockets';\nimport crypto from 'node:crypto';\nexport default { fetch() { return new Response(String(x + typeof connect + typeof crypto.randomUUID)) } };",
+            "import { helper } from './helper.ts';\nimport { connect } from 'cloudflare:sockets';\nimport crypto from 'node:crypto';\nexport default { fetch() { return new Response(String(helper(1) + typeof connect + typeof crypto.randomUUID)) } };",
         )
         .unwrap();
         let b = run_spec(dir.path(), "index.ts", "", &[]);
         assert!(b.main_source.contains("node:crypto"));
         assert!(b.main_source.contains("cloudflare:sockets"));
         assert!(b.externals.is_empty());
+        // Both project files are reported as dependencies (absolute,
+        // sorted) — the sandbox needs them for cache invalidation.
+        let root = dir.path().canonicalize().unwrap();
+        let this = root.join("index.ts");
+        let helper = root.join("helper.ts");
+        assert!(
+            b.dependencies
+                .contains(&this.to_string_lossy().into_owned()),
+            "{:?}",
+            b.dependencies
+        );
+        assert!(
+            b.dependencies
+                .contains(&helper.to_string_lossy().into_owned()),
+            "{:?}",
+            b.dependencies
+        );
     }
 
     #[test]

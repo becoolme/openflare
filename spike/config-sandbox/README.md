@@ -1,35 +1,28 @@
-# `cloudflare.config.*` sandbox spike
+# `cloudflare.config.*` sandbox verification
 
-Proof of concept for evaluating `cloudflare.config.ts` inside a workerd
-dynamic worker instead of a Node child process. **Not wired into
-`of deploy`** — see [docs/config-sandbox-spike.md](../../docs/config-sandbox-spike.md)
-for the results, timings and conclusions.
+The sandbox itself lives in `scripts/load-cloudflare-config-worker.mjs`
+and is wired into `of deploy` / `of check` as `--config-sandbox=worker`
+(default: `node`). This directory only keeps the end-to-end verification
+harness; the design, semantics and known gaps are in
+[docs/config-sandbox-spike.md](../../docs/config-sandbox-spike.md).
 
 ```
-pnpm install                                     # @cloudflare/config for the fixture
+# prerequisites (same pins as every other deploy path)
 cargo build --manifest-path of-bundler/Cargo.toml
+pnpm install
 
-# upstream workerd (darwin/linux) — same upstream commit as the pin
-node spike/config-sandbox/run.mjs --workerd /path/to/workerd --case parity
-
-# pinned fork (linux) under Docker
-node spike/config-sandbox/run.mjs \
-  --docker-image debian:12-slim \
-  --workerd /path/to/linux-workerd \
-  --case parity
-
-# all cases
+# full matrix: parity, nested factories, env injection, cf-worker,
+# dependencies, host FS, network, oversized payload, invalid config,
+# while(true) timeout, missing workerd
 node spike/config-sandbox/verify.mjs --workerd /path/to/workerd
+
+# Rust integration matrix (self-skips without VRT_WORKERD_BIN)
+VRT_WORKERD_BIN=/path/to/workerd \
+  cargo test -p vrt-local --test config_sandbox
 ```
 
-Cases:
-
-| case | what it asserts |
-| --- | --- |
-| `parity` | bundle -> dynamic worker -> JSON -> trusted `convertToWranglerConfig` equals `scripts/load-cloudflare-config.mjs` |
-| `fs-import` | a config reading a host path is blocked (workerd's virtual FS has no host files) |
-| `network` | a config fetching an address is denied by the dynamic worker's outbound policy |
-| `loop` | `while (true)` is bounded by the caller's wall-clock deadline |
-
-The runner needs a `@cloudflare/config` install (repo devDependency) and a
-workerd binary. It never downloads anything.
+`verify.mjs` drives the two production helpers directly
+(`scripts/load-cloudflare-config.mjs` as the baseline and
+`scripts/load-cloudflare-config-worker.mjs` for the sandbox); it does not
+re-implement the chain. It exits `2` when a prerequisite is missing and
+`1` when an assertion fails. CI runs it in the `real-workerd` job.

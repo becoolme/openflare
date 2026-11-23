@@ -1,25 +1,32 @@
-# `cloudflare.config.*` evaluation in a dynamic worker (spike)
+# `cloudflare.config.*` evaluation in a workerd sandbox
 
-Status: **PoC, not wired into `of deploy`.** This page records what was
-built, what was measured, and what the remaining gaps are. The code lives
-in [`spike/config-sandbox/`](../spike/config-sandbox/README.md); the only
-production-adjacent change is an opt-in `alias` knob in the bundling wire
-(`of-bundler`, used by nothing in the deploy path).
+Status: **opt-in implementation.** `of deploy` / `of check` accept
+`--config-sandbox=worker`; the default remains `node`, so existing
+projects and scripts keep their current behaviour. The sandbox runs the
+config bundle in a workerd dynamic worker — no host filesystem, no
+outbound network — and keeps validation and `convertToWranglerConfig` on
+the trusted side.
+
+Code:
+
+- `scripts/load-cloudflare-config-worker.mjs` — production driver
+  (bundle → dynamic worker → JSON → trusted zod/convert);
+- `scripts/load-cloudflare-config.mjs` — the Node loader (default path,
+  unchanged);
+- `scripts/shims/cloudflare-config-public.mjs` — Workers-safe
+  `@cloudflare/config` shim;
+- `vrt-local/src/project_cfg.rs` — sandbox selection, helper invocation,
+  deadline/error mapping;
+- `vrt-local/tests/config_sandbox.rs` and
+  `spike/config-sandbox/verify.mjs` — the test matrix.
 
 ## Why
 
-[`docs/wrangler-config.md`](wrangler-config.md) evaluates a
-`cloudflare.config.ts` by running Cloudflare's own `@cloudflare/config`
-loader in a Node child process with a fixed cwd, a cleared environment,
-a deadline and output caps — but **that is not a sandbox**. The config is
-arbitrary code with the invoking user's filesystem, network and process
-rights.
-
-This spike answers one question: can the config be *evaluated* inside a
-workerd dynamic worker (`workerLoader`), with the resulting value carried
-back as JSON and converted on the trusted side, so that the untrusted
-code never runs with the user's privileges? It is a link test, not a
-migration.
+The Node path (`docs/wrangler-config.md`) is a *restricted child
+process*, not a sandbox: a `cloudflare.config.ts` is arbitrary Node code
+with the invoking user's filesystem, network and process rights. The
+worker sandbox removes those rights from the untrusted evaluation step
+without changing the resulting `RawConfig`.
 
 ## Chain
 
@@ -27,257 +34,308 @@ migration.
  cloudflare.config.ts (project code, untrusted)
         │
         │ 1. of-bundler (rolldown, platform=neutral, ESM)
-        │    alias: @cloudflare/config$ -> shims/cloudflare-config-public.mjs
-        │           "./src/index.js"$ -> generated shim exporting the
-        │            absolute specifier (mirrors the Node cf-worker hook)
+        │    alias @cloudflare/config$  -> scripts/shims/cloudflare-config-public.mjs
+        │    alias <cf-worker spec>$   -> generated module exporting the path
         ▼
- single ESM module (4,008 B for the repo fixture)
+ ESM modules (main + dynamic chunks)
         │
-        │ 2. embedded into a bootstrap worker's `workerLoader` call
-        │    (WorkerCode: mainModule + config module, limits.cpuMs)
+        │ 2. embedded into a bootstrap worker's workerLoader call
         ▼
  workerd process ── HTTP loopback ──> bootstrap worker
         │                                  │ env.LOADER.get(...)
         │                                  ▼
         │                            dynamic worker (separate isolate)
-        │                              wrapper: call default export with
-        │                              {mode, isPreview}, normalize
-        │                              cf-worker entrypoint, JSON.stringify
+        │                              sandbox-env.js sets a frozen process
+        │                              wrapper mirrors Cloudflare's definition
+        │                              resolver (nested factories), JSON
         │                                  │
         │                                  └─ 512 KiB payload cap
         ▼
- JSON {config} ── 3. trusted side ──> CloudflareConfigSchema (zod)
-                                       -> convertToWranglerConfig()
-                                       -> RawConfig
+ JSON {config, issues} ── 3. trusted side ──> CloudflareConfigSchema (zod)
+                                             -> convertToWranglerConfig()
+                                             -> RawConfig
 ```
 
-Step 1 needs one bundler feature: specifier aliases. `of-bundler` had
-none, so this spike added `BundleOpts.alias` /
-`BundleOptsSpec.alias` (`vrt-local/src/bundle.rs`,
-`vrt-local/src/bundle_spec.rs`) wired to rolldown's `resolve.alias`
-(`of-bundler/src/main.rs`). Keys are prefix matches, `key$` is exact
-(oxc semantics). Values are absolute files.
+`scripts/load-cloudflare-config-worker.mjs` prints the same
+`{raw, dependencies}` document on stdout and uses the same stderr
+contract (`{error, message, issues?}` plus `phase`) as the Node helper.
+`project_cfg.rs` therefore parses both paths with one implementation and
+maps failures with one table.
 
-Coverage added: `of-bundler` unit tests for a bare alias and a relative
-alias, plus `vrt-local/tests/bundle.rs::bundle_alias_rewrites_specifier_before_resolution`,
-which runs the real helper through the wire in `cargo test --workspace`.
-
-## Commands
+## Usage
 
 ```sh
-# helper + deps
-cargo build --manifest-path of-bundler/Cargo.toml
-pnpm install
+# default: Node loader (unchanged)
+of deploy --root .vrt ./worker
 
-# upstream workerd, same upstream commit as the pin (1.20261120.1, darwin arm64)
-node spike/config-sandbox/run.mjs --workerd <workerd> --case parity
+# sandboxed evaluation
+VRT_WORKERD_BIN=/path/to/workerd \
+  of deploy --root .vrt --config-sandbox=worker ./worker
 
-# pinned fork (linux arm64) under Docker
-node spike/config-sandbox/run.mjs \
-  --docker-image debian:12-slim \
-  --workerd <linux-workerd> \
-  --case parity
-
-# every case
-node spike/config-sandbox/verify.mjs --workerd <workerd>
+# pre-flight only
+of check --config-sandbox=worker ./worker
 ```
 
-The runner prints a JSON report with `--json`. It is not part of CI: it
-needs a workerd binary and (for a real comparison) `@cloudflare/config`
-in `node_modules`. CI covers the bundler change; the sandbox verdict is
-local evidence, reproduced below.
+`--env <name>` still maps to the loader `mode`, and `--preview` still
+sets `isPreview`. Both flags are forwarded unchanged in either sandbox,
+including remote (`--url`) and `--dry-run` packing. `vrt.toml` and
+wrangler files are read, never evaluated, so the flag does not affect
+them.
 
-## Measured results
+### Requirements and knobs
 
-Fixture: `vrt-local/tests/fixtures/cf-config` —
-`defineConfig(({mode, isPreview}) => ...)`, `bindings.text`, and a
-`with { type: "cf-worker" }` entrypoint.
+| What | Value |
+| --- | --- |
+| workerd binary | `VRT_WORKERD_BIN` (then `OF_WORKERD_BIN`); no fallback to the Node path. The binary must support `workerLoader`; the driver runs it with `--experimental` |
+| bundler | resolved like every other bundle (`OF_BUNDLER`, embedded, in-repo, co-installed) and passed to the driver |
+| sandbox driver override | `VRT_CF_CONFIG_SANDBOX_LOADER` (tests/ops) |
+| one-evaluation deadline | `VRT_CF_CONFIG_SANDBOX_TIMEOUT_MS`, 100..30000 ms, default **5000 ms** |
+| whole-helper deadline | `VRT_CF_CONFIG_LOADER_TIMEOUT_MS`, 100..600000 ms, default **60000 ms**; worker mode raises it to `sandbox deadline + 45 s` when that is larger |
+| config source cap | 256 KiB |
+| bundle cap | 8 MiB of emitted JS before embedding |
+| result payload cap | 512 KiB |
+| bundle / startup caps | 30 s / 15 s |
 
-`parity`, upstream workerd 2026-11-20 (darwin arm64):
+If workerd is missing the command fails closed with
+`VRT_CONFIG_LOADER_FAILED` and tells the operator to install workerd or
+use `--config-sandbox=node`; it never silently evaluates in Node.
 
-| step | result | time |
-| --- | --- | --- |
-| bundle (alias on) | ok, 4,008 B | 101–430 ms (cold/warm helper) |
-| workerd start + ready | ok | 105–559 ms |
-| dynamic eval -> JSON | HTTP 200 | 25–256 ms |
-| trusted zod + convert | ok | 3 ms |
-| Node loader baseline | ok | 187–293 ms |
-| parity | **identical `RawConfig`** | — |
+## Timeout and isolation
 
-The sandbox RawConfig and
-`node scripts/load-cloudflare-config.mjs ... --mode staging` compared
-deep-equal (after key sorting):
+The binding constraint is the caller's wall clock. Measurements on the
+pinned fork show that `limits.cpuMs` terminates a `while (true)` isolate
+(CPU drops to ~0.5%), but the `stub.getEntrypoint().fetch()` RPC **never
+completes and never returns an error** — the outer request hangs. A CPU
+budget alone is therefore not a response-time bound.
 
-```json
-{"name":"cf-config-fixture",
- "main":"<fixture>/src/index.js",
- "compatibility_date":"2026-09-17",
- "vars":{"GREETING":"hello","STAGE":"staging","PREVIEW":"production"}}
-```
+The driver handles this explicitly:
 
-`--preview` reaches `isPreview` the same way (`PREVIEW: "preview"`), and
-a missing `--mode` leaves `STAGE` absent, matching the Node path.
+1. the outer `fetch` is aborted at `--timeout-ms`;
+2. workerd is spawned `detached` (its own process group) and the whole
+   group is `SIGKILL`ed on timeout, on helper exit, and from the driver's
+   `exit` handler;
+3. the caller receives `VRT_CONFIG_LOADER_TIMEOUT` with the deadline and
+   the env knob — never a hang.
 
-Repeating the whole chain with the **pinned fork** (`vrt-20261122-d21616b`,
-linux arm64, inside `debian:12-slim`) produced the same identical
-RawConfig: bundle 166 ms warm, eval 39 ms. Docker cold start (~9 s,
-image + 166 MB binary via the mount) dominates and is not representative
-of a local process launch. The fork publishes linux x64/arm64 assets
-only, which is why the darwin measurements use the upstream npm build of
-the same upstream commit.
+The dynamic worker also gets `limits: { cpuMs }` equal to the deadline as
+a backstop. Upstream workerd ignores it; the pinned fork enforces it. It
+is a defence in depth, not the guarantee.
 
-### Alias: needed?
+Isolation results (reproduced by `verify.mjs`):
 
-Reporting only: bundling the fixture **without** the `@cloudflare/config`
-alias also succeeds and produces a byte-identical 4,008 B bundle. The
-package declares `"sideEffects": false`, so rolldown drops the Node
-loader half of the root entry and only `defineConfig`/`bindings` from
-`./public` survive. The alias is still the intended route (it does not
-depend on tree-shaking a third-party entry that may start pulling in
-`node:module` in a future release), but the spike does not claim the
-alias is strictly required today.
+- `readFileSync("/etc/passwd")` fails with workerd's virtual-FS
+  `no such file or directory`; no host bytes reach the config;
+- `fetch("http://169.254.169.254/…")` and a raw
+  `cloudflare:sockets` `connect()` to the same address both fail: a
+  dynamic worker's `globalOutbound` defaults to the null client channel,
+  so the sandbox is not an SSRF pivot. The JS-visible fetch error is an
+  opaque `internal error; reference = …`; sockets report
+  `cannot connect to the specified address`. Callers see a generic
+  evaluation failure either way;
+- the dynamic worker gets no bindings, secrets or inherited env beyond
+  the explicit `process.env` map described below.
 
-## Boundary results
+## `process.env` (decision)
 
-### `node:fs` / host files
+workerd has no `process`. Rather than silently taking the
+`undefined` branch, the sandbox **injects exactly the same allowlisted
+environment the Node child receives** as a frozen `process.env`
+(`CF_CHILD_ENV_ALLOW` in `project_cfg.rs`, mirrored in the driver),
+plus `process.cwd()` (the canonical project directory) and
+`process.platform`. `sandbox-env.js` is imported before the config
+module, so top-level `process.env` reads work too.
 
-`import { readFileSync } from "node:fs"` **bundles** (the helper marks
-`node:*` external). The dynamic worker loads it and executes
-`readFileSync("/etc/passwd")`; workerd's virtual filesystem returns
-`Error: no such file or directory, readAll '/etc/passwd'`. No host bytes
-reach the config. Nothing in the bundler rejects the import, so the
-isolation comes from workerd's FS, not from a static allowlist.
+Why this choice:
 
-### Network
+- **Parity.** A config that branches on `TZ`, `LANG`, `HOME` or
+  `TMPDIR` behaves the same in both sandboxes. The Node child already
+  clears everything else (`NODE_OPTIONS`, credentials, `VRT_*`), so the
+  boundary is unchanged.
+- **Explicit over absent.** Silent `undefined` would make a config deploy
+  differently based on which flag was passed.
+- **Defence in depth.** The driver re-filters before embedding the values;
+  a non-allowlisted variable that somehow reaches the helper's own
+  environment still never reaches the config (covered by a test).
 
-`fetch("http://169.254.169.254/latest/meta-data/")` inside the factory
-fails: workerd logs `connecting to 169.254.169.254:80 is not allowed`.
-A dynamic worker's `globalOutbound` defaults to the null client channel,
-so the sandbox is not an SSRF pivot. Caveat: the JS-visible error is an
-opaque `internal error; reference = ...`, so callers cannot distinguish
-policy denial from a crash; the trusted side must treat any non-200 as a
-generic evaluation failure.
+`NODE_ENV` and `CI` are **not** allowlisted (they are not in the Node
+child either). A config that needs build-time values should use
+`defineConfig`'s `mode`/`isPreview` arguments, which are the supported
+inputs in both paths. The `process` object has only `env`, `cwd`,
+`platform`; other APIs (`exit`, `nextTick`, `argv`, …) are absent and a
+config that calls them fails the evaluation.
 
-### `while (true)`
+## Nested factories
 
-The request never completes. Two different runtimes behave differently:
+Cloudflare's loader resolves *any* definition — top-level, `worker`,
+`containers`, cross-worker `env` references — through
+`createDefinitionResolver` inside the config's process. Functions cannot
+cross the JSON boundary, so the worker wrapper mirrors that resolver
+(`normalizeWorkerEntrypoint`, `normalizeWorkerEnv`,
+`normalizeContainerReferences`, `resolveAndParseConfig`) and sends the
+resolved value plus any custom container issues. The trusted side then
+runs the real `CloudflareConfigSchema` and merges the reported issues.
 
-- **Upstream workerd (darwin arm64, npm 1.20261120.1):** the dynamic
-  worker's `limits: {cpuMs: 250}` is *not* enforced. The process keeps
-  spinning at 87–106% CPU for as long as it is left alive; sample at
-  t+4 s showed 70.9% and rising.
-- **Pinned fork (linux arm64):** the budget is enforced — CPU drops to
-  ~0.5% after the limit (the isolate is terminated). But the RPC caller
-  (`stub.getEntrypoint().fetch()`) **still never receives an error**;
-  the outer request hangs past 30 s.
+Covered by tests:
 
-Control: the fork's per-Worker `limits = (cpuMs = 50)` on a *static*
-worker returns HTTP 500 `Worker exceeded CPU time limit.` in 94 ms, so
-the fork's enforcer itself works; the gap is the dynamic-worker RPC
-outcome. Consequence for any design: **the caller must always impose a
-wall-clock deadline and kill the workerd process.** A `workerLoader`
-CPU budget alone is not a response-time bound.
+- `defineWorker(() => …)` and `defineContainer({…})` resolve;
+- `exports: durableObject({ container })` becomes the container **name**;
+- a container not listed in `containers` or passed as a string reports a
+  `VRT_CONFIG_INVALID` issue with the same path the Node loader uses.
 
-`workerLoader` also requires `--experimental`; the fork adds
-`maxWorkers` (`(name = "LOADER", workerLoader = (maxWorkers = 32))`),
-which the runner omits for upstream compatibility. Production would use
-the fork and keep the quota.
+## `cf-worker` imports
+
+`with { type: "cf-worker" }` is an import attribute, not a module. The
+driver scans the config source for the literal form, resolves the
+specifier, and aliases it to a generated module exporting the absolute
+path. The referenced entry is **never bundled or executed** (the test
+entrypoint throws if evaluated).
+
+Only the literal attribute form is supported. A computed attribute
+(`import(spec, { with: { type: "cf-worker" } })`) fails closed with
+`VRT_CONFIG_LOADER_FAILED` instead of accidentally bundling the entry
+module.
+
+## `dependencies`
+
+The driver reports every project source file rolldown put in the graph
+(entry, relative imports, JSON modules, dynamic `import()` chunks) as a
+sorted absolute list, excluding `node_modules` packages and the generated
+shims. Static-import parity with the Node loader is covered by the
+verification matrix; a dynamically imported source is reported by the
+sandbox and not by the Node loader, which is a deliberate superset.
+Modules that are fully tree-shaken are not part of the evaluated code and
+are not reported.
+
+`of` currently discards the list after validation (same as the Node
+path); the sandbox makes it available so the later cache/reload work does
+not need a second bundler change.
+
+## Error mapping
+
+The helper's stderr is a single JSON line; `project_cfg.rs` honours only
+the public codes it defines.
+
+| Phase | Helper detail | Public error | Exit |
+| --- | --- | --- | --- |
+| config file unreadable / wrong extension / too large | `VRT_CONFIG_LOADER_USAGE` | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| bundling (`of-bundler` error, unsupported cf-worker form) | bundle message + `phase: "bundle"` | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| workerd missing / cannot start / never listens | `phase: "startup"` | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| config factory throws / module load error | `phase: "eval"` + capped message | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| non-200 inner response | status + capped message | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| payload above 512 KiB | `VRT_CONFIG_SANDBOX_PAYLOAD_TOO_LARGE` | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| wall-clock deadline | `VRT_CONFIG_LOADER_TIMEOUT` | `VRT_CONFIG_LOADER_TIMEOUT` | 3 |
+| zod / container issues | `VRT_CONFIG_INVALID` + issues | `VRT_CONFIG_INVALID` | 2 |
+| `convertToWranglerConfig` throws | `phase: "convert"` | `VRT_CONFIG_LOADER_FAILED` | 3 |
+| helper itself died / bad stdout | no typed code | `VRT_CONFIG_LOADER_FAILED` | 3 |
+
+Diagnostics are capped and value-free for schema failures (issue
+`path`/`code`/`message` only). A message thrown by the config's own code
+is capped text chosen by the config author; it is never the evaluated
+config object. The helper never prints the config payload.
 
 ## Semantic differences from the Node path
 
-These are the ones that matter for a future implementation; the PoC does
-not close them.
+These are deliberate and documented; everything else is expected to be
+identical.
 
-1. **Validation placement.** The Node loader calls
-   `CloudflareConfigSchema.safeParse` before `convertToWranglerConfig`.
-   The worker returns raw JSON, and `convertToWranglerConfig` does **not**
-   validate. The trusted side must re-validate (the PoC does) — otherwise
-   a malformed config silently converts. Zod issue projection
-   (`code`/`path`/`message`, capped) must be reimplemented or delegated.
-2. **Nested definitions.** The Node loader resolves *any* config value
-   that is a function (`worker`, `containers`, cross-worker `env`
-   references) through `createDefinitionResolver`. The PoC only calls
-   the top-level factory; `defineWorker(() => ...)`/`defineContainer`
-   factories would serialize as `{}`. A faithful implementation has to
-   mirror that resolver inside the worker.
-3. **`cf-worker` imports.** These are import attributes, not modules.
-   The Node hook synthesizes a module exporting the specifier; rolldown
-   has no equivalent. The PoC scans the config source and aliases the
-   specifier to a generated shim. That requires reading the source in
-   the bundler driver and only handles the literal attribute form (no
-   computed specifiers).
-4. **`process.env`.** The Node path forwards a small allowlist, so a
-   config can read `NODE_ENV`/`CI`/etc. workerd has no `process.env`;
-   such branches silently take the `undefined` path. A sandbox has to
-   decide which env values (if any) are exposed and inject them
-   explicitly (e.g. as bindings).
-5. **Filesystem and modules.** `import.meta.url`, `__dirname`, and
-   relative reads resolve against a virtual FS that contains no project
-   files. Configs that read a JSON/TOML file next to themselves (or
-   import one) will fail or see nothing. The bundler can inline JSON
-   imports, but arbitrary reads cannot work.
-6. **`dependencies`.** The Node helper reports every imported file.
-   `of` validates and currently discards it, so today this is harmless;
-   if watch/rebuild starts using it, the sandbox path has no equivalent
-   and the bundler would need to report the module graph.
-7. **Module cache.** `loadConfig` re-imports with a `cf-no-cache` UUID;
-   `workerLoader.get(name, ...)` caches by name. A repeated evaluation
-   must use `load()` (one-shot) or a fresh name/loader id, or it will
-   return the first config forever.
-8. **Error shape.** The Node path maps zod failures to
-   `VRT_CONFIG_INVALID` with structured issues and loader failures to
-   `VRT_CONFIG_LOADER_FAILED`/`VRT_CONFIG_LOADER_TIMEOUT`. The sandbox
-   path yields (a) bundler errors, (b) an HTTP status plus an opaque
-   workerd error string, (c) trusted-side validation issues. Those need a
-   stable mapping before `of` can surface them.
-9. **Package version.** The PoC bundles and converts with the repo's
-   `@cloudflare/config` (`1.0.0-rc.3`) on both sides. `of` must pin the
-   same version for the sandbox bundle and the trusted conversion (or a
-   schema/conversion drift becomes silent).
-10. **Single-file bundles only.** The runner embeds `main_source` only;
-    code-split chunks (dynamic `import()`) and rule-typed externals are
-    ignored, so a config using them would fail inside the worker. A real
-    implementation has to ship every returned module.
+1. **Isolation.** The config cannot read host files, open sockets or
+   spawn processes. A config that needs either is unusable in worker
+   mode; it fails with `VRT_CONFIG_LOADER_FAILED`, not a silent fallback.
+2. **`process`.** Only `env` (allowlisted), `cwd()` and `platform` exist.
+   `process.argv`, `process.exit`, timers beyond workerd's globals and
+   Node built-ins that need privileges are absent.
+3. **Package version.** The sandbox bundles `@cloudflare/config` from
+   the `of` install (repo pin `1.0.0-rc.3`) and converts with the same
+   copy. The Node path uses the project's installed package and requires
+   it to be resolvable from the config file. Target the version pinned by
+   `of` when using the sandbox.
+4. **Files and module URLs.** There is no host filesystem. Configs that
+   read a JSON/TOML file next to themselves (or `import.meta.url`/resolve
+   paths against a real file) fail or see nothing; importing a JSON module
+   through the bundler still works.
+5. **`cwd`.** `process.cwd()` is the canonicalized project directory;
+   the dynamic worker's real FS is empty.
+6. **Validation placement.** The worker returns raw JSON; zod runs in
+   the trusted driver. `convertToWranglerConfig` never sees untrusted
+   code, only validated data.
+7. **One-shot evaluation.** `workerLoader.get("cf-config", …)` is called
+   once per helper process; no module cache is reused across deploys.
+8. **Environment.** Same allowlist as the Node child; no
+   `NODE_ENV`/`NODE_PATH`/credentials.
+9. **Cost.** One workerd start + bundle per config evaluation
+   (~2 s warm on a developer machine; the Node path is ~0.1 s). It runs
+   once per deploy/check, not per request.
 
-The PoC runner prints the evaluated config in its report (values
-included). That is acceptable for a local spike only: the Node path is
-deliberately value-free in its diagnostics, and a real implementation
-must keep it that way (zod issue projection without echoing values).
+## Tests
 
-## Is it worth continuing?
+```sh
+# whole matrix (needs a workerd binary + built of-bundler)
+node spike/config-sandbox/verify.mjs --workerd /path/to/workerd
 
-**Yes, with conditions.** The hard part works: a config bundle can be
-evaluated in a dynamic worker, the value crosses the boundary as JSON,
-and the result is byte-for-byte the same `RawConfig` the Node path
-produces — at roughly the same latency (~0.5–1.1 s total; the Node
-baseline alone is ~0.2–0.3 s). Isolation is real: no host FS, no
-outbound network, and a per-invocation CPU budget on the pinned fork.
+# Rust integration (CI `real-workerd` job sets VRT_WORKERD_BIN)
+cargo test -p vrt-local --test config_sandbox
 
-What makes it a spike, not a shippable path:
+# bundler wire + dependency reporting
+cargo test --manifest-path of-bundler/Cargo.toml
+```
 
-- The caller must bound wall clock and kill workerd; the RPC caller does
-  not observe a CPU-limit failure.
-- Validation and (ideally) `convertToWranglerConfig` must move to the
-  trusted side. `convertToWranglerConfig` is pure JS and could run in the
-  worker, but its output is untrusted input to `of`; the smallest safe
-  design is: worker returns `CloudflareConfig` JSON, Rust validates, and
-  `CloudflareConfig -> RawConfig` is ported (a mechanical mapping that
-  is small compared with the existing wrangler normalizer), or a Node
-  helper keeps doing only the pure conversion (no untrusted execution).
-- The sandbox needs a workerd binary at every place `of deploy` runs.
-  The platform already pins the fork for its runtimes, so this is a
-  packaging/availability question, not a new dependency.
-- `cf-worker` entrypoints, nested factories and `process.env` need
-  explicit design (items 2–4 above).
+`verify.mjs` drives both production helpers and asserts:
 
-Suggested follow-up (not started): a `of-bundler` "config" mode that
-returns the bundle plus the cf-worker specifier map; a one-shot
-`workerLoader.load()` evaluation with a fresh loader id; trusted-side
-validation with the same error codes as today; a `VRT_WORKERD_BIN`-gated
-integration test next to the existing real-workerd suites.
+| case | assertion |
+| --- | --- |
+| parity | staging / preview / no-mode `RawConfig` and `dependencies` deep-equal to Node |
+| nested factories | `defineWorker` + `defineContainer` resolve; container reference becomes its name; parity |
+| env injection | allowlisted `TZ` reaches both; non-allowlisted values never cross |
+| cf-worker | entrypoint becomes `main`; the throwing entry module never executes; parity |
+| dependencies | imported project helper is reported by both paths |
+| dynamic import | a `import()` chunk is shipped, evaluated, and its source reported |
+| host FS | `readFileSync` fails with `VRT_CONFIG_LOADER_FAILED` |
+| network | `fetch` and `cloudflare:sockets` connects fail with `VRT_CONFIG_LOADER_FAILED` |
+| oversized payload | 600 KiB result is refused before the trusted side buffers it |
+| invalid config | `VRT_CONFIG_INVALID`, issue path `worker.name` |
+| `while (true)` | `VRT_CONFIG_LOADER_TIMEOUT` within a bounded wall clock, no hang |
+| missing workerd | fail closed with an actionable message |
+
+CI: the `real-workerd` job builds `of-bundler`, fetches the pinned
+workerd, runs `cargo test -p vrt-local --test config_sandbox` through
+`scripts/ci-real-workerd.sh`, then runs `verify.mjs`. The sandbox tests
+self-skip when `VRT_WORKERD_BIN` is unset (same convention as the other
+real-workerd suites).
+
+## Known gaps
+
+- **Not the default.** `node` stays the default until the sandbox has
+  run against real projects; `worker` is opt-in per command.
+- **workerd must be installed wherever deploys run.** It is the same
+  pinned binary `of serve` uses, but the sandbox does not download it.
+- **Package pinning.** A project that pins a different
+  `@cloudflare/config` version than `of` may see `defineConfig`/schema
+  drift; the sandbox uses `of`'s copy (documented above).
+- **No partial fallback.** A config that needs Node-only APIs fails in
+  worker mode; it is not retried in Node (fail closed).
+- **Dependencies are reported but not consumed.** Watch/reload still
+  needs the consumer side; the sandbox exposes the list.
+- **Memory is not capped independently.** The wall-clock deadline and
+  workerd's isolate limits bound CPU; a config that allocates very large
+  structures before the JSON cap is not separately memory-quota tested.
+- **Outer-deadline edge case.** The driver kills workerd's process group
+  on every normal/timeout path. If the driver itself had to be SIGKILLed
+  by the outer helper deadline (90 s+), a detached workerd could outlive
+  it; the inner phases (30 s bundle / 15 s startup / 5 s eval) keep that
+  path unreachable in practice.
+- **Output cap is a hard failure.** A config materially larger than
+  512 KiB must be split; the sandbox does not stream.
 
 ## Changelog
 
+- 2026-11-23: implementation. `of deploy` / `of check` gain
+  `--config-sandbox=node|worker` (default `node`); the worker path
+  bundles with `of-bundler`, evaluates in a workerd dynamic worker with
+  a 5 s caller deadline that kills the workerd process group, mirrors
+  Cloudflare's nested-definition resolver, injects the allowlisted
+  `process.env`, synthesises `cf-worker` specifiers, reports project
+  dependencies, and maps every failure to the existing typed codes.
+  Adds the Rust sandbox matrix, `verify.mjs`, CI coverage and docs.
 - 2026-11-23: initial spike. `of-bundler` gains an opt-in specifier
   alias option with unit + wire tests; PoC runner under
   `spike/config-sandbox/`; measured bundle/eval/convert parity against

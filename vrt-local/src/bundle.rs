@@ -101,6 +101,13 @@ fn embedded_path() -> Result<PathBuf, LocalError> {
     Ok(path)
 }
 
+/// Resolve the `of-bundler` helper (`$OF_BUNDLER`, embedded bytes,
+/// in-repo build, then co-installed binary). Also used by the config
+/// sandbox driver, which shells out to the same helper.
+pub fn bundler_path() -> Result<PathBuf, LocalError> {
+    find_bundler()
+}
+
 fn find_bundler() -> Result<PathBuf, LocalError> {
     if let Ok(p) = std::env::var("OF_BUNDLER") {
         if !p.is_empty() {

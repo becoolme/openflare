@@ -25,7 +25,7 @@ use snapshot_protocol::compute_desired::{
 };
 
 use crate::state::LocalState;
-use crate::worker_pkg::{assemble, gather_dir_for_env, DeployOverrides};
+use crate::worker_pkg::{assemble, gather_dir_for_env_preview_sandbox, DeployOverrides};
 use crate::LocalError;
 
 /// Synthetic ids for the validation snapshot — identifier-charset
@@ -59,7 +59,12 @@ pub fn check_worker(
     worker_dir: &Path,
     overrides: &DeployOverrides,
 ) -> Result<CheckReport, LocalError> {
-    let g = gather_dir_for_env(worker_dir, overrides.env_name.as_deref())?;
+    let g = gather_dir_for_env_preview_sandbox(
+        worker_dir,
+        overrides.env_name.as_deref(),
+        overrides.is_preview,
+        overrides.config_sandbox,
+    )?;
     let files = g.files.len();
     let pkg = assemble(g, overrides, CHECK_TENANT, &|_| None, None)?;
 

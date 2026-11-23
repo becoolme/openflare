@@ -54,8 +54,9 @@ mod preflight;
 pub mod preview;
 mod project_cfg;
 pub use project_cfg::{
-    load_worker_meta, load_worker_meta_for_env, load_worker_meta_for_env_preview, MetaSource,
-    WRANGLER_CANDIDATES,
+    load_cf_project_config, load_worker_meta, load_worker_meta_for_env,
+    load_worker_meta_for_env_preview, load_worker_meta_for_env_preview_sandbox, ConfigSandbox,
+    MetaSource, WRANGLER_CANDIDATES,
 };
 pub use worker_pkg::WorkerToml;
 pub mod serve;
@@ -435,10 +436,11 @@ impl VrtLocal {
             let pepper = keys::load_signing_seed(&self.root)?;
             // Same preview branch as the pack below — a name that only
             // exists in the preview branch must resolve consistently.
-            let (meta, _src) = crate::project_cfg::load_worker_meta_for_env_preview(
+            let (meta, _src) = crate::project_cfg::load_worker_meta_for_env_preview_sandbox(
                 worker_dir,
                 overrides.env_name.as_deref(),
                 overrides.is_preview,
+                overrides.config_sandbox,
             )?;
             let name = overrides.name.clone().unwrap_or(meta.name);
             let prior = st_probe

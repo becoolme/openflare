@@ -131,7 +131,7 @@ result nor has its output interpreted.
 type error even though the config itself may be TypeScript. Pre-build the
 worker to `.js`/`.mjs`, or point `worker.entrypoint` at a JS file.
 
-### Restricted child process — not a sandbox
+### Restricted child process (default) — not a sandbox
 
 The loader runs as a child of `of deploy` / `of dev` / `of doctor`
 with:
@@ -151,12 +151,31 @@ with:
 This is **not** a sandbox. A config file is arbitrary Node code: it can
 read the filesystem, open sockets, spawn processes and inherit the
 invoking user's privileges. Only run `cloudflare.config.*` from projects
-you trust, exactly as you would for `wrangler`/`cf`. A real sandbox
-(read-only root, no network, no child processes) is tracked as follow-up
-work; this page does not claim one. A PoC that evaluates the bundled
-config in a workerd dynamic worker and converts on the trusted side is
-documented in [config-sandbox-spike.md](config-sandbox-spike.md) —
-measured, not shipped.
+you trust, exactly as you would for `wrangler`/`cf`.
+
+### Worker sandbox (`--config-sandbox=worker`)
+
+Pass `--config-sandbox=worker` to evaluate the same config in a workerd
+dynamic worker instead: the bundled config gets no host filesystem, no
+outbound network and no inherited env beyond an explicit allowlist, and
+validation/`convertToWranglerConfig` stay on the trusted side. The
+resulting `RawConfig` and the wrangler normalization below are identical.
+
+```sh
+VRT_WORKERD_BIN=/path/to/workerd \
+  of deploy --root .vrt --config-sandbox=worker ./worker
+of check --config-sandbox=worker ./worker
+```
+
+`node` stays the default. The sandbox needs a workerd binary
+(`VRT_WORKERD_BIN`, then `OF_WORKERD_BIN`) and fails closed without one.
+One evaluation has a 5 s wall-clock deadline
+(`VRT_CF_CONFIG_SANDBOX_TIMEOUT_MS`, 100..30000 ms); on timeout the whole
+workerd process group is killed and the command exits with
+`VRT_CONFIG_LOADER_TIMEOUT`. The outer helper deadline
+(`VRT_CF_CONFIG_LOADER_TIMEOUT_MS`, 60 s default) still bounds bundling +
+startup. Full design, isolation results, semantic differences and the
+test matrix: [config-sandbox-spike.md](config-sandbox-spike.md).
 
 ### Failure mapping
 
@@ -167,6 +186,9 @@ measured, not shipped.
 | helper exceeded the deadline | `VRT_CONFIG_LOADER_TIMEOUT` |
 | helper printed invalid JSON or no `raw` object | `VRT_CONFIG_LOADER_FAILED` |
 | helper script or `VRT_CF_CONFIG_LOADER` target missing | `VRT_CONFIG_LOADER_FAILED` |
+| sandbox bundle/startup/evaluation/payload failure | `VRT_CONFIG_LOADER_FAILED` (message carries the phase) |
+| sandbox evaluation exceeded `VRT_CF_CONFIG_SANDBOX_TIMEOUT_MS` | `VRT_CONFIG_LOADER_TIMEOUT` |
+| sandbox missing workerd (`--config-sandbox=worker`) | `VRT_CONFIG_LOADER_FAILED` (install workerd or use `node`) |
 
 Nothing is silently ignored: a broken programmatic config fails the
 command. Zod issues are projected to `code`/`path`/`message` (capped at 20)
@@ -297,9 +319,11 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
 
 ## Changelog
 
-- 2026-11-23: spike only — link the `cloudflare.config.*` dynamic-worker
-  evaluation PoC ([config-sandbox-spike.md](config-sandbox-spike.md)).
-  No behavior change: the Node loader path above still evaluates configs.
+- 2026-11-23: `of deploy` / `of check` accept
+  `--config-sandbox=worker`, which evaluates the config in a workerd
+  dynamic worker (no host FS/network, 5 s wall-clock deadline) and keeps
+  validation/conversion on the trusted side; `node` remains the default.
+  See [config-sandbox-spike.md](config-sandbox-spike.md).
 - 2026-11-22: `cloudflare.config.ts` / `.js` (the `cf` CLI programmatic
   format) is now evaluated through Cloudflare's official
   `@cloudflare/config` loader in a restricted Node child process and then
