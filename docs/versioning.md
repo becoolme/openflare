@@ -606,9 +606,23 @@ write the active pointer.
   a domain without a token secret stays closed (404, `previewUrl: null`)
   even with a valid token; the active version's preview host is gated
   too.
+- Real-machine compose acceptance in `scripts/e2e-versioning.sh`: brings
+  up `deploy/standalone` with a pinned real workerd, enables
+  `[preview] domain` + `tokenSecretFile`, then drives one worker through
+  deploy v1 → preview v2 (production stays v1, the signed URL serves v2)
+  → promote v2 (production moves, the v2 URL follows) → rollback v1 (v2
+  archived, its preview host 404s) → `versions prune --dry-run` (state
+  hash and oplog unchanged) → real prune (only the aged preview is
+  removed; active and newest preview survive) → `versions share` (no
+  token and expired token are 403, the correct token is 200). The
+  script redacts bearer tokens in every diagnostic and tears the stack
+  down on failure.
 
 ## Changelog
 
+- 2026-11-23: real-machine compose acceptance for the version
+  lifecycle (`scripts/e2e-versioning.sh` plus its `node:test` guards).
+  No runtime behavior change.
 - 2026-11-22: preview access control. Signed, expiring preview tokens
   (HMAC bound to version + worker), mandatory by default; a
   `[preview] domain` without `tokenSecretFile` is closed; bootstrap

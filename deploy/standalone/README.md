@@ -74,6 +74,26 @@ asserts Host-header 200s, KV read/write, assets ETag/304 + SPA
 fallback, `of status`, and restart recovery — then `down -v`.
 Failures dump every service's logs.
 
+## Version lifecycle acceptance: `scripts/e2e-versioning.sh`
+
+The deploy-version lifecycle has its own real-machine gate. It uses the
+same compose stack and the same pinned workerd, enables
+`[preview] domain` + `tokenSecretFile` before `vrt-host` starts, and
+then drives one worker through deploy v1 → `--preview` v2 → `promote`
+v2 → `rollback` v1 → `versions prune` (dry run and real) →
+`versions share` (200 with a token, 403 without or after expiry):
+
+```sh
+WORKERD_SOURCE=file WORKERD_SHA256=$WORKERD_SHA256 \
+  scripts/e2e-versioning.sh
+```
+
+It builds/uses the stack itself and tears it down (`down -v`) on
+failure after dumping the version list, the active pointer, recorded
+HTTP statuses and the service logs. Preview URLs carry a bearer token,
+so every diagnostic is token-redacted. See
+[deploy versions](../../docs/versioning.md) for the rules it asserts.
+
 ## Smoke (stub runtime — no workerd)
 
 ```sh
