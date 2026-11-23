@@ -43,12 +43,15 @@ client input.
 
 ## Known differences from Cloudflare
 
-- **No Workflows-specific concurrency, retention, or subrequest
-  enforcement.** Cloudflare's account-level workflow concurrency quota,
-  instance retention window, and per-step subrequest budget are not
-  modelled here. The signed config carries only `limits.steps`; workerd's
-  worker-wide limits still apply, and workflow instance storage follows
-  the defining worker's Durable Object storage lifecycle.
+- **No Workflows-specific concurrency or subrequest enforcement.**
+  Cloudflare's account-level workflow concurrency quota and per-step
+  subrequest budget are not modelled here. The signed config carries only
+  `limits.steps`; workerd's worker-wide limits still apply.
+- **Fixed terminal-instance retention.** Completed, terminated and errored
+  instances are deleted seven days after reaching the terminal status
+  (`binding.vrt.worker.js` alarm). Per-Workflow `default_retention` and
+  per-instance `retention` are not wired yet, so the duration is not
+  configurable through the binding.
 - Deploy-time static gate: for same-worker classes, `class_name` must
   be a named export AND lexically `extends` a chain rooted at
   `WorkflowEntrypoint` (`vrt-local/src/wf_scan.rs`). Unresolvable shapes

@@ -34,8 +34,8 @@ fn vendored_workflows_files_match_sha256sums() {
     let sums = sums();
     assert_eq!(
         sums.len(),
-        3,
-        "SHA256SUMS covers exactly the three artifacts"
+        4,
+        "SHA256SUMS covers exactly the four artifacts"
     );
     for (name, sha) in &sums {
         let bytes =
@@ -49,7 +49,7 @@ fn vendored_workflows_files_match_sha256sums() {
     // And the crate's compiled-in copies are the same bytes.
     assert_eq!(
         vrt_config::workflows::engine_worker_sha256(),
-        sums["binding.worker.js"]
+        sums["binding.vrt.worker.js"]
     );
     assert_eq!(
         sha256_hex(vrt_config::workflows::WRAPPED_BINDING_JS),
@@ -64,6 +64,10 @@ fn vendored_engine_exports_expected_entrypoints() {
     assert!(
         src.contains("WorkflowBinding"),
         "engine bundle exports WorkflowBinding entrypoint"
+    );
+    assert!(
+        src.contains("VRT_RETENTION_AT") && src.contains("WORKFLOW_SUCCESS_RETENTION_MS"),
+        "VRT engine fork carries terminal retention cleanup"
     );
     let wrapped = std::str::from_utf8(vrt_config::workflows::WRAPPED_BINDING_JS).unwrap();
     assert!(

@@ -1,9 +1,11 @@
 # Vendored: Cloudflare Workflows engine (miniflare build)
 
 These artifacts are the compiled single-file bundles miniflare ships
-for its local Workflows support. VRT reuses them verbatim — the engine
-runs as a Durable Object inside the tenant workerd, and the wrapped
-binding presents the user-facing `env.<workflowBinding>` API.
+for its local Workflows support. The engine runs as a Durable Object
+inside the tenant workerd, and the wrapped binding presents the
+user-facing `env.<workflowBinding>` API. `binding.worker.js` stays as
+the upstream+W1/W2 reference; the emitted engine is the documented
+`binding.vrt.worker.js` fork below.
 
 W1-r2 added `zod.worker.js` (miniflare `dist/src/workers/shared/`):
 `binding.worker.js` imports `miniflare:zod` at module scope (its zod
@@ -29,7 +31,10 @@ the same slot miniflare uses (`index.js` `#assembleConfig`).
 | VRT pinned workerd | `workerd@1.20261103.1` (`deploy/standalone/workerd`, B8) — the vendored bundle is older than the runtime it runs on; the API surface it uses (`ctx.storage.sql`, alarms, `WorkflowEntrypoint`, service bindings) is stable across the pinned versions. Verified by `vrt-host/tests/workerd_entry_smoke.rs::real_workerd_workflow`. |
 
 - `binding.worker.js` exports `Engine` (the DO class) and
-  `WorkflowBinding` (the service entrypoint the wrapped binding calls).
+  `WorkflowBinding` (the service entrypoint the wrapped binding calls);
+  it remains the byte-pinned upstream+W1/W2 reference.
+- `binding.vrt.worker.js` is the VRT engine fork (same exports) emitted
+  as `workflows.mjs`; it adds terminal-instance retention cleanup.
 - `wrapped-binding.worker.js` exports `makeBinding` (the
   `WrappedBinding` factory; produces the `env.WF`-shaped API).
 - `zod.worker.js` exports `z` (the zod namespace the engine imports
@@ -39,11 +44,31 @@ the same slot miniflare uses (`index.js` `#assembleConfig`).
 
 ## Integrity
 
-`SHA256SUMS` pins the exact bytes; `vrt-config` tests re-hash the files
-and fail closed on any drift. Never edit the vendored files in place —
-upgrade them as a unit (see below). The single sanctioned exception is
-the W1-r5 / W2 P0-0 patches below, which are carried as documented
-local changes.
+`SHA256SUMS` pins the exact bytes of all four artifacts; `vrt-config`
+tests re-hash the files and fail closed on any drift. Never edit a
+vendored file in place — upgrade it as a unit (see below). The
+sanctioned local changes are the W1-r5 / W2 P0-0 patches in
+`binding.worker.js` and the VRT retention fork in
+`binding.vrt.worker.js`.
+
+## VRT fork: terminal-instance retention (binding.vrt.worker.js)
+
+Cloudflare retains completed/errored instance state for a bounded period.
+This engine has no such cleanup. The fork adds a per-instance retention
+deadline without changing the upstream reference file:
+
+- `Engine.setStatus` stores `VRT_RETENTION_AT` on the transition to
+  `Complete` / `Terminated` / `Errored` and arms the actor alarm; the
+  delay is `WORKFLOW_SUCCESS_RETENTION_MS` /
+  `WORKFLOW_ERROR_RETENTION_MS`, defaulting to seven days.
+- `Engine.alarm()` deletes all instance storage once that deadline is due;
+  otherwise it runs the existing priority-queue resume and re-arms the
+  retention deadline.
+- `Queued` / `Running` clears the marker, so a restarted instance cannot
+  inherit a stale cleanup deadline.
+
+Per-Workflow and per-instance retention configuration is not yet wired;
+the fork currently applies the seven-day default to every instance.
 
 ## Local patch: W1-r5 durable resume (binding.worker.js only)
 
