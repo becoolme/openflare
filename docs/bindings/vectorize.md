@@ -156,12 +156,13 @@ enables the backend; absent → ops fail closed (`code: 3100`).
 
 ## Known differences from Cloudflare
 
-- **Index deletion does not purge provider data.** The control plane
-  deletes the index metadata only; the runtime has no Vectorize purge op,
-  so the local `<tenant>/<indexId>.vec.db` can remain on disk. A
-  re-created index always gets a new per-incarnation `indexId`, so stale
-  vectors are never rebound to the new index. Reclaiming the file
-  requires an explicit runtime/storage purge.
+- **Index deletion requires an explicit storage purge.** A cell that
+  configures `[storage_purge.vectorize] dir` (the same directory as
+  `[vectorize] dir`) claims `vectorizePurge`; the control plane then
+  queues a bounded `STORAGE_PURGE {storage:"vectorize"}` cell op before
+  deleting metadata. A cell without that config refuses the delete
+  instead of silently orphaning data. Re-created indexes always get a
+  new per-incarnation `indexId`, so stale vectors are never rebound.
 - **Exact KNN, not ANN.** Recall is 1.0 — a strict superset of the
   recall Cloudflare's approximate index returns. Result *order* and
   score values follow CF's metric semantics exactly.

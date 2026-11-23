@@ -26,6 +26,7 @@
 //!   unconfigured backend, or backend error → FAILED with a bounded
 //!   fixed-phrase error (never a fake DONE, never a panic).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,6 +61,10 @@ pub struct StoragePurgeConfig {
     /// standalone data root (`dir` shared with `[r2]`).
     #[serde(default)]
     pub r2: Option<vrt_provider::config::FsR2Config>,
+    /// Filesystem Vectorize backend (`[storage_purge.vectorize]`) — the
+    /// provider's index store root (`dir` shared with `[vectorize]`).
+    #[serde(default)]
+    pub vectorize: Option<vrt_provider::config::FsVectorizeConfig>,
     /// Entries/objects bound per purge pass (default 2000, ≤10_000).
     /// Continuation is control-plane redispatch, not an in-op loop.
     #[serde(default = "default_max_items_per_op")]
@@ -234,6 +239,7 @@ impl vrt_provider::r2::R2DataBackend for R2Backend {
 pub struct StoragePurgeExecutor {
     kv: Option<std::sync::Arc<KvBackend>>,
     r2: Option<std::sync::Arc<R2Backend>>,
+    vectorize: Option<PathBuf>,
     max_items: usize,
     timeout: Duration,
 }
@@ -296,12 +302,21 @@ impl StoragePurgeExecutor {
                     })?;
             r2 = Some(std::sync::Arc::new(R2Backend::Fs(provider)));
         }
-        if kv.is_none() && r2.is_none() {
+        let vectorize = match &cfg.vectorize {
+            Some(v) => {
+                std::fs::create_dir_all(&v.dir)
+                    .map_err(|_| "storage_purge.vectorize dir is not usable".to_string())?;
+                Some(v.dir.clone())
+            }
+            None => None,
+        };
+        if kv.is_none() && r2.is_none() && vectorize.is_none() {
             return Err("storage_purge configured with no usable backend".to_string());
         }
         Ok(Self {
             kv,
             r2,
+            vectorize,
             max_items: cfg.max_items_per_op.clamp(1, MAX_ITEMS_CEILING),
             timeout,
         })
@@ -318,6 +333,11 @@ impl StoragePurgeExecutor {
     /// capability claim derives from this.
     pub fn has_r2(&self) -> bool {
         self.r2.is_some()
+    }
+
+    /// True when a Vectorize index store was wired for purge.
+    pub fn has_vectorize(&self) -> bool {
+        self.vectorize.is_some()
     }
 
     /// Shared R2 backend for the data cell-ops executor (`None` → kinds
@@ -380,6 +400,22 @@ impl StoragePurgeExecutor {
                     None => return failed(op, "r2 purge backend unconfigured"),
                 }
             }
+            "vectorize" => {
+                if !vrt_provider::purge::valid_purge_tenant(&payload.tenant_id)
+                    || !vrt_provider::purge::valid_purge_target_id(&payload.storage_id)
+                {
+                    return failed(op, "invalid vectorize identity");
+                }
+                match self.vectorize.as_deref() {
+                    Some(root) => vrt_provider::vectorize::purge_index_files(
+                        root,
+                        &payload.tenant_id,
+                        &payload.storage_id,
+                        self.max_items,
+                    ),
+                    None => return failed(op, "vectorize purge backend unconfigured"),
+                }
+            }
             _ => return failed(op, "unknown storage kind"),
         };
         match outcome {
@@ -435,6 +471,7 @@ mod tests {
             r2: Some(std::sync::Arc::new(R2Backend::Fs(
                 vrt_provider::r2::fs::FsR2Provider::new(root.join("r2"), 1024).unwrap(),
             ))),
+            vectorize: Some(root.join("vectorize")),
             max_items: 3,
             timeout: Duration::from_secs(5),
         }
@@ -465,6 +502,40 @@ mod tests {
         let ack = exec
             .execute(&op(serde_json::json!({
                 "storage": "s3", "storageId": "vrtkv_x", "tenantId": "t"
+            })))
+            .await;
+        assert_eq!(ack.status, "FAILED");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    #[tokio::test]
+    async fn fs_vectorize_purge_is_scoped_and_complete() {
+        let dir = std::env::temp_dir().join(format!("sp-vx-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let exec = fs_executor(&dir);
+        let indexes = dir.join("vectorize").join("t1");
+        std::fs::create_dir_all(&indexes).unwrap();
+        let id = "abcdefghijklmnopqrstuvwxyz";
+        for suffix in [".vec.db", ".vec.db-wal", ".vec.db-shm"] {
+            std::fs::write(indexes.join(format!("{id}{suffix}")), b"x").unwrap();
+        }
+        let keep = indexes.join("keep.vec.db");
+        std::fs::write(&keep, b"x").unwrap();
+
+        let ack = exec
+            .execute(&op(serde_json::json!({
+                "storage": "vectorize", "storageId": id, "tenantId": "t1"
+            })))
+            .await;
+        assert_eq!(ack.status, "DONE");
+        assert_eq!(ack.result.as_ref().unwrap()["complete"], true);
+        assert_eq!(ack.result.as_ref().unwrap()["deletedKeys"], 3);
+        assert!(keep.exists());
+
+        let ack = exec
+            .execute(&op(serde_json::json!({
+                "storage": "vectorize", "storageId": "../x", "tenantId": "t1"
             })))
             .await;
         assert_eq!(ack.status, "FAILED");
@@ -548,6 +619,7 @@ mod tests {
             s3: None,
             kv: None,
             r2: None,
+            vectorize: None,
             max_items_per_op: 100,
             timeout_secs: 1,
         };

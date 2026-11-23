@@ -113,6 +113,11 @@ pub struct AckCapabilities {
     /// op is never queued for this cell (fail closed).
     #[serde(default)]
     pub storage_purge: bool,
+    /// `[storage_purge.vectorize]` wired — the control plane may enqueue
+    /// `STORAGE_PURGE{storage:"vectorize"}` ops. Omitted while false for
+    /// rolling upgrades.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub vectorize_purge: bool,
     /// KV backend wired on this cell (`[storage_purge]` carries the KV
     /// backend config mirroring the provider's `[kv]`/`[kvrocks]`). The
     /// control plane rejects KV bindings (409 VRT_CAPABILITY_UNSUPPORTED)
