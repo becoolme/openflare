@@ -280,8 +280,8 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-ratelimit.js", esModule = embed "sys/f461934cce694d59dc08783881e04a1b9f61e52a1c2a5db50999294849f7e244"),
-        (name = "facade/ratelimit-core.js", esModule = embed "sys/b320e26f1354a5f92d12abee57283c43693274e4df618f92e8823f7f2812cd7f"),
+        (name = "facade/facade-ratelimit.js", esModule = embed "sys/53c094769f9a3e67e86a2ca4b72399ee05c86a4bcdb1ab691262f1b71457fd7e"),
+        (name = "facade/ratelimit-core.js", esModule = embed "sys/3553c417246ebca24419c689ac0357e133c1ce15512a0205ae678cbe26c1bb6e"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
         (name = "third_party/open-compute/facade/loader/python-snapshot.js", esModule = embed "sys/97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"),
         (name = "third_party/open-compute/facade/loader/shared.js", esModule = embed "sys/ad6ec6871acd01776f6fe414510e0126266f15f95480ce1172c3fa34babfef6e"),
