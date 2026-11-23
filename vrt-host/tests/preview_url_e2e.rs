@@ -103,8 +103,13 @@ fn worker_dir(root: &Path, name: &str, version: u8) -> PathBuf {
 fn write_host_config(root: &Path, domain: Option<&str>) {
     let dir = root.join("config");
     std::fs::create_dir_all(&dir).unwrap();
+    let key = root.join("keys/preview-token.secret");
     let body = match domain {
-        Some(d) => format!("cellId = \"local\"\n\n[preview]\ndomain = \"{d}\"\n"),
+        Some(d) => format!(
+            "cellId = \"local\"\n\n[preview]\ndomain = \"{d}\"\n\
+             tokenSecretFile = \"{}\"\n",
+            key.display()
+        ),
         None => "cellId = \"local\"\n".to_string(),
     };
     std::fs::write(dir.join("vrt-host.toml"), body).unwrap();
@@ -125,6 +130,20 @@ fn host_preview_domain(root: &Path) -> Option<String> {
     cfg.domain()
 }
 
+/// The host-side verifier, resolved through the real typed config.
+fn host_preview_key(root: &Path) -> Option<snapshot_protocol::preview_token::PreviewTokenKey> {
+    let text = std::fs::read_to_string(root.join("config/vrt-host.toml")).unwrap();
+    let doc: toml::Value = toml::from_str(&text).unwrap();
+    let cfg: vrt_host::config::PreviewConfig = doc
+        .get("preview")
+        .cloned()
+        .map(|v| v.try_into().unwrap())
+        .unwrap_or_default();
+    cfg.routing()
+        .expect("host preview routing resolves")
+        .map(|r| r.key)
+}
+
 struct Rig {
     root: PathBuf,
     worker: String,
@@ -135,6 +154,7 @@ struct Rig {
     status: vrt_host::status::HostStatus,
     ingress: Arc<IngressState>,
     preview_domain: Option<String>,
+    preview_key: Option<snapshot_protocol::preview_token::PreviewTokenKey>,
     _dir: PathBuf,
 }
 
@@ -217,6 +237,14 @@ impl Rig {
             .worker_id
             .clone()
     }
+
+    /// Request path carrying a valid token for `version_id`.
+    fn preview_path(&self, version_id: &str) -> String {
+        let key = self.preview_key.as_ref().expect("preview key configured");
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        let token = key.mint(version_id, &self.worker_id(), now + 600);
+        format!("/?__vrt_preview_token={token}")
+    }
 }
 
 async fn boot(preview_domain: Option<&str>, worker: &str) -> (Rig, axum::Router, String) {
@@ -242,6 +270,7 @@ async fn boot(preview_domain: Option<&str>, worker: &str) -> (Rig, axum::Router,
     .unwrap();
     write_host_config(&root, preview_domain);
     let preview_domain = host_preview_domain(&root);
+    let preview_key = host_preview_key(&root);
 
     let (router, _api) = vrt_local::mgmt::router(root.clone()).unwrap();
     let token = String::from_utf8(std::fs::read(root.join("mgmt/token")).unwrap()).unwrap();
@@ -282,6 +311,7 @@ async fn boot(preview_domain: Option<&str>, worker: &str) -> (Rig, axum::Router,
         Duration::from_millis(500),
         1024,
     );
+    ingress.set_preview_auth(preview_key.clone());
     let rig = Rig {
         root,
         worker: worker.to_string(),
@@ -292,6 +322,7 @@ async fn boot(preview_domain: Option<&str>, worker: &str) -> (Rig, axum::Router,
         status,
         ingress,
         preview_domain,
+        preview_key,
         _dir: base.clone(),
     };
     (rig, router, token)
@@ -372,7 +403,14 @@ async fn preview_url_serves_the_version_without_touching_production() {
         .unwrap_or_else(|| panic!("previewUrl missing: {body}"))
         .to_string();
     let preview_host = format!("{v2_id}--{}.{PREVIEW_DOMAIN}", rig.worker);
-    assert_eq!(preview_url, format!("https://{preview_host}/"));
+    assert!(
+        preview_url.starts_with(&format!("https://{preview_host}/?__vrt_preview_token=v1.")),
+        "a preview URL is signed and expiring: {preview_url}"
+    );
+    assert!(
+        v2_json["previewUrlExpiresAtUnixS"].as_u64().is_some(),
+        "the URL reports its token expiry: {body}"
+    );
     // The active pointer did not move.
     assert_eq!(rig.active_version().as_deref(), Some(v1_id.as_str()));
     let preview_instance = vrt_local::preview_instance_id(&wid, &v2_id);
@@ -384,7 +422,13 @@ async fn preview_url_serves_the_version_without_touching_production() {
 
     // ---- preview host → the preview instance, labelled ----
 
-    let (st, headers, _) = http_get(ig.addr, &preview_host, "/", &[]).await;
+    let (st, headers, _) = http_get(
+        ig.addr,
+        &preview_host,
+        &rig.preview_path(&v2_id),
+        &[],
+    )
+    .await;
     assert_eq!(st, 200, "preview host must serve the preview version");
     assert_eq!(
         header(&headers, "x-stub-worker"),
@@ -430,7 +474,7 @@ async fn preview_url_serves_the_version_without_touching_production() {
     let (st, headers, _) = http_get(
         ig.addr,
         &format!("{v1_id}--{}.{PREVIEW_DOMAIN}", rig.worker),
-        "/",
+        &rig.preview_path(&v1_id),
         &[],
     )
     .await;
@@ -463,9 +507,13 @@ async fn preview_url_serves_the_version_without_touching_production() {
             .find(|v| v["versionId"] == id)
             .unwrap_or_else(|| panic!("version {id} missing"))
     };
-    assert_eq!(
-        row(&v2_id)["previewUrl"].as_str(),
-        Some(format!("https://{preview_host}/").as_str())
+    assert!(
+        row(&v2_id)["previewUrl"]
+            .as_str()
+            .is_some_and(|u| u.starts_with(&format!(
+                "https://{preview_host}/?__vrt_preview_token=v1."
+            ))),
+        "versions list carries a signed preview URL"
     );
     assert!(row(&v1_id)["previewUrl"].as_str().is_some(), "active");
     assert_eq!(row(&v2_id)["status"], "preview");
@@ -516,7 +564,13 @@ async fn preview_url_serves_the_version_without_touching_production() {
         remaining_previews, 0,
         "an active version is not a preview instance"
     );
-    let (st, headers, _) = http_get(ig.addr, &preview_host, "/", &[]).await;
+    let (st, headers, _) = http_get(
+        ig.addr,
+        &preview_host,
+        &rig.preview_path(&v2_id),
+        &[],
+    )
+    .await;
     assert_eq!(st, 200);
     assert_eq!(
         header(&headers, "x-vrt-preview-version"),

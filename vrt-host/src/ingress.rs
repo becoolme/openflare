@@ -22,7 +22,8 @@
 //! Traefik / tenant-gateway integration and its exact contract are
 //! future work (documented in `workers-runtime-host.md`).
 
-use crate::route::{normalize_host, RouteTable};
+use crate::route::{normalize_host, PreviewBinding, RouteTable};
+use snapshot_protocol::preview_token;
 use crate::supervisor::{InFlightGuard, TenantRegistry};
 use arc_swap::ArcSwap;
 use axum::body::Body;
@@ -611,6 +612,11 @@ pub struct IngressState {
     /// route table's single-worker catch-all target. Production
     /// configs never set it — `RouteTable::lookup` stays exact-match.
     dev_catch_all: Arc<AtomicBool>,
+    /// PREVIEW ACCESS: HMAC key for signed preview tokens, resolved once
+    /// from `[preview] tokenSecretFile`. `None` means preview routing is
+    /// off; if a preview route still exists (a bug), every request 403s
+    /// rather than serving anonymously.
+    preview_auth: std::sync::OnceLock<preview_token::PreviewTokenKey>,
 }
 
 impl IngressState {
@@ -647,7 +653,16 @@ impl IngressState {
             ws_max_per_tenant: WS_DEFAULT_MAX_PER_TENANT,
             logs: std::sync::OnceLock::new(),
             dev_catch_all: Arc::new(AtomicBool::new(false)),
+            preview_auth: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attach the preview-token verifier (once; later calls are ignored).
+    /// `None` keeps preview access closed.
+    pub fn set_preview_auth(&self, key: Option<preview_token::PreviewTokenKey>) {
+        if let Some(key) = key {
+            let _ = self.preview_auth.set(key);
+        }
     }
 
     /// Attach the dev-mode catch-all switch (once; default off).
@@ -709,6 +724,7 @@ impl IngressState {
                 None => std::sync::OnceLock::new(),
             },
             dev_catch_all: self.dev_catch_all.clone(),
+            preview_auth: copy_once_lock(&self.preview_auth),
         })
     }
 
@@ -744,6 +760,7 @@ impl IngressState {
                 None => std::sync::OnceLock::new(),
             },
             dev_catch_all: self.dev_catch_all.clone(),
+            preview_auth: copy_once_lock(&self.preview_auth),
         })
     }
 
@@ -779,6 +796,7 @@ impl IngressState {
                 None => std::sync::OnceLock::new(),
             },
             dev_catch_all: self.dev_catch_all.clone(),
+            preview_auth: copy_once_lock(&self.preview_auth),
         })
     }
 
@@ -815,6 +833,7 @@ impl IngressState {
                 None => std::sync::OnceLock::new(),
             },
             dev_catch_all: self.dev_catch_all.clone(),
+            preview_auth: copy_once_lock(&self.preview_auth),
         })
     }
 
@@ -857,6 +876,7 @@ impl IngressState {
                 None => std::sync::OnceLock::new(),
             },
             dev_catch_all: self.dev_catch_all.clone(),
+            preview_auth: copy_once_lock(&self.preview_auth),
         })
     }
 
@@ -864,6 +884,17 @@ impl IngressState {
     pub fn set_routes(&self, table: RouteTable) {
         self.routes.store(Arc::new(table));
     }
+}
+
+/// Copy a set-once value into a rebuilt [`IngressState`] (the
+/// `with_*` builders construct a new struct, so every optional handle
+/// must be carried over explicitly).
+fn copy_once_lock<T: Clone>(src: &std::sync::OnceLock<T>) -> std::sync::OnceLock<T> {
+    let out = std::sync::OnceLock::new();
+    if let Some(value) = src.get() {
+        let _ = out.set(value.clone());
+    }
+    out
 }
 
 /// Typed ingress failure → status + machine-readable code.
@@ -890,6 +921,11 @@ pub enum IngressError {
     /// Scale-to-zero: host wake capacity exhausted.
     #[error("wake_capacity")]
     WakeCapacity,
+    /// Preview request without a valid token (403) — a hard stop, never a
+    /// fallback to the production instance. The payload is a stable
+    /// token-error code (`preview_token_missing|expired|invalid|...`).
+    #[error("preview_forbidden")]
+    PreviewForbidden(&'static str),
     /// Worker socket missing on the live generation.
     #[error("worker_unavailable")]
     WorkerUnavailable,
@@ -932,6 +968,7 @@ impl IngressError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "tenant wake capacity exhausted",
             ),
+            Self::PreviewForbidden(reason) => (StatusCode::FORBIDDEN, *reason),
             Self::WorkerUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "worker unavailable on this generation",
@@ -953,7 +990,10 @@ impl IngressError {
     pub fn platform_code(&self) -> Option<crate::logs::PlatformCode> {
         use crate::logs::PlatformCode as C;
         match self {
-            Self::BadHost | Self::UnknownHost | Self::PayloadTooLarge => None,
+            Self::BadHost
+            | Self::UnknownHost
+            | Self::PayloadTooLarge
+            | Self::PreviewForbidden(_) => None,
             Self::TenantUnavailable(_) => Some(C::TenantUnavailable),
             Self::CircuitOpen => Some(C::CircuitOpen),
             Self::WakeTimeout => Some(C::WakeTimeout),
@@ -981,6 +1021,7 @@ impl IngressError {
             Self::WakeCapacity => Some("wake_capacity"),
             Self::WsCapacity => Some("ws_capacity"),
             Self::PayloadTooLarge => Some("payload_too_large"),
+            Self::PreviewForbidden(_) => Some("preview_forbidden"),
             _ => Some("error"),
         }
     }
@@ -1055,10 +1096,94 @@ async fn proxy(
     }
 }
 
+/// Validate the signed preview token for `binding` and strip it from the
+/// request before it reaches the worker.
+///
+/// The token can arrive in the query string (a shareable link) or in the
+/// host-scoped bootstrap cookie. Either way it is removed from the
+/// forwarded request: preview credentials are host-internal. Returns the
+/// `Set-Cookie` value to add when the token came from the query string,
+/// so a browser can load the page's subresources without re-attaching the
+/// query parameter.
+fn authorize_preview(
+    state: &IngressState,
+    req: &mut Request,
+    binding: &PreviewBinding,
+) -> Result<Option<String>, IngressError> {
+    let key = state
+        .preview_auth
+        .get()
+        .ok_or(IngressError::PreviewForbidden("preview_auth_unconfigured"))?;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+
+    // 1. Query token (and remove the parameter unconditionally: a
+    //    malformed/duplicate token must not reach the worker either).
+    let original_query = req.uri().query().unwrap_or_default().to_string();
+    let (query_token, remaining_query) = preview_token::take_from_query(&original_query);
+    if remaining_query != original_query {
+        rewrite_query(req.uri_mut(), &remaining_query)?;
+    }
+
+    // 2. Bootstrap cookie (read, then strip from the forwarded headers).
+    let raw_cookie = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let cookie_token = raw_cookie
+        .as_deref()
+        .and_then(preview_token::take_from_cookie);
+    if let Some(raw) = raw_cookie {
+        match preview_token::strip_cookie(&raw) {
+            Some(rest) if rest == raw => {} // no credential in this header
+            Some(rest) => {
+                let value = HeaderValue::from_str(&rest).map_err(|_| IngressError::Internal)?;
+                req.headers_mut().insert(header::COOKIE, value);
+            }
+            None => {
+                req.headers_mut().remove(header::COOKIE);
+            }
+        }
+    }
+
+    let (token, from_query) = match (query_token, cookie_token) {
+        (Some(token), _) => (token, true),
+        (None, Some(token)) => (token, false),
+        (None, None) => {
+            return Err(IngressError::PreviewForbidden("preview_token_missing"));
+        }
+    };
+    key.verify(&binding.version_id, &binding.worker_id, &token, now)
+        .map_err(|e| IngressError::PreviewForbidden(e.code()))?;
+    Ok(from_query.then(|| preview_token::bootstrap_cookie(&token, now)))
+}
+
+/// Replace a request URI's query string, preserving the path.
+fn rewrite_query(uri: &mut axum::http::Uri, query: &str) -> Result<(), IngressError> {
+    let mut parts = uri.clone().into_parts();
+    let path = parts
+        .path_and_query
+        .as_ref()
+        .map(|pq| pq.path())
+        .unwrap_or("/");
+    let path_and_query = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
+    parts.path_and_query = Some(
+        path_and_query
+            .parse()
+            .map_err(|_| IngressError::Internal)?,
+    );
+    *uri = axum::http::Uri::from_parts(parts).map_err(|_| IngressError::Internal)?;
+    Ok(())
+}
+
 async fn proxy_inner(
     state: Arc<IngressState>,
     peer: SocketAddr,
-    req: Request,
+    mut req: Request,
 ) -> Result<Response, IngressError> {
     if state
         .panic_once
@@ -1090,6 +1215,17 @@ async fn proxy_inner(
         })
         .ok_or(IngressError::UnknownHost)?;
 
+    // PREVIEW ACCESS: a preview hostname is authenticated BEFORE any
+    // tenant work. Missing/expired/mismatched tokens are a hard 403 —
+    // there is no anonymous mode and no fallback to the production
+    // instance. The token is accepted from the query string (a shareable
+    // link) or from the host-scoped bootstrap cookie, and is stripped
+    // from the forwarded request either way.
+    let preview_set_cookie = match &target.preview {
+        Some(binding) => authorize_preview(&state, &mut req, binding)?,
+        None => None,
+    };
+
     // B12: request accounting starts once routing resolves to a
     // concrete platform worker_id — pre-route failures (bad/unknown
     // host) have no worker label and are not worker metrics.
@@ -1101,8 +1237,8 @@ async fn proxy_inner(
             // (or the app itself) can never mistake preview output for
             // production. Worker-supplied `x-vrt-*` headers were scrubbed
             // upstream, so these values are host-authored.
-            if let Some(version) = &target.preview {
-                if let Ok(value) = HeaderValue::from_str(version) {
+            if let Some(binding) = &target.preview {
+                if let Ok(value) = HeaderValue::from_str(&binding.version_id) {
                     r.headers_mut().insert(
                         axum::http::HeaderName::from_static("x-vrt-preview-version"),
                         value,
@@ -1112,6 +1248,25 @@ async fn proxy_inner(
                     axum::http::HeaderName::from_static("x-vrt-preview"),
                     HeaderValue::from_static("1"),
                 );
+                // The preview URL carries a bearer token in its query
+                // string: never leak it to third parties through the
+                // Referer header, and keep tokenized preview URLs out of
+                // search indexes.
+                r.headers_mut().insert(
+                    axum::http::HeaderName::from_static("referrer-policy"),
+                    HeaderValue::from_static("strict-origin-when-cross-origin"),
+                );
+                r.headers_mut().insert(
+                    axum::http::HeaderName::from_static("x-robots-tag"),
+                    HeaderValue::from_static("noindex, nofollow"),
+                );
+                // Bootstrap the host-scoped cookie so a browser can load
+                // subresources without re-attaching the query token.
+                if let Some(cookie) = preview_set_cookie {
+                    if let Ok(value) = HeaderValue::from_str(&cookie) {
+                        r.headers_mut().append(header::SET_COOKIE, value);
+                    }
+                }
             }
             Ok(r)
         }
@@ -1924,8 +2079,8 @@ fn scrubbed_headers(
     // writes these (inbound `x-vrt-*` was stripped above), so a worker
     // cannot forge preview status on a production route, and a preview
     // can branch its own side effects without parsing its Host header.
-    if let Some(version) = &target.preview {
-        if let Ok(value) = HeaderValue::from_str(version) {
+    if let Some(binding) = &target.preview {
+        if let Ok(value) = HeaderValue::from_str(&binding.version_id) {
             out.insert(
                 axum::http::HeaderName::from_static("x-vrt-preview-version"),
                 value,

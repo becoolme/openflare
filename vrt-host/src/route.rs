@@ -23,12 +23,21 @@ pub struct RouteTarget {
     /// per-worker `facade-images` socket). Without the binding the path
     /// falls through to tenant code untouched.
     pub images: bool,
-    /// PREVIEW: version id this route serves AS A PREVIEW (either a
+    /// PREVIEW: the version this route serves AS A PREVIEW (either a
     /// preview instance or the active version reached through a preview
     /// hostname). `None` for production hostnames. The ingress stamps
     /// `x-vrt-preview-version` on every such response so a preview can
-    /// never be mistaken for production traffic.
-    pub preview: Option<String>,
+    /// never be mistaken for production traffic, and requires a signed
+    /// token bound to this `(version_id, worker_id)` pair.
+    pub preview: Option<PreviewBinding>,
+}
+
+/// What a preview route is authorized to serve. `worker_id` is the
+/// PRODUCTION worker (the token audience), not the preview instance id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewBinding {
+    pub version_id: String,
+    pub worker_id: String,
 }
 
 /// Immutable host→target map. Swapped atomically (`ArcSwap`) on each
@@ -146,21 +155,26 @@ impl RouteTable {
         if let Some(domain) = preview_domain.filter(|d| !d.is_empty()) {
             for tenant in &desired.tenants {
                 for worker in &tenant.workers {
-                    let version_id = match &worker.preview {
-                        Some(preview) => &preview.version_id,
-                        None => &worker.active_version.version_id,
-                    };
                     // A preview instance is named after the PRODUCTION
                     // worker it previews (`preview.workerId`); the
-                    // active version is named after its own worker.
-                    let name = match &worker.preview {
-                        Some(preview) => tenant
-                            .workers
-                            .iter()
-                            .find(|w| w.worker_id == preview.worker_id)
-                            .map(|w| w.name.as_str())
-                            .unwrap_or(worker.name.as_str()),
-                        None => worker.name.as_str(),
+                    // active version is named after its own worker. The
+                    // token audience is always the production worker id.
+                    let (version_id, owner_id, name) = match &worker.preview {
+                        Some(preview) => (
+                            preview.version_id.clone(),
+                            preview.worker_id.clone(),
+                            tenant
+                                .workers
+                                .iter()
+                                .find(|w| w.worker_id == preview.worker_id)
+                                .map(|w| w.name.as_str())
+                                .unwrap_or(worker.name.as_str()),
+                        ),
+                        None => (
+                            worker.active_version.version_id.clone(),
+                            worker.worker_id.clone(),
+                            worker.name.as_str(),
+                        ),
                     };
                     let host = format!("{}--{}.{}", version_id, name, domain).to_ascii_lowercase();
                     if map.contains_key(&host) {
@@ -169,7 +183,10 @@ impl RouteTable {
                         continue;
                     }
                     let mut target = Self::target_for(tenant, worker);
-                    target.preview = Some(version_id.clone());
+                    target.preview = Some(PreviewBinding {
+                        version_id,
+                        worker_id: owner_id,
+                    });
                     map.insert(host, target);
                 }
             }
@@ -398,7 +415,15 @@ mod tests {
             .lookup("vrt_preview--edge-api.preview.example.com")
             .expect("preview route");
         assert_eq!(pv.worker_id, "w1.pv01234567");
-        assert_eq!(pv.preview.as_deref(), Some("vrt_preview"));
+        assert_eq!(
+            pv.preview.as_ref().map(|p| p.version_id.as_str()),
+            Some("vrt_preview")
+        );
+        assert_eq!(
+            pv.preview.as_ref().map(|p| p.worker_id.as_str()),
+            Some("w1"),
+            "the token audience is the production worker id"
+        );
         let prod = table.lookup("api.example.com").expect("prod route");
         assert_eq!(prod.worker_id, "w1");
         assert!(prod.preview.is_none());
@@ -408,7 +433,10 @@ mod tests {
             .lookup("vrt_active--edge-api.preview.example.com")
             .expect("active preview route");
         assert_eq!(active.worker_id, "w1");
-        assert_eq!(active.preview.as_deref(), Some("vrt_active"));
+        assert_eq!(
+            active.preview.as_ref().map(|p| p.version_id.as_str()),
+            Some("vrt_active")
+        );
         // A version that is neither preview nor active has no route.
         assert!(table
             .lookup("vrt_archived--edge-api.preview.example.com")

@@ -156,6 +156,22 @@ pub struct PreviewConfig {
     /// serving is off (the default).
     #[serde(default)]
     pub domain: Option<String>,
+    /// Absolute path of the preview-token HMAC key (`0600`), written by
+    /// `of init` as `<root>/keys/preview-token.secret`. Preview access
+    /// tokens are MANDATORY: with a domain but no token secret the
+    /// preview domain stays closed (every preview host is a 404), and
+    /// production routing is unchanged.
+    #[serde(default)]
+    pub token_secret_file: Option<PathBuf>,
+}
+
+/// Resolved preview serving config: a domain AND a verification key.
+/// Constructed only when both are configured — there is no
+/// "anonymous previews" mode.
+#[derive(Clone)]
+pub struct PreviewRouting {
+    pub domain: String,
+    pub key: snapshot_protocol::preview_token::PreviewTokenKey,
 }
 
 /// Maximum preview-domain length (DNS hostname bound).
@@ -170,6 +186,45 @@ impl PreviewConfig {
     pub fn domain(&self) -> Option<String> {
         let raw = self.domain.as_deref()?.trim().to_ascii_lowercase();
         (!raw.is_empty()).then_some(raw)
+    }
+
+    /// Resolve preview serving: `None` = preview domain closed.
+    ///
+    /// A configured domain without a token secret is CLOSED, not open
+    /// (the secure default). A configured-but-unreadable/malformed
+    /// secret fails startup: silently disabling access control is worse
+    /// than refusing to boot.
+    pub fn routing(&self) -> Result<Option<PreviewRouting>, ConfigError> {
+        let Some(domain) = self.domain() else {
+            return Ok(None);
+        };
+        let Some(path) = self.token_secret_file.as_ref() else {
+            tracing::warn!(
+                "[preview] domain is set without tokenSecretFile — preview URLs stay disabled"
+            );
+            return Ok(None);
+        };
+        if !path.is_absolute() {
+            return Err(ConfigError::Invalid(
+                "preview.tokenSecretFile must be an absolute path",
+            ));
+        }
+        let meta = std::fs::metadata(path)
+            .map_err(|_| ConfigError::Invalid("preview.tokenSecretFile unreadable"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o777 != 0o600 {
+                return Err(ConfigError::Invalid(
+                    "preview.tokenSecretFile must be mode 0600",
+                ));
+            }
+        }
+        let raw = std::fs::read_to_string(path)
+            .map_err(|_| ConfigError::Invalid("preview.tokenSecretFile unreadable"))?;
+        let key = snapshot_protocol::preview_token::PreviewTokenKey::from_hex(&raw)
+            .map_err(|_| ConfigError::Invalid("preview.tokenSecretFile malformed"))?;
+        Ok(Some(PreviewRouting { domain, key }))
     }
 
     /// Fail closed: a configured-but-unusable domain refuses startup
@@ -2858,6 +2913,50 @@ mod tests {
 
         // Unknown keys fail closed like every other host section.
         assert!(toml::from_str::<PreviewConfig>("domain = \"p.example.com\"\nbogus = 1").is_err());
+    }
+
+    /// PREVIEW ACCESS: a domain without a token secret is CLOSED, a
+    /// configured secret is verified fail-closed (absolute path, 0600,
+    /// 64 hex chars), and a valid pair yields a verifier key.
+    #[test]
+    fn preview_routing_requires_a_token_secret_and_verifies_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("preview-token.secret");
+        let key = snapshot_protocol::preview_token::PreviewTokenKey::from_signing_seed(&[3u8; 32]);
+        std::fs::write(&key_path, key.to_hex()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // Domain only ⇒ no routing (secure default, not a startup error).
+        let domain_only: PreviewConfig = toml::from_str("domain = \"preview.example.com\"").unwrap();
+        assert!(domain_only.routing().unwrap().is_none());
+
+        // Relative path ⇒ refused.
+        let relative: PreviewConfig = toml::from_str(
+            "domain = \"preview.example.com\"\ntokenSecretFile = \"keys/preview-token.secret\"",
+        )
+        .unwrap();
+        assert!(relative.routing().is_err());
+
+        // Wrong mode ⇒ refused.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let configured: PreviewConfig = toml::from_str(&format!(
+            "domain = \"preview.example.com\"\ntokenSecretFile = \"{}\"",
+            key_path.display()
+        ))
+        .unwrap();
+        assert!(configured.routing().is_err(), "0644 key must be refused");
+
+        // Valid pair ⇒ a verifier that accepts a freshly minted token.
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let routing = configured.routing().unwrap().expect("routing on");
+        assert_eq!(routing.domain, "preview.example.com");
+        let token = routing.key.mint("vrt_x", "w_1", 2_000);
+        assert_eq!(routing.key.verify("vrt_x", "w_1", &token, 1_000), Ok(()));
+
+        // Malformed secret ⇒ fail closed.
+        std::fs::write(&key_path, "not-a-key").unwrap();
+        assert!(configured.routing().is_err());
     }
 
     /// Scale-to-zero P0: default off, off builds nothing, enabled

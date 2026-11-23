@@ -164,11 +164,16 @@ pub struct DeployResult {
     pub artifact_digest: String,
     /// Published envelope revision.
     pub revision: u64,
-    /// PREVIEW: URL serving this version while it is a preview (or the
-    /// active version). `None` for a normal deploy — and for a preview
-    /// when the host has no `[preview] domain` configured (nothing can
-    /// route it yet). Display-only; the host derives routing itself.
+    /// PREVIEW: signed, expiring URL serving this version while it is a
+    /// preview (or the active version). `None` for a normal deploy — and
+    /// for a preview when the host has no `[preview] domain` +
+    /// `tokenSecretFile` configured (nothing can route it yet).
+    /// Display-only; the host derives routing itself.
     pub preview_url: Option<String>,
+    /// Expiry (unix seconds) of `previewUrl`'s bearer token. `None`
+    /// exactly when `previewUrl` is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url_expires_at_unix_s: Option<u64>,
 }
 
 /// Read-only status view (`of status` backing call).
@@ -240,10 +245,14 @@ pub struct VersionInfo {
     pub artifact_digest: String,
     /// Behavior/config hash (`cfg_<digest-prefix>`).
     pub config_hash: String,
-    /// PREVIEW: URL this version is reachable at while it is a preview
-    /// or the active version. `None` for archived versions and for any
-    /// version when no preview domain is configured.
+    /// PREVIEW: signed, expiring URL this version is reachable at while
+    /// it is a preview or the active version. `None` for archived
+    /// versions and for any version when previews are not fully
+    /// configured.
     pub preview_url: Option<String>,
+    /// Expiry (unix seconds) of `previewUrl`'s bearer token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_url_expires_at_unix_s: Option<u64>,
 }
 
 /// Detailed version list for one worker.
@@ -311,6 +320,21 @@ pub struct PruneResult {
     pub changed: bool,
 }
 
+/// `of versions share` result — a signed URL for one stored version.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareResult {
+    /// Resolved worker display name.
+    pub worker: String,
+    /// Stable worker id (the token audience).
+    pub worker_id: String,
+    pub version_id: String,
+    /// Signed preview URL (bearer token in the query string).
+    pub url: String,
+    /// Token expiry (unix seconds).
+    pub expires_at_unix_s: u64,
+}
+
 /// Envelope lifetime — the protocol maximum (24 h). `renew` (or any
 /// mutating op) must run before expiry; `of serve` (T17) renews on a
 /// timer. Kept in sync with `envelope::MAX_TTL` — a compile-time
@@ -355,6 +379,11 @@ impl VrtLocal {
                 .map_err(|_| LocalError::Layout("csprng"))?;
             let key = SigningKey::from_seed(&seed)?;
             keys::write_signing_key(&staging, &seed)?;
+            // PREVIEW ACCESS: derived HMAC key persisted for vrt-host
+            // (0600) so preview tokens can be verified without the
+            // signing seed. Derived, not random: an existing root can
+            // recreate the same file on the next deploy.
+            keys::ensure_preview_token_secret(&staging)?;
             let trusted = key.trusted_key();
             keys::write_trusted_key(&staging, &trusted)?;
             // T17: management-API bearer token — random, owner-only.
@@ -739,13 +768,32 @@ impl VrtLocal {
         // prune records, and every remaining reference is recomputed from
         // the just-written state.
         self.gc_objects(&st);
-        // PREVIEW URL (display): resolved from the host config while the
-        // name is still owned here — the oplog entry below consumes it.
+        // PREVIEW URL (display): a SIGNED, expiring link. Preview
+        // requests require the token by default, so a bare URL would open
+        // nothing. Resolved from the host config while the name is still
+        // owned here; `refresh_key` keeps an upgraded root (no key file
+        // yet) usable on its first preview deploy.
         let preview_url = if preview {
-            preview::url_for(&self.root, &version_id, &pkg.name)
+            st.workers
+                .get(&pkg.name)
+                // Preview instances are projected only for a serving
+                // worker (`to_desired` skips a worker without an active
+                // version), so a preview-first deploy advertises no URL.
+                .filter(|w| w.active_version_id.is_some())
+                .and_then(|w| {
+                    preview::signed_url_default(
+                        &self.root,
+                        &version_id,
+                        &w.worker_id,
+                        &pkg.name,
+                        true,
+                    )
+                })
         } else {
             None
         };
+        let preview_url_expires_at_unix_s =
+            preview_url.as_ref().map(|u| u.expires_at_unix_s);
         oplog::append(
             &self.root,
             &oplog::entry(
@@ -774,7 +822,8 @@ impl VrtLocal {
             )?;
         }
         Ok(DeployResult {
-            preview_url,
+            preview_url: preview_url.map(|u| u.url),
+            preview_url_expires_at_unix_s,
             version_id,
             artifact_digest: digest,
             revision: st.revision,
@@ -969,28 +1018,46 @@ impl VrtLocal {
             .find(|(n, w)| n.as_str() == worker || w.worker_id == worker)
             .ok_or(LocalError::NotFound("worker"))?;
         let active = record.active_version_id.as_deref();
-        let domain = preview::preview_domain(&self.root);
+        let worker_id = record.worker_id.clone();
+        // A worker without an active version is skipped by `to_desired`,
+        // so the host projects NONE of its preview instances either: no
+        // URL is advertised until the first promote makes it servable.
+        let serving = active.is_some();
         let versions = record
             .versions
             .iter()
-            .map(|v| VersionInfo {
-                version_id: v.version_id.clone(),
-                status: v.status,
-                active: active == Some(v.version_id.as_str()),
-                created_at_unix_ms: v.created_at_unix_ms,
-                created_by: v.created_by.clone(),
-                artifact_digest: v.artifact_digest.clone(),
-                config_hash: v.config_hash.clone(),
+            .map(|v| {
                 // Same rule as routing: a version is reachable over a
                 // preview URL while it is a preview or the active version.
-                // Archived versions (and every version when no domain is
-                // configured) report null rather than a URL that 404s.
-                preview_url: match (&domain, v.status) {
-                    (Some(d), VersionStatus::Preview | VersionStatus::Active) => {
-                        preview::preview_url(d, &v.version_id, name)
+                // Archived versions (and every version when previews are
+                // not fully configured) report null rather than a URL that
+                // would be refused. Read-only: this never writes the key
+                // file (a deploy/share does that).
+                let url = match v.status {
+                    VersionStatus::Preview | VersionStatus::Active if serving => {
+                        preview::signed_url_default(
+                            &self.root,
+                            &v.version_id,
+                            &worker_id,
+                            name,
+                            false,
+                        )
                     }
                     _ => None,
-                },
+                };
+                VersionInfo {
+                    version_id: v.version_id.clone(),
+                    status: v.status,
+                    active: active == Some(v.version_id.as_str()),
+                    created_at_unix_ms: v.created_at_unix_ms,
+                    created_by: v.created_by.clone(),
+                    artifact_digest: v.artifact_digest.clone(),
+                    config_hash: v.config_hash.clone(),
+                    preview_url_expires_at_unix_s: url
+                        .as_ref()
+                        .map(|u| u.expires_at_unix_s),
+                    preview_url: url.map(|u| u.url),
+                }
             })
             .collect();
         Ok(WorkerVersions {
@@ -998,6 +1065,64 @@ impl VrtLocal {
             worker_id: record.worker_id.clone(),
             active_version_id: record.active_version_id.clone(),
             versions,
+        })
+    }
+
+    /// Mint a signed preview URL for one stored version
+    /// (`of versions share`).
+    ///
+    /// The token is bound to `(versionId, workerId)` and expires after
+    /// `ttl_secs` (bounded 60s..=30d); it cannot be used on another
+    /// version, another worker or after expiry. Read-only w.r.t. state:
+    /// no revision bump, no oplog entry (the URL itself is the bearer
+    /// credential, so it is never logged).
+    pub fn share_version(
+        &self,
+        version_id: &str,
+        worker: Option<&str>,
+        ttl_secs: u64,
+    ) -> Result<ShareResult, LocalError> {
+        use snapshot_protocol::preview_token::{MAX_TTL_SECS, MIN_TTL_SECS};
+        if !(MIN_TTL_SECS..=MAX_TTL_SECS).contains(&ttl_secs) {
+            return Err(LocalError::State("previewTtl"));
+        }
+        let _lock = lock::StateLock::acquire(&self.root)?;
+        let st = state::read(&self.root)?;
+        let worker_name = Self::resolve_version_owner(&st, worker, version_id)?;
+        let record = st
+            .workers
+            .get(&worker_name)
+            .ok_or(LocalError::NotFound("worker"))?;
+        // Only routable versions have a URL: the host projects previews
+        // for a SERVING worker only, and an archived version has no
+        // route at all. Refuse loudly instead of printing a dead link.
+        if record.active_version_id.is_none() {
+            return Err(LocalError::Preview("workerNotServing"));
+        }
+        let routable = record.versions.iter().any(|v| {
+            v.version_id == version_id
+                && matches!(v.status, VersionStatus::Preview | VersionStatus::Active)
+        });
+        if !routable {
+            return Err(LocalError::Preview("versionNotRoutable"));
+        }
+        // `refresh_key`: an explicit operator action may create the key
+        // file on a root that predates preview access.
+        let url = preview::signed_url(
+            &self.root,
+            version_id,
+            &record.worker_id,
+            &worker_name,
+            ttl_secs,
+            true,
+        )
+        .ok_or(LocalError::Preview("previewAccess"))?;
+        Ok(ShareResult {
+            worker: worker_name,
+            worker_id: record.worker_id.clone(),
+            version_id: version_id.to_string(),
+            url: url.url,
+            expires_at_unix_s: url.expires_at_unix_s,
         })
     }
 

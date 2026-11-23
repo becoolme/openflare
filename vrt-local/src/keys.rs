@@ -69,6 +69,60 @@ pub fn load_signing_seed(root: &Path) -> Result<[u8; 32], LocalError> {
         .map_err(|_| LocalError::Layout("key length"))
 }
 
+/// PREVIEW ACCESS: derived HMAC key file (`keys/preview-token.secret`,
+/// `0600`). `vrt-host` reads this path via `[preview] tokenSecretFile`;
+/// the control plane derives the authoritative value from the signing
+/// seed, so the file is a distribution artifact, not independent key
+/// material.
+pub fn preview_token_secret_path(root: &Path) -> std::path::PathBuf {
+    crate::layout::keys_dir(root).join("preview-token.secret")
+}
+
+/// Derive and PERSIST the preview-token key (idempotent).
+///
+/// The file is rewritten when it is missing or does not match the
+/// key derived from the signing seed (a stale copy would make every
+/// freshly minted URL fail verification, so self-healing here is the
+/// fail-closed direction: the host's verifier and the control plane's
+/// minter converge on the same value). Callers that hold the writer
+/// lock (deploy, prune) may call this; display-only paths use
+/// [`read_preview_token_secret`].
+pub fn ensure_preview_token_secret(
+    root: &Path,
+) -> Result<snapshot_protocol::preview_token::PreviewTokenKey, LocalError> {
+    use snapshot_protocol::preview_token::PreviewTokenKey;
+    let seed = load_signing_seed(root)?;
+    let key = PreviewTokenKey::from_signing_seed(&seed);
+    let want = key.to_hex();
+    let path = preview_token_secret_path(root);
+    let matches = std::fs::read_to_string(&path)
+        .map(|existing| existing.trim().eq_ignore_ascii_case(&want))
+        .unwrap_or(false);
+    if !matches {
+        vrt_securefs::atomic_write(&path, want.as_bytes(), 0o600)
+            .map_err(|_| LocalError::Layout("preview token write"))?;
+    }
+    Ok(key)
+}
+
+/// Read the preview-token key WITHOUT writing.
+///
+/// `None` when the file is missing or does not match the derived key —
+/// display paths (`previewUrl`, `of versions list`) must not advertise a
+/// URL the host would refuse.
+pub fn read_preview_token_secret(
+    root: &Path,
+) -> Option<snapshot_protocol::preview_token::PreviewTokenKey> {
+    use snapshot_protocol::preview_token::PreviewTokenKey;
+    let seed = load_signing_seed(root).ok()?;
+    let key = PreviewTokenKey::from_signing_seed(&seed);
+    let existing = std::fs::read_to_string(preview_token_secret_path(root)).ok()?;
+    existing
+        .trim()
+        .eq_ignore_ascii_case(&key.to_hex())
+        .then_some(key)
+}
+
 /// Load `keys/trusted.json` — the local verifier record used by
 /// `read_verified_desired` (cron + queue dispatch). `keyId` must equal
 /// the id DERIVED from `publicKey` — a tampered record fails closed.

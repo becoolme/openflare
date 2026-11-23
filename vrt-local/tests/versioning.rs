@@ -375,11 +375,11 @@ fn concurrent_promotes_never_produce_two_active_versions() {
 
 // ── PREVIEW URLs ─────────────────────────────────────────────────────
 
-/// `previewUrl` is derived from the HOST config, never guessed: with no
-/// `[preview] domain` the API reports null, and only `--preview` (or an
-/// active version) ever gets one.
+/// `previewUrl` is derived from the HOST config, never guessed, and it
+/// is SIGNED: previews require a token, so a domain without a token
+/// secret is a closed domain and reports null.
 #[test]
-fn preview_url_reflects_the_host_preview_domain() {
+fn preview_url_reflects_the_host_preview_config() {
     let root = root();
     let local = init(&root);
     let v1 = worker_dir(&root, "urls", "export default {v: 1}\n");
@@ -405,7 +405,8 @@ fn preview_url_reflects_the_host_preview_domain() {
         None
     );
 
-    // Configure the SAME knob vrt-host routes on.
+    // A domain WITHOUT `tokenSecretFile` keeps the domain closed: the
+    // host installs no preview route, so no URL may be advertised.
     std::fs::create_dir_all(root.join("config")).unwrap();
     std::fs::write(
         root.join("config/vrt-host.toml"),
@@ -417,17 +418,55 @@ fn preview_url_reflects_the_host_preview_domain() {
         Some("preview.example.com"),
         "case is normalized"
     );
-
     let v3 = worker_dir(&root, "urls", "export default {v: 3}\n");
-    let p3 = local
+    let closed = local
         .deploy_preview(&v3, &DeployOverrides::default())
         .unwrap();
-    let want = format!("https://{}--urls.preview.example.com/", p3.version_id);
-    assert_eq!(p3.preview_url.as_deref(), Some(want.as_str()));
+    assert_eq!(
+        closed.preview_url, None,
+        "a domain without a token secret is closed"
+    );
+
+    // Configure the SAME knobs vrt-host routes and verifies with.
+    let key_path = root.join("keys/preview-token.secret");
+    std::fs::write(
+        root.join("config/vrt-host.toml"),
+        format!(
+            "cellId = \"local\"\n\n[preview]\ndomain = \"Preview.Example.COM\"\n\
+             tokenSecretFile = \"{}\"\n",
+            key_path.display()
+        ),
+    )
+    .unwrap();
+    let v4 = worker_dir(&root, "urls", "export default {v: 4}\n");
+    let p4 = local
+        .deploy_preview(&v4, &DeployOverrides::default())
+        .unwrap();
+    let prefix = format!(
+        "https://{}--urls.preview.example.com/?__vrt_preview_token=v1.",
+        p4.version_id
+    );
+    let url = p4.preview_url.as_deref().expect("signed preview URL");
+    assert!(url.starts_with(&prefix), "{url}");
+    let expires = p4.preview_url_expires_at_unix_s.expect("expiry reported");
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    assert!(expires > now && expires <= now + 3600 + 5, "{expires} vs {now}");
+    // The token verifies for this (version, worker) and nothing else.
+    let key = snapshot_protocol::preview_token::PreviewTokenKey::from_hex(
+        &std::fs::read_to_string(&key_path).unwrap(),
+    )
+    .unwrap();
+    let token = url.split_once("__vrt_preview_token=").unwrap().1;
+    let wid = local.versions("urls").unwrap().worker_id;
+    assert_eq!(key.verify(&p4.version_id, &wid, token, now), Ok(()));
+    assert!(
+        key.verify(&closed.version_id, &wid, token, now).is_err(),
+        "a token is bound to its version"
+    );
 
     // Active versions keep a preview URL (the host serves them), archived
     // versions lose it.
-    local.promote("urls", &p3.version_id).unwrap();
+    local.promote("urls", &p4.version_id).unwrap();
     let list = local.versions("urls").unwrap();
     let row = |id: &str| {
         list.versions
@@ -435,16 +474,151 @@ fn preview_url_reflects_the_host_preview_domain() {
             .find(|v| v.version_id == id)
             .unwrap_or_else(|| panic!("version {id} missing"))
     };
-    assert_eq!(row(&p3.version_id).status, VersionStatus::Active);
-    assert!(row(&p3.version_id).preview_url.is_some());
-    // The earlier preview stays a preview (promote only moves the active
-    // pointer), so it is routable now that a domain exists.
+    assert_eq!(row(&p4.version_id).status, VersionStatus::Active);
+    assert!(row(&p4.version_id).preview_url.is_some());
+    assert!(row(&p4.version_id).preview_url_expires_at_unix_s.is_some());
+    // Earlier previews stay previews and become routable now that both
+    // knobs are configured.
     assert_eq!(row(&no_domain.version_id).status, VersionStatus::Preview);
     assert!(row(&no_domain.version_id).preview_url.is_some());
+    assert!(row(&closed.version_id).preview_url.is_some());
     // The version that was ACTIVE and got replaced loses its URL: it is
     // archived, and the host has no route for it.
     assert_eq!(row(&r1.version_id).status, VersionStatus::Archived);
     assert_eq!(row(&r1.version_id).preview_url, None);
+    assert_eq!(row(&r1.version_id).preview_url_expires_at_unix_s, None);
+}
+
+/// `of versions share` mints a scoped, expiring URL for one version; it
+/// never changes state and refuses an unusable TTL or a closed domain.
+#[test]
+fn share_version_mints_a_scoped_expiring_url() {
+    let root = root();
+    let local = init(&root);
+    let v1 = worker_dir(&root, "share", "export default {v: 1}\n");
+    let first = local.deploy(&v1, &DeployOverrides::default()).unwrap();
+    let v2 = worker_dir(&root, "share", "export default {v: 2}\n");
+    let preview = local
+        .deploy_preview(&v2, &DeployOverrides::default())
+        .unwrap();
+
+    // No preview config → a loud failure (not a URL that 404s).
+    assert!(matches!(
+        local.share_version(&preview.version_id, None, 3600),
+        Err(LocalError::Preview("previewAccess"))
+    ));
+
+    let key_path = root.join("keys/preview-token.secret");
+    std::fs::write(
+        root.join("config/vrt-host.toml"),
+        format!(
+            "cellId = \"local\"\n\n[preview]\ndomain = \"preview.example.com\"\n\
+             tokenSecretFile = \"{}\"\n",
+            key_path.display()
+        ),
+    )
+    .unwrap();
+
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let shared = local
+        .share_version(&preview.version_id, None, 600)
+        .unwrap();
+    assert_eq!(shared.worker, "share");
+    assert!(shared.url.contains(&preview.version_id));
+    let expires = shared.expires_at_unix_s;
+    assert!(expires >= now + 600 && expires <= now + 605, "{expires}");
+    let token = shared
+        .url
+        .split_once("__vrt_preview_token=")
+        .unwrap()
+        .1;
+    let key = snapshot_protocol::preview_token::PreviewTokenKey::from_hex(
+        &std::fs::read_to_string(&key_path).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        key.verify(&preview.version_id, &shared.worker_id, token, now),
+        Ok(())
+    );
+    assert!(key
+        .verify(&preview.version_id, "w_other", token, now)
+        .is_err());
+
+    // CLI wiring: `of versions share` prints the same JSON shape.
+    let exe = env!("CARGO_BIN_EXE_of");
+    let out = std::process::Command::new(exe)
+        .arg("versions")
+        .arg("share")
+        .arg("--root")
+        .arg(root.as_os_str())
+        .arg("--ttl-seconds")
+        .arg("600")
+        .arg(&preview.version_id)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "share CLI failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cli: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(cli["workerId"], shared.worker_id);
+    assert!(cli["url"]
+        .as_str()
+        .unwrap()
+        .contains("__vrt_preview_token=v1."));
+
+    // TTL is bounded, not clamped silently.
+    assert!(matches!(
+        local.share_version(&preview.version_id, None, 1),
+        Err(LocalError::State("previewTtl"))
+    ));
+    assert!(matches!(
+        local.share_version(&preview.version_id, None, 40 * 24 * 3600),
+        Err(LocalError::State("previewTtl"))
+    ));
+    // Unknown version fails closed.
+    assert!(matches!(
+        local.share_version("vrt_missing", None, 600),
+        Err(LocalError::NotFound("version"))
+    ));
+
+    // Archived versions have no route: refuse instead of a dead link.
+    // (The first deploy was replaced by a promote, so it is archived now;
+    // other previews stay previewable and keep their URLs.)
+    let v3 = worker_dir(&root, "share", "export default {v: 3}\n");
+    let third = local
+        .deploy_preview(&v3, &DeployOverrides::default())
+        .unwrap();
+    local.promote("share", &third.version_id).unwrap();
+    assert_eq!(
+        local
+            .versions("share")
+            .unwrap()
+            .versions
+            .iter()
+            .find(|v| v.version_id == first.version_id)
+            .unwrap()
+            .status,
+        VersionStatus::Archived
+    );
+    assert!(matches!(
+        local.share_version(&first.version_id, None, 600),
+        Err(LocalError::Preview("versionNotRoutable"))
+    ));
+
+    // A preview-first worker is skipped by the desired document, so the
+    // host projects no preview instance: no URL, and share refuses.
+    let fresh = worker_dir(&root, "fresh", "export default {v: 1}\n");
+    let fresh_preview = local
+        .deploy_preview(&fresh, &DeployOverrides::default())
+        .unwrap();
+    assert_eq!(fresh_preview.preview_url, None);
+    assert_eq!(fresh_preview.preview_url_expires_at_unix_s, None);
+    assert!(matches!(
+        local.share_version(&fresh_preview.version_id, Some("fresh"), 600),
+        Err(LocalError::Preview("workerNotServing"))
+    ));
 }
 
 /// Durable objects and workflows are not version-isolated yet: a preview

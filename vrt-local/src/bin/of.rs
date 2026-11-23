@@ -49,6 +49,7 @@ USAGE:
   of versions list --root <dir> <worker>
   of versions prune --root <dir> [<worker>] [--dry-run] [--max-age-days <n>] [--max-count <n>]
   of versions retention --root <dir> [--auto|--no-auto] [--max-age-days <n>] [--max-count <n>]
+  of versions share --root <dir> [--worker <name|workerId>] [--ttl-seconds <n>] <version_id>
   of renew   --root <dir>
   of key     --root <dir>                        (print trusted public key)
   of health  --root <dir>                        (mgmt /healthz → exit code)
@@ -292,6 +293,26 @@ async fn run(args: Vec<String>) -> Result<(), String> {
                         max_count: num_flag(&args[1..], "--max-count")?,
                     };
                     let result = direct(&root, |l| l.prune_versions(&request))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&result).unwrap_or_default()
+                    );
+                    Ok(())
+                }
+                // Signed, expiring preview URL for one version. The
+                // token is bound to (versionId, workerId); sharing it
+                // never changes state.
+                Some("share") => {
+                    let version = pos.get(1).ok_or("version required")?.clone();
+                    let ttl_secs =
+                        num_flag::<u64>(&args[1..], "--ttl-seconds")?.unwrap_or(24 * 60 * 60);
+                    let result = direct(&root, |l| {
+                        l.share_version(
+                            &version,
+                            arg(&args[1..], "--worker"),
+                            ttl_secs,
+                        )
+                    })?;
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&result).unwrap_or_default()
@@ -1369,7 +1390,13 @@ fn cmd_deploy(args: &[String]) -> Result<(), String> {
             l.deploy(Path::new(&dir), &overrides)
         };
         deployed.map(|r| {
-            serde_json::json!({"versionId": r.version_id, "artifactDigest": r.artifact_digest, "revision": r.revision, "previewUrl": r.preview_url})
+            serde_json::json!({
+                "versionId": r.version_id,
+                "artifactDigest": r.artifact_digest,
+                "revision": r.revision,
+                "previewUrl": r.preview_url,
+                "previewUrlExpiresAtUnixS": r.preview_url_expires_at_unix_s,
+            })
         })
     })?;
     println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());

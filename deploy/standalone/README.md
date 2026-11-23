@@ -156,11 +156,14 @@ $compose of doctor --root /data          # add --json or --strict
 
 `deploy --preview` stores an immutable version without moving traffic;
 `promote` switches the worker's active version through the same signed
-desired revision path as `rollback`. With `[preview] domain` set in
-`/data/config/vrt-host.toml`, the preview is also reachable at
-`https://<versionId>--<worker>.<domain>/` (off by default → `previewUrl`
-is `null`). See [deploy versions](../../docs/versioning.md) for
-lifecycle, preview URLs, concurrency and current limits.
+desired revision path as `rollback`. With `[preview] domain` AND
+`tokenSecretFile` set in `/data/config/vrt-host.toml`, the preview is
+reachable at
+`https://<versionId>--<worker>.<domain>/?__vrt_preview_token=…` (off by
+default → `previewUrl` is `null`; the returned URL is signed and expires
+after an hour; `of versions share` mints a longer one). See
+[deploy versions](../../docs/versioning.md) for lifecycle, preview
+access, retention, concurrency and current limits.
 
 `of logs` is a read-only tail of the host log hub (console.log,
 exceptions, platform codes; secrets are already redacted at ingest).

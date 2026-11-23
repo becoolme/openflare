@@ -72,6 +72,18 @@ fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+    // PREVIEW ACCESS: resolve the domain + verification key ONCE at
+    // startup (after the subscriber, so the "domain without a secret"
+    // warning is actually emitted). A configured-but-broken secret fails
+    // startup (fail closed); a domain without a token secret leaves
+    // preview serving off. The key is never logged.
+    let preview_routing = match config.preview.routing() {
+        Ok(routing) => routing,
+        Err(e) => {
+            eprintln!("vrt-host: {e}");
+            return ExitCode::from(2);
+        }
+    };
     // RV-R66: DO/workflow state must have an off-host copy unless the dev
     // waiver is explicit (never a silent single-copy production run).
     if let Some(msg) = config.durability_posture_error() {
@@ -90,7 +102,7 @@ fn main() -> ExitCode {
         eprintln!("vrt-host: [isolation] requires euid 0 (setuid/setgid at launch)");
         return ExitCode::from(2);
     }
-    if let Err(code) = run(config) {
+    if let Err(code) = run(config, preview_routing) {
         return code;
     }
     ExitCode::SUCCESS
@@ -166,7 +178,10 @@ fn render_params(args: &[String]) -> ExitCode {
     }
 }
 
-fn run(config: HostConfig) -> Result<(), ExitCode> {
+fn run(
+    config: HostConfig,
+    preview_routing: Option<vrt_host::config::PreviewRouting>,
+) -> Result<(), ExitCode> {
     for dir in [&config.work_dir, &config.cache_dir] {
         vrt_securefs::ensure_secure_dir(dir).map_err(|e| {
             // io::Error only contains errno/cause and safety-check info (path, owner/mode),
@@ -182,10 +197,13 @@ fn run(config: HostConfig) -> Result<(), ExitCode> {
             tracing::error!("tokio runtime init failed");
             ExitCode::from(2)
         })?;
-    runtime.block_on(run_async(config))
+    runtime.block_on(run_async(config, preview_routing))
 }
 
-async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
+async fn run_async(
+    config: HostConfig,
+    preview_routing: Option<vrt_host::config::PreviewRouting>,
+) -> Result<(), ExitCode> {
     let store = FileDesiredStore::new(
         &config.desired.path,
         &config.cell_id,
@@ -557,6 +575,7 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         ws.max_sessions,
         ws.max_sessions_per_tenant,
     );
+    ingress_state.set_preview_auth(preview_routing.as_ref().map(|r| r.key.clone()));
     if let Some(hub) = &log_hub {
         ingress_state.set_log_hub(hub.clone());
     }
@@ -596,9 +615,10 @@ async fn run_async(config: HostConfig) -> Result<(), ExitCode> {
         assignment_file: config.desired.assignment_file.as_deref(),
         pod_id: config.desired.pod_id.as_deref(),
         status: status.clone(),
-        // PREVIEW: host-owned suffix; never from the snapshot. Absent =
-        // preview URLs are disabled (every preview host 404s).
-        preview_domain: config.preview.domain(),
+        // PREVIEW: host-owned suffix; never from the snapshot. Absent
+        // (or a domain without a token secret) = preview URLs are
+        // disabled (every preview host 404s).
+        preview_domain: preview_routing.as_ref().map(|r| r.domain.clone()),
     };
     // T34f2/R1: startup-only orphan sweep — at this point the process
     // provably owns NO children, so a verified workerd whose owning

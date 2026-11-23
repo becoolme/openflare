@@ -19,6 +19,7 @@ of promote --root <dir> [--worker <name|workerId>] <version_id>
 of versions list --root <dir> <worker>
 of versions prune --root <dir> [<worker>] [--dry-run] [--max-age-days <n>] [--max-count <n>]
 of versions retention --root <dir> [--auto|--no-auto] [--max-age-days <n>] [--max-count <n>]
+of versions share --root <dir> [--worker <name|workerId>] [--ttl-seconds <n>] <version_id>
 ```
 
 The legacy `of versions <worker>` form is an alias for
@@ -28,14 +29,26 @@ The legacy `of versions <worker>` form is an alias for
 only when the id is unique across workers).
 
 `of deploy --preview` returns the same JSON shape as a normal deploy,
-including `versionId`, plus `previewUrl` (`null` when the host has no
-preview domain configured). No id is printed unless the version record
-was persisted; a failure after the object write but before the state
-write leaves only a harmless orphan object, never a reported version.
+including `versionId`, plus `previewUrl` and
+`previewUrlExpiresAtUnixS`. The URL is **signed and expiring** (one hour
+by default): previews require a token, so a bare URL would open nothing.
+`previewUrl` is `null` when previews are not fully configured (no
+`[preview] domain`, no `tokenSecretFile`, or a key file that does not
+match this root's signing seed). No id is printed unless the version
+record was persisted; a failure after the object write but before the
+state write leaves only a harmless orphan object, never a reported
+version.
 
 `of versions list` prints `WorkerVersions` JSON; every
-`versions[*]` row carries `previewUrl` (same rule: `null` for archived
-versions and for every version when no preview domain is configured).
+`versions[*]` row carries `previewUrl` / `previewUrlExpiresAtUnixS` under
+the same rule (`null` for archived versions, and for every version while
+previews are not fully configured). The listing mints tokens read-only —
+it never writes the key file; a deploy or `of versions share` does.
+
+`of versions share <version_id>` mints a fresh URL for any stored
+version (60 s … 30 days; default 24 h) and prints
+`{worker, workerId, versionId, url, expiresAtUnixS}`. It fails loudly
+(`preview: previewAccess`) when previews are not configured.
 
 ## Data model
 
@@ -105,7 +118,7 @@ like production (see the security boundary below).
 ### Scheme
 
 ```text
-https://<versionId>--<workerName>.<previewDomain>/
+https://<versionId>--<workerName>.<previewDomain>/?__vrt_preview_token=v1.<exp>.<hmac>
 ```
 
 `<versionId>` is the immutable `vrt_…` id, `<workerName>` is the
@@ -121,9 +134,12 @@ match a preview route.
 Examples:
 
 ```text
-vrt_9f2c1e…--edge-api.preview.example.com      ← deploy --preview
-vrt_71aa03…--edge-api.preview.example.com      ← now the ACTIVE version
+vrt_9f2c1e…--edge-api.preview.example.com/?__vrt_preview_token=v1.…  ← deploy --preview
+vrt_71aa03…--edge-api.preview.example.com/?__vrt_preview_token=v1.…  ← now the ACTIVE version
 ```
+
+The hostname alone is not a capability: without a valid token every
+preview request is a 403.
 
 ### Configuration
 
@@ -135,32 +151,46 @@ Preview routing is **host configuration and off by default**. In
 # Public suffix for preview hostnames. Absent or empty = previews are
 # not routable at all (every preview request is a 404).
 domain = "preview.example.com"
+# Mandatory HMAC key. Written by `of init` (0600, absolute path).
+# Preview URLs are token-gated: a domain WITHOUT this file is closed.
+tokenSecretFile = "/data/keys/preview-token.secret"
 ```
 
 - `domain` must be a lowercase DNS name: no scheme, port, path,
   wildcard, leading/trailing dot, no `_`. An unusable value fails host
   startup (`preview.domain must be a lowercase DNS name …`) instead of
   silently serving nothing.
+- `tokenSecretFile` must be an absolute path to a `0600` file holding 64
+  hex chars. A configured-but-unreadable/malformed/world-readable file
+  fails host startup; a domain with NO `tokenSecretFile` leaves preview
+  serving **off** (a warning is logged). There is no anonymous mode.
 - The host derives every preview hostname itself; the suffix is never
   read from a snapshot, a worker config or a request.
-- `vrt-local` reads the **same file** (`<root>/config/vrt-host.toml`,
-  `[preview] domain`) only to report `previewUrl` in the API/CLI. That
-  value is display-only: routing authority stays with `vrt-host`, and an
-  unreadable/invalid value simply reports `null`.
+- `vrt-local` reads the **same file** only to report `previewUrl` in the
+  API/CLI. It additionally requires the configured key file to match the
+  key derived from `<root>/keys/signing.seed`, so a URL is never
+  advertised unless the host can verify it. That value is display-only:
+  routing authority stays with `vrt-host`.
+- **Upgrade/downgrade**: adding `tokenSecretFile` turns previews from
+  open to token-gated (the intended default). `[preview]` uses
+  `deny_unknown_fields` like every host section, so an OLDER `vrt-host`
+  refuses a config that carries the new key — remove the line before
+  rolling the host back, or it fails startup (fail closed, never open).
 
 ### Which requests serve which version
 
 | Request | Serves | Response markers |
 | --- | --- | --- |
 | production hostname (worker `routes`) | active version | none |
-| `<versionId>--<worker>.<domain>`, version `preview` | that preview instance | `x-vrt-preview: 1`, `x-vrt-preview-version: <versionId>` |
-| `<versionId>--<worker>.<domain>`, version `active` | the production instance (same code as production) | same markers |
-| any other `<…>.<domain>`, or any preview host when no domain is configured | **404** (`unknown_host`) | — |
-| archived version | **404** | — |
+| `<versionId>--<worker>.<domain>` + valid token, version `preview` | that preview instance | `x-vrt-preview: 1`, `x-vrt-preview-version: <versionId>` |
+| `<versionId>--<worker>.<domain>` + valid token, version `active` | the production instance (same code as production) | same markers |
+| `<versionId>--<worker>.<domain>` with no/expired/wrong token | **403** (`preview_forbidden`) | — |
+| any other `<…>.<domain>`, any preview host when the domain or token secret is not configured, or an archived version | **404** | — |
 
 There is no fallback: an unknown, archived or mistyped version id never
-resolves to production, and a preview request never mutates
-`activeVersionId`, worker hostnames or bindings. Derived routes never
+resolves to production, a missing token never causes a production
+response, and a preview request never mutates `activeVersionId`, worker
+hostnames or bindings. Derived routes never
 overwrite an existing route in the table (first-wins), so a snapshot can
 never shadow a production hostname with a derived one.
 
@@ -174,6 +204,61 @@ worker on the request path, so the code can branch its own side effects
 without parsing its Host header. The ingress strips worker-supplied
 `x-vrt-*` response headers and re-adds them itself, so a production
 worker cannot forge preview status.
+
+### Access control (signed preview tokens)
+
+Preview access is token-gated by default. The token is a bearer
+capability bound to exactly one `(versionId, workerId)` pair:
+
+```text
+v1.<expiresAtUnixSeconds>.<hex hmac-sha256>
+
+MAC input: "openflare.preview-token.v1\n<versionId>\n<workerId>\n<expiresAt>"
+```
+
+- The **key** is derived from the cell signing seed with a distinct
+  label (`HMAC-SHA256(seed, "openflare.preview-token.v1")`) and persisted
+  as `<root>/keys/preview-token.secret` (`0600`) so `vrt-host` can verify
+  without holding the Ed25519 seed. Rotating the signing key invalidates
+  every outstanding token — the only revocation mechanism (tokens are
+  stateless and cannot be revoked individually).
+- **Binding**: the host recomputes the MAC from the route it already
+  resolved and the expiry field inside the token. Neither the version id
+  nor the worker id is parsed out of attacker input, so a token cannot
+  name a hostname of its own, cannot be replayed on another version or
+  worker, and an edited expiry breaks the MAC.
+- **Verification** runs before any tenant work: length-bounded parse,
+  constant-time HMAC compare, then expiry. Missing → 403
+  `preview_token_missing`, tampered/wrong pair → `preview_token_invalid`,
+  past expiry → `preview_token_expired`, over-long lifetime →
+  `preview_token_too_long`. Every failure is a hard 403; production is
+  never used as a fallback.
+- **Delivery**: the token rides in the `__vrt_preview_token` query
+  parameter (so a link is self-contained) or in a host-scoped bootstrap
+  cookie. The first authenticated navigation from a query token gets
+  `Set-Cookie: __vrt_preview_token=…; Path=/; HttpOnly; Secure;
+  SameSite=Lax; Max-Age=<remaining>`, so the page's subresources load
+  without re-attaching the parameter. Each preview hostname is its own
+  origin, so the cookie never crosses versions or workers. Both the query
+  parameter and the cookie are stripped from the request forwarded to the
+  worker.
+- **Lifetime**: URLs printed by `of deploy --preview` and
+  `of versions list` live one hour. `of versions share` accepts
+  60 s…30 days (default 24 h). Verification refuses a correctly signed
+  token whose remaining lifetime exceeds 30 days + 5 minutes skew.
+- **No account model**: a token grants access to that preview only. It
+  does not authenticate to the management API, production hostnames or
+  another worker's preview.
+- **Only routable versions get URLs.** Preview instances are projected
+  for a SERVING worker only, so a preview-first worker (no active
+  version yet) reports `previewUrl: null` until it is promoted once.
+  `of versions share` refuses an archived or non-serving version
+  instead of printing a dead link.
+- **Referrer hygiene.** Preview responses set
+  `Referrer-Policy: strict-origin-when-cross-origin` (the token is in the
+  query string and must not leak cross-origin) and
+  `X-Robots-Tag: noindex, nofollow`. The URL itself is a bearer
+  credential: do not paste it into public logs, issues or analytics.
 
 ## Preview retention and GC
 
@@ -380,9 +465,11 @@ real browsers needs, in addition:
    `vrt-host` instead of treating them as unknown. The existing
    constraints on the shared entrypoint (Traefik/ServiceLB, hostPort,
    certificates) apply unchanged.
-4. **Abuse bounds**: preview hostnames are public once DNS exists; there
-   is no per-preview access control yet (no signed preview tokens), so
-   treat a preview as a public URL.
+4. **Abuse bounds**: preview hostnames become resolvable once DNS exists,
+   but content access is token-gated (see "Access control"). Add
+   per-token rate limiting at the shared entrypoint if previews are
+   reachable from the public internet; the host verifies every request
+   but does not throttle token guesses.
 
 ## Concurrency and idempotency
 
@@ -416,15 +503,23 @@ real browsers needs, in addition:
   validation; it is never silently skipped.
 - Failed preview/promote operations never return a version id or a
   success revision.
-- With no configured preview domain every preview hostname is a 404 —
-  there is no "serve the newest preview anyway" fallback.
+- With no configured preview domain (or no `tokenSecretFile`) every
+  preview hostname is a 404 — there is no "serve the newest preview
+  anyway" fallback.
+- A malformed/unreadable/world-readable token secret refuses host
+  startup; a key file that does not match the control plane's derived
+  key makes `vrt-local` report no URL (the host would 403).
+- A preview request without a valid token is a 403; it is never served
+  from the production instance.
 
 ## Explicitly not implemented
 
 - Wildcard DNS, certificates and edge integration for preview URLs
   (see "Production integration").
 - Per-version data isolation (KV/R2/D1/PG/queue namespaces).
-- Preview access control (signed preview tokens / passwords).
+- Per-preview passwords/basic auth, per-user authorization and
+  individual token revocation (tokens expire; rotating the signing key
+  revokes the whole set).
 - Per-preview processes (previews share the tenant workerd process).
 - Durable Object and Workflow previews.
 - Pinning individual preview versions against retention. Promote the
@@ -461,16 +556,23 @@ write the active pointer.
   (case/port/`_`), feature-off 404s, version selection, active-version
   preview host, derived routes never overwriting production.
 - Unit tests in `vrt-host/src/config.rs`: `[preview] domain` default-off
-  and fail-closed validation.
+  and fail-closed validation, and `tokenSecretFile` resolution (domain
+  without a secret is closed; relative/world-readable/malformed secret
+  fails startup; a valid pair mints and verifies).
 - Protocol tests in `snapshot-protocol/src/compute_desired.rs`: preview
   instance round-trip and every rejection (routes, side effects,
   secrets, version mismatch, unknown/self/chained target, capacity).
+- Token tests in `snapshot-protocol/src/preview_token.rs`: derivation is
+  deterministic/domain-separated, version+worker binding, signed expiry,
+  tamper/overlong/malformed rejection, query and cookie extraction, and
+  the hardened bootstrap cookie.
 - API tests in `vrt-local/tests/versioning.rs`: same input same id,
   preview not moving the desired active version, preview-first worker
   absent from desired, promote switching traffic and being idempotent,
   cross-worker rejection, missing artifact rejection, concurrent
-  promote invariant, `previewUrl` from the host config, DO/workflow
-  preview refusal.
+  promote invariant, signed `previewUrl` from the host config (closed
+  without a token secret), token binding/expiry, `share_version` scoping
+  and TTL bounds, DO/workflow preview refusal.
 - Retention tests in `vrt-local/src/retention.rs` (policy bounds,
   newest/active protection, count and age boundaries, idempotent
   mutation) and `vrt-local/tests/retention.rs` (aged preview pruned
@@ -497,9 +599,22 @@ write the active pointer.
   versions 404 → promote v2 → production serves v2 and the v2 preview
   URL follows → no-domain mode returns `null` and 404s → a missing
   preview artifact leaves production serving.
+- Access-control end-to-end in `vrt-host/tests/preview_access_e2e.rs`:
+  anonymous/expired/tampered/wrong-version/wrong-worker tokens are 403;
+  a valid token serves the preview instance and sets the bootstrap cookie
+  (cookie-only subresource request succeeds); production needs no token;
+  a domain without a token secret stays closed (404, `previewUrl: null`)
+  even with a valid token; the active version's preview host is gated
+  too.
 
 ## Changelog
 
+- 2026-11-22: preview access control. Signed, expiring preview tokens
+  (HMAC bound to version + worker), mandatory by default; a
+  `[preview] domain` without `tokenSecretFile` is closed; bootstrap
+  cookie for subresources; `of versions share`; `previewUrl` is signed
+  and reports its expiry; key derived from the signing seed and
+  persisted as `keys/preview-token.secret`.
 - 2026-11-22: re-previewing a stored version refreshes its recency
   (`createdAtUnixMs`) so it is the newest preview: it is projected again
   and survives the same deploy's retention pass. The deploy's own
