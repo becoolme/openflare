@@ -333,7 +333,7 @@ impl LocalState {
     /// pre-feature version ids (no churn on upgrade). The lifecycle
     /// fields added by the versioning MVP are removed above, so ids
     /// minted before it remain byte-identical.
-    fn version_id(pkg: &crate::worker_pkg::PackedWorker) -> String {
+    pub(crate) fn version_id(pkg: &crate::worker_pkg::PackedWorker) -> String {
         let record = Self::version_record(pkg, String::new());
         let bytes = serde_json::to_vec(&Self::identity_value(&record)).unwrap_or_default();
         let digest = hex::encode(sha2::Sha256::digest(&bytes));
@@ -459,11 +459,17 @@ impl LocalState {
             {
                 Some(existing) => {
                     // Re-previewing the active version leaves it active;
-                    // re-previewing an archived version marks it preview.
+                    // re-previewing any other stored version makes it the
+                    // NEWEST preview: refresh `createdAtUnixMs` so the
+                    // render order and the retention policy both treat it
+                    // as the build the operator just asked for. Without
+                    // this, re-previewing an old version could hand back
+                    // a URL that is not projected (or is pruned by the
+                    // same deploy's retention pass).
                     if record.active_version_id.as_deref() != Some(version_id.as_str()) {
                         existing.status = VersionStatus::Preview;
-                    }
-                    if existing.created_at_unix_ms == 0 {
+                        existing.created_at_unix_ms = now_unix_ms;
+                    } else if existing.created_at_unix_ms == 0 {
                         existing.created_at_unix_ms = now_unix_ms;
                     }
                 }
@@ -647,17 +653,23 @@ impl LocalState {
             // bounds the rendered config, not the stored history — an
             // older preview stays stored/promotable, it is just not
             // served over HTTP until re-previewed.
-            let mut previewable: Vec<&VersionRecord> = w
+            //
+            // Newest = `createdAtUnixMs`, then Vec position (append-only,
+            // so a later deploy wins a same-millisecond tie). This is the
+            // SAME order the retention policy uses to pick what it keeps,
+            // so GC can never drop a preview the renderer would serve.
+            let mut previewable: Vec<(usize, &VersionRecord)> = w
                 .versions
                 .iter()
-                .filter(|v| v.status == VersionStatus::Preview)
+                .enumerate()
+                .filter(|(_, v)| v.status == VersionStatus::Preview)
                 .collect();
-            previewable.sort_by(|a, b| {
+            previewable.sort_by(|(ia, a), (ib, b)| {
                 b.created_at_unix_ms
                     .cmp(&a.created_at_unix_ms)
-                    .then_with(|| b.version_id.cmp(&a.version_id))
+                    .then_with(|| ib.cmp(ia))
             });
-            for version in previewable
+            for (_, version) in previewable
                 .into_iter()
                 .take(snapshot_protocol::compute_desired::MAX_PREVIEWS_PER_WORKER)
             {

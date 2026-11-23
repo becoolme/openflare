@@ -28,6 +28,8 @@ of secret ls  --root <dir>
 of status  --root <dir>
 of versions --root <dir> <worker>
 of versions list --root <dir> <worker>
+of versions prune --root <dir> [<worker>] [--dry-run] [--max-age-days <n>] [--max-count <n>]
+of versions retention --root <dir> [--auto|--no-auto] [--max-age-days <n>] [--max-count <n>]
 of renew   --root <dir>
 of key     --root <dir>                        (print trusted public key)
 of health  --root <dir>                        (mgmt /healthz → exit code)
