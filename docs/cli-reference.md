@@ -30,6 +30,7 @@ of versions --root <dir> <worker>
 of versions list --root <dir> <worker>
 of versions prune --root <dir> [<worker>] [--dry-run] [--max-age-days <n>] [--max-count <n>]
 of versions retention --root <dir> [--auto|--no-auto] [--max-age-days <n>] [--max-count <n>]
+of versions share --root <dir> [--worker <name|workerId>] [--ttl-seconds <n>] <version_id>
 of renew   --root <dir>
 of key     --root <dir>                        (print trusted public key)
 of health  --root <dir>                        (mgmt /healthz → exit code)
@@ -54,8 +55,10 @@ of queue-metrics --root <dir> (--queue-id <26 chars> | --queue-name <name> [--te
 Version lifecycle details (`deploy --preview`, `promote`, `versions
 list`, preview URLs, and the current MVP limits) are in
 [deploy versions](versioning.md). A preview deploy's JSON output (and
-`/v1/deploy`, `/v1/versions`) carries `previewUrl` — `null` unless the
-host configures `[preview] domain` in `root/config/vrt-host.toml`.
+`/v1/deploy`, `/v1/versions`) carries a signed, expiring `previewUrl` —
+`null` unless the host configures both `[preview] domain` and
+`tokenSecretFile` in `root/config/vrt-host.toml` (previews are
+token-gated by default; `of versions share` mints a fresh link).
 
 `--config-sandbox=worker` evaluates a `cloudflare.config.*` in a workerd
 dynamic worker instead of the default Node loader; it needs

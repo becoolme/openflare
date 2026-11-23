@@ -1,22 +1,28 @@
 //! Versioned preview URLs — the control-plane half.
 //!
-//! Routing lives in `vrt-host`: it owns the `[preview] domain` config and
-//! turns each preview instance in the signed snapshot into
-//! `<versionId>--<workerName>.<domain>`. This module only *reports* the
-//! URL the operator can open, by reading the same host config file
+//! Routing lives in `vrt-host`: it owns the `[preview]` config and turns
+//! each preview instance in the signed snapshot into
+//! `<versionId>--<workerName>.<domain>`. This module *reports* the URL the
+//! operator can open, by reading the same host config file
 //! (`<root>/config/vrt-host.toml`). It is deliberately display-only:
 //!
-//! - an absent/unreadable/invalid `[preview] domain` yields `None`
-//!   (the API returns `previewUrl: null`), never a guessed URL;
+//! - an absent/unreadable/invalid config yields `None` (the API returns
+//!   `previewUrl: null`), never a guessed URL;
 //! - the host re-derives the hostname from its own config on every
-//!   converge, so a stale/malformed value here can never create a route.
+//!   converge, so a stale/malformed value here can never create a route;
+//! - previews REQUIRE a signed token by default: a URL is only reported
+//!   when the host config declares `[preview] tokenSecretFile` and that
+//!   file carries the key derived from this root's signing seed. With no
+//!   token secret configured the preview domain stays closed (the host
+//!   routes nothing and this module reports no URL).
 //!
 //! Wire shape: `<versionId>--<workerName>.<previewDomain>`. The `--`
 //! separator cannot appear in a worker name (the protocol forbids it, it
 //! is the platform's `<worker>--<team>` separator), and version ids are
 //! `<prefix>_<hex>`, so the two halves are unambiguous.
 
-use std::path::Path;
+use snapshot_protocol::preview_token::{PreviewTokenKey, DEFAULT_TTL_SECS};
+use std::path::{Path, PathBuf};
 
 /// Host config file name under `<root>/config/`.
 pub const HOST_CONFIG: &str = "vrt-host.toml";
@@ -24,19 +30,53 @@ pub const HOST_CONFIG: &str = "vrt-host.toml";
 /// Maximum hostname length (DNS).
 const MAX_HOSTNAME_LEN: usize = 253;
 
-/// Read `[preview] domain` from `<root>/config/vrt-host.toml`.
+/// `[preview]` as resolved from the host config.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewAccess {
+    /// Normalized public suffix.
+    pub domain: String,
+    /// Absolute path of the HMAC key file the host verifies with.
+    pub token_secret_file: PathBuf,
+}
+
+/// A signed preview URL plus its expiry (unix seconds).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewUrl {
+    /// `https://<version>--<worker>.<domain>/?__vrt_preview_token=…`
+    pub url: String,
+    /// Token expiry (unix seconds). The URL stops working at this time.
+    pub expires_at_unix_s: u64,
+}
+
+/// Read and validate `[preview]` from `<root>/config/vrt-host.toml`.
 ///
-/// Returns `None` when the file is missing, unparsable, has no
-/// `[preview]` section, or carries a domain this module will not render
-/// into a URL. Documents are parsed leniently on purpose: a host config
-/// this build does not fully understand (a newer field) must not turn
-/// `previewUrl` into an error.
-pub fn preview_domain(root: &Path) -> Option<String> {
-    let path = crate::layout::config_dir(root).join(HOST_CONFIG);
-    let text = std::fs::read_to_string(path).ok()?;
+/// Both `domain` and an ABSOLUTE `tokenSecretFile` are required: a domain
+/// without a token secret is a closed preview domain, not an open one.
+/// Documents are parsed leniently on purpose: a host config this build
+/// does not fully understand (a newer field) must not turn `previewUrl`
+/// into an error.
+pub fn access(root: &Path) -> Option<PreviewAccess> {
+    let text = std::fs::read_to_string(crate::layout::config_dir(root).join(HOST_CONFIG)).ok()?;
     let doc: toml::Value = toml::from_str(&text).ok()?;
-    let domain = doc.get("preview")?.get("domain")?.as_str()?;
-    normalize_domain(domain)
+    let preview = doc.get("preview")?;
+    let domain = normalize_domain(preview.get("domain")?.as_str()?)?;
+    let token_secret_file = PathBuf::from(preview.get("tokenSecretFile")?.as_str()?);
+    if !token_secret_file.is_absolute() {
+        return None;
+    }
+    Some(PreviewAccess {
+        domain,
+        token_secret_file,
+    })
+}
+
+/// Read `[preview] domain` alone (routing shape without the access
+/// requirement). Kept for diagnostics/tests; [`access`] is what gates a
+/// URL.
+pub fn preview_domain(root: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(crate::layout::config_dir(root).join(HOST_CONFIG)).ok()?;
+    let doc: toml::Value = toml::from_str(&text).ok()?;
+    normalize_domain(doc.get("preview")?.get("domain")?.as_str()?)
 }
 
 /// Validate + canonicalize a preview domain.
@@ -75,7 +115,10 @@ pub fn preview_host(domain: &str, version_id: &str, worker_name: &str) -> String
     format!("{}--{}.{}", version_id, worker_name, domain)
 }
 
-/// Full `https://…/` preview URL, or `None` for an unusable input.
+/// Unsigned `https://…/` preview URL, or `None` for an unusable input.
+///
+/// This URL opens nothing on a host that requires tokens (the default):
+/// use [`signed_url`] for an access-bearing link.
 pub fn preview_url(domain: &str, version_id: &str, worker_name: &str) -> Option<String> {
     if version_id.is_empty() || worker_name.is_empty() || domain.is_empty() {
         return None;
@@ -86,10 +129,102 @@ pub fn preview_url(domain: &str, version_id: &str, worker_name: &str) -> Option<
     ))
 }
 
-/// Convenience: the preview URL for `(version, worker)` in `root`, or
-/// `None` when this root has no usable preview domain configured.
-pub fn url_for(root: &Path, version_id: &str, worker_name: &str) -> Option<String> {
-    preview_url(&preview_domain(root)?, version_id, worker_name)
+/// Mint a signed, expiring preview URL for `(version, worker)`.
+///
+/// `worker_id` is the PRODUCTION worker id (the token audience); the
+/// token is bound to `(version_id, worker_id)` and cannot be replayed on
+/// another version or worker. `refresh_key` controls whether a missing
+/// `keys/preview-token.secret` is (re)created from the signing seed:
+/// mutating callers pass `true`; read-only listings pass `false` so a GET
+/// never writes key material.
+///
+/// Returns `None` when previews are not fully configured (no domain, no
+/// absolute `tokenSecretFile`, key file absent or not matching this
+/// root's derived key). A URL is never shown unless the host can verify
+/// it.
+pub fn signed_url(
+    root: &Path,
+    version_id: &str,
+    worker_id: &str,
+    worker_name: &str,
+    ttl_secs: u64,
+    refresh_key: bool,
+) -> Option<PreviewUrl> {
+    let access = access(root)?;
+    let key = if refresh_key {
+        crate::keys::ensure_preview_token_secret(root).ok()?
+    } else {
+        crate::keys::read_preview_token_secret(root)?
+    };
+    // The host verifies with the file, not with our derived value: only
+    // advertise a URL when both sides provably hold the same key.
+    // Mirror the host's loader checks: the verifier refuses a
+    // world-readable key file at startup, so advertising a URL for it
+    // would print a dead link.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::metadata(&access.token_secret_file).ok()?;
+        if meta.permissions().mode() & 0o777 != 0o600 {
+            return None;
+        }
+    }
+    let on_disk = std::fs::read_to_string(&access.token_secret_file).ok()?;
+    if !on_disk.trim().eq_ignore_ascii_case(&key.to_hex()) {
+        return None;
+    }
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let ttl = ttl_secs.clamp(
+        snapshot_protocol::preview_token::MIN_TTL_SECS,
+        snapshot_protocol::preview_token::MAX_TTL_SECS,
+    );
+    let expires_at_unix_s = now.saturating_add(ttl);
+    Some(PreviewUrl {
+        url: signed_url_for_key(
+            &access.domain,
+            &key,
+            version_id,
+            worker_id,
+            worker_name,
+            expires_at_unix_s,
+        ),
+        expires_at_unix_s,
+    })
+}
+
+/// Convenience wrapper for the default display TTL (one hour).
+pub fn signed_url_default(
+    root: &Path,
+    version_id: &str,
+    worker_id: &str,
+    worker_name: &str,
+    refresh_key: bool,
+) -> Option<PreviewUrl> {
+    signed_url(
+        root,
+        version_id,
+        worker_id,
+        worker_name,
+        DEFAULT_TTL_SECS,
+        refresh_key,
+    )
+}
+
+fn signed_url_for_key(
+    domain: &str,
+    key: &PreviewTokenKey,
+    version_id: &str,
+    worker_id: &str,
+    worker_name: &str,
+    expires_at_unix_s: u64,
+) -> String {
+    let token = key.mint(version_id, worker_id, expires_at_unix_s);
+    format!(
+        "https://{}/?{}={}",
+        preview_host(domain, version_id, worker_name),
+        snapshot_protocol::preview_token::TOKEN_PARAM,
+        token
+    )
 }
 
 #[cfg(test)]
@@ -114,12 +249,14 @@ mod tests {
             preview_domain(dir.path()).as_deref(),
             Some("preview.example.com")
         );
+        assert_eq!(access(dir.path()), None, "no tokenSecretFile -> closed");
     }
 
     #[test]
     fn absent_section_or_file_is_none() {
         let dir = root_with(None);
         assert_eq!(preview_domain(dir.path()), None);
+        assert_eq!(access(dir.path()), None);
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(preview_domain(empty.path()), None);
     }
@@ -157,13 +294,15 @@ mod tests {
     }
 
     #[test]
-    fn url_for_requires_a_configured_domain() {
-        let dir = root_with(Some("preview.example.com"));
-        assert_eq!(
-            url_for(dir.path(), "vrt_abc123", "edge-api").as_deref(),
-            Some("https://vrt_abc123--edge-api.preview.example.com/")
-        );
-        let off = root_with(None);
-        assert_eq!(url_for(off.path(), "vrt_abc123", "edge-api"), None);
+    fn access_requires_an_absolute_token_secret_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/vrt-host.toml"),
+            "cellId = \"local\"\n\n[preview]\ndomain = \"preview.example.com\"\n\
+             tokenSecretFile = \"keys/preview-token.secret\"\n",
+        )
+        .unwrap();
+        assert_eq!(access(dir.path()), None, "relative path is refused");
     }
 }

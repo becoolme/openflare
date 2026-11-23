@@ -145,7 +145,15 @@ maxBodyBytes = 1048576
 # is never read from a snapshot or a request. Responses carry
 # `x-vrt-preview: 1` + `x-vrt-preview-version`. Previews never receive
 # tenant secrets; KV/R2/D1/queue bindings stay shared with production.
-# `vrt-local` reads this same file to report `previewUrl` in
-# `of deploy --preview` / `of versions list`.
+# Preview ACCESS tokens are mandatory: `tokenSecretFile` must point at the
+# 0600 key written by `of init` (<root>/keys/preview-token.secret). A
+# domain without it leaves previews closed (every preview host is 404);
+# a configured-but-unreadable/world-readable key fails host startup.
+# Requests need `?__vrt_preview_token=…` (or the bootstrap cookie);
+# missing/expired/wrong tokens are 403 and never fall back to production.
+# `vrt-local` reads this same file to report a signed `previewUrl` in
+# `of deploy --preview` / `of versions list`, and `of versions share`
+# mints a fresh URL for any stored version.
 [preview]
 # domain = "preview.example.com"
+# tokenSecretFile = "/data/keys/preview-token.secret"

@@ -25,6 +25,7 @@
 pub mod compute_desired;
 pub mod envelope;
 pub mod error;
+pub mod preview_token;
 #[cfg(test)]
 mod golden_fixture;
 mod strict;
