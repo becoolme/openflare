@@ -6,9 +6,12 @@
 //! path every other module uses. `SHA256SUMS` is re-verified in
 //! `vrt-config/tests/workflows_vendor.rs` — drift fails closed.
 
-/// Raw bytes of `binding.worker.js` — the Engine DO + WorkflowBinding
-/// service entrypoint. Emitted as the engine service's `workflows.mjs`.
-pub const ENGINE_WORKER_JS: &[u8] = include_bytes!("../system-workers/workflows/binding.worker.js");
+/// Raw bytes of the VRT engine fork — the upstream Engine DO +
+/// WorkflowBinding entrypoint plus terminal-instance retention cleanup.
+/// Emitted as the engine service's `workflows.mjs`; the upstream file is
+/// kept byte-identical for the SHA256SUMS drift check.
+pub const ENGINE_WORKER_JS: &[u8] =
+    include_bytes!("../system-workers/workflows/binding.vrt.worker.js");
 
 /// Raw bytes of `wrapped-binding.worker.js` — emits `makeBinding` for
 /// the user-facing `env.<binding>` API. Inlined into
