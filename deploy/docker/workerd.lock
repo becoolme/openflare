@@ -1,23 +1,23 @@
 {
   "source": "github-release",
-  "version": "vrt-20261123-323dc39",
+  "version": "vrt-20261123-d1742f5",
   "upstream": {
-    "version": "1.20261120.1",
-    "commit": "7545be644952d71d76b904b37ae71b10c0ba8cad"
+    "version": "1.20261123.1",
+    "commit": "c5730a83eb1bb1405312cbc5ccdc8cd4f19d2d15"
   },
   "artifacts": {
     "linux-x64": {
-      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-323dc39/workerd-linux-x64.gz",
-      "archiveSha256": "9b83e10e6ce515de2e52aa5f340ae4e1fccb76e11618acaefa0ffa4100e3f43e",
-      "binarySha256": "f8ef394b426949c427c967b11bedc9da34f5cc4f8d8d294d860e8579fbd1a35a",
-      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-323dc39/workerd.capnp",
+      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-d1742f5/workerd-linux-x64.gz",
+      "archiveSha256": "13e79cf9b4049aa1d6b53d800291202f3cc6782c0b2f476d82a52c95e091b4e5",
+      "binarySha256": "4031e809b4ca648764ed1b7e85faecaa873f6beff52fa5cac0c298d01f67905d",
+      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-d1742f5/workerd.capnp",
       "capnpSha256": "72497e8c22a37d01d97956baefb16fc7c7f538c3d394125eaf96488e220368fb"
     },
     "linux-arm64": {
-      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-323dc39/workerd-linux-arm64.gz",
-      "archiveSha256": "a6656a03285e14a5b327a4610e750a5b9069ad26cc80bdd01c64b434502c303f",
-      "binarySha256": "b01022d1c177e297d47df9bc277a01d0b4a7525b194cfb28a1b32a3e4f493155",
-      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-323dc39/workerd.capnp",
+      "url": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-d1742f5/workerd-linux-arm64.gz",
+      "archiveSha256": "31ddb69ebf4db8b8101d169d51c0d0ea5f09dc73b8ba82e61d1a60ba2aff4791",
+      "binarySha256": "2a018263fa58f1539b55d4f477322267f904917c054b5101434e08b0899b22cb",
+      "capnpUrl": "https://github.com/becoolme/workerd/releases/download/vrt-20261123-d1742f5/workerd.capnp",
       "capnpSha256": "72497e8c22a37d01d97956baefb16fc7c7f538c3d394125eaf96488e220368fb"
     }
   }
