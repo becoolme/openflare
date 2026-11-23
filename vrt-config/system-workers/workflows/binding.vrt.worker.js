@@ -2506,7 +2506,7 @@ var defaultConfig = {
               accountId,
               instance.id,
               3 /* Errored */
-            ), await this.#engine.timeoutHandler.release(this.#engine), await this.#engine.abort(ABORT_REASONS.NOT_SERIALISABLE);
+            ), await this.#engine.releaseConcurrency(instance.id), await this.#engine.timeoutHandler.release(this.#engine), await this.#engine.abort(ABORT_REASONS.NOT_SERIALISABLE);
             return;
           }
           if (e instanceof StreamOutputStorageLimitError) {
@@ -2531,7 +2531,7 @@ var defaultConfig = {
               accountId,
               instance.id,
               3 /* Errored */
-            ), await this.#engine.timeoutHandler.release(this.#engine), await this.#engine.abort(ABORT_REASONS.STORAGE_LIMIT_EXCEEDED);
+            ), await this.#engine.releaseConcurrency(instance.id), await this.#engine.timeoutHandler.release(this.#engine), await this.#engine.abort(ABORT_REASONS.STORAGE_LIMIT_EXCEEDED);
             return;
           }
           if (e instanceof Error && e.name === "DataCloneError")
@@ -2558,7 +2558,7 @@ var defaultConfig = {
               accountId,
               instance.id,
               3 /* Errored */
-            ), await this.#engine.timeoutHandler.release(this.#engine), await this.#engine.abort(ABORT_REASONS.NOT_SERIALISABLE);
+            ), await this.#engine.releaseConcurrency(instance.id), await this.#engine.timeoutHandler.release(this.#engine), await this.#engine.abort(ABORT_REASONS.NOT_SERIALISABLE);
           else throw e instanceof Error && e.message.includes("string or blob too big: SQLITE_TOOBIG") ? new WorkflowInternalError(
             `Step ${stepNameWithCounter} output is too large. Maximum allowed size is 1MiB.`
           ) : new WorkflowInternalError(
@@ -3443,6 +3443,10 @@ var WorkflowSubscriptionTarget = class extends RpcTarget3 {
 
 // ../workflows-shared/src/engine.ts
 var ENGINE_STATUS_KEY = "ENGINE_STATUS", WORKFLOW_OUTPUT_KEY = "WORKFLOW_OUTPUT", EVENT_MAP_PREFIX2 = "EVENT_MAP", DEFAULT_STEP_LIMIT = 1e4, PAUSE_DATETIME2 = "PAUSE_DATETIME", RESTART_PENDING_KEY = "RESTART_PENDING", VRT_RETENTION_AT = "VRT_RETENTION_AT", VRT_DEFAULT_RETENTION_MS = 6048e5;
+function vrtConcurrencyLimit(value) {
+  let n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : 4500;
+}
 function vrtRetentionMs(value) {
   let n = typeof value == "number" ? value : Number(value);
   return Number.isFinite(n) && n >= 0 ? n : VRT_DEFAULT_RETENTION_MS;
@@ -3659,6 +3663,34 @@ async function buildWorkflowSubscriptionEvent(storage, log, instanceId, params) 
       return { ...common, type: "internal" };
   }
 }
+var Coordinator = class extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env), this.limit = vrtConcurrencyLimit(env.WORKFLOW_CONCURRENCY_LIMIT), ctx.blockConcurrencyWhile(async () => {
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS _vrt_wf_active(
+        id TEXT PRIMARY KEY,
+        acquired_at INTEGER NOT NULL
+      ) WITHOUT ROWID`);
+    });
+  }
+  acquire(id) {
+    return this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO _vrt_wf_active(id, acquired_at) VALUES(?, ?)",
+        id,
+        Date.now()
+      );
+      let count = this.ctx.storage.sql.exec(
+        "SELECT COUNT(*) AS n FROM _vrt_wf_active"
+      ).toArray()[0].n;
+      if (count <= this.limit)
+        return true;
+      return this.ctx.storage.sql.exec("DELETE FROM _vrt_wf_active WHERE id=?", id), false;
+    });
+  }
+  release(id) {
+    this.ctx.storage.sql.exec("DELETE FROM _vrt_wf_active WHERE id=?", id);
+  }
+};
 var Engine = class extends DurableObject {
   logs = [];
   isRunning = !1;
@@ -3978,6 +4010,15 @@ var Engine = class extends DurableObject {
       status,
       createdOn
     };
+  }
+  async releaseConcurrency(instanceId) {
+    if (!instanceId || this.env.COORDINATOR === void 0)
+      return;
+    try {
+      await this.env.COORDINATOR.get(this.env.COORDINATOR.idFromName("workflow")).release(instanceId);
+    } catch (error) {
+      console.error("vrt: workflow concurrency release failed", error);
+    }
   }
   async setStatus(accountId, instanceId, status) {
     let previousStatus = await this.ctx.storage.get(ENGINE_STATUS_KEY);
@@ -4318,11 +4359,13 @@ ${i}`] = events[i];
   }
   /** Deletes all instance state and aborts its current execution. */
   async deleteInstance() {
-    if (await this.ctx.storage.get(INSTANCE_METADATA) === void 0)
+    let metadata = await this.ctx.storage.get(INSTANCE_METADATA);
+    if (metadata === void 0)
       throw createWorkflowError(
         "Instance does not exist",
         "instance.not_found"
       );
+    await this.releaseConcurrency(metadata.instance.id);
     if (await this.ctx.storage.deleteAll(), this.env.MINIFLARE_LOOPBACK !== void 0 && this.env.WORKFLOW_NAME !== void 0)
       try {
         let response = await this.env.MINIFLARE_LOOPBACK.fetch(
@@ -4460,6 +4503,8 @@ ${i}`] = events[i];
   async alarm() {
     let retentionAt = await this.ctx.storage.get(VRT_RETENTION_AT);
     if (typeof retentionAt == "number" && Date.now() >= retentionAt) {
+      let metadata = await this.ctx.storage.get(INSTANCE_METADATA);
+      metadata !== void 0 && await this.releaseConcurrency(metadata.instance.id);
       await this.ctx.storage.deleteAll(), await this.ctx.storage.deleteAlarm();
       return;
     }
@@ -4609,7 +4654,7 @@ ${i}`] = events[i];
         result
       }), await this.ctx.storage.transaction(async () => {
         await this.setStatus(accountId, instance.id, 5 /* Complete */);
-      }), clearRollbackRegistry(this.rollbackRegistry), this.isRunning = !1;
+      }), await this.releaseConcurrency(instance.id), clearRollbackRegistry(this.rollbackRegistry), this.isRunning = !1;
     } catch (err) {
       if (isAbortError(err)) {
         this.isRunning = !1;
@@ -4631,7 +4676,7 @@ ${i}`] = events[i];
           );
           this.writeLog(3 /* WORKFLOW_FAILURE */, null, null, {
             error: fatalError
-          }), await this.setStatus(accountId, instance.id, 3 /* Errored */), await this.abort(ABORT_REASONS.NON_RETRYABLE_ERROR), this.isRunning = !1;
+          }), await this.setStatus(accountId, instance.id, 3 /* Errored */), await this.releaseConcurrency(instance.id), await this.abort(ABORT_REASONS.NON_RETRYABLE_ERROR), this.isRunning = !1;
           return;
         }
         error = {
@@ -4647,7 +4692,7 @@ ${i}`] = events[i];
         error
       }), await this.ctx.storage.transaction(async () => {
         await this.setStatus(accountId, instance.id, 3 /* Errored */);
-      }), this.isRunning = !1;
+      }), await this.releaseConcurrency(instance.id), this.isRunning = !1;
     }
     return {
       id: instance.id
@@ -4745,6 +4790,9 @@ var WorkflowBinding = class extends WorkerEntrypoint {
     if (!isValidWorkflowInstanceId(id))
       throw new WorkflowError("Workflow instance has invalid id");
     await waitForPersistedInstanceDelete(this.env, id);
+    let coordinator = this.env.COORDINATOR.get(this.env.COORDINATOR.idFromName("workflow"));
+    if (!await coordinator.acquire(id))
+      throw createWorkflowError("Workflow concurrency limit reached", "workflow.concurrency_limit");
     let stubId = this.env.ENGINE.idFromName(id), stub = this.env.ENGINE.get(stubId), introspectionSession = workflowIntrospectionSessions.get(
       this.env.WORKFLOW_NAME
     );
@@ -4781,6 +4829,8 @@ var WorkflowBinding = class extends WorkerEntrypoint {
     ).then((val) => {
       val !== void 0 && val[Symbol.dispose]();
     }).catch(() => {
+      coordinator.release(id).catch(() => {
+      });
     });
     return this.ctx.waitUntil(initPromise), {
       id
@@ -5038,6 +5088,7 @@ var WorkflowBinding = class extends WorkerEntrypoint {
   }
 };
 export {
+  Coordinator,
   Engine,
   WorkflowBinding
 };

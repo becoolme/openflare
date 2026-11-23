@@ -2763,6 +2763,9 @@ fn emit_workflow_engine(
     out.push_str(
         "        (name = \"ENGINE\", durableObjectNamespace = (className = \"Engine\")),\n",
     );
+    out.push_str(
+        "        (name = \"COORDINATOR\", durableObjectNamespace = (className = \"Coordinator\")),\n",
+    );
     // USER_WORKFLOW — service designator points at the DEFINING
     // worker's service + declared entrypoint (W7: `script_name`
     // targets another same-tenant worker's service — workerd service
@@ -2801,8 +2804,9 @@ fn emit_workflow_engine(
     }
     out.push_str("      ],\n");
     out.push_str(&format!(
-        "      durableObjectNamespaces = [\n        (className = \"Engine\", uniqueKey = {}, enableSql = true, preventEviction = true),\n      ],\n",
+        "      durableObjectNamespaces = [\n        (className = \"Engine\", uniqueKey = {}, enableSql = true, preventEviction = true),\n        (className = \"Coordinator\", uniqueKey = {}, enableSql = true, preventEviction = true),\n      ],\n",
         capnp_text(&wf.unique_key),
+        capnp_text(&crate::workflows::coordinator_unique_key(&wf.unique_key)),
     ));
     out.push_str(&format!(
         "      durableObjectStorage = (localDisk = {}),\n",

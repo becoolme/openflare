@@ -43,10 +43,14 @@ client input.
 
 ## Known differences from Cloudflare
 
-- **No Workflows-specific concurrency or subrequest enforcement.**
-  Cloudflare's account-level workflow concurrency quota and per-step
-  subrequest budget are not modelled here. The signed config carries only
-  `limits.steps`; workerd's worker-wide limits still apply.
+- **Fixed per-Workflow concurrency limit.** A per-Workflow coordinator
+  DO caps active instances at 4,500 by default; `create()` over the cap
+  fails with `workflow.concurrency_limit` instead of queueing. The slot
+  is released on completion/error/termination or explicit delete. This is
+  a per-Workflow cap, not Cloudflare's account-wide quota; the limit is
+  not yet configurable through the binding.
+- **No per-step subrequest budget.** The signed config carries only
+  `limits.steps`; workerd's worker-wide subrequest quota still applies.
 - **Fixed terminal-instance retention.** Completed, terminated and errored
   instances are deleted seven days after reaching the terminal status
   (`binding.vrt.worker.js` alarm). Per-Workflow `default_retention` and
