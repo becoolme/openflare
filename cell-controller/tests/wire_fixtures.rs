@@ -193,6 +193,7 @@ fn desired_ack_fixture() {
             images: true,
             secrets_store: true,
             version_metadata: true,
+            vectorize: true,
         }),
     };
     check(

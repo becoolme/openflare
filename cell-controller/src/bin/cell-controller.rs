@@ -158,6 +158,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // pinned binary — upstream, no fork shim) -- unconditionally on.
         secrets_store: true,
         version_metadata: true,
+        // `vectorize` bindings render with this generation (the pinned
+        // workerd ships `cloudflare-internal:vectorize-api` and the
+        // sysmanifest requires `facade-vectorize`) -- unconditionally on.
+        vectorize: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,
