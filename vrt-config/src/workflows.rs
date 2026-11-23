@@ -7,7 +7,8 @@
 //! `vrt-config/tests/workflows_vendor.rs` — drift fails closed.
 
 /// Raw bytes of the VRT engine fork — the upstream Engine DO +
-/// WorkflowBinding entrypoint plus terminal-instance retention cleanup.
+/// WorkflowBinding entrypoint plus terminal retention and a per-workflow
+/// concurrency coordinator.
 /// Emitted as the engine service's `workflows.mjs`; the upstream file is
 /// kept byte-identical for the SHA256SUMS drift check.
 pub const ENGINE_WORKER_JS: &[u8] =
@@ -187,6 +188,12 @@ pub fn wfop_token(pepper: &str, unique_key: &str) -> String {
         pepper.as_bytes(),
         format!("vrt-wfop:{unique_key}").as_bytes(),
     ))
+}
+
+/// Per-workflow coordinator storage identity (64-hex) — derives a second
+/// DO namespace from the declared engine uniqueKey.
+pub fn coordinator_unique_key(unique_key: &str) -> String {
+    sha256_hex(format!("vrt-wfcoord:{unique_key}").as_bytes())
 }
 
 /// sha256 of the vendored engine bundle (lowercase hex) — computed at

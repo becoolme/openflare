@@ -52,10 +52,20 @@ fn emit_engine_service_with_namespace_and_bindings() {
     assert!(out.contains(
         "(className = \"Engine\", uniqueKey = \"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\", enableSql = true, preventEviction = true),"
     ), "{out}");
+    assert!(
+        out.contains("(className = \"Coordinator\", uniqueKey = \""),
+        "{out}"
+    );
 
     // Engine bindings per miniflare wiring.
     assert!(
         out.contains("(name = \"ENGINE\", durableObjectNamespace = (className = \"Engine\"))"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "(name = \"COORDINATOR\", durableObjectNamespace = (className = \"Coordinator\"))"
+        ),
         "{out}"
     );
     assert!(out.contains(

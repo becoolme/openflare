@@ -51,7 +51,7 @@ sanctioned local changes are the W1-r5 / W2 P0-0 patches in
 `binding.worker.js` and the VRT retention fork in
 `binding.vrt.worker.js`.
 
-## VRT fork: terminal-instance retention (binding.vrt.worker.js)
+## VRT fork: terminal retention + concurrency (binding.vrt.worker.js)
 
 Cloudflare retains completed/errored instance state for a bounded period.
 This engine has no such cleanup. The fork adds a per-instance retention
@@ -67,8 +67,15 @@ deadline without changing the upstream reference file:
 - `Queued` / `Running` clears the marker, so a restarted instance cannot
   inherit a stale cleanup deadline.
 
+The fork also exports a `Coordinator` Durable Object per Workflow. It keeps
+an SQLite table of active instance ids and caps them at
+`WORKFLOW_CONCURRENCY_LIMIT` (default 4,500). `create()` fails with
+`workflow.concurrency_limit` when full; terminal status, explicit delete, or
+retention cleanup releases the slot idempotently.
+
 Per-Workflow and per-instance retention configuration is not yet wired;
-the fork currently applies the seven-day default to every instance.
+the fork currently applies the seven-day default to every instance. The
+concurrency cap is also fixed at the default for now.
 
 ## Local patch: W1-r5 durable resume (binding.worker.js only)
 
