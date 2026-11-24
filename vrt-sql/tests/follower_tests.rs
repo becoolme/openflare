@@ -94,6 +94,18 @@ fn count(f: &Follower) -> i64 {
 }
 
 #[test]
+fn promotion_readiness_rejects_empty_follower() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let f = follower(store, clock, tmp.path().join("follower"));
+    let readiness = f.promotion_readiness().unwrap();
+    assert!(!readiness.ready);
+    assert_eq!(readiness.reason, "no-state");
+    assert!(!readiness.generation_exists);
+}
+
+#[test]
 fn tails_segments_and_pins_a_commit_point() {
     let tmp = tempfile::tempdir().unwrap();
     let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
@@ -116,6 +128,10 @@ fn tails_segments_and_pins_a_commit_point() {
     assert!(r.caught_up());
     assert_eq!(count(&f), 1);
     assert_eq!(r.head_epoch, 1);
+    let readiness = f.promotion_readiness().unwrap();
+    assert!(readiness.ready, "{readiness:?}");
+    assert_eq!(readiness.reason, "ready");
+    assert!(readiness.generation_exists);
 
     // A reader holds one immutable generation: newer commits are invisible until it reopens.
     let pinned = f.open_readonly().unwrap();
