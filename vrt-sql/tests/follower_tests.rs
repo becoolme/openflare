@@ -132,6 +132,11 @@ fn tails_segments_and_pins_a_commit_point() {
     assert!(readiness.ready, "{readiness:?}");
     assert_eq!(readiness.reason, "ready");
     assert!(readiness.generation_exists);
+    let plan = f.promotion_plan().unwrap();
+    assert_eq!(plan.expected_epoch, r.head_epoch);
+    assert_eq!(plan.expected_lsn, r.head_lsn);
+    assert_eq!(plan.next_epoch, r.head_epoch + 1);
+    assert_eq!(plan.generation, readiness.generation.unwrap());
 
     // A reader holds one immutable generation: newer commits are invisible until it reopens.
     let pinned = f.open_readonly().unwrap();
