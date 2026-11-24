@@ -49,8 +49,12 @@ client input.
   with `workflow.concurrency_limit` instead of queueing. The slot is
   released on completion/error/termination or explicit delete. This is a
   per-Workflow cap, not Cloudflare's account-wide quota.
-- **No per-step subrequest budget.** The signed config carries only
-  `limits.steps`; workerd's worker-wide subrequest quota still applies.
+- **No per-instance subrequest budget.** Cloudflare defaults to 10,000
+  subrequests per Workflow instance (configurable up to 10 million via
+  `limits.subrequests`); this runtime currently enforces only workerd's
+  worker-wide per-invocation quota. Cumulative per-instance accounting
+  needs engine/workerd support, so `limits.subrequests` is rejected by
+  config validation instead of being accepted without effect.
 - **Terminal-instance retention.** Completed, terminated and errored
   instances are deleted seven days after reaching the terminal status by
   default (`binding.vrt.worker.js` alarm). `default_retention`
