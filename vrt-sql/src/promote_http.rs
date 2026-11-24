@@ -28,6 +28,9 @@ struct PromoteState {
     follower: Arc<Follower>,
     persister: Arc<Persister>,
     auth: crate::service::ServiceAuth,
+    /// One promotion at a time. The manifest CAS is already atomic, but the
+    /// local adoption copy must not race another promote on this process.
+    busy: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -53,6 +56,7 @@ pub fn router(
             follower,
             persister,
             auth,
+            busy: Arc::new(tokio::sync::Mutex::new(())),
         })
 }
 
@@ -111,9 +115,20 @@ async fn promote(
         }
     };
 
+    let _guard = match state.busy.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return err(
+                StatusCode::CONFLICT,
+                "VRT_PROMOTE_BUSY",
+                "another promotion is in progress on this follower",
+            )
+        }
+    };
     let follower = state.follower.clone();
     let persister = state.persister.clone();
     let db = follower.database_id().to_string();
+    let task_db = db.clone();
     let task = tokio::task::spawn_blocking(move || -> Result<serde_json::Value, FollowerError> {
         let plan = follower.promotion_plan()?;
         if let Some(epoch) = request.expected_epoch {
@@ -137,7 +152,7 @@ async fn promote(
         let outcome = follower.promote(&persister)?;
         let mut handle = outcome.handle.clone();
         let released = persister
-            .release(&db, &mut handle, persister.clock().now_ms())
+            .release(&task_db, &mut handle, persister.clock().now_ms())
             .is_ok();
         Ok(serde_json::json!({
             "success": true,
@@ -152,8 +167,14 @@ async fn promote(
     .await;
 
     match task {
-        Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => promote_error(e),
+        Ok(Ok(v)) => {
+            tracing::info!(db = %db, result = %v, "follower promotion committed");
+            Json(v).into_response()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(db = %db, error = %e, "follower promotion failed");
+            promote_error(e)
+        }
         Err(e) => err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "VRT_PROMOTE_FAILED",
