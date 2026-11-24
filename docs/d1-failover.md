@@ -39,9 +39,9 @@ to the new writer.
      `[vrtSql].addr` when absent; replicas keep the existing bounded fallback.
    - The promoted epoch and address must be published together (one signed
      desired revision) after the new writer is serving.
-   - The data plane rejects a request whose signed epoch differs from the
-     current writer lease epoch (`VRT_FENCED`), so an old provider snapshot
-     cannot write against the promoted writer.
+   - The manifest CAS remains the writer authority: an old writer process is
+     fenced on its next commit, and the signed epoch is a routing/dedup hint
+     (a restarted writer may advance the epoch before desired is republished).
 3. **Automatic failover — implemented (opt-in)**
    - `[d1sql].auto_failover` entries give the cell a writer health probe, the
      follower promote endpoint and the new writer address.
