@@ -213,6 +213,19 @@ pub struct PromotionReadiness {
     pub generation_exists: bool,
 }
 
+/// Read-only CAS inputs for a future manual promotion. The actual promote
+/// command must still compare `expected_epoch`/`expected_lsn`, write the next
+/// epoch manifest with CAS, and only then start the writer.
+#[derive(Debug, Clone)]
+pub struct PromotionPlan {
+    pub database_id: String,
+    pub expected_epoch: u64,
+    pub expected_lsn: u64,
+    pub next_epoch: u64,
+    pub generation: String,
+    pub chain: Vec<EpochSpan>,
+}
+
 impl FollowerStatus {
     /// Commits between the applied watermark and the manifest head (0 when caught up).
     pub fn lag_commits(&self) -> u64 {
@@ -404,6 +417,25 @@ impl Follower {
             head_lsn: status.head_lsn,
             generation: status.generation,
             generation_exists,
+        })
+    }
+
+    /// CAS inputs for a future manual promotion. Fail closed unless
+    /// `promotion_readiness()` is ready.
+    pub fn promotion_plan(&self) -> Result<PromotionPlan, FollowerError> {
+        let readiness = self.promotion_readiness()?;
+        if !readiness.ready {
+            return Err(FollowerError::NotReady);
+        }
+        let manifest = self.read_manifest()?.ok_or(FollowerError::NotReady)?;
+        let generation = readiness.generation.ok_or(FollowerError::NotReady)?;
+        Ok(PromotionPlan {
+            database_id: self.database_id.clone(),
+            expected_epoch: manifest.epoch,
+            expected_lsn: manifest.lsn,
+            next_epoch: manifest.epoch.saturating_add(1),
+            generation,
+            chain: manifest.chain,
         })
     }
 
