@@ -2109,7 +2109,13 @@ impl WsTunnel {
 
         let idle_ms = self.idle_timeout.as_millis() as u64;
         let max_at = tokio::time::Instant::now() + self.max_duration;
-        let mut guard = Some(guard);
+        // Hibernation-enabled sessions must not pin the tenant resident for
+        // their whole lifetime; idle activity is tracked separately.
+        let mut guard = if self.hibernation.enabled {
+            None
+        } else {
+            Some(guard)
+        };
         let reason = 'session: loop {
             let up = match upstream.as_mut() {
                 Some(up) => up,
@@ -2175,14 +2181,16 @@ impl WsTunnel {
                 {
                     break 'session "reattach_failed";
                 }
-                let Some(next_guard) = self
-                    .runtime
-                    .endpoint_slot(&self.worker_id)
-                    .and_then(|slot| slot.acquire())
-                else {
-                    break 'session "reattach_guard";
-                };
-                guard = Some(next_guard);
+                if !self.hibernation.enabled {
+                    let Some(next_guard) = self
+                        .runtime
+                        .endpoint_slot(&self.worker_id)
+                        .and_then(|slot| slot.acquire())
+                    else {
+                        break 'session "reattach_guard";
+                    };
+                    guard = Some(next_guard);
+                }
                 upstream = Some(new_up);
                 ws_outcome(w, "reattached");
                 continue 'session;
