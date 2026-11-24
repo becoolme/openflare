@@ -55,7 +55,9 @@ SQLite state, or WebSocket sessions, and wake them from:
    True hibernation therefore needs a connection-holding proxy at the ingress
    that persists session metadata and can re-handshake/reattach to a new
    generation, with a bounded per-session replay buffer. Until that exists, an
-   open session correctly keeps the tenant resident (fail safe).
+   open session correctly keeps the tenant resident (fail safe). The pure
+   state-machine prototype is in `spike/ws-hibernation/` (not wired to
+   production).
 4. **Automatic policy**: idle window, max sleep, wake budget, metrics.
 
 ## Invariants
