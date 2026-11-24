@@ -244,6 +244,9 @@ pub struct StructuralFacts {
     pub queue_consumers: bool,
     /// Declares workflows.
     pub workflows: bool,
+    /// The cell alarm index has confirmed every DO class is fully scanned and
+    /// no alarm is due inside the safety lead. Default `false` (fail closed).
+    pub alarm_safe: bool,
 }
 
 /// waitUntil accounting at commit time.
@@ -340,7 +343,7 @@ impl HibernationBlocker for StructuralBlocker {
     }
     fn check(&self, ctx: &BlockContext) -> Option<BlockReason> {
         let s = ctx.structural;
-        if s.durable_objects {
+        if s.durable_objects && !s.alarm_safe {
             Some(BlockReason::StructuralDurableObject)
         } else if s.workflows {
             Some(BlockReason::StructuralWorkflow)
@@ -409,9 +412,8 @@ pub const QUEUE_WAKE_MAX_WAIT: Duration = Duration::from_secs(20);
 /// forwarded op so a typed result is returned before 15s.
 pub const WORKFLOW_WAKE_MAX_WAIT: Duration = Duration::from_secs(8);
 
-/// Closed set of wake triggers. `Http`, `Cron`, `Queue` and `Workflow`
-/// are implemented; DO-alarm is added as a variant with its own retry
-/// policy in a later phase (never as a string).
+/// Closed set of wake triggers. `Http`, `Cron`, `Queue`, `Workflow` and
+/// `Alarm` are all implemented; never a string.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WakeSourceKind {
     /// An ingress HTTP request.
@@ -420,6 +422,10 @@ pub enum WakeSourceKind {
     Cron,
     /// A cell-controller queue dispatch (`/v1/queue/dispatch`).
     Queue,
+    /// A cell-controller DO alarm wake (`/v1/do-alarm/wake`). The tenant
+    /// already holds the alarm in workerd's class `metadata.sqlite`; starting
+    /// the generation delivers it.
+    Alarm,
     /// A cell-controller workflow op (`/v1/wfops`). The workflow engine
     /// is a DO inside workerd, so workflow tenants never hibernate
     /// (`StructuralWorkflow` stays); this wakes a tenant that slept
@@ -435,6 +441,7 @@ impl WakeSourceKind {
             Self::Http => "http",
             Self::Cron => "cron",
             Self::Queue => "queue",
+            Self::Alarm => "alarm",
             Self::Workflow => "workflow",
         }
     }
@@ -443,7 +450,7 @@ impl WakeSourceKind {
     /// single wake may use (>= 1).
     pub fn max_attempts(self) -> u32 {
         match self {
-            Self::Http | Self::Cron | Self::Queue | Self::Workflow => 2,
+            Self::Http | Self::Cron | Self::Queue | Self::Workflow | Self::Alarm => 2,
         }
     }
 
@@ -455,7 +462,7 @@ impl WakeSourceKind {
     /// timeout, see that constant).
     pub fn max_wait(self, default: Duration) -> Duration {
         match self {
-            Self::Http | Self::Cron => default,
+            Self::Http | Self::Cron | Self::Alarm => default,
             Self::Queue => default.min(QUEUE_WAKE_MAX_WAIT),
             Self::Workflow => default.min(WORKFLOW_WAKE_MAX_WAIT),
         }
@@ -966,6 +973,16 @@ mod tests {
                 None
             );
         }
+        // A safe DO alarm gate releases the structural block.
+        let safe_do = StructuralFacts {
+            durable_objects: true,
+            alarm_safe: true,
+            ..none
+        };
+        assert_eq!(
+            chain.first_block(BlockPhase::Admission, &ctx(0, safe_do, WaitUntilFact::NotProbed)),
+            None
+        );
     }
 
     #[test]

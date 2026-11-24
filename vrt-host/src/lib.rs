@@ -53,6 +53,7 @@ pub mod config;
 pub mod control;
 pub mod cron_trigger;
 pub mod desired;
+pub mod do_alarm;
 pub mod do_migration;
 pub mod do_placement;
 pub mod do_placement_store;

@@ -44,6 +44,11 @@ pub const MAX_REPORT_ERRORS: usize = 500;
 pub const MAX_ERROR_CHARS: usize = 512;
 /// Hard cap on the report body pushed to the control plane.
 pub const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
+/// How long a host trusts one alarm gate before treating DO sleep as unsafe.
+pub const ALARM_GATE_TTL_MS: u64 = 90_000;
+/// An alarm due inside this window keeps the tenant resident, covering the
+/// wake loop period + scan/report latency + clock skew.
+pub const ALARM_SAFETY_LEAD_MS: u64 = 60_000;
 /// Default collection cadence.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 /// Windows longer than this are clamped (a pod that vanished for days).
@@ -829,6 +834,15 @@ pub struct AlarmsView {
     pub sampled_at_ms: i64,
 }
 
+/// One tenant's DO sleep verdict pushed to its pod.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlarmGate {
+    pub tenant_id: String,
+    pub safe: bool,
+    pub ttl_ms: u64,
+}
+
 /// Every external dependency of the periodic report. Tests implement this
 /// with in-memory data; production uses [`HttpReportIo`].
 #[async_trait::async_trait]
@@ -846,6 +860,11 @@ pub trait ReportIo: Send + Sync {
     }
     async fn stats(&self, d1: &[String], queues: &[String]) -> Result<StatsPayload, String>;
     async fn push(&self, report: &CellReport) -> Result<(), String>;
+    /// Push the tenant's DO alarm-sleep verdict to the pod. Default no-op:
+    /// older hosts/tests simply keep DO tenants resident.
+    async fn push_alarm_gate(&self, _pod_id: &str, _gate: &AlarmGate) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn instance_set(mut view: InstancesView, budget: usize) -> InstanceSet {
@@ -976,6 +995,55 @@ impl<T: ReportIo> Reporter<T> {
                 if let Err(e) = index.mark_unknown(&class, now) {
                     tracing::warn!(tenant = %class.tenant_id, class = %class.class_key,
                         error = %e, "do alarm index persist failed");
+                }
+            }
+        }
+    }
+
+    /// Derive and push one tenant gate per pod from the alarm index. A tenant
+    /// with any declared DO class that is not fully scanned, unknown, or has an
+    /// alarm inside the lead window is published as unsafe.
+    async fn publish_alarm_gates(
+        &self,
+        plan: &ReportPlan,
+        assignments: &BTreeMap<String, PodAssignment>,
+        now_ms: i64,
+    ) {
+        let Some(index) = &self.alarm_index else {
+            return;
+        };
+        let now = now_ms.max(0) as u64;
+        for assignment in assignments.values() {
+            let mut by_tenant: BTreeMap<String, Vec<&InstanceTarget>> = BTreeMap::new();
+            for target in &plan.do_classes {
+                if assignment
+                    .workers
+                    .iter()
+                    .any(|w| w.tenant_id == target.tenant_id && w.worker_id == target.worker_id)
+                {
+                    by_tenant
+                        .entry(target.tenant_id.clone())
+                        .or_default()
+                        .push(target);
+                }
+            }
+            for (tenant_id, targets) in by_tenant {
+                let safe = targets.iter().all(|target| {
+                    let class = AlarmClass {
+                        tenant_id: target.tenant_id.clone(),
+                        worker_id: target.worker_id.clone(),
+                        class_key: target.class_key.clone(),
+                    };
+                    index.is_safe_to_sleep_stage2(&class, now, ALARM_SAFETY_LEAD_MS)
+                });
+                let gate = AlarmGate {
+                    tenant_id,
+                    safe,
+                    ttl_ms: ALARM_GATE_TTL_MS,
+                };
+                if let Err(e) = self.io.push_alarm_gate(&assignment.pod_id, &gate).await {
+                    tracing::debug!(pod = %assignment.pod_id, tenant = %gate.tenant_id,
+                        error = %e, "do alarm gate push failed; tenant stays resident");
                 }
             }
         }
@@ -1143,6 +1211,7 @@ impl<T: ReportIo> Reporter<T> {
             }
             self.observe_alarms(&pod, target, now_ms).await;
         }
+        self.publish_alarm_gates(&plan, assignments, now_ms).await;
         if report.errors.len() > MAX_REPORT_ERRORS {
             report.errors.truncate(MAX_REPORT_ERRORS - 1);
             report.errors.push("errors truncated".into());
@@ -1327,6 +1396,25 @@ impl ReportIo for HttpReportIo {
             return Err("alarms body too large".into());
         }
         serde_json::from_slice(&bytes).map_err(|e| format!("alarms decode: {e}"))
+    }
+
+    async fn push_alarm_gate(&self, pod_id: &str, gate: &AlarmGate) -> Result<(), String> {
+        let url = format!("{}/v1/do-alarm/gate", self.pod(pod_id)?);
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.http
+                .post(&url)
+                .header("content-type", "application/json")
+                .json(gate)
+                .send(),
+        )
+        .await
+        .map_err(|_| "alarm gate timeout".to_string())?
+        .map_err(|e| format!("alarm gate transport: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("alarm gate status {}", resp.status()));
+        }
+        Ok(())
     }
 
     async fn stats(&self, d1: &[String], queues: &[String]) -> Result<StatsPayload, String> {
@@ -1573,6 +1661,7 @@ vrt_host_wake_seconds_count 1
 
     struct MemoryIo {
         pushes: std::sync::Arc<std::sync::Mutex<Vec<CellReport>>>,
+        gates: std::sync::Arc<std::sync::Mutex<Vec<(String, AlarmGate)>>>,
     }
 
     #[async_trait::async_trait]
@@ -1652,6 +1741,13 @@ vrt_host_wake_seconds_count 1
             self.pushes.lock().unwrap().push(report.clone());
             Ok(())
         }
+        async fn push_alarm_gate(&self, pod_id: &str, gate: &AlarmGate) -> Result<(), String> {
+            self.gates
+                .lock()
+                .unwrap()
+                .push((pod_id.to_string(), gate.clone()));
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -1689,6 +1785,7 @@ vrt_host_wake_seconds_count 1
         let mut reporter = Reporter::new(
             MemoryIo {
                 pushes: pushes.clone(),
+                gates: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             },
             "cell-001",
         );
@@ -1750,9 +1847,11 @@ vrt_host_wake_seconds_count 1
             tmp.path(),
         ))));
         let pushes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gates = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut reporter = Reporter::new(
             MemoryIo {
                 pushes: pushes.clone(),
+                gates: gates.clone(),
             },
             "cell-001",
         )
@@ -1763,6 +1862,12 @@ vrt_host_wake_seconds_count 1
             .unwrap();
         assert_eq!(index.earliest().unwrap().at_ms, 42);
         assert!(!index.snapshot().is_empty());
+        let gates = gates.lock().unwrap();
+        assert!(!gates.is_empty());
+        assert!(
+            gates.iter().all(|(_, g)| !g.safe),
+            "a due alarm must publish an unsafe gate"
+        );
         // The file is written in the cell state dir and reloads.
         let reopened = AlarmIndex::open(Some(crate::alarm_index::index_path(tmp.path())));
         assert_eq!(reopened.earliest().unwrap().at_ms, 42);

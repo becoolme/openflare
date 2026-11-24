@@ -1,7 +1,7 @@
 # Durable Object hibernation: staged design
 
-Status: alarm index implemented; sleep eligibility and wake are not implemented
-(DO tenants still stay resident).
+Status: alarm index + alarm wake implemented (opt-in via the cell controller).
+DO tenants without a fresh safe gate still stay resident.
 
 ## Current blocker
 
@@ -27,8 +27,10 @@ SQLite state, or WebSocket sessions, and wake them from:
    state directory. Classes whose scan failed are recorded as unknown and are
    never considered sleepable. See `cell-controller/src/alarm_index.rs` and
    the host `POST /v1/introspect/alarms` endpoint.
-2. **Wake RPC** from cell-controller to the pod supervisor: load the tenant
-   generation, replay alarms, then allow traffic.
+2. **Wake RPC — implemented** as `POST /v1/do-alarm/wake`. The pod starts the
+   tenant through the shared `WakeFlight`; workerd itself loads
+   `metadata.sqlite:_cf_ALARM` and fires overdue alarms. The controller
+   consumes `AlarmIndex::due` every 5s and re-scans the class after a wake.
 3. **DO storage quiescence**: no in-flight requests, no open WebSocket, no
    storage transaction; otherwise skip sleep.
 4. **WebSocket detach/re-attach**: either reject sleep with open sockets
@@ -38,8 +40,11 @@ SQLite state, or WebSocket sessions, and wake them from:
 
 ## Stages
 
-1. **Sleep eligibility**: allow DO tenants with no open sockets and an
-   empty/inactive alarm set to scale to zero; prove no data loss.
+1. **Sleep eligibility — implemented behind the gate**: the controller pushes
+   `POST /v1/do-alarm/gate` (`safe` + TTL) from the alarm index. A class must
+   have been scanned since the controller started, be free of unknown/truncated
+   reads and have no alarm inside the 60s lead window. A missing/expired gate
+   keeps the tenant resident.
 2. **Alarm wake**: persist earliest alarm, wake via cell-controller, re-arm.
 3. **WebSocket hibernation**: detach sessions, bounded replay buffer,
    reattach; reject if a frame cannot be buffered.
