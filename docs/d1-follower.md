@@ -96,7 +96,10 @@ For the control plane / cell path, the same operation is available as
 `POST /internal/dbs/{id}/promote` on the follower listener when
 `follower.promoteWriterDbRoot` is configured (opt-in; requires the service
 auth secret). The cell-controller turns a `PROMOTE` D1 op into that call when
-`[d1sql].promoteEndpoint` is set.
+`[d1sql].promoteEndpoint` is set. Supply the new serving endpoint in the
+`PROMOTE` op payload (`writerAddr`) so the control plane can publish
+`epoch + writerAddr` in the signed binding; without it the provider keeps its
+static `[vrtSql].addr`.
 
 After promotion, publish the new `epoch` (and optionally `writerAddr`) in the
 signed D1 binding. The provider then routes writes to the new writer; a stale
