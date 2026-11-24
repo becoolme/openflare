@@ -604,6 +604,8 @@ pub struct IngressState {
     /// Live + reserved sessions per tenant. A key is removed when its
     /// count reaches zero, so the map is bounded by live tenants.
     ws_tenant_active: Arc<Mutex<HashMap<String, usize>>>,
+    /// Detached-session hibernation policy (default off).
+    ws_hibernation: Arc<WsHibernation>,
     /// Worker-log hub: host-observed routing failures are recorded as
     /// `level=platform` records. Set once after construction; unset =
     /// log collection disabled (zero overhead).
@@ -651,6 +653,7 @@ impl IngressState {
             ws_active: Arc::new(AtomicUsize::new(0)),
             ws_tenant_active: Arc::new(Mutex::new(HashMap::new())),
             ws_max_per_tenant: WS_DEFAULT_MAX_PER_TENANT,
+            ws_hibernation: Arc::new(WsHibernation::default()),
             logs: std::sync::OnceLock::new(),
             dev_catch_all: Arc::new(AtomicBool::new(false)),
             preview_auth: std::sync::OnceLock::new(),
@@ -714,6 +717,46 @@ impl IngressState {
             ws_active: self.ws_active.clone(),
             ws_tenant_active: self.ws_tenant_active.clone(),
             ws_max_per_tenant: self.ws_max_per_tenant,
+            ws_hibernation: self.ws_hibernation.clone(),
+            panic_once: std::sync::atomic::AtomicBool::new(false),
+            logs: match self.logs.get() {
+                Some(h) => {
+                    let c = std::sync::OnceLock::new();
+                    let _ = c.set(h.clone());
+                    c
+                }
+                None => std::sync::OnceLock::new(),
+            },
+            dev_catch_all: self.dev_catch_all.clone(),
+            preview_auth: copy_once_lock(&self.preview_auth),
+        })
+    }
+
+    /// Enable/disable holding detached WebSocket sessions across tenant
+    /// hibernation. Off by default; zero bytes clamps to 1 KiB.
+    pub fn with_ws_hibernation(self: &Arc<Self>, enabled: bool, replay_bytes: usize) -> Arc<Self> {
+        Arc::new(IngressState {
+            routes: ArcSwap::new(self.routes.load_full()),
+            registry: self.registry.clone(),
+            request_timeout: self.request_timeout,
+            connect_timeout: self.connect_timeout,
+            max_body_bytes: self.max_body_bytes,
+            switch_hold_budget: self.switch_hold_budget,
+            switch_hold_max_reqs: self.switch_hold_max_reqs,
+            switch_hold_max_bytes: self.switch_hold_max_bytes,
+            forwarded_proto: self.forwarded_proto.clone(),
+            client_ip: self.client_ip.clone(),
+            geoip: self.geoip.clone(),
+            ws_idle_timeout: self.ws_idle_timeout,
+            ws_max_duration: self.ws_max_duration,
+            ws_max_sessions: self.ws_max_sessions,
+            ws_active: self.ws_active.clone(),
+            ws_tenant_active: self.ws_tenant_active.clone(),
+            ws_max_per_tenant: self.ws_max_per_tenant,
+            ws_hibernation: Arc::new(WsHibernation {
+                enabled,
+                replay_bytes: replay_bytes.max(1024),
+            }),
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -750,6 +793,7 @@ impl IngressState {
             ws_active: self.ws_active.clone(),
             ws_tenant_active: self.ws_tenant_active.clone(),
             ws_max_per_tenant: self.ws_max_per_tenant,
+            ws_hibernation: self.ws_hibernation.clone(),
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -786,6 +830,7 @@ impl IngressState {
             ws_active: self.ws_active.clone(),
             ws_tenant_active: self.ws_tenant_active.clone(),
             ws_max_per_tenant: self.ws_max_per_tenant,
+            ws_hibernation: self.ws_hibernation.clone(),
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -823,6 +868,7 @@ impl IngressState {
             ws_active: self.ws_active.clone(),
             ws_tenant_active: self.ws_tenant_active.clone(),
             ws_max_per_tenant: self.ws_max_per_tenant,
+            ws_hibernation: self.ws_hibernation.clone(),
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -866,6 +912,7 @@ impl IngressState {
             ws_active: self.ws_active.clone(),
             ws_tenant_active: self.ws_tenant_active.clone(),
             ws_max_per_tenant: max_per_tenant.max(1),
+            ws_hibernation: self.ws_hibernation.clone(),
             panic_once: std::sync::atomic::AtomicBool::new(false),
             logs: match self.logs.get() {
                 Some(h) => {
@@ -1536,6 +1583,12 @@ async fn handle_routed(
         is_ws,
     );
 
+    let ws_resume = is_ws.then(|| ReconnectRequest {
+        method: upstream_req.method().clone(),
+        uri: upstream_req.uri().clone(),
+        headers: upstream_req.headers().clone(),
+        version: upstream_req.version(),
+    });
     let endpoint = slot.endpoint().clone();
     let log_hub = state.logs.get().cloned();
     // `request_timeout` bounds connect + response headers only; a
@@ -1560,6 +1613,8 @@ async fn handle_routed(
                 guard,
                 ws_permit,
                 &target.worker_id,
+                runtime.clone(),
+                ws_resume,
                 metric,
             );
         }
@@ -1809,6 +1864,7 @@ impl Drop for WsPermit {
 
 /// Upstream answered 101: answer the client with a normalized 101 and
 /// hand both upgraded halves to the tunnel task.
+#[allow(clippy::too_many_arguments)]
 fn finish_ws_upgrade(
     state: &IngressState,
     mut response: hyper::Response<hyper::body::Incoming>,
@@ -1816,6 +1872,8 @@ fn finish_ws_upgrade(
     guard: InFlightGuard,
     permit: Option<WsPermit>,
     worker_id: &str,
+    runtime: Arc<crate::supervisor::TenantRuntime>,
+    reconnect: Option<ReconnectRequest>,
     metric: &mut crate::metrics::RequestMetric,
 ) -> Result<Response, IngressError> {
     let (Some(client_upgrade), Some(mut permit)) = (client_upgrade, permit) else {
@@ -1840,9 +1898,14 @@ fn finish_ws_upgrade(
     metric.finish(Some(StatusCode::SWITCHING_PROTOCOLS), None);
     let tunnel = WsTunnel {
         worker_id: worker_id.to_string(),
+        runtime,
         idle_timeout: state.ws_idle_timeout,
         max_duration: state.ws_max_duration,
         upgrade_wait: state.request_timeout,
+        hibernation: (*state.ws_hibernation).clone(),
+        reconnect,
+        switch_hold_max_reqs: state.switch_hold_max_reqs,
+        switch_hold_max_bytes: state.switch_hold_max_bytes,
     };
     tokio::spawn(tunnel.run(client_upgrade, upstream_upgrade, guard, permit));
 
@@ -1920,17 +1983,91 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
     }
 }
 
+async fn wait_idle(started: Instant, last_ms: Arc<AtomicU64>, idle_ms: u64) {
+    loop {
+        let last = last_ms.load(Ordering::Relaxed);
+        let now = started.elapsed().as_millis() as u64;
+        let idle_for = now.saturating_sub(last);
+        if idle_for >= idle_ms {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(idle_ms - idle_for)).await;
+    }
+}
+
+/// Detached-session hibernation policy.
+#[derive(Clone, Debug)]
+struct WsHibernation {
+    enabled: bool,
+    replay_bytes: usize,
+}
+
+impl Default for WsHibernation {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            replay_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// The original upgrade request, replayed as a fresh upstream handshake when
+/// a detached session reattaches to a new generation.
+#[derive(Clone)]
+struct ReconnectRequest {
+    method: Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    version: axum::http::Version,
+}
+
 /// Bounded byte tunnel between the two upgraded halves.
 struct WsTunnel {
     worker_id: String,
+    runtime: Arc<crate::supervisor::TenantRuntime>,
     idle_timeout: Duration,
     max_duration: Duration,
     /// Bound on awaiting each side's upgrade (the client side completes
     /// only after our 101 is flushed).
     upgrade_wait: Duration,
+    hibernation: WsHibernation,
+    reconnect: Option<ReconnectRequest>,
+    switch_hold_max_reqs: usize,
+    switch_hold_max_bytes: usize,
 }
 
 impl WsTunnel {
+    /// Open a fresh upstream WebSocket handshake against the current serving
+    /// generation, replaying the original upgrade request.
+    async fn reconnect(&self) -> Option<hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>> {
+        use http_body_util::BodyExt;
+        use hyper_util::rt::TokioIo;
+        let req = self.reconnect.as_ref()?;
+        let slot = self.runtime.endpoint_slot(&self.worker_id)?;
+        let endpoint = slot.endpoint().clone();
+        let io = endpoint.connect().await.ok()?;
+        let body = http_body_util::Full::new(bytes::Bytes::new())
+            .map_err(axum::Error::new)
+            .boxed_unsync();
+        let mut upstream = hyper::Request::builder()
+            .method(req.method.clone())
+            .uri(req.uri.clone())
+            .version(req.version)
+            .body(body)
+            .ok()?;
+        *upstream.headers_mut() = req.headers.clone();
+        let mut response = upstream_call(io, upstream).await.ok()?;
+        if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+            return None;
+        }
+        let upgrade = hyper::upgrade::on(&mut response);
+        let upgrade = tokio::time::timeout(self.upgrade_wait, upgrade)
+            .await
+            .ok()?
+            .ok()?;
+        Some(TokioIo::new(upgrade))
+    }
+
     /// Owns `guard` and `permit` for the whole session, so tenant
     /// hibernation / drain observe it and the session cap is exact.
     /// Every exit, including a panic unwind, drops both.
@@ -1938,7 +2075,7 @@ impl WsTunnel {
         self,
         client: hyper::upgrade::OnUpgrade,
         upstream: hyper::upgrade::OnUpgrade,
-        _guard: InFlightGuard,
+        guard: InFlightGuard,
         _permit: WsPermit,
     ) {
         use hyper_util::rt::TokioIo;
@@ -1952,7 +2089,7 @@ impl WsTunnel {
             }
         };
         let mut upstream = match tokio::time::timeout(self.upgrade_wait, upstream).await {
-            Ok(Ok(u)) => TokioIo::new(u),
+            Ok(Ok(u)) => Some(TokioIo::new(u)),
             _ => {
                 ws_outcome(w, "upstream_upgrade_failed");
                 return;
@@ -1971,28 +2108,90 @@ impl WsTunnel {
         };
 
         let idle_ms = self.idle_timeout.as_millis() as u64;
-        let idle_watch = async {
-            loop {
-                let last = last_ms.load(Ordering::Relaxed);
-                let now = started.elapsed().as_millis() as u64;
-                let idle_for = now.saturating_sub(last);
-                if idle_for >= idle_ms {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(idle_ms - idle_for)).await;
+        let max_at = tokio::time::Instant::now() + self.max_duration;
+        let mut guard = Some(guard);
+        let reason = 'session: loop {
+            let up = match upstream.as_mut() {
+                Some(up) => up,
+                None => break "closed",
+            };
+            let reason = tokio::select! {
+                r = tokio::io::copy_bidirectional(&mut client, up) => match r {
+                    Ok(_) => "closed",
+                    Err(_) => "error",
+                },
+                _ = wait_idle(started, last_ms.clone(), idle_ms) => "idle_timeout",
+                _ = tokio::time::sleep_until(max_at) => "max_duration",
+            };
+            let asleep = self.runtime.state().is_asleep()
+                || self.runtime.state() == crate::state::TenantState::Hibernating;
+            if reason == "idle_timeout" || reason == "max_duration" || !self.hibernation.enabled
+                || !asleep || self.reconnect.is_none()
+            {
+                break reason;
             }
-        };
-        let reason = tokio::select! {
-            r = tokio::io::copy_bidirectional(&mut client, &mut upstream) => match r {
-                Ok(_) => "closed",
-                Err(_) => "error",
-            },
-            _ = idle_watch => "idle_timeout",
-            _ = tokio::time::sleep(self.max_duration) => "max_duration",
+            // Workerd stopped: release the in-flight guard so the tenant can
+            // finish hibernating, but keep the client socket and session slot.
+            drop(guard.take());
+            ws_outcome(w, "detached");
+            let mut buffered: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = tokio::select! {
+                    r = tokio::io::AsyncReadExt::read(&mut client, &mut buf) => match r {
+                        Ok(n) => n,
+                        Err(_) => break 'session "error",
+                    },
+                    _ = wait_idle(started, last_ms.clone(), idle_ms) => break 'session "idle_timeout",
+                    _ = tokio::time::sleep_until(max_at) => break 'session "max_duration",
+                };
+                if n == 0 {
+                    break 'session "closed";
+                }
+                if buffered.len() + n > self.hibernation.replay_bytes {
+                    ws_outcome(w, "replay_overflow");
+                    break 'session "replay_overflow";
+                }
+                buffered.extend_from_slice(&buf[..n]);
+                if let Err(_) = self
+                    .runtime
+                    .await_wake(
+                        0,
+                        self.switch_hold_max_reqs,
+                        self.switch_hold_max_bytes,
+                        crate::hibernate::WakeSourceKind::WebSocket,
+                    )
+                    .await
+                {
+                    break 'session "wake_failed";
+                }
+                let Some(mut new_up) = self.reconnect().await else {
+                    break 'session "reattach_failed";
+                };
+                if tokio::io::AsyncWriteExt::write_all(&mut new_up, &buffered)
+                    .await
+                    .is_err()
+                    || tokio::io::AsyncWriteExt::flush(&mut new_up).await.is_err()
+                {
+                    break 'session "reattach_failed";
+                }
+                let Some(next_guard) = self
+                    .runtime
+                    .endpoint_slot(&self.worker_id)
+                    .and_then(|slot| slot.acquire())
+                else {
+                    break 'session "reattach_guard";
+                };
+                guard = Some(next_guard);
+                upstream = Some(new_up);
+                ws_outcome(w, "reattached");
+                continue 'session;
+            }
         };
         // Dropping both halves closes the sockets.
         drop(client);
         drop(upstream);
+        drop(guard);
         reg.inc(
             "vrt_host_ws_session_end_total",
             &[("worker_id", w), ("reason", reason)],
@@ -2916,6 +3115,16 @@ mod ws_tests {
                 max,
                 per_tenant,
             )
+    }
+
+    #[test]
+    fn ws_hibernation_defaults_off_and_clamps_the_window() {
+        let base = st(8, 4);
+        assert!(!base.ws_hibernation.enabled);
+        assert_eq!(base.ws_hibernation.replay_bytes, 64 * 1024);
+        let on = base.with_ws_hibernation(true, 1);
+        assert!(on.ws_hibernation.enabled);
+        assert_eq!(on.ws_hibernation.replay_bytes, 1024);
     }
 
     #[test]

@@ -426,6 +426,9 @@ pub enum WakeSourceKind {
     /// already holds the alarm in workerd's class `metadata.sqlite`; starting
     /// the generation delivers it.
     Alarm,
+    /// A client WebSocket frame arrived on a detached hibernated session;
+    /// the ingress wakes the tenant and reattaches the tunnel.
+    WebSocket,
     /// A cell-controller workflow op (`/v1/wfops`). The workflow engine
     /// is a DO inside workerd, so workflow tenants never hibernate
     /// (`StructuralWorkflow` stays); this wakes a tenant that slept
@@ -442,6 +445,7 @@ impl WakeSourceKind {
             Self::Cron => "cron",
             Self::Queue => "queue",
             Self::Alarm => "alarm",
+            Self::WebSocket => "websocket",
             Self::Workflow => "workflow",
         }
     }
@@ -450,7 +454,9 @@ impl WakeSourceKind {
     /// single wake may use (>= 1).
     pub fn max_attempts(self) -> u32 {
         match self {
-            Self::Http | Self::Cron | Self::Queue | Self::Workflow | Self::Alarm => 2,
+            Self::Http | Self::Cron | Self::Queue | Self::Workflow | Self::Alarm | Self::WebSocket => {
+                2
+            }
         }
     }
 
@@ -462,7 +468,7 @@ impl WakeSourceKind {
     /// timeout, see that constant).
     pub fn max_wait(self, default: Duration) -> Duration {
         match self {
-            Self::Http | Self::Cron | Self::Alarm => default,
+            Self::Http | Self::Cron | Self::Alarm | Self::WebSocket => default,
             Self::Queue => default.min(QUEUE_WAKE_MAX_WAIT),
             Self::Workflow => default.min(WORKFLOW_WAKE_MAX_WAIT),
         }
