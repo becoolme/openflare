@@ -487,7 +487,27 @@ async fn run_promote_check(config_path: PathBuf) -> ExitCode {
     };
     match follower.promotion_readiness() {
         Ok(r) => {
-            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            let plan = if r.ready {
+                follower.promotion_plan().ok().map(|p| {
+                    serde_json::json!({
+                        "expectedEpoch": p.expected_epoch,
+                        "expectedLsn": p.expected_lsn,
+                        "nextEpoch": p.next_epoch,
+                        "generation": p.generation,
+                        "chain": p.chain,
+                    })
+                })
+            } else {
+                None
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "readiness": r,
+                    "plan": plan,
+                }))
+                .unwrap_or_default()
+            );
             if r.ready {
                 ExitCode::SUCCESS
             } else {
