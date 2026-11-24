@@ -54,8 +54,9 @@ SQLite state, or WebSocket sessions, and wake them from:
    to `hibernationReplayBytes`, and on the next frame wakes the tenant and
    reattaches through a fresh upstream handshake. Overflow refuses the sleep
    (fail safe). Server frames emitted during the stop window are not buffered.
-   The replay/detach state machine is unit-tested; a real-workerd reattach test
-   is the next validation step.
+   The replay/detach state machine is unit-tested and
+   `vrt-host/tests/s2z_hibernate_workerd.rs` covers a real-workerd
+   sleep → client-frame reattach round trip.
 4. **Automatic policy**: idle window, max sleep, wake budget, metrics.
 
 ## Invariants
