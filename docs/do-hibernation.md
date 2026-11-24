@@ -48,8 +48,14 @@ SQLite state, or WebSocket sessions, and wake them from:
    reads and have no alarm inside the 60s lead window. A missing/expired gate
    keeps the tenant resident.
 2. **Alarm wake**: persist earliest alarm, wake via cell-controller, re-arm.
-3. **WebSocket hibernation**: detach sessions, bounded replay buffer,
-   reattach; reject if a frame cannot be buffered.
+3. **WebSocket hibernation — blocked by architecture.** The ingress tunnels
+   raw WebSocket bytes directly to the tenant workerd process and holds the
+   session guard for the whole lifetime. Stopping workerd closes that tunnel;
+   workerd has no API to hand an existing client socket to a new process.
+   True hibernation therefore needs a connection-holding proxy at the ingress
+   that persists session metadata and can re-handshake/reattach to a new
+   generation, with a bounded per-session replay buffer. Until that exists, an
+   open session correctly keeps the tenant resident (fail safe).
 4. **Automatic policy**: idle window, max sleep, wake budget, metrics.
 
 ## Invariants
