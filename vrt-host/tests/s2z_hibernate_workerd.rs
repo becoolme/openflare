@@ -616,6 +616,94 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VRT_WORKERD_BIN"]
+async fn s2z_websocket_reattaches_after_hibernation() {
+    use tokio::io::AsyncWriteExt;
+    init_logs();
+    if workerd_bin_or_skip().is_none() {
+        return;
+    }
+    let _g = WORKERD_TEST_LOCK.lock().await;
+    let fx = Fixture::new();
+    let (a, b, c) = (free_port(), free_port(), free_port());
+    let r = render_spec(&fx, a, b, c, 1, MOD_WS, false);
+    let rt = TenantRuntime::new("t1");
+    let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), s2z_params());
+    wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
+    let ingress = ingress_for(&rt).with_ws_hibernation(true, 64 * 1024);
+    let ig = start_ingress(&ingress).await;
+
+    let mut s = tokio::net::TcpStream::connect(ig.addr).await.unwrap();
+    s.write_all(
+        b"GET /ws HTTP/1.1\r\nhost: w1.test\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+    // No frames -> idle -> the tenant sleeps while the client socket stays open.
+    wait_state(&rt, TenantState::Hibernated, Duration::from_secs(15)).await;
+    assert!(!pid_alive(rt.active_pid()));
+
+    // A client frame wakes the tenant and is replayed to a fresh generation.
+    s.write_all(&ws_text_frame("after-sleep")).await.unwrap();
+    let body = tokio::time::timeout(Duration::from_secs(20), read_ws_text(&mut s))
+        .await
+        .expect("reattached echo timed out");
+    assert_eq!(body, "after-sleep");
+    wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
+    ig.stop().await;
+    shutdown(&rt, h).await;
+}
+
+async fn read_head(s: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    loop {
+        let mut c = [0u8; 512];
+        let n = s.read(&mut c).await.unwrap();
+        assert!(n > 0, "closed before handshake");
+        buf.extend_from_slice(&c[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            buf.truncate(i + 4);
+            break;
+        }
+    }
+    String::from_utf8_lossy(&buf).to_string()
+}
+
+fn ws_text_frame(text: &str) -> Vec<u8> {
+    let payload = text.as_bytes();
+    assert!(payload.len() < 126);
+    let mask = [1u8, 2, 3, 4];
+    let mut out = vec![0x81, 0x80 | payload.len() as u8];
+    out.extend_from_slice(&mask);
+    out.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+    out
+}
+
+async fn read_ws_text(s: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut head = [0u8; 2];
+    s.read_exact(&mut head).await.unwrap();
+    assert_eq!(head[0] & 0x0f, 1, "expected a text frame");
+    let masked = head[1] & 0x80 != 0;
+    let len = (head[1] & 0x7f) as usize;
+    assert!(len < 126);
+    let mut payload = vec![0u8; len];
+    s.read_exact(&mut payload).await.unwrap();
+    if masked {
+        let mut mask = [0u8; 4];
+        s.read_exact(&mut mask).await.unwrap();
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i % 4];
+        }
+    }
+    String::from_utf8_lossy(&payload).to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires VRT_WORKERD_BIN"]
 async fn s2z_pending_waituntil_defers_hibernate() {
     init_logs();
     if workerd_bin_or_skip().is_none() {
@@ -818,6 +906,20 @@ async fn get_dbg(port: u16, path: &str, dbg: bool) -> Option<(u16, String)> {
 
 /// DO extending the native `DurableObject` base (the production
 /// regression: a Proxy ctx fails workerd's constructor type check).
+const MOD_WS: &str = r#"
+export default {
+  async fetch(req) {
+    const u = new URL(req.url);
+    if (u.pathname !== "/ws") return new Response("ok");
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+    server.addEventListener("message", (ev) => server.send(ev.data));
+    return new Response(null, { status: 101, webSocket: client });
+  },
+};
+"#;
+
 const MOD_DO_ALARM: &str = r#"
 import { DurableObject } from "cloudflare:workers";
 export class EventLog extends DurableObject {
