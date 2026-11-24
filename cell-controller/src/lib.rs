@@ -22,6 +22,7 @@
 //! - [`controller`]: the reconcile/cron/probe loops tying it together.
 
 pub mod ack;
+pub mod alarm_index;
 pub mod assign;
 pub mod controller;
 pub mod cron;

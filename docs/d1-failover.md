@@ -1,6 +1,6 @@
 # D1 failover: staged design
 
-Status: design only — not implemented.
+Status: stage 1 (manual promotion) implemented. Stages 2–3 are design only.
 
 ## Goal
 
@@ -22,11 +22,16 @@ to the new writer.
 
 ## Stages
 
-1. **Manual promotion**
+1. **Manual promotion — implemented**
    - `vrt-sql promote --config follower.toml` verifies the local generation,
-     CASes the manifest epoch, rewrites local writer state, and starts the
-     writer.
+     CASes the manifest epoch, publishes it as the new epoch's baseline
+     snapshot, and adopts it as the local writer image.
+   - The promote process releases the new lease; start `vrt-sql serve` with the
+     same `[persistence]` and `dbRoot` (`--writer-db-root`) to serve.
+   - A crash between CAS and adoption is resumable: the manifest carries the
+     generation sha256, so a rerun only completes the local adoption.
    - Fencing test: old writer's next commit fails; new writer accepts.
+   - Tests: `vrt-sql/tests/follower_tests.rs` (`promote_*`).
 2. **Provider routing**
    - Follower status exposes generation/epoch.
    - Provider re-resolves writer endpoint after epoch change; stale-read

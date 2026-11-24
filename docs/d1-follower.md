@@ -63,7 +63,7 @@ vrt-sql follower --config /etc/openflare/d1-follower.toml
 One process replicates one `databaseId`. Start several processes for several
 databases.
 
-## Promotion preflight
+## Promotion
 
 Before a manual writer promotion, run the read-only preflight:
 
@@ -74,6 +74,28 @@ vrt-sql promote --check --config /etc/openflare/d1-follower.toml
 It prints `Follower::promotion_readiness()` JSON and exits non-zero unless the
 follower is caught up, has a non-empty readable generation, and is not ahead of
 the manifest. It never CASes the manifest or changes local state.
+
+Promote for real with the same config:
+
+```bash
+# Stop the old writer first (or accept that it will be fenced).
+vrt-sql promote --config /etc/openflare/d1-follower.toml \
+  --writer-db-root /var/lib/vrt-sql/dbs [--json]
+```
+
+Promotion:
+1. re-verifies the follower is exactly at the manifest head;
+2. uploads the generation as the next epoch's baseline snapshot;
+3. CASes the manifest to `epoch + 1` (this fences the old writer on its next
+   commit);
+4. adopts the generation as `{writerDbRoot}/{shard}/{id}/db.sqlite` and writes
+   the `.vrt-lsn` sidecar;
+5. releases the new lease so `vrt-sql serve` can claim it immediately.
+
+If the process crashes between the manifest CAS and local adoption, rerunning
+the same command resumes only the adoption (the manifest stores the generation
+sha256). A follower that is behind, ahead, or whose manifest moved fails closed
+with a non-zero exit.
 
 ## Serving reads and routing
 
@@ -220,8 +242,10 @@ cannot damage the primary.
   `dump()` stay on the writer. A write sent through `/query` is rejected by the
   replica and retried on the writer (no double execution: the replica is
   read-only).
-- **No failover.** Promotion of a follower to writer still requires the
-  existing lease/epoch takeover; the follower is not a consensus member.
+- **Manual failover only.** `vrt-sql promote` performs the lease/epoch CAS and
+  local adoption; automatic promotion is still design-only. The follower is not
+  a consensus member, and the old writer must be stopped (it is fenced on its
+  next commit, not killed).
 - **Bounded GC retention, no per-replica watermark.** GC keeps the newest two
   snapshots and the segments above the older one, so a follower that is one
   checkpoint behind can continue incrementally. A follower further behind (or

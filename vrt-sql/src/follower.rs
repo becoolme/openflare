@@ -25,7 +25,7 @@
 
 use crate::clock::Clock;
 use crate::paths::{self, ResourceKind};
-use crate::persist::{epoch_for_lsn, EpochSpan, Manifest};
+use crate::persist::{epoch_for_lsn, EpochSpan, Manifest, PersistError, Persister, PromotedWriter};
 use crate::seg;
 use crate::service::PersistenceConfig;
 use rusqlite::{Connection, OpenFlags};
@@ -278,6 +278,9 @@ pub enum FollowerError {
     /// Internal: re-read the manifest and bootstrap from the current snapshot.
     #[error("re-bootstrap required: {0}")]
     RetryBootstrap(String),
+    /// The promotion CAS or local adoption failed (fail closed).
+    #[error("promotion failed: {0}")]
+    Promotion(#[from] PersistError),
 }
 
 /// Read-only follower for one database.
@@ -429,6 +432,11 @@ impl Follower {
         }
         let manifest = self.read_manifest()?.ok_or(FollowerError::NotReady)?;
         let generation = readiness.generation.ok_or(FollowerError::NotReady)?;
+        if epoch_for_lsn(&manifest.chain, manifest.lsn).is_none() {
+            return Err(FollowerError::Corrupt(
+                "manifest epoch chain does not cover its head lsn".into(),
+            ));
+        }
         Ok(PromotionPlan {
             database_id: self.database_id.clone(),
             expected_epoch: manifest.epoch,
@@ -437,6 +445,24 @@ impl Follower {
             generation,
             chain: manifest.chain,
         })
+    }
+
+    /// Promote this follower's verified generation to writer.
+    ///
+    /// The `persister` must be configured with the promoted writer's local
+    /// `db_root` (and the shared object store). This performs the manifest CAS
+    /// and adopts the generation as the writer's local image. It does not
+    /// start the serving process; callers must release or keep the returned
+    /// lease according to how the writer is launched.
+    pub fn promote(&self, persister: &Persister) -> Result<PromotedWriter, FollowerError> {
+        let plan = self.promotion_plan()?;
+        let generation = self.root.join(&plan.generation);
+        Ok(persister.promote_from_generation(
+            &self.database_id,
+            plan.expected_epoch,
+            plan.expected_lsn,
+            &generation,
+        )?)
     }
 
     /// Compute live status (reads the manifest).

@@ -131,3 +131,49 @@ async fn introspect_lists_declared_class_instances_over_http() {
         );
     }
 }
+
+#[tokio::test]
+async fn alarm_introspection_reads_the_device_alarm_over_http() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = "a".repeat(64);
+    let dir = tmp.path().join("team:w").join(&key);
+    std::fs::create_dir_all(&dir).unwrap();
+    let id = "b".repeat(64);
+    let conn = rusqlite::Connection::open(dir.join(format!("{id}.sqlite"))).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE _cf_METADATA (key INTEGER PRIMARY KEY, value BLOB);\
+         INSERT INTO _cf_METADATA VALUES (1, 1700000000123000000);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let registry = TenantRegistry::new();
+    let rt = TenantRuntime::new("team");
+    rt.set_do_storage_view(Some(DoStorageView {
+        tenant_dir: tmp.path().to_path_buf(),
+        worker_classes: BTreeMap::from([("team:w".to_string(), vec![key.clone()])]),
+    }));
+    registry.insert("team".into(), rt);
+
+    let app = introspect::router(registry);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/introspect/alarms")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "tenantId": "team",
+                "workerId": "team:w",
+                "classKey": key,
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["instances"][0]["id"], id);
+    assert_eq!(body["instances"][0]["alarmAtMs"], 1_700_000_000_123u64);
+    assert_eq!(body["instances"][0]["alarmKnown"], true);
+}

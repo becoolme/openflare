@@ -1007,6 +1007,7 @@ fn gc_is_kind_namespaced() {
             epoch: 1,
             first_lsn: 1,
         }],
+        promotion: None,
     })
     .unwrap();
     put(&seg::manifest_key(D1, DB), &live);

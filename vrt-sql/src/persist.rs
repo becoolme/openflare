@@ -9,7 +9,9 @@ use crate::paths;
 use crate::seg;
 use crate::timeline::{self, TimelineEntry, TimelineIndex};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use vrt_objstore::{ObjectStore, StoreError};
@@ -68,6 +70,11 @@ pub struct Manifest {
     /// owning epoch's key space (orphan segments never enter the chain). Ascending by epoch.
     #[serde(default)]
     pub chain: Vec<EpochSpan>,
+    /// Follow a `vrt-sql promote` CAS: sha256 of the follower generation the
+    /// new epoch was promoted from. Used only to resume a promotion whose CAS
+    /// succeeded but whose local adoption did not. Cleared on a normal takeover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promotion: Option<String>,
 }
 
 /// Snapshot reference.
@@ -129,6 +136,8 @@ pub struct ManifestHandle {
     pub holder: String,
     pub snapshot: Option<SnapshotRef>,
     pub chain: Vec<EpochSpan>,
+    /// Promotion marker (see [`Manifest::promotion`]).
+    pub promotion: Option<String>,
     /// Number of persisted commits since the last checkpoint.
     pub commits_since_ckpt: u64,
     /// Renewal failed but the lease is still within `expiry-margin` -> degraded, reads allowed.
@@ -154,6 +163,7 @@ impl ManifestHandle {
             tombstone,
             snapshot: self.snapshot.clone(),
             chain: self.chain.clone(),
+            promotion: self.promotion.clone(),
         }
     }
     fn from_manifest(m: &Manifest, etag: String) -> Self {
@@ -165,6 +175,7 @@ impl ManifestHandle {
             holder: m.holder.clone(),
             snapshot: m.snapshot.clone(),
             chain: m.chain.clone(),
+            promotion: m.promotion.clone(),
             commits_since_ckpt: 0,
             degraded: false,
         }
@@ -240,6 +251,45 @@ pub enum PersistError {
     /// a marker promise that cannot be written to disk means the local persistence layer is untrustworthy; propagate upward, do not ignore.
     #[error("local io: {0}")]
     LocalIo(String),
+    /// The manifest moved between the follower snapshot and the promotion CAS.
+    /// The caller must re-sync the follower and retry against the new head.
+    #[error(
+        "manifest changed during promotion (expected epoch {expected_epoch} lsn {expected_lsn})"
+    )]
+    ManifestChanged {
+        expected_epoch: u64,
+        expected_lsn: u64,
+    },
+    /// The follower generation is unreadable or does not describe the expected
+    /// commit point. Promotion never guesses.
+    #[error("promotion generation invalid: {0}")]
+    InvalidGeneration(String),
+}
+
+/// A writer promoted from a verified follower generation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotedWriter {
+    /// Epoch of the manifest the follower was caught up to.
+    pub previous_epoch: u64,
+    /// lsn of the manifest the follower was caught up to.
+    pub previous_lsn: u64,
+    /// New writer epoch (the promotion CAS).
+    pub epoch: u64,
+    /// Committed lsn carried over unchanged (the snapshot baseline).
+    pub lsn: u64,
+    /// Holder recorded by the CAS.
+    pub holder: String,
+    /// Baseline snapshot published from the follower generation.
+    pub snapshot: SnapshotRef,
+    /// Local writer image adopted from the follower generation.
+    pub db_file: PathBuf,
+    /// True when a previous attempt already CASed this promotion and only the
+    /// local adoption was completed by this call.
+    pub resumed: bool,
+    /// Lease handle at the promoted epoch (for release / hand-off).
+    #[serde(skip)]
+    pub handle: ManifestHandle,
 }
 
 /// RV-R66: max number of objects a single `gc_orphans` deletes (including failed attempts).
@@ -707,6 +757,7 @@ impl Persister {
                             epoch: 1,
                             first_lsn: 1,
                         }],
+                        promotion: None,
                     };
                     match self.write_manifest_inm(database_id, &m) {
                         Ok(etag) => {
@@ -745,6 +796,7 @@ impl Persister {
                             epoch: 1,
                             first_lsn: 1,
                         }],
+                        promotion: None,
                     };
                     match self.write_manifest_inm(database_id, &m) {
                         Ok(etag) => Ok(ClaimStep::Done(ClaimOutcome::Ready {
@@ -777,6 +829,9 @@ impl Persister {
                 if takeover {
                     next.epoch = m.epoch + 1;
                     next.holder = self.cfg.holder.clone();
+                    // A real writer claim supersedes an unfinished promotion:
+                    // never let a stale promote replay adopt over it.
+                    next.promotion = None;
                     // The epoch+1 writer continues segment numbering from manifest.lsn+1.
                     next.chain.push(EpochSpan {
                         epoch: next.epoch,
@@ -1253,6 +1308,253 @@ impl Persister {
         Ok(())
     }
 
+    /// Promote a verified follower generation to writer.
+    ///
+    /// Stages (all fail closed, in this order):
+    /// 1. verify the generation file (shape, size cap, integrity, sha256) and
+    ///    that its `(epoch, lsn)` is the manifest head;
+    /// 2. upload the generation as the new epoch's baseline snapshot (an
+    ///    object-store put, idempotent by content);
+    /// 3. CAS the manifest to `epoch + 1` with a fresh lease, the promoted
+    ///    snapshot and a new epoch span starting at `lsn + 1`;
+    /// 4. adopt the generation as this writer's local `db.sqlite` plus the
+    ///    `.vrt-lsn` sidecar, so a later claim needs no restore.
+    ///
+    /// A crash after step 3 is resumable: a rerun observes the promoted
+    /// manifest (same lsn, same snapshot sha256, same epoch span) and only
+    /// completes step 4. A writer still holding the old epoch cannot commit
+    /// after step 3 because its manifest CAS carries the old etag.
+    pub fn promote_from_generation(
+        &self,
+        database_id: &str,
+        expected_epoch: u64,
+        expected_lsn: u64,
+        generation: &Path,
+    ) -> Result<PromotedWriter, PersistError> {
+        if expected_lsn == 0 {
+            return Err(PersistError::InvalidGeneration(
+                "an empty database cannot be promoted".into(),
+            ));
+        }
+        let meta = std::fs::metadata(generation).map_err(|e| {
+            PersistError::InvalidGeneration(format!(
+                "generation stat {}: {e}",
+                generation.display()
+            ))
+        })?;
+        if !meta.is_file() || meta.len() == 0 {
+            return Err(PersistError::InvalidGeneration(
+                "generation is not a non-empty regular file".into(),
+            ));
+        }
+        if meta.len() > self.cfg.snapshot_max_bytes {
+            return Err(PersistError::SnapshotTooLarge(meta.len()));
+        }
+        match crate::wal::integrity_ok(generation) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(PersistError::InvalidGeneration(
+                    "generation failed integrity_check".into(),
+                ))
+            }
+            Err(e) => {
+                return Err(PersistError::InvalidGeneration(format!(
+                    "generation integrity_check: {e}"
+                )))
+            }
+        }
+        let generation_sha = sha256_file(generation)?;
+
+        for _ in 0..3 {
+            let Some((m, etag)) = self.read_manifest(database_id)? else {
+                return Err(PersistError::InvalidGeneration(
+                    "manifest does not exist".into(),
+                ));
+            };
+            if m.tombstone {
+                return Err(PersistError::Tombstoned);
+            }
+
+            // A rerun may observe the manifest BEFORE the promotion (the
+            // caller's expected epoch) or AFTER it (the manifest already
+            // carries the promoted epoch because the first attempt crashed
+            // between CAS and local adoption). The promotion marker is the
+            // only unambiguous signal: a normal writer takeover clears it.
+            let prompted_epoch = m.epoch;
+            let same_promotion = m.lsn == expected_lsn
+                && m.promotion.as_deref() == Some(generation_sha.as_str())
+                && (prompted_epoch == expected_epoch
+                    || prompted_epoch == expected_epoch.saturating_add(1))
+                && m.snapshot
+                    .as_ref()
+                    .is_some_and(|s| s.lsn == expected_lsn && s.sha256 == generation_sha)
+                && m.chain.iter().any(|span| {
+                    span.epoch == prompted_epoch && span.first_lsn == expected_lsn.saturating_add(1)
+                });
+            if same_promotion {
+                let snapshot = m
+                    .snapshot
+                    .clone()
+                    .ok_or_else(|| PersistError::InvalidGeneration("missing snapshot".into()))?;
+                let db_file = self.adopt_generation(database_id, generation, expected_lsn)?;
+                let handle = ManifestHandle::from_manifest(&m, etag);
+                return Ok(PromotedWriter {
+                    previous_epoch: prompted_epoch.saturating_sub(1),
+                    previous_lsn: expected_lsn,
+                    epoch: prompted_epoch,
+                    lsn: m.lsn,
+                    holder: m.holder,
+                    snapshot,
+                    db_file,
+                    resumed: true,
+                    handle,
+                });
+            }
+            if m.epoch != expected_epoch || m.lsn != expected_lsn {
+                return Err(PersistError::ManifestChanged {
+                    expected_epoch,
+                    expected_lsn,
+                });
+            }
+            let owner = epoch_for_lsn(&m.chain, m.lsn);
+            if owner != Some(m.epoch) {
+                return Err(PersistError::InvalidGeneration(format!(
+                    "manifest chain owner {owner:?} != epoch {}",
+                    m.epoch
+                )));
+            }
+            if m.chain
+                .last()
+                .is_some_and(|s| s.first_lsn > expected_lsn + 1)
+            {
+                return Err(PersistError::InvalidGeneration(
+                    "manifest epoch chain already covers the next lsn".into(),
+                ));
+            }
+
+            let next_epoch = m.epoch.saturating_add(1);
+            let snapshot =
+                self.upload_snapshot(database_id, next_epoch, expected_lsn, generation)?;
+            if snapshot.sha256 != generation_sha {
+                return Err(PersistError::Corrupt(
+                    "uploaded snapshot sha256 differs from the generation".into(),
+                ));
+            }
+            let now = self.clock.now_ms();
+            let mut next = m.clone();
+            next.epoch = next_epoch;
+            next.lsn = expected_lsn;
+            next.holder = self.cfg.holder.clone();
+            next.expires_at_ms = now + self.cfg.lease_ms;
+            next.tombstone = false;
+            next.snapshot = Some(snapshot.clone());
+            next.promotion = Some(generation_sha.clone());
+            next.chain.push(EpochSpan {
+                epoch: next_epoch,
+                first_lsn: expected_lsn + 1,
+            });
+
+            match self.write_manifest_im(database_id, &etag, &next) {
+                Ok(new_etag) => {
+                    let db_file = self.adopt_generation(database_id, generation, expected_lsn)?;
+                    let handle = ManifestHandle::from_manifest(&next, new_etag);
+                    return Ok(PromotedWriter {
+                        previous_epoch: expected_epoch,
+                        previous_lsn: expected_lsn,
+                        epoch: next_epoch,
+                        lsn: expected_lsn,
+                        holder: self.cfg.holder.clone(),
+                        snapshot,
+                        db_file,
+                        resumed: false,
+                        handle,
+                    });
+                }
+                Err(PersistError::Store(StoreError::PreconditionFailed)) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(PersistError::Store(StoreError::unavailable(
+            true,
+            "promotion CAS races exhausted",
+        )))
+    }
+
+    /// Install a verified generation as this writer's local image.
+    ///
+    /// The generation is copied to a temp file in the writer's own db dir,
+    /// fsynced and integrity-checked before it can replace `db.sqlite`. An
+    /// existing local image is preserved as `db.sqlite.promote-backup-<id>`
+    /// instead of being deleted. The sidecar is written last (at the promoted
+    /// lsn with zero WAL frames, matching a fully checkpointed main file), so
+    /// a later claim trusts the image without restoring.
+    fn adopt_generation(
+        &self,
+        database_id: &str,
+        generation: &Path,
+        lsn: u64,
+    ) -> Result<PathBuf, PersistError> {
+        let db_file = paths::derive_db_file(&self.db_root, database_id)
+            .map_err(|e| PersistError::LocalIo(format!("db file path: {e}")))?;
+        let dir = db_file
+            .parent()
+            .ok_or_else(|| PersistError::LocalIo("db file has no parent".into()))?
+            .to_path_buf();
+        if db_file.exists() {
+            if let Some(sc) = self.read_sidecar(&dir) {
+                if sc.trusted(lsn) {
+                    return Ok(db_file);
+                }
+            }
+        }
+
+        let tmp = dir.join(format!(".promote-{}.tmp", unique_suffix()));
+        std::fs::copy(generation, &tmp)
+            .map_err(|e| PersistError::LocalIo(format!("promotion copy: {e}")))?;
+        std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .map_err(|e| PersistError::LocalIo(format!("promotion fsync: {e}")))?;
+        match crate::wal::integrity_ok(&tmp) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(PersistError::InvalidGeneration(
+                    "adopted image failed integrity_check".into(),
+                ));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(PersistError::InvalidGeneration(format!(
+                    "adopted image integrity_check: {e}"
+                )));
+            }
+        }
+        clear_sqlite_sidecars(&tmp);
+
+        if db_file.exists() {
+            let backup = dir.join(format!("db.sqlite.promote-backup-{}", unique_suffix()));
+            std::fs::rename(&db_file, &backup)
+                .map_err(|e| PersistError::LocalIo(format!("promotion backup existing db: {e}")))?;
+        }
+        clear_sqlite_sidecars(&db_file);
+        std::fs::rename(&tmp, &db_file)
+            .map_err(|e| PersistError::LocalIo(format!("promotion rename: {e}")))?;
+        let df = std::fs::File::open(&dir)
+            .map_err(|e| PersistError::LocalIo(format!("promotion dir open: {e}")))?;
+        df.sync_all()
+            .map_err(|e| PersistError::LocalIo(format!("promotion dir fsync: {e}")))?;
+        self.write_sidecar(
+            &dir,
+            &Sidecar {
+                v: 1,
+                lsn,
+                file_frames: 0,
+                intent: false,
+            },
+        )?;
+        Ok(db_file)
+    }
+
     /// Orphan object GC: list `db/{id}/`.
     /// - `.seg`: not on the chain / beyond committed / already covered by the baseline snapshot (`lsn <=
     ///   baseline_lsn`, snapshot semantics equivalent) -> delete.
@@ -1618,6 +1920,7 @@ impl Persister {
                         tombstone: true,
                         snapshot: None,
                         chain: Vec::new(),
+                        promotion: None,
                     };
                     match self.write_manifest_inm(database_id, &m) {
                         Ok(_) => return Ok(()),
@@ -1709,6 +2012,39 @@ pub enum GcTombstonedOutcome {
 enum ClaimStep {
     Retry,
     Done(ClaimOutcome),
+}
+
+fn sha256_file(path: &Path) -> Result<String, PersistError> {
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| PersistError::LocalIo(format!("sha256 open: {e}")))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .map_err(|e| PersistError::LocalIo(format!("sha256 read: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn clear_sqlite_sidecars(path: &Path) {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut side = path.as_os_str().to_os_string();
+        side.push(suffix);
+        let _ = std::fs::remove_file(PathBuf::from(side));
+    }
+}
+
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
 }
 
 /// Parse the epoch/lsn of `db/{id}/{epoch}/{lsn}.seg`.
