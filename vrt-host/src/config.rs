@@ -1507,6 +1507,14 @@ pub struct WebsocketConfig {
     /// default 256 (or maxSessions when that is smaller).
     #[serde(default)]
     pub max_sessions_per_tenant: Option<usize>,
+    /// Hold upgraded client sessions across tenant hibernation and reattach
+    /// them on the next client frame. Default false (existing behavior).
+    #[serde(default)]
+    pub hibernation: bool,
+    /// Bounded client-frame replay window for a detached session
+    /// (1024..=1 MiB, default 64 KiB).
+    #[serde(default)]
+    pub hibernation_replay_bytes: Option<usize>,
 }
 
 /// Resolved WebSocket limits (defaults applied, already validated).
@@ -1556,7 +1564,24 @@ impl WebsocketConfig {
                 ));
             }
         }
+        if let Some(v) = self.hibernation_replay_bytes {
+            if !(1024..=1024 * 1024).contains(&v) {
+                return Err(ConfigError::Invalid(
+                    "ingress.websocket.hibernationReplayBytes must be 1024..=1048576",
+                ));
+            }
+        }
+        if !self.hibernation && self.hibernation_replay_bytes.is_some() {
+            return Err(ConfigError::Invalid(
+                "ingress.websocket.hibernationReplayBytes requires hibernation = true",
+            ));
+        }
         Ok(())
+    }
+
+    /// Effective detached-session replay window.
+    pub fn hibernation_replay_bytes(&self) -> usize {
+        self.hibernation_replay_bytes.unwrap_or(64 * 1024)
     }
 
     /// The effective limits. Call after [`Self::validate`].
@@ -3165,6 +3190,23 @@ mod tests {
         let small: IngressConfig = toml::from_str("[websocket]\nmaxSessions = 8\n").unwrap();
         small.validate().unwrap();
         assert_eq!(small.websocket_limits().max_sessions_per_tenant, 8);
+
+        // Hibernation is off by default and opt-in with a bounded window.
+        assert!(!d.websocket.hibernation);
+        assert_eq!(d.websocket.hibernation_replay_bytes(), 64 * 1024);
+        let h: IngressConfig =
+            toml::from_str("[websocket]\nhibernation = true\nhibernationReplayBytes = 2048\n")
+                .unwrap();
+        h.validate().unwrap();
+        assert!(h.websocket.hibernation);
+        assert_eq!(h.websocket.hibernation_replay_bytes(), 2048);
+        let bad: IngressConfig =
+            toml::from_str("[websocket]\nhibernationReplayBytes = 2048\n").unwrap();
+        assert!(bad.validate().is_err(), "window without hibernation is a config error");
+        let bad: IngressConfig =
+            toml::from_str("[websocket]\nhibernation = true\nhibernationReplayBytes = 512\n")
+                .unwrap();
+        assert!(bad.validate().is_err());
 
         // Unknown keys rejected.
         assert!(toml::from_str::<IngressConfig>("[websocket]\nbogus = 1\n").is_err());

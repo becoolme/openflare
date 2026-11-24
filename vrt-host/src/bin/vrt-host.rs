@@ -575,6 +575,10 @@ async fn run_async(
         ws.max_sessions,
         ws.max_sessions_per_tenant,
     );
+    let ingress_state = ingress_state.with_ws_hibernation(
+        config.ingress.websocket.hibernation,
+        config.ingress.websocket.hibernation_replay_bytes(),
+    );
     ingress_state.set_preview_auth(preview_routing.as_ref().map(|r| r.key.clone()));
     if let Some(hub) = &log_hub {
         ingress_state.set_log_hub(hub.clone());

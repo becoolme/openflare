@@ -67,6 +67,8 @@ idleTimeoutSecs = 300          # 1..=3600
 maxDurationSecs = 14400        # 1..=86400
 maxSessions = 4096             # 1..=65536
 maxSessionsPerTenant = 256     # 1..=maxSessions
+hibernation = false            # hold detached sessions across tenant sleep
+hibernationReplayBytes = 65536 # 1024..=1048576 bounded client-frame replay
 ```
 
 Values outside these ranges, and unknown keys, are rejected when the config is
@@ -101,11 +103,16 @@ the handshake completes, not when the session ends.
   session holds the in-flight guard, so the tenant is not hibernated or
   scaled to zero while it is open. Close idle sessions on the client or rely
   on the idle timeout.
-- Cloudflare's hibernatable WebSocket eviction is not emulated. The worker
-  process stays resident while the session is open. The ingress owns the
-  client tunnel and workerd has no re-attach API for an existing socket, so
-  process-level hibernation cannot preserve the session; a connection-holding
-  proxy would be required (see `docs/do-hibernation.md`).
+- Cloudflare's hibernatable WebSocket eviction is not emulated by default. The
+  worker process stays resident while the session is open. With
+  `ingress.websocket.hibernation = true`, the ingress releases the tenant's
+  in-flight guard when workerd stops, holds the client socket, buffers client
+  frames up to `hibernationReplayBytes`, and on the next client frame wakes the
+  tenant, performs a fresh upstream WebSocket handshake and replays those
+  frames. Server frames emitted while the process was stopping are not
+  buffered, so applications must tolerate a resume handshake; overflow refuses
+  the sleep instead of truncating. The original request path/host is replayed,
+  so the worker must resolve the same session from its URL/headers.
 - When a deployment switches generations, the old generation is drained for a
   grace period. A session still open when the grace period expires is cut.
   Clients are expected to reconnect.
