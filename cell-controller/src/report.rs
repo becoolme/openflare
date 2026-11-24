@@ -15,10 +15,12 @@
 //! The wire shape is mirrored by `plane/src/routes.ts` and
 //! `apps/console/app/pages/kit/api.vue`; see `fixtures/vrt-wire/cell-report.json`.
 
+use crate::alarm_index::{AlarmClass, AlarmIndex, AlarmObservation};
 use crate::assign::PodAssignment;
 use serde::{Deserialize, Serialize};
 use snapshot_protocol::compute_desired::{BindingDesired, ComputeDesired};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Bumped when the wire shape changes incompatibly.
@@ -803,6 +805,30 @@ pub struct InstancesView {
     pub sampled_at_ms: i64,
 }
 
+/// One object's alarm fields from the host alarm scan.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlarmInstance {
+    pub id: String,
+    #[serde(default)]
+    pub alarm_at_ms: Option<u64>,
+    #[serde(default)]
+    pub alarm_known: bool,
+}
+
+/// `/v1/introspect/alarms` view (same class resolution as instances).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlarmsView {
+    pub declared: bool,
+    #[serde(default)]
+    pub instances: Vec<AlarmInstance>,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub sampled_at_ms: i64,
+}
+
 /// Every external dependency of the periodic report. Tests implement this
 /// with in-memory data; production uses [`HttpReportIo`].
 #[async_trait::async_trait]
@@ -813,6 +839,11 @@ pub trait ReportIo: Send + Sync {
         pod_id: &str,
         target: &InstanceTarget,
     ) -> Result<InstancesView, String>;
+    /// Alarm scan for the persistent cell alarm index. Defaults to
+    /// unsupported so older hosts/tests fail closed (class marked unknown).
+    async fn alarms(&self, _pod_id: &str, _target: &InstanceTarget) -> Result<AlarmsView, String> {
+        Err("alarm scan unsupported".into())
+    }
     async fn stats(&self, d1: &[String], queues: &[String]) -> Result<StatsPayload, String>;
     async fn push(&self, report: &CellReport) -> Result<(), String>;
 }
@@ -877,6 +908,8 @@ pub struct Reporter<T: ReportIo> {
     cell_id: String,
     state: BTreeMap<String, PodDelta>,
     last_tick_ms: Option<i64>,
+    /// Optional Durable Object alarm index fed by the same pod scans.
+    alarm_index: Option<Arc<AlarmIndex>>,
 }
 
 impl<T: ReportIo> Reporter<T> {
@@ -886,6 +919,65 @@ impl<T: ReportIo> Reporter<T> {
             cell_id: cell_id.into(),
             state: BTreeMap::new(),
             last_tick_ms: None,
+            alarm_index: None,
+        }
+    }
+
+    /// Fold DO alarm scans into the persistent cell index on every tick.
+    pub fn with_alarm_index(mut self, index: Arc<AlarmIndex>) -> Self {
+        self.alarm_index = Some(index);
+        self
+    }
+
+    /// Update the index from one pod's alarm view. A failed scan, undeclared
+    /// class or truncated listing marks the class unknown (fail closed).
+    async fn observe_alarms(&self, pod: &str, target: &InstanceTarget, now_ms: i64) {
+        let Some(index) = &self.alarm_index else {
+            return;
+        };
+        let class = AlarmClass {
+            tenant_id: target.tenant_id.clone(),
+            worker_id: target.worker_id.clone(),
+            class_key: target.class_key.clone(),
+        };
+        let now = now_ms.max(0) as u64;
+        match self.io.alarms(pod, target).await {
+            Ok(view) if view.declared && !view.truncated => {
+                let observations: Vec<AlarmObservation> = view
+                    .instances
+                    .into_iter()
+                    .map(|instance| AlarmObservation {
+                        object_id: instance.id,
+                        at_ms: instance.alarm_at_ms,
+                        known: instance.alarm_known,
+                    })
+                    .collect();
+                if let Err(e) = index.observe_class(&class, &observations, now) {
+                    tracing::warn!(tenant = %class.tenant_id, class = %class.class_key,
+                        error = %e, "do alarm index persist failed");
+                }
+            }
+            Ok(view) => {
+                tracing::debug!(
+                    tenant = %class.tenant_id,
+                    class = %class.class_key,
+                    declared = view.declared,
+                    truncated = view.truncated,
+                    "do alarm scan incomplete; marking class unknown"
+                );
+                if let Err(e) = index.mark_unknown(&class, now) {
+                    tracing::warn!(tenant = %class.tenant_id, class = %class.class_key,
+                        error = %e, "do alarm index persist failed");
+                }
+            }
+            Err(e) => {
+                tracing::debug!(tenant = %class.tenant_id, class = %class.class_key,
+                    error = %e, "do alarm scan failed; marking class unknown");
+                if let Err(e) = index.mark_unknown(&class, now) {
+                    tracing::warn!(tenant = %class.tenant_id, class = %class.class_key,
+                        error = %e, "do alarm index persist failed");
+                }
+            }
         }
     }
 
@@ -1021,6 +1113,7 @@ impl<T: ReportIo> Reporter<T> {
                 }
                 Err(e) => report.errors.push(format!("workflow {}: {e}", target.name)),
             }
+            self.observe_alarms(&pod, target, now_ms).await;
         }
         for target in &plan.do_classes {
             if instance_budget == 0 {
@@ -1048,6 +1141,7 @@ impl<T: ReportIo> Reporter<T> {
                 }
                 Err(e) => report.errors.push(format!("do class {}: {e}", target.name)),
             }
+            self.observe_alarms(&pod, target, now_ms).await;
         }
         if report.errors.len() > MAX_REPORT_ERRORS {
             report.errors.truncate(MAX_REPORT_ERRORS - 1);
@@ -1201,6 +1295,38 @@ impl ReportIo for HttpReportIo {
             return Err("instances body too large".into());
         }
         serde_json::from_slice(&bytes).map_err(|e| format!("instances decode: {e}"))
+    }
+
+    async fn alarms(&self, pod_id: &str, target: &InstanceTarget) -> Result<AlarmsView, String> {
+        let url = format!("{}/v1/introspect/alarms", self.pod(pod_id)?);
+        let body = serde_json::json!({
+            "tenantId": target.tenant_id,
+            "workerId": target.worker_id,
+            "classKey": target.class_key,
+        });
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.http
+                .post(&url)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send(),
+        )
+        .await
+        .map_err(|_| "alarms timeout".to_string())?
+        .map_err(|e| format!("alarms transport: {e}"))?;
+        let status = resp.status();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("alarms body: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("alarms status {status}"));
+        }
+        if bytes.len() > MAX_INSTANCE_BYTES {
+            return Err("alarms body too large".into());
+        }
+        serde_json::from_slice(&bytes).map_err(|e| format!("alarms decode: {e}"))
     }
 
     async fn stats(&self, d1: &[String], queues: &[String]) -> Result<StatsPayload, String> {
@@ -1457,7 +1583,7 @@ vrt_host_wake_seconds_count 1
         async fn instances(
             &self,
             _pod_id: &str,
-            target: &InstanceTarget,
+            _target: &InstanceTarget,
         ) -> Result<InstancesView, String> {
             Ok(InstancesView {
                 declared: true,
@@ -1466,6 +1592,22 @@ vrt_host_wake_seconds_count 1
                     bytes: 4096,
                 }],
                 storage_bytes: 4096,
+                truncated: false,
+                sampled_at_ms: 1,
+            })
+        }
+        async fn alarms(
+            &self,
+            _pod_id: &str,
+            _target: &InstanceTarget,
+        ) -> Result<AlarmsView, String> {
+            Ok(AlarmsView {
+                declared: true,
+                instances: vec![AlarmInstance {
+                    id: "a".repeat(64),
+                    alarm_at_ms: Some(42),
+                    alarm_known: true,
+                }],
                 truncated: false,
                 sampled_at_ms: 1,
             })
@@ -1570,6 +1712,60 @@ vrt_host_wake_seconds_count 1
                 .instance_count,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn reporter_feeds_the_persistent_do_alarm_index() {
+        let desired = {
+            let fixture: serde_json::Value = serde_json::from_str(include_str!(
+                "../../snapshot-protocol/fixtures/ts_compute_desired.json"
+            ))
+            .unwrap();
+            let envelope: serde_json::Value =
+                serde_json::from_str(fixture["envelope"].as_str().unwrap()).unwrap();
+            serde_json::from_value::<ComputeDesired>(envelope["payload"].clone()).unwrap()
+        };
+        let assignments = BTreeMap::from([(
+            "pod-0".to_string(),
+            PodAssignment {
+                pod_id: "pod-0".into(),
+                revision: 1,
+                payload_digest: "a".repeat(64),
+                envelope_digest: String::new(),
+                generated_at: String::new(),
+                workers: vec![
+                    crate::assign::AssignedWorker {
+                        tenant_id: "team-001".into(),
+                        worker_id: "worker-a".into(),
+                    },
+                    crate::assign::AssignedWorker {
+                        tenant_id: "team-001".into(),
+                        worker_id: "worker-b".into(),
+                    },
+                ],
+            },
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let index = std::sync::Arc::new(AlarmIndex::open(Some(crate::alarm_index::index_path(
+            tmp.path(),
+        ))));
+        let pushes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut reporter = Reporter::new(
+            MemoryIo {
+                pushes: pushes.clone(),
+            },
+            "cell-001",
+        )
+        .with_alarm_index(index.clone());
+        reporter
+            .tick(&desired, &assignments, 1_060_000)
+            .await
+            .unwrap();
+        assert_eq!(index.earliest().unwrap().at_ms, 42);
+        assert!(!index.snapshot().is_empty());
+        // The file is written in the cell state dir and reloads.
+        let reopened = AlarmIndex::open(Some(crate::alarm_index::index_path(tmp.path())));
+        assert_eq!(reopened.earliest().unwrap().at_ms, 42);
     }
 
     #[tokio::test]

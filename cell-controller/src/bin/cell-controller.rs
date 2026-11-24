@@ -532,6 +532,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+        // DO alarm index: persisted in the cell state dir so it survives
+        // controller restarts. Without a state dir it is memory-only and
+        // every class is re-observed on the next report tick.
+        let alarm_path = config
+            .fence_file
+            .as_ref()
+            .and_then(|f| std::path::Path::new(f).parent().map(|d| d.to_path_buf()))
+            .or_else(|| config.cron_state_dir.clone())
+            .map(|d| cell_controller::alarm_index::index_path(&d));
+        if alarm_path.is_none() {
+            tracing::warn!(
+                "no cell state dir — DO alarm index is in-memory only (rebuilt each tick)"
+            );
+        }
+        let alarm_index =
+            std::sync::Arc::new(cell_controller::alarm_index::AlarmIndex::open(alarm_path));
         match cell_controller::report::HttpReportIo::new(
             &pods,
             &config.control_plane_url,
@@ -544,8 +560,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ctl = controller.dispatch_handle();
                 let cell = config.cell_id.clone();
                 let every = std::time::Duration::from_secs(report_cfg.interval_secs);
+                let alarm_index = alarm_index.clone();
                 tokio::spawn(async move {
-                    let mut reporter = cell_controller::report::Reporter::new(io, cell);
+                    let mut reporter = cell_controller::report::Reporter::new(io, cell)
+                        .with_alarm_index(alarm_index);
                     let mut tick = tokio::time::interval(every);
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {

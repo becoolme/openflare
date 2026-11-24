@@ -1,6 +1,7 @@
 # Durable Object hibernation: staged design
 
-Status: design only — not implemented.
+Status: alarm index implemented; sleep eligibility and wake are not implemented
+(DO tenants still stay resident).
 
 ## Current blocker
 
@@ -20,8 +21,12 @@ SQLite state, or WebSocket sessions, and wake them from:
 
 ## Required primitives
 
-1. **Persistent alarm index** in the cell-controller: the earliest alarm per
-   tenant/actor, updated by the host on `setAlarm`/`deleteAlarm`.
+1. **Persistent alarm index — implemented** in the cell-controller: the
+   earliest alarm per tenant/actor, refreshed from the host's read-only
+   `_cf_METADATA` alarm scan and stored in `do-alarm-index.json` in the cell
+   state directory. Classes whose scan failed are recorded as unknown and are
+   never considered sleepable. See `cell-controller/src/alarm_index.rs` and
+   the host `POST /v1/introspect/alarms` endpoint.
 2. **Wake RPC** from cell-controller to the pod supervisor: load the tenant
    generation, replay alarms, then allow traffic.
 3. **DO storage quiescence**: no in-flight requests, no open WebSocket, no

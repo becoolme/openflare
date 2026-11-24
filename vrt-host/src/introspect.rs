@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Json;
+use rusqlite::OpenFlags;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
@@ -31,6 +32,17 @@ pub struct InstanceFile {
     pub id: String,
     /// Main `.sqlite` file bytes.
     pub bytes: u64,
+    /// Durable Object alarm time (unix ms), when the alarm index scan read it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alarm_at_ms: Option<u64>,
+    /// Whether `alarm_at_ms` is authoritative. `false` means the read failed
+    /// or was not requested; alarm-based sleeping must treat it as unknown.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub alarm_known: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,12 +117,28 @@ fn now_ms() -> i64 {
 pub fn router(registry: Arc<TenantRegistry>) -> axum::Router {
     axum::Router::new()
         .route("/v1/introspect/instances", post(instances))
+        .route("/v1/introspect/alarms", post(alarms))
         .with_state(registry)
 }
 
 async fn instances(
     State(registry): State<Arc<TenantRegistry>>,
     Json(query): Json<InstancesQuery>,
+) -> Response {
+    scan_response(registry, query, false)
+}
+
+async fn alarms(
+    State(registry): State<Arc<TenantRegistry>>,
+    Json(query): Json<InstancesQuery>,
+) -> Response {
+    scan_response(registry, query, true)
+}
+
+fn scan_response(
+    registry: Arc<TenantRegistry>,
+    query: InstancesQuery,
+    with_alarms: bool,
 ) -> Response {
     if !valid_tenant(&query.tenant_id)
         || !valid_worker(&query.worker_id)
@@ -163,7 +191,7 @@ async fn instances(
         )
             .into_response();
     }
-    match scan_class_dir(&dir) {
+    match scan_class_dir(&dir, with_alarms) {
         Ok((instances, storage_bytes, truncated)) => Json(InstancesView {
             tenant_id: query.tenant_id,
             worker_id: query.worker_id,
@@ -198,7 +226,7 @@ fn empty(query: &InstancesQuery, declared: bool) -> InstancesView {
 
 /// Scan one class dir. Hard bounds keep a runaway directory from holding the
 /// listener; a missing dir is an empty class, not an error.
-fn scan_class_dir(dir: &Path) -> Result<(Vec<InstanceFile>, u64, bool), String> {
+fn scan_class_dir(dir: &Path, with_alarms: bool) -> Result<(Vec<InstanceFile>, u64, bool), String> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0, false)),
@@ -233,14 +261,61 @@ fn scan_class_dir(dir: &Path) -> Result<(Vec<InstanceFile>, u64, bool), String> 
                 truncated = true;
                 continue;
             }
+            let (alarm_at_ms, alarm_known) = if with_alarms {
+                match read_alarm_at_ms(&entry.path()) {
+                    Ok(at) => (at, true),
+                    Err(e) => {
+                        tracing::debug!(path = %entry.path().display(), error = %e,
+                            "durable object alarm read failed; reporting unknown");
+                        (None, false)
+                    }
+                }
+            } else {
+                (None, false)
+            };
             instances.push(InstanceFile {
                 id: id.to_string(),
                 bytes: meta.len(),
+                alarm_at_ms,
+                alarm_known,
             });
         }
     }
     instances.sort_by(|a, b| a.id.cmp(&b.id));
     Ok((instances, storage_bytes, truncated))
+}
+
+/// Read the Durable Object alarm time from a workerd SQLite file.
+///
+/// workerd stores the alarm in `_cf_METADATA` (key 1) as unix nanoseconds;
+/// the table is absent until the object first writes. The connection is
+/// read-only so a scan can never mutate a live object; a busy or WAL-broken
+/// read is an error (the caller reports `known:false` and fails closed).
+fn read_alarm_at_ms(path: &Path) -> Result<Option<u64>, String> {
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("open: {e}"))?;
+    let _ = conn.busy_timeout(std::time::Duration::from_millis(100));
+    let has_table: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='_cf_METADATA'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("metadata probe: {e}"))?;
+    if has_table == 0 {
+        return Ok(None);
+    }
+    let value: Option<i64> = conn
+        .query_row("SELECT value FROM _cf_METADATA WHERE key = 1", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| format!("alarm read: {e}"))?;
+    Ok(value
+        .and_then(|ns| u64::try_from(ns).ok())
+        .map(|ns| ns / 1_000_000))
 }
 
 #[cfg(test)]
@@ -268,7 +343,7 @@ mod tests {
         std::fs::write(dir.join("notes.txt"), b"x").unwrap();
         std::fs::write(dir.join("legacy.sqlite"), b"legacy").unwrap();
 
-        let (instances, bytes, truncated) = scan_class_dir(&dir).unwrap();
+        let (instances, bytes, truncated) = scan_class_dir(&dir, false).unwrap();
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].id, "a".repeat(64));
         assert_eq!(instances[0].bytes, 3);
@@ -277,7 +352,7 @@ mod tests {
         // main files + wal + notes + the non-instance legacy sqlite
         assert_eq!(bytes, 3 + 5 + 3 + 1 + 6);
         // missing dir is an empty class, never an error
-        let (none, zero, _) = scan_class_dir(&tmp.path().join("absent")).unwrap();
+        let (none, zero, _) = scan_class_dir(&tmp.path().join("absent"), false).unwrap();
         assert!(none.is_empty());
         assert_eq!(zero, 0);
     }
@@ -292,9 +367,45 @@ mod tests {
         std::fs::write(&outside, b"secret").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join(format!("{}.sqlite", "e".repeat(64))))
             .unwrap();
-        let (instances, bytes, _) = scan_class_dir(&dir).unwrap();
+        let (instances, bytes, _) = scan_class_dir(&dir, false).unwrap();
         assert!(instances.is_empty());
         assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn alarm_scan_reads_cf_metadata_and_marks_unreadable_instances_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("class");
+        std::fs::create_dir_all(&dir).unwrap();
+        let armed = format!("{}.sqlite", "a".repeat(64));
+        let unarmed = format!("{}.sqlite", "b".repeat(64));
+        let corrupt = format!("{}.sqlite", "c".repeat(64));
+        let conn = rusqlite::Connection::open(dir.join(&armed)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _cf_METADATA (key INTEGER PRIMARY KEY, value BLOB);\
+             INSERT INTO _cf_METADATA VALUES (1, 1700000000123000000);",
+        )
+        .unwrap();
+        drop(conn);
+        rusqlite::Connection::open(dir.join(&unarmed))
+            .unwrap()
+            .execute_batch("CREATE TABLE t(v INTEGER)")
+            .unwrap();
+        std::fs::write(dir.join(&corrupt), b"not a database").unwrap();
+
+        let (instances, _, _) = scan_class_dir(&dir, true).unwrap();
+        let by_id = |prefix: &str| {
+            instances
+                .iter()
+                .find(|i| i.id == prefix.repeat(64))
+                .unwrap()
+        };
+        assert_eq!(by_id("a").alarm_at_ms, Some(1_700_000_000_123));
+        assert!(by_id("a").alarm_known);
+        assert_eq!(by_id("b").alarm_at_ms, None);
+        assert!(by_id("b").alarm_known);
+        assert_eq!(by_id("c").alarm_at_ms, None);
+        assert!(!by_id("c").alarm_known);
     }
 
     #[test]
