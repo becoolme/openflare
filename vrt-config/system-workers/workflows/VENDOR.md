@@ -74,8 +74,9 @@ an SQLite table of active instance ids and caps them at
 retention cleanup releases the slot idempotently.
 
 The signed workflow declaration can set `successRetentionMs` /
-`errorRetentionMs` (max 30 days) and `concurrencyLimit`; per-instance
-retention is not wired yet. Absent values use seven days and 4,500.
+`errorRetentionMs` (max 30 days) and `concurrencyLimit`. Per-instance
+`create({retention})` overrides are persisted before init and used at the
+terminal transition. Absent values use seven days and 4,500.
 
 ## Local patch: W1-r5 durable resume (binding.worker.js only)
 
