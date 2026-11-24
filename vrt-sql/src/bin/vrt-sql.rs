@@ -46,6 +46,24 @@ async fn run() -> ExitCode {
     if args.first().map(String::as_str) == Some("time-travel") {
         return run_time_travel(&args[1..]).await;
     }
+    if args.first().map(String::as_str) == Some("promote") {
+        let path = args
+            .windows(2)
+            .find(|w| w[0] == "--config")
+            .map(|w| PathBuf::from(&w[1]))
+            .or_else(|| std::env::var_os("VRT_SQL_FOLLOWER_CONFIG").map(PathBuf::from));
+        if !args.iter().any(|a| a == "--check") {
+            eprintln!("usage: vrt-sql promote --check --config <follower.toml>");
+            return ExitCode::FAILURE;
+        }
+        return match path {
+            Some(path) => run_promote_check(path).await,
+            None => {
+                eprintln!("vrt-sql promote: --config or VRT_SQL_FOLLOWER_CONFIG is required");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if args.first().map(String::as_str) == Some("follower") {
         let path = match args.as_slice() {
             [_, flag, path] if flag == "--config" => Some(PathBuf::from(path)),
@@ -410,6 +428,74 @@ async fn run_time_travel(args: &[String]) -> ExitCode {
         }
         Err(e) => {
             tracing::error!(error = %e, "time travel task panicked/join failed");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `vrt-sql promote --check`: read-only promotion preflight. Never CASes the
+/// manifest or mutates the follower; exits non-zero unless `ready:true`.
+async fn run_promote_check(config_path: PathBuf) -> ExitCode {
+    use std::sync::Arc;
+    use vrt_sql::follower::{Follower, FollowerServiceConfig};
+    use vrt_sql::paths::ResourceKind;
+
+    let raw = match std::fs::read(&config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, path = %config_path.display(), "failed to read follower config");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config: FollowerServiceConfig = match serde_json::from_slice(&raw)
+        .or_else(|_| toml::from_str::<FollowerServiceConfig>(std::str::from_utf8(&raw).unwrap_or("")))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "follower config parse failed (JSON or TOML expected)");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(field) = config.validate() {
+        tracing::error!(field, "invalid follower config");
+        return ExitCode::FAILURE;
+    }
+    let store = match vrt_sql::service::open_object_store(&config.persistence) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::error!("promotion check requires persistence.backend fs|s3");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "follower persistence init failed (fail closed)");
+            return ExitCode::FAILURE;
+        }
+    };
+    let clock: Arc<dyn vrt_sql::clock::Clock> = Arc::new(vrt_sql::clock::SystemClock);
+    let follower = match Follower::new(
+        store,
+        ResourceKind::D1,
+        config.follower.database_id.clone(),
+        config.db_root.clone(),
+        clock,
+    ) {
+        Ok(f) => f.with_retain_generations(config.follower.retain_generations),
+        Err(e) => {
+            tracing::error!(error = %e, "follower init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    match follower.promotion_readiness() {
+        Ok(r) => {
+            println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+            if r.ready {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "promotion readiness failed");
             ExitCode::FAILURE
         }
     }

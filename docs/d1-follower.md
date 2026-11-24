@@ -63,6 +63,18 @@ vrt-sql follower --config /etc/openflare/d1-follower.toml
 One process replicates one `databaseId`. Start several processes for several
 databases.
 
+## Promotion preflight
+
+Before a manual writer promotion, run the read-only preflight:
+
+```bash
+vrt-sql promote --check --config /etc/openflare/d1-follower.toml
+```
+
+It prints `Follower::promotion_readiness()` JSON and exits non-zero unless the
+follower is caught up, has a non-empty readable generation, and is not ahead of
+the manifest. It never CASes the manifest or changes local state.
+
 ## Serving reads and routing
 
 A follower with a listener exposes:
