@@ -636,7 +636,7 @@ async fn s2z_websocket_reattaches_after_hibernation() {
 
     let mut s = tokio::net::TcpStream::connect(ig.addr).await.unwrap();
     s.write_all(
-        b"GET /ws HTTP/1.1\r\nhost: w1.test\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n",
+        b"GET /ws HTTP/1.1\r\nhost: app.example.com\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-version: 13\r\n\r\n",
     )
     .await
     .unwrap();
@@ -928,7 +928,7 @@ export class EventLog extends DurableObject {
   async fetch(req) {
     const u = new URL(req.url);
     if (u.pathname === "/alarm") {
-      await this.ctx.storage.setAlarm(Date.now() + 30000);
+      await this.ctx.storage.setAlarm(Date.now() + 5000);
       return new Response("armed");
     }
     if (u.pathname === "/alarm-hits") {
