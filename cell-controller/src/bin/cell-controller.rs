@@ -320,6 +320,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
         tracing::info!("d1 ops executor enabled");
     }
+    // D1 stage 3: opt-in automatic failover. One probe loop per configured
+    // database; the follower CAS stays the single-writer authority and the
+    // control plane republishes the signed desired after the report.
+    if let Some(d1cfg) = config.d1sql.as_ref() {
+        if !d1cfg.auto_failover.is_empty() {
+            let token = std::fs::read_to_string(&config.token_file)
+                .expect("token_file unreadable")
+                .trim()
+                .to_string();
+            let secret = match vrt_securefs::load_service_secret(
+                std::path::Path::new(&d1cfg.auth_secret_file),
+                vrt_securefs::SecretPurpose::ServiceHmac,
+            ) {
+                Ok(s) => s.into_bytes(),
+                Err(e) => {
+                    tracing::error!(%e, "d1 auto-failover auth secret unusable — disabled");
+                    return Err(e.into());
+                }
+            };
+            for cfg in d1cfg.auto_failover.clone() {
+                let deps = match cell_controller::d1_auto::HttpAutoDeps::new(
+                    &config.control_plane_url,
+                    &config.cell_id,
+                    token.clone(),
+                    secret.clone(),
+                ) {
+                    Ok(d) => std::sync::Arc::new(d),
+                    Err(e) => {
+                        tracing::error!(%e, "d1 auto-failover disabled — init failed");
+                        continue;
+                    }
+                };
+                let probe = cfg.probe_interval();
+                let db = cfg.database_id.clone();
+                let db_for_task = db.clone();
+                let probe_secs = cfg.probe_interval_secs;
+                tokio::spawn(async move {
+                    let mut auto = cell_controller::d1_auto::AutoFailover::new(cfg.clone());
+                    let mut tick = tokio::time::interval(probe);
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        match auto
+                            .tick(&*deps, std::time::Instant::now())
+                            .await
+                        {
+                            cell_controller::d1_auto::AutoOutcome::Healthy => {}
+                            outcome => tracing::warn!(
+                                db = %db_for_task,
+                                ?outcome,
+                                "d1 auto-failover tick"
+                            ),
+                        }
+                    }
+                });
+                tracing::warn!(
+                    db = %db,
+                    probe_secs,
+                    "d1 automatic failover enabled"
+                );
+            }
+        }
+    }
     // W3/W4: generic cell-ops channel — workflow instance ops AND
     // (W4) D1 ops. Enabled whenever the cell can reach a pod (same
     // `[[pods]]` bases) OR has a `[d1sql]` data plane; each kind is

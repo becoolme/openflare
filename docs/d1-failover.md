@@ -1,7 +1,7 @@
 # D1 failover: staged design
 
-Status: stages 1–2 implemented (manual promotion + provider routing). Stage 3
-(automatic failover) is design only.
+Status: stages 1–3 implemented (manual promotion, provider routing, opt-in
+automatic failover).
 
 ## Goal
 
@@ -42,10 +42,15 @@ to the new writer.
    - The data plane rejects a request whose signed epoch differs from the
      current writer lease epoch (`VRT_FENCED`), so an old provider snapshot
      cannot write against the promoted writer.
-3. **Automatic failover**
-   - Cell-controller health probe + lease-aware promotion with a cooldown.
-   - Requires a witness (object-store CAS is enough for single-writer; no
-     quorum replication) and must fail closed if manifest freshness is unknown.
+3. **Automatic failover — implemented (opt-in)**
+   - `[d1sql].auto_failover` entries give the cell a writer health probe, the
+     follower promote endpoint and the new writer address.
+   - After `failure_threshold` consecutive failed probes the cell calls the
+     follower promote endpoint (lease-aware manifest CAS), then reports
+     `epoch/lsn/writerAddr` to the control plane's `/vrt/d1-writer` route,
+     which republishes the signed desired document.
+   - `cooldown_secs` bounds retries; a failed promotion never reports and never
+     blocks on a hung endpoint.
 
 ## Non-goals
 
