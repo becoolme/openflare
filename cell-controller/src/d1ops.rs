@@ -169,6 +169,8 @@ impl D1OrderGuard {
     }
 }
 
+static PROMOTE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Kinds routed to the D1 executor on the generic channel.
 pub fn is_d1_kind(kind: &str) -> bool {
     matches!(kind, "EXECUTE" | "MIGRATIONS_APPLY" | "DROP" | "PROMOTE")
@@ -728,16 +730,22 @@ impl D1OpsExecutor {
                 Ok(v) => done(op, v),
                 Err(e) => fail(op, &e),
             },
-            D1OpKind::Promote => match self.promote_db(op).await {
-                Ok(v) => {
-                    crate::metrics::d1_promote("ok");
-                    done(op, v)
+            D1OpKind::Promote => {
+                // Serialize promotions across the legacy and generic op
+                // channels; the follower CAS is atomic, but the local
+                // adoption must never race within this process.
+                let _guard = PROMOTE_LOCK.lock().await;
+                match self.promote_db(op).await {
+                    Ok(v) => {
+                        crate::metrics::d1_promote("ok");
+                        done(op, v)
+                    }
+                    Err(e) => {
+                        crate::metrics::d1_promote("failed");
+                        fail(op, &e)
+                    }
                 }
-                Err(e) => {
-                    crate::metrics::d1_promote("failed");
-                    fail(op, &e)
-                }
-            },
+            }
         }
     }
 
