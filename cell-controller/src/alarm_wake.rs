@@ -154,6 +154,7 @@ impl AlarmWaker {
             due: due.len(),
             ..Default::default()
         };
+        crate::metrics::alarm_wake(due.len(), 0, 0, 0);
         if due.is_empty() {
             return summary;
         }
@@ -230,6 +231,7 @@ impl AlarmWaker {
                 }
             }
         }
+        crate::metrics::alarm_wake(0, summary.ok, summary.failed, summary.unassigned);
         // Bound the ledger; entries for cleared alarms age out on reload.
         let mut retry = self.retry.lock().unwrap_or_else(|e| e.into_inner());
         if retry.len() > 10_000 {

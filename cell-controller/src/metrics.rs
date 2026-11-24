@@ -23,6 +23,11 @@ fn reg() -> &'static Registry {
         r.declare_counter("vrt_cell_cron_dispatch_total", "Cron dispatch outcomes (delivered|failed|retried_switching|skipped_lease_lost|skipped_no_lease|blackout|missed_deadline).");
         r.declare_counter("vrt_cell_logs_total", "Worker log shipping events by outcome (shipped records|drain_failed|push_failed).");
         r.declare_counter("vrt_cell_poll_errors_total", "Pull/fetch errors by source (desired|render_inputs).");
+        r.declare_counter("vrt_cell_d1_promote_total", "D1 promotion outcomes (ok|failed).");
+        r.declare_counter("vrt_cell_d1_auto_total", "D1 automatic-failover outcomes (probe_failed|promoted|promote_failed|cooling).");
+        r.declare_counter("vrt_cell_do_alarm_due_total", "Durable Object alarms due during a wake tick.");
+        r.declare_counter("vrt_cell_do_alarm_wake_total", "Durable Object alarm wake requests by outcome (ok|failed|unassigned).");
+        r.declare_counter("vrt_cell_do_alarm_gate_total", "DO sleep gates published by verdict (safe|unsafe).");
         r
     })
 }
@@ -118,6 +123,42 @@ pub fn cron_tick(
             );
         }
     }
+}
+
+/// D1 manual PROMOTE outcome.
+pub fn d1_promote(outcome: &'static str) {
+    reg().inc("vrt_cell_d1_promote_total", &[("outcome", outcome)], 1.0);
+}
+
+/// D1 automatic-failover outcome.
+pub fn d1_auto(outcome: &'static str) {
+    reg().inc("vrt_cell_d1_auto_total", &[("outcome", outcome)], 1.0);
+}
+
+/// One alarm-wake tick (counts are already aggregated).
+pub fn alarm_wake(due: usize, ok: usize, failed: usize, unassigned: usize) {
+    let r = reg();
+    if due > 0 {
+        r.inc("vrt_cell_do_alarm_due_total", &[], due as f64);
+    }
+    for (outcome, n) in [("ok", ok), ("failed", failed), ("unassigned", unassigned)] {
+        if n > 0 {
+            r.inc(
+                "vrt_cell_do_alarm_wake_total",
+                &[("outcome", outcome)],
+                n as f64,
+            );
+        }
+    }
+}
+
+/// One tenant DO sleep gate.
+pub fn alarm_gate(safe: bool) {
+    reg().inc(
+        "vrt_cell_do_alarm_gate_total",
+        &[("verdict", if safe { "safe" } else { "unsafe" })],
+        1.0,
+    );
 }
 
 /// Pull/fetch failure (`source` ∈ `desired|render_inputs`).
