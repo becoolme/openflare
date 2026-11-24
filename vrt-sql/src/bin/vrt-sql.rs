@@ -28,6 +28,8 @@ fn main() -> ExitCode {
 fn usage() -> ExitCode {
     eprintln!("usage: vrt-sql serve --config <path>");
     eprintln!("       vrt-sql follower --config <path>");
+    eprintln!("       vrt-sql promote --config <follower.toml> [--writer-db-root <dir>] [--json]");
+    eprintln!("       vrt-sql promote --check --config <follower.toml>");
     eprintln!("       vrt-sql time-travel --config <path> --db <id> (--at <unix-ms> | --bookmark <bm>) [--dry-run] [--json]");
     ExitCode::FAILURE
 }
@@ -52,17 +54,19 @@ async fn run() -> ExitCode {
             .find(|w| w[0] == "--config")
             .map(|w| PathBuf::from(&w[1]))
             .or_else(|| std::env::var_os("VRT_SQL_FOLLOWER_CONFIG").map(PathBuf::from));
-        if !args.iter().any(|a| a == "--check") {
-            eprintln!("usage: vrt-sql promote --check --config <follower.toml>");
+        let Some(path) = path else {
+            eprintln!("vrt-sql promote: --config or VRT_SQL_FOLLOWER_CONFIG is required");
             return ExitCode::FAILURE;
-        }
-        return match path {
-            Some(path) => run_promote_check(path).await,
-            None => {
-                eprintln!("vrt-sql promote: --config or VRT_SQL_FOLLOWER_CONFIG is required");
-                ExitCode::FAILURE
-            }
         };
+        if args.iter().any(|a| a == "--check") {
+            return run_promote_check(path).await;
+        }
+        let writer_db_root = args
+            .windows(2)
+            .find(|w| w[0] == "--writer-db-root")
+            .map(|w| PathBuf::from(&w[1]));
+        let json_out = args.iter().any(|a| a == "--json");
+        return run_promote(path, writer_db_root, json_out).await;
     }
     if args.first().map(String::as_str) == Some("follower") {
         let path = match args.as_slice() {
@@ -519,6 +523,121 @@ async fn run_promote_check(config_path: PathBuf) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `vrt-sql promote`: CAS the manifest to a new writer epoch from a caught-up
+/// follower generation and adopt that generation as the writer's local image.
+///
+/// The writer lease is released at the end so a separate `vrt-sql serve`
+/// process (same `[persistence]`, `dbRoot` = `--writer-db-root`) can claim it
+/// immediately. The old writer is fenced by the manifest CAS.
+async fn run_promote(
+    config_path: PathBuf,
+    writer_db_root: Option<PathBuf>,
+    json_out: bool,
+) -> ExitCode {
+    use std::sync::Arc;
+    use vrt_sql::follower::{Follower, FollowerServiceConfig};
+    use vrt_sql::paths::ResourceKind;
+
+    let raw = match std::fs::read(&config_path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, path = %config_path.display(), "failed to read follower config");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config: FollowerServiceConfig = match serde_json::from_slice(&raw)
+        .or_else(|_| toml::from_str::<FollowerServiceConfig>(std::str::from_utf8(&raw).unwrap_or("")))
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, "follower config parse failed (JSON or TOML expected)");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(field) = config.validate() {
+        tracing::error!(field, "invalid follower config");
+        return ExitCode::FAILURE;
+    }
+    let store = match vrt_sql::service::open_object_store(&config.persistence) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            tracing::error!("promotion requires persistence.backend fs|s3");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "follower persistence init failed (fail closed)");
+            return ExitCode::FAILURE;
+        }
+    };
+    let clock: Arc<dyn vrt_sql::clock::Clock> = Arc::new(vrt_sql::clock::SystemClock);
+    let follower = match Follower::new(
+        store.clone(),
+        ResourceKind::D1,
+        config.follower.database_id.clone(),
+        config.db_root.clone(),
+        clock.clone(),
+    ) {
+        Ok(f) => f.with_retain_generations(config.follower.retain_generations),
+        Err(e) => {
+            tracing::error!(error = %e, "follower init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let writer_root = writer_db_root.unwrap_or_else(|| config.db_root.clone());
+    let persister = vrt_sql::persist::Persister::new(
+        store,
+        config.persistence.persist_config(),
+        clock,
+        writer_root,
+        ResourceKind::D1,
+    );
+
+    let db = config.follower.database_id.clone();
+    let outcome = match follower.promote(&persister) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(db = %db, error = %e, "promotion failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut handle = outcome.handle.clone();
+    let released = match persister.release(&db, &mut handle, persister.clock().now_ms()) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(db = %db, error = %e,
+                "promotion succeeded but the lease release failed; a later claim waits for expiry");
+            false
+        }
+    };
+
+    if json_out {
+        let body = serde_json::json!({
+            "promoted": outcome,
+            "released": released,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "promoted {} from epoch {} lsn {} to epoch {} lsn {} ({}); writer image {}",
+            db,
+            outcome.previous_epoch,
+            outcome.previous_lsn,
+            outcome.epoch,
+            outcome.lsn,
+            if outcome.resumed {
+                "resumed"
+            } else {
+                "new CAS"
+            },
+            outcome.db_file.display()
+        );
+    }
+    ExitCode::SUCCESS
 }
 
 /// `vrt-sql follower`: tail the object-store chain into immutable local generations.

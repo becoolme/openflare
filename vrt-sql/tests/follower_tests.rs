@@ -373,3 +373,185 @@ fn status_reports_lag_before_the_next_sync() {
     assert_eq!(status.head_lsn, 3);
     assert_eq!(status.lag_commits(), 1);
 }
+
+fn count_engine(e: &vrt_sql::engine::RusqliteEngine) -> i64 {
+    let out = e
+        .query_batch_sync(
+            &[stmt("SELECT count(*) AS count FROM t")],
+            &ctx(),
+            ResultsFormat::ArrayOfObjects,
+        )
+        .unwrap();
+    out[0].results[0]["count"].as_i64().unwrap()
+}
+
+fn promoter(
+    store: Arc<dyn ObjectStore>,
+    clock: Arc<TestClock>,
+    root: PathBuf,
+    holder: &str,
+) -> Persister {
+    Persister::new(
+        store,
+        PersistConfig {
+            lease_ms: 10_000,
+            clock_skew_margin_ms: 500,
+            holder: holder.into(),
+            checkpoint_every_commits: 0,
+            retention_ms: 60_000,
+            snapshot_max_bytes: 1 << 30,
+        },
+        clock,
+        root,
+        D1,
+    )
+}
+
+#[test]
+fn promote_cas_adopts_generation_and_fences_stale_writer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let old_reg = writer(store.clone(), clock.clone(), tmp.path().join("old"), 0);
+    let old = old_reg.get(D1, DB).unwrap();
+    write(&old, "CREATE TABLE t(v INTEGER)").unwrap();
+    write(&old, "INSERT INTO t VALUES (1)").unwrap();
+
+    let f = follower(store.clone(), clock.clone(), tmp.path().join("replica"));
+    f.sync_once().unwrap();
+    let plan = f.promotion_plan().unwrap();
+
+    let p = promoter(
+        store.clone(),
+        clock.clone(),
+        tmp.path().join("promoted"),
+        "promoter",
+    );
+    let out = f.promote(&p).unwrap();
+    assert_eq!(
+        (out.previous_epoch, out.previous_lsn, out.epoch, out.lsn),
+        (
+            plan.expected_epoch,
+            plan.expected_lsn,
+            plan.next_epoch,
+            plan.expected_lsn
+        )
+    );
+    assert!(!out.resumed);
+    assert!(
+        out.db_file.exists(),
+        "writer image adopted from the generation"
+    );
+    assert_eq!(out.handle.epoch, out.epoch);
+    assert_eq!(out.handle.lsn, out.lsn);
+
+    // Hand the lease to the serving writer immediately.
+    let mut handle = out.handle.clone();
+    p.release(DB, &mut handle, clock.now_ms()).unwrap();
+
+    // The old writer is fenced on its next commit.
+    let err = write(&old, "INSERT INTO t VALUES (99)").unwrap_err();
+    assert!(matches!(err, EngineError::Fenced(_)), "{err:?}");
+    assert!(old.is_fenced());
+
+    // A fresh writer claims the promoted local image without restoring.
+    let new_reg = writer(store.clone(), clock.clone(), tmp.path().join("promoted"), 0);
+    let new = new_reg.get(D1, DB).unwrap();
+    assert_eq!(new.commit_lsn(), plan.expected_lsn);
+    assert_eq!(count_engine(&new), 1);
+    write(&new, "INSERT INTO t VALUES (2)").unwrap();
+    assert_eq!(count_engine(&new), 2);
+
+    // The follower can tail the promoted writer's next epoch.
+    let r = f.sync_once().unwrap();
+    assert_eq!(r.to_lsn, plan.expected_lsn + 1);
+    assert_eq!(count(&f), 2);
+}
+
+#[test]
+fn promote_rejects_a_follower_behind_the_head() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let reg = writer(store.clone(), clock.clone(), tmp.path().join("writer"), 0);
+    let e = reg.get(D1, DB).unwrap();
+    write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
+    write(&e, "INSERT INTO t VALUES (1)").unwrap();
+
+    let f = follower(store.clone(), clock.clone(), tmp.path().join("replica"));
+    f.sync_once().unwrap();
+    write(&e, "INSERT INTO t VALUES (2)").unwrap();
+
+    let p = promoter(store, clock, tmp.path().join("promoted"), "promoter");
+    let err = f.promote(&p).unwrap_err();
+    assert!(matches!(err, FollowerError::NotReady), "{err:?}");
+}
+
+#[test]
+fn promote_cas_conflict_reports_manifest_change() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let reg = writer(store.clone(), clock.clone(), tmp.path().join("writer"), 0);
+    let e = reg.get(D1, DB).unwrap();
+    write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
+    write(&e, "INSERT INTO t VALUES (1)").unwrap();
+
+    let f = follower(store.clone(), clock.clone(), tmp.path().join("replica"));
+    f.sync_once().unwrap();
+    let plan = f.promotion_plan().unwrap();
+    let generation = f.root().join(&plan.generation);
+
+    // The head advances between the plan and the CAS.
+    write(&e, "INSERT INTO t VALUES (2)").unwrap();
+    let p = promoter(store, clock, tmp.path().join("promoted"), "promoter");
+    let err = p
+        .promote_from_generation(DB, plan.expected_epoch, plan.expected_lsn, &generation)
+        .unwrap_err();
+    assert!(
+        matches!(err, vrt_sql::persist::PersistError::ManifestChanged { .. }),
+        "{err:?}"
+    );
+    // The CAS never ran: the old writer keeps its lease and can still commit.
+    write(&e, "INSERT INTO t VALUES (3)").unwrap();
+    assert!(!e.is_fenced());
+}
+
+#[test]
+fn promote_resumes_local_adoption_after_a_crash_between_cas_and_install() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let old_reg = writer(store.clone(), clock.clone(), tmp.path().join("old"), 0);
+    let old = old_reg.get(D1, DB).unwrap();
+    write(&old, "CREATE TABLE t(v INTEGER)").unwrap();
+    write(&old, "INSERT INTO t VALUES (1)").unwrap();
+
+    let f = follower(store.clone(), clock.clone(), tmp.path().join("replica"));
+    f.sync_once().unwrap();
+    let plan = f.promotion_plan().unwrap();
+    let generation = f.root().join(&plan.generation);
+    let p = promoter(
+        store.clone(),
+        clock.clone(),
+        tmp.path().join("promoted"),
+        "promoter",
+    );
+    let first = p
+        .promote_from_generation(DB, plan.expected_epoch, plan.expected_lsn, &generation)
+        .unwrap();
+    assert!(!first.resumed);
+
+    // Simulate the crash window: CAS committed, local adoption vanished.
+    std::fs::remove_file(&first.db_file).unwrap();
+    let sidecar = first.db_file.parent().unwrap().join(".vrt-lsn");
+    let _ = std::fs::remove_file(sidecar);
+
+    let retry = p
+        .promote_from_generation(DB, plan.expected_epoch, plan.expected_lsn, &generation)
+        .unwrap();
+    assert!(retry.resumed);
+    assert_eq!(retry.epoch, first.epoch, "resume must not bump the epoch again");
+    assert!(retry.db_file.exists());
+    assert_eq!(count(&f), 1);
+}
