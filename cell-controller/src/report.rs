@@ -15,7 +15,7 @@
 //! The wire shape is mirrored by `plane/src/routes.ts` and
 //! `apps/console/app/pages/kit/api.vue`; see `fixtures/vrt-wire/cell-report.json`.
 
-use crate::alarm_index::{AlarmClass, AlarmIndex, AlarmObservation};
+use crate::alarm_index::{AlarmClass, AlarmIndex, AlarmObservation, AlarmSnapshot};
 use crate::assign::PodAssignment;
 use serde::{Deserialize, Serialize};
 use snapshot_protocol::compute_desired::{BindingDesired, ComputeDesired};
@@ -865,6 +865,10 @@ pub trait ReportIo: Send + Sync {
     async fn push_alarm_gate(&self, _pod_id: &str, _gate: &AlarmGate) -> Result<(), String> {
         Ok(())
     }
+    /// Push the cell-wide alarm index snapshot for console visibility.
+    async fn push_alarms(&self, _snapshot: &AlarmSnapshot) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 fn instance_set(mut view: InstancesView, budget: usize) -> InstanceSet {
@@ -1213,6 +1217,11 @@ impl<T: ReportIo> Reporter<T> {
             self.observe_alarms(&pod, target, now_ms).await;
         }
         self.publish_alarm_gates(&plan, assignments, now_ms).await;
+        if let Some(index) = &self.alarm_index {
+            if let Err(e) = self.io.push_alarms(&index.export()).await {
+                tracing::debug!(error = %e, "do alarm snapshot push failed");
+            }
+        }
         if report.errors.len() > MAX_REPORT_ERRORS {
             report.errors.truncate(MAX_REPORT_ERRORS - 1);
             report.errors.push("errors truncated".into());
@@ -1414,6 +1423,29 @@ impl ReportIo for HttpReportIo {
         .map_err(|e| format!("alarm gate transport: {e}"))?;
         if !resp.status().is_success() {
             return Err(format!("alarm gate status {}", resp.status()));
+        }
+        Ok(())
+    }
+
+    async fn push_alarms(&self, snapshot: &AlarmSnapshot) -> Result<(), String> {
+        let url = format!(
+            "{}/api/internal/clusters/{}/vrt/alarms",
+            self.control_plane_url.trim_end_matches('/'),
+            self.cell_id
+        );
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.http
+                .post(&url)
+                .bearer_auth(&self.token)
+                .json(snapshot)
+                .send(),
+        )
+        .await
+        .map_err(|_| "alarm snapshot timeout".to_string())?
+        .map_err(|e| format!("alarm snapshot transport: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("alarm snapshot status {}", resp.status()));
         }
         Ok(())
     }

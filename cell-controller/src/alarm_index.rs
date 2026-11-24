@@ -52,6 +52,16 @@ pub struct AlarmEntry {
     pub observed_at_ms: u64,
 }
 
+/// Bounded export for the control-plane console.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AlarmSnapshot {
+    pub entries: Vec<AlarmEntry>,
+    pub unknown: Vec<AlarmClass>,
+    pub truncated: Vec<AlarmClass>,
+    pub observed: Vec<AlarmClass>,
+}
+
 /// One object as reported by a host scan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -354,6 +364,17 @@ impl AlarmIndex {
             .unwrap_or_else(|e| e.into_inner())
             .observed
             .contains_key(class)
+    }
+
+    /// Bounded console export: known alarms + class health.
+    pub fn export(&self) -> AlarmSnapshot {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        AlarmSnapshot {
+            entries: state.entries.values().cloned().collect(),
+            unknown: state.unknown.iter().cloned().collect(),
+            truncated: state.truncated.iter().cloned().collect(),
+            observed: state.observed.keys().cloned().collect(),
+        }
     }
 
     /// Snapshot of every known alarm (for diagnostics/tests).
