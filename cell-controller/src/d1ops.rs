@@ -886,6 +886,17 @@ fn promote_payload(payload: &serde_json::Value) -> Result<serde_json::Value, Str
         }
         None => None,
     };
+    if let Some(v) = obj.get("writerAddr") {
+        let addr = v.as_str().ok_or("writerAddr must be a string")?;
+        if addr.is_empty()
+            || addr.len() > 256
+            || addr.ends_with('/')
+            || addr.chars().any(|c| c.is_whitespace())
+            || !(addr.starts_with("http://") || addr.starts_with("https://"))
+        {
+            return Err("writerAddr must be an http(s) URL without a trailing slash".into());
+        }
+    }
     let mut out = serde_json::Map::new();
     if let Some((e, l)) = expected {
         out.insert("expectedEpoch".into(), serde_json::json!(e));
