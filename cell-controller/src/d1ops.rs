@@ -729,8 +729,14 @@ impl D1OpsExecutor {
                 Err(e) => fail(op, &e),
             },
             D1OpKind::Promote => match self.promote_db(op).await {
-                Ok(v) => done(op, v),
-                Err(e) => fail(op, &e),
+                Ok(v) => {
+                    crate::metrics::d1_promote("ok");
+                    done(op, v)
+                }
+                Err(e) => {
+                    crate::metrics::d1_promote("failed");
+                    fail(op, &e)
+                }
             },
         }
     }

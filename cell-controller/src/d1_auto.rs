@@ -143,12 +143,14 @@ impl AutoFailover {
             self.failures = 0;
             return AutoOutcome::Healthy;
         }
+        crate::metrics::d1_auto("probe_failed");
         self.failures = self.failures.saturating_add(1);
         let cooldown = Duration::from_secs(self.cfg.cooldown_secs);
         if self
             .last_promote
             .is_some_and(|at| now.saturating_duration_since(at) < cooldown)
         {
+            crate::metrics::d1_auto("cooling");
             return AutoOutcome::Cooling;
         }
         if self.failures < self.cfg.failure_threshold {
@@ -180,8 +182,10 @@ impl AutoFailover {
                         error = %e,
                         "d1 auto-failover promoted but the control-plane report failed"
                     );
+                    crate::metrics::d1_auto("promote_failed");
                     return AutoOutcome::PromoteFailed;
                 }
+                crate::metrics::d1_auto("promoted");
                 tracing::warn!(
                     db = %self.cfg.database_id,
                     epoch = promotion.epoch,
@@ -193,6 +197,7 @@ impl AutoFailover {
                 }
             }
             Err(e) => {
+                crate::metrics::d1_auto("promote_failed");
                 tracing::error!(db = %self.cfg.database_id, error = %e,
                     "d1 auto-failover promotion failed");
                 AutoOutcome::PromoteFailed

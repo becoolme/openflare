@@ -1036,6 +1036,7 @@ impl<T: ReportIo> Reporter<T> {
                     };
                     index.is_safe_to_sleep_stage2(&class, now, ALARM_SAFETY_LEAD_MS)
                 });
+                crate::metrics::alarm_gate(safe);
                 let gate = AlarmGate {
                     tenant_id,
                     safe,
