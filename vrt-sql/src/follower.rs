@@ -1152,6 +1152,7 @@ databaseId = "abcdefghijklmnopqrstuvwxyz"
             listen_tcp: None,
             auth_secret_file: None,
             bookmark_secret_file: None,
+            promote_writer_db_root: None,
         };
         assert!(none_cfg.validate().is_err());
     }
