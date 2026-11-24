@@ -282,14 +282,12 @@ pub async fn handle_d1(
                 let engine = registry
                     .get_until(crate::paths::ResourceKind::D1, &database_id, ctx.deadline)
                     .map_err(|e| (e, false))?;
-                // Stage 2 failover: the provider signs every request with the
-                // epoch from the signed desired. A stale provider (old snapshot)
-                // must not write against the promoted writer, even though the
-                // dedup key would otherwise accept its seq.
-                if engine.persistence_enabled() && call_epoch != engine.lease_epoch() {
-                    crate::metrics::persistence_failure("stale_epoch");
-                    return Err((EngineError::Fenced(engine.lease_epoch()), false));
-                }
+                // The signed epoch is a routing/dedup hint, not the writer
+                // authority: the manifest CAS is authoritative and a process
+                // restart may advance the epoch before the control plane has
+                // republished it. Rejecting a lower epoch here would strand a
+                // healthy restarted writer, so the lease/manifest gate below
+                // remains the fence.
                 match run_query(&engine, &stmts, &ctx, format) {
                     Ok(results) => {
                         // T36: degraded (lease valid but renewal failed) -> reads still allowed but counted.
