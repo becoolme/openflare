@@ -195,6 +195,24 @@ pub struct FollowerStatus {
     pub last_error: Option<String>,
 }
 
+/// Read-only promotion preflight. This never CASes the manifest or mutates
+/// local state; it only tells the operator whether a manual promotion would
+/// start from a readable, caught-up generation.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotionReadiness {
+    pub database_id: String,
+    pub ready: bool,
+    pub reason: String,
+    pub phase: FollowerPhase,
+    pub applied_epoch: u64,
+    pub applied_lsn: u64,
+    pub head_epoch: u64,
+    pub head_lsn: u64,
+    pub generation: Option<String>,
+    pub generation_exists: bool,
+}
+
 impl FollowerStatus {
     /// Commits between the applied watermark and the manifest head (0 when caught up).
     pub fn lag_commits(&self) -> u64 {
@@ -350,6 +368,43 @@ impl Follower {
     /// Read the persisted watermark.
     pub fn state(&self) -> Result<Option<FollowerState>, FollowerError> {
         self.read_state()
+    }
+
+    /// Preflight for a manual writer promotion. Fail closed: any missing or
+    /// stale state is reported, never inferred as ready.
+    pub fn promotion_readiness(&self) -> Result<PromotionReadiness, FollowerError> {
+        let status = self.status()?;
+        let state = self.state()?;
+        let generation_exists = status
+            .generation
+            .as_ref()
+            .and_then(|g| std::fs::metadata(self.root.join(g)).ok())
+            .is_some();
+        let (ready, reason) = if state.is_none() {
+            (false, "no-state")
+        } else if status.applied_lsn > status.head_lsn {
+            (false, "ahead-of-manifest")
+        } else if status.applied_lsn < status.head_lsn {
+            (false, "catching-up")
+        } else if status.applied_lsn == 0 {
+            (false, "empty")
+        } else if !generation_exists {
+            (false, "generation-missing")
+        } else {
+            (true, "ready")
+        };
+        Ok(PromotionReadiness {
+            database_id: self.database_id.clone(),
+            ready,
+            reason: reason.to_string(),
+            phase: status.phase,
+            applied_epoch: status.applied_epoch,
+            applied_lsn: status.applied_lsn,
+            head_epoch: status.head_epoch,
+            head_lsn: status.head_lsn,
+            generation: status.generation,
+            generation_exists,
+        })
     }
 
     /// Compute live status (reads the manifest).
