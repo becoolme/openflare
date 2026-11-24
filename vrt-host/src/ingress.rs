@@ -2142,59 +2142,58 @@ impl WsTunnel {
             ws_outcome(w, "detached");
             let mut buffered: Vec<u8> = Vec::new();
             let mut buf = [0u8; 8192];
-            loop {
-                let n = tokio::select! {
-                    r = tokio::io::AsyncReadExt::read(&mut client, &mut buf) => match r {
-                        Ok(n) => n,
-                        Err(_) => break 'session "error",
-                    },
-                    _ = wait_idle(started, last_ms.clone(), idle_ms) => break 'session "idle_timeout",
-                    _ = tokio::time::sleep_until(max_at) => break 'session "max_duration",
-                };
-                if n == 0 {
-                    break 'session "closed";
-                }
-                if buffered.len() + n > self.hibernation.replay_bytes {
-                    ws_outcome(w, "replay_overflow");
-                    break 'session "replay_overflow";
-                }
-                buffered.extend_from_slice(&buf[..n]);
-                if let Err(_) = self
-                    .runtime
-                    .await_wake(
-                        0,
-                        self.switch_hold_max_reqs,
-                        self.switch_hold_max_bytes,
-                        crate::hibernate::WakeSourceKind::WebSocket,
-                    )
-                    .await
-                {
-                    break 'session "wake_failed";
-                }
-                let Some(mut new_up) = self.reconnect().await else {
-                    break 'session "reattach_failed";
-                };
-                if tokio::io::AsyncWriteExt::write_all(&mut new_up, &buffered)
-                    .await
-                    .is_err()
-                    || tokio::io::AsyncWriteExt::flush(&mut new_up).await.is_err()
-                {
-                    break 'session "reattach_failed";
-                }
-                if !self.hibernation.enabled {
-                    let Some(next_guard) = self
-                        .runtime
-                        .endpoint_slot(&self.worker_id)
-                        .and_then(|slot| slot.acquire())
-                    else {
-                        break 'session "reattach_guard";
-                    };
-                    guard = Some(next_guard);
-                }
-                upstream = Some(new_up);
-                ws_outcome(w, "reattached");
-                continue 'session;
+            let n = tokio::select! {
+                r = tokio::io::AsyncReadExt::read(&mut client, &mut buf) => match r {
+                    Ok(n) => n,
+                    Err(_) => break 'session "error",
+                },
+                _ = wait_idle(started, last_ms.clone(), idle_ms) => break 'session "idle_timeout",
+                _ = tokio::time::sleep_until(max_at) => break 'session "max_duration",
+            };
+            if n == 0 {
+                break 'session "closed";
             }
+            if buffered.len() + n > self.hibernation.replay_bytes {
+                ws_outcome(w, "replay_overflow");
+                break 'session "replay_overflow";
+            }
+            buffered.extend_from_slice(&buf[..n]);
+            if self
+                .runtime
+                .await_wake(
+                    0,
+                    self.switch_hold_max_reqs,
+                    self.switch_hold_max_bytes,
+                    crate::hibernate::WakeSourceKind::WebSocket,
+                )
+                .await
+                .is_err()
+            {
+                break 'session "wake_failed";
+            }
+            let Some(mut new_up) = self.reconnect().await else {
+                break 'session "reattach_failed";
+            };
+            if tokio::io::AsyncWriteExt::write_all(&mut new_up, &buffered)
+                .await
+                .is_err()
+                || tokio::io::AsyncWriteExt::flush(&mut new_up).await.is_err()
+            {
+                break 'session "reattach_failed";
+            }
+            if !self.hibernation.enabled {
+                let Some(next_guard) = self
+                    .runtime
+                    .endpoint_slot(&self.worker_id)
+                    .and_then(|slot| slot.acquire())
+                else {
+                    break 'session "reattach_guard";
+                };
+                guard = Some(next_guard);
+            }
+            upstream = Some(new_up);
+            ws_outcome(w, "reattached");
+            continue 'session;
         };
         // Dropping both halves closes the sockets.
         drop(client);
