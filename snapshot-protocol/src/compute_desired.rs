@@ -987,6 +987,15 @@ pub struct WorkflowDesired {
     /// json binding when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits_steps: Option<u32>,
+    /// `default_retention.success_retention` normalized to milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_retention_ms: Option<u64>,
+    /// `default_retention.error_retention` normalized to milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_retention_ms: Option<u64>,
+    /// Platform concurrency cap override (1..=4,500); absent = 4,500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
 }
 
 /// One wrangler `tail_consumers[]` entry, resolved to the consumer's
@@ -2230,6 +2239,21 @@ impl WorkerDesired {
             if let Some(steps) = wf.limits_steps {
                 if !(1..=MAX_WORKFLOW_STEPS).contains(&steps) {
                     return Err(DesiredError::QuotaBounds("workflows.limitsSteps"));
+                }
+            }
+            if let Some(ms) = wf.success_retention_ms {
+                if ms > 30 * 24 * 60 * 60 * 1000 {
+                    return Err(DesiredError::QuotaBounds("workflows.successRetentionMs"));
+                }
+            }
+            if let Some(ms) = wf.error_retention_ms {
+                if ms > 30 * 24 * 60 * 60 * 1000 {
+                    return Err(DesiredError::QuotaBounds("workflows.errorRetentionMs"));
+                }
+            }
+            if let Some(limit) = wf.concurrency_limit {
+                if !(1..=4_500).contains(&limit) {
+                    return Err(DesiredError::QuotaBounds("workflows.concurrencyLimit"));
                 }
             }
         }

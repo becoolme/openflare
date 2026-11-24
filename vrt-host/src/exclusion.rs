@@ -336,6 +336,9 @@ mod tests {
             service_worker_id: None,
             unique_key: "c".repeat(64),
             limits_steps: None,
+            success_retention_ms: None,
+            error_retention_ms: None,
+            concurrency_limit: None,
         });
         assert_eq!(
             exclusion_verdict(&t, "wf", &BTreeSet::new()),

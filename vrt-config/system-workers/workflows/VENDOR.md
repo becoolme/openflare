@@ -73,9 +73,9 @@ an SQLite table of active instance ids and caps them at
 `workflow.concurrency_limit` when full; terminal status, explicit delete, or
 retention cleanup releases the slot idempotently.
 
-Per-Workflow and per-instance retention configuration is not yet wired;
-the fork currently applies the seven-day default to every instance. The
-concurrency cap is also fixed at the default for now.
+The signed workflow declaration can set `successRetentionMs` /
+`errorRetentionMs` (max 30 days) and `concurrencyLimit`; per-instance
+retention is not wired yet. Absent values use seven days and 4,500.
 
 ## Local patch: W1-r5 durable resume (binding.worker.js only)
 

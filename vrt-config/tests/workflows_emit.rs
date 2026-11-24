@@ -22,7 +22,10 @@ fn tenant_with_wf() -> TenantDesired {
         "binding": "WF",
         "className": "OrderFlow",
         "uniqueKey": "c".repeat(64),
-        "limitsSteps": 42
+        "limitsSteps": 42,
+        "successRetentionMs": 259200000,
+        "errorRetentionMs": 86400000,
+        "concurrencyLimit": 100
     }]);
     serde_json::from_value(value).unwrap()
 }
@@ -81,6 +84,18 @@ fn emit_engine_service_with_namespace_and_bindings() {
     );
     assert!(
         out.contains("(name = \"STEP_LIMIT\", json = \"42\")"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(name = \"WORKFLOW_SUCCESS_RETENTION_MS\", text = \"259200000\")"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(name = \"WORKFLOW_ERROR_RETENTION_MS\", text = \"86400000\")"),
+        "{out}"
+    );
+    assert!(
+        out.contains("(name = \"WORKFLOW_CONCURRENCY_LIMIT\", text = \"100\")"),
         "{out}"
     );
     // W6: per-worker loopback shim — the engine's MINIFLARE_LOOPBACK

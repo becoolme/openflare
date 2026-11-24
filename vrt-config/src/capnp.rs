@@ -2802,6 +2802,24 @@ fn emit_workflow_engine(
             steps,
         ));
     }
+    if let Some(ms) = wf.success_retention_ms {
+        out.push_str(&format!(
+            "        (name = \"WORKFLOW_SUCCESS_RETENTION_MS\", text = \"{}\"),\n",
+            ms,
+        ));
+    }
+    if let Some(ms) = wf.error_retention_ms {
+        out.push_str(&format!(
+            "        (name = \"WORKFLOW_ERROR_RETENTION_MS\", text = \"{}\"),\n",
+            ms,
+        ));
+    }
+    if let Some(limit) = wf.concurrency_limit {
+        out.push_str(&format!(
+            "        (name = \"WORKFLOW_CONCURRENCY_LIMIT\", text = \"{}\"),\n",
+            limit,
+        ));
+    }
     out.push_str("      ],\n");
     out.push_str(&format!(
         "      durableObjectNamespaces = [\n        (className = \"Engine\", uniqueKey = {}, enableSql = true, preventEviction = true),\n        (className = \"Coordinator\", uniqueKey = {}, enableSql = true, preventEviction = true),\n      ],\n",
