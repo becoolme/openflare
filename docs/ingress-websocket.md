@@ -102,7 +102,10 @@ the handshake completes, not when the session ends.
   scaled to zero while it is open. Close idle sessions on the client or rely
   on the idle timeout.
 - Cloudflare's hibernatable WebSocket eviction is not emulated. The worker
-  process stays resident while the session is open.
+  process stays resident while the session is open. The ingress owns the
+  client tunnel and workerd has no re-attach API for an existing socket, so
+  process-level hibernation cannot preserve the session; a connection-holding
+  proxy would be required (see `docs/do-hibernation.md`).
 - When a deployment switches generations, the old generation is drained for a
   grace period. A session still open when the grace period expires is cut.
   Clients are expected to reconnect.
