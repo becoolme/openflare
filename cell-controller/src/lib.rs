@@ -27,6 +27,7 @@ pub mod alarm_wake;
 pub mod assign;
 pub mod controller;
 pub mod cron;
+pub mod d1_auto;
 pub mod d1ops;
 pub mod execset;
 pub mod kvops;

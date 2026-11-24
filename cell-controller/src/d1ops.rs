@@ -41,6 +41,9 @@ pub struct D1SqlConfig {
     /// absent, `PROMOTE` ops fail with a typed error instead of hanging.
     #[serde(default)]
     pub promote_endpoint: Option<String>,
+    /// Opt-in automatic writer failover policies (one per database).
+    #[serde(default)]
+    pub auto_failover: Vec<crate::d1_auto::AutoFailoverConfig>,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -302,7 +305,7 @@ fn engine_seq(op_seq: i64, stmt_idx: usize, chan: u64) -> u64 {
 /// names, short single-label names (search-path dependent) and look-alikes
 /// such as `127.0.0.1.evil.test` are rejected. Returns the normalized
 /// endpoint without a trailing slash.
-pub fn validate_data_plane_endpoint(raw: &str) -> Result<String, String> {
+pub(crate) fn validate_data_plane_endpoint(raw: &str) -> Result<String, String> {
     if raw.is_empty() || raw.len() > 256 {
         return Err("must be 1..=256 bytes".into());
     }
@@ -382,6 +385,9 @@ impl D1OpsExecutor {
             ),
             None => None,
         };
+        for auto in &config.auto_failover {
+            auto.validate().map_err(|e| format!("d1sql.{e}"))?;
+        }
         let secret = vrt_securefs::load_service_secret(
             std::path::Path::new(&config.auth_secret_file),
             vrt_securefs::SecretPurpose::ServiceHmac,
@@ -1158,6 +1164,7 @@ mod tests {
             auth_secret_file: p.to_string_lossy().into(),
             timeout_secs: 1,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         };
         // trailing newline -> accepted and identical key to vrt-sql/provider
         let nl = dir.path().join("nl");
@@ -1239,6 +1246,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         })
         .unwrap();
         let ack = exec
@@ -1263,6 +1271,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         })
         .unwrap();
         let ack = exec
@@ -1287,6 +1296,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         })
         .unwrap();
         for payload in [
@@ -1314,6 +1324,7 @@ mod tests {
             auth_secret_file: "/nonexistent".into(),
             timeout_secs: 5,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         };
         assert!(D1OpsExecutor::new(&cfg).is_err());
     }
@@ -1383,6 +1394,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         };
         assert!(D1OpsExecutor::new(&mk("http://vrt-sql.vrt-system.svc:8082")).is_ok());
         let err = D1OpsExecutor::new(&mk("http://example.com:8082")).err().unwrap();
@@ -1393,6 +1405,7 @@ mod tests {
             auth_secret_file: dir.path().join("nope").to_string_lossy().into(),
             timeout_secs: 1,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         };
         assert!(D1OpsExecutor::new(&missing).is_err());
     }
@@ -1404,6 +1417,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         })
         .unwrap()
     }
@@ -1717,6 +1731,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 2,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         })
         .unwrap();
         let src =
@@ -1793,6 +1808,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 2,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         })
         .unwrap();
         let src =
@@ -1847,6 +1863,7 @@ mod tests {
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 2,
             promote_endpoint: None,
+            auto_failover: Vec::new(),
         })
         .unwrap();
         let src = crate::wfops::HttpCellOpsSource::new(
