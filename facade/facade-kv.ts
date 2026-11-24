@@ -30,6 +30,19 @@ function readType(options: unknown): "text" | "json" | "arrayBuffer" | "stream" 
   return "text";
 }
 
+function cacheable(
+  options: unknown,
+  ttl: number | undefined,
+  type: "text" | "json" | "arrayBuffer" | "stream",
+): boolean {
+  if (ttl === undefined || !Number.isSafeInteger(ttl) || ttl < 30) return false;
+  if (type === "stream") return false;
+  if (typeof options === "string") return true;
+  if (options === null || typeof options !== "object") return false;
+  const declared = (options as { type?: unknown }).type;
+  return declared === undefined || declared === type;
+}
+
 function remember(key: string, entry: CacheEntry): void {
   if (cache.size >= MAX_CACHE_ENTRIES) {
     const first = cache.keys().next();
@@ -64,7 +77,7 @@ export class KVNamespace extends VendoredKVNamespace {
   async get(keyOrKeys: string | string[], typeOrOptions?: unknown): Promise<unknown> {
     const ttl = cacheTtl(typeOrOptions);
     const type = readType(typeOrOptions);
-    if (Array.isArray(keyOrKeys) || ttl === undefined || ttl < 30 || type === "stream") {
+    if (Array.isArray(keyOrKeys) || !cacheable(typeOrOptions, ttl, type)) {
       return super.get(keyOrKeys as never, typeOrOptions as never);
     }
     const key = `${this.#scope}\u0001get\u0001${type}\u0001${keyOrKeys}`;
@@ -86,7 +99,7 @@ export class KVNamespace extends VendoredKVNamespace {
   ): Promise<unknown> {
     const ttl = cacheTtl(typeOrOptions);
     const type = readType(typeOrOptions);
-    if (Array.isArray(keyOrKeys) || ttl === undefined || ttl < 30 || type === "stream") {
+    if (Array.isArray(keyOrKeys) || !cacheable(typeOrOptions, ttl, type)) {
       return super.getWithMetadata(keyOrKeys as never, typeOrOptions as never);
     }
     const key = `${this.#scope}\u0001meta\u0001${type}\u0001${keyOrKeys}`;

@@ -15,6 +15,14 @@ function readType(options) {
     }
     return "text";
 }
+function cacheable(options, ttl, type) {
+    if (ttl === undefined || !Number.isSafeInteger(ttl) || ttl < 30) return false;
+    if (type === "stream") return false;
+    if (typeof options === "string") return true;
+    if (options === null || typeof options !== "object") return false;
+    const declared = options.type;
+    return declared === undefined || declared === type;
+}
 function remember(key, entry) {
     if (cache.size >= MAX_CACHE_ENTRIES) {
         const first = cache.keys().next();
@@ -45,7 +53,7 @@ export class KVNamespace extends VendoredKVNamespace {
     async get(keyOrKeys, typeOrOptions) {
         const ttl = cacheTtl(typeOrOptions);
         const type = readType(typeOrOptions);
-        if (Array.isArray(keyOrKeys) || ttl === undefined || ttl < 30 || type === "stream") {
+        if (Array.isArray(keyOrKeys) || !cacheable(typeOrOptions, ttl, type)) {
             return super.get(keyOrKeys, typeOrOptions);
         }
         const key = `${this.#scope}\u0001get\u0001${type}\u0001${keyOrKeys}`;
@@ -70,7 +78,7 @@ export class KVNamespace extends VendoredKVNamespace {
     async getWithMetadata(keyOrKeys, typeOrOptions) {
         const ttl = cacheTtl(typeOrOptions);
         const type = readType(typeOrOptions);
-        if (Array.isArray(keyOrKeys) || ttl === undefined || ttl < 30 || type === "stream") {
+        if (Array.isArray(keyOrKeys) || !cacheable(typeOrOptions, ttl, type)) {
             return super.getWithMetadata(keyOrKeys, typeOrOptions);
         }
         const key = `${this.#scope}\u0001meta\u0001${type}\u0001${keyOrKeys}`;

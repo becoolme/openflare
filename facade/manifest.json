@@ -16,8 +16,8 @@
           "name": "facade/facade-kv.js",
           "dist": "facade/dist/facade/facade-kv.js",
           "source": "facade/facade-kv.ts",
-          "sourceSha256": "605920dcd3ca7d53fae1d5153578198a8fb6ce224e1a9edbec923c79a95f9530",
-          "sha256": "274cca28c79bf68bda11461893edb4cf6c8694578191a407048ab6e10275ca49"
+          "sourceSha256": "73dfafaee2f81c005bc11f29d108c572a1476d4884eefa0da3ef6a7077b2a436",
+          "sha256": "85fe4277383f701876d8f12dda46f91dd4937784d6bd0ba94aee549df33fcc2e"
         },
         {
           "name": "facade/props.js",
