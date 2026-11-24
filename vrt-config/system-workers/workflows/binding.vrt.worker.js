@@ -3442,7 +3442,7 @@ var WorkflowSubscriptionTarget = class extends RpcTarget3 {
 };
 
 // ../workflows-shared/src/engine.ts
-var ENGINE_STATUS_KEY = "ENGINE_STATUS", WORKFLOW_OUTPUT_KEY = "WORKFLOW_OUTPUT", EVENT_MAP_PREFIX2 = "EVENT_MAP", DEFAULT_STEP_LIMIT = 1e4, PAUSE_DATETIME2 = "PAUSE_DATETIME", RESTART_PENDING_KEY = "RESTART_PENDING", VRT_RETENTION_AT = "VRT_RETENTION_AT", VRT_DEFAULT_RETENTION_MS = 6048e5;
+var ENGINE_STATUS_KEY = "ENGINE_STATUS", WORKFLOW_OUTPUT_KEY = "WORKFLOW_OUTPUT", EVENT_MAP_PREFIX2 = "EVENT_MAP", DEFAULT_STEP_LIMIT = 1e4, PAUSE_DATETIME2 = "PAUSE_DATETIME", RESTART_PENDING_KEY = "RESTART_PENDING", VRT_RETENTION_AT = "VRT_RETENTION_AT", VRT_RETENTION_POLICY = "VRT_RETENTION_POLICY", VRT_DEFAULT_RETENTION_MS = 6048e5, VRT_MAX_RETENTION_MS = 2592e6;
 function vrtConcurrencyLimit(value) {
   let n = Number(value);
   return Number.isSafeInteger(n) && n > 0 ? n : 4500;
@@ -3450,6 +3450,22 @@ function vrtConcurrencyLimit(value) {
 function vrtRetentionMs(value) {
   let n = typeof value == "number" ? value : Number(value);
   return Number.isFinite(n) && n >= 0 ? n : VRT_DEFAULT_RETENTION_MS;
+}
+function vrtInstanceRetention(value) {
+  if (value === void 0)
+    return;
+  if (value === null || typeof value != "object")
+    throw createWorkflowError("Invalid retention", "body");
+  let out = {};
+  for (let [key, target] of [["successRetention", "successMs"], ["errorRetention", "errorMs"]]) {
+    if (value[key] === void 0)
+      continue;
+    let ms = r(value[key]);
+    if (!Number.isSafeInteger(ms) || ms < 0 || ms > VRT_MAX_RETENTION_MS)
+      throw createWorkflowError("Invalid retention", "body");
+    out[target] = ms;
+  }
+  return Object.keys(out).length ? out : void 0;
 }
 function binaryReplacer(_key, value) {
   return typeof value == "bigint" ? `[BigInt(${value})]` : value instanceof ArrayBuffer ? `[ArrayBuffer(${value.byteLength} bytes)]` : ArrayBuffer.isView(value) && !(value instanceof DataView) ? `[${value.constructor.name}(${value.byteLength} bytes)]` : value;
@@ -4562,7 +4578,7 @@ ${i}`] = events[i];
       }
     })();
   }
-  async init(accountId, workflow, version, instance, event) {
+  async init(accountId, workflow, version, instance, event, retention) {
     // VRT W2 P0-0: coalescing single-flight. A caller arriving while a
     // claim is in flight joins it; when the claim settles without a
     // live run (early-return on terminal status) the next caller may
@@ -4579,6 +4595,8 @@ ${i}`] = events[i];
     }
     if (this.isRunning)
       return;
+    if (retention !== void 0)
+      await this.ctx.storage.put(VRT_RETENTION_POLICY, retention);
     let p = this.#initInner(accountId, workflow, version, instance, event), claimed = p.finally(() => {
       this.#initClaim === claimed && (this.#initClaim = null);
     });
@@ -4785,11 +4803,13 @@ var WorkflowBinding = class extends WorkerEntrypoint {
   }
   async create({
     id = crypto.randomUUID(),
-    params = {}
+    params = {},
+    retention = void 0
   } = {}) {
     if (!isValidWorkflowInstanceId(id))
       throw new WorkflowError("Workflow instance has invalid id");
     await waitForPersistedInstanceDelete(this.env, id);
+    let instanceRetention = vrtInstanceRetention(retention);
     let coordinator = this.env.COORDINATOR.get(this.env.COORDINATOR.idFromName("workflow"));
     if (!await coordinator.acquire(id))
       throw createWorkflowError("Workflow concurrency limit reached", "workflow.concurrency_limit");
@@ -4825,7 +4845,8 @@ var WorkflowBinding = class extends WorkerEntrypoint {
         payload: params,
         instanceId: id,
         workflowName: this.env.WORKFLOW_NAME
-      }
+      },
+      instanceRetention
     ).then((val) => {
       val !== void 0 && val[Symbol.dispose]();
     }).catch(() => {

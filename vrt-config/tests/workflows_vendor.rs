@@ -69,6 +69,14 @@ fn vendored_engine_exports_expected_entrypoints() {
         src.contains("VRT_RETENTION_AT") && src.contains("WORKFLOW_SUCCESS_RETENTION_MS"),
         "VRT engine fork carries terminal retention cleanup"
     );
+    assert!(
+        src.contains("workflow.concurrency_limit"),
+        "VRT engine fork carries the concurrency coordinator"
+    );
+    assert!(
+        src.contains("vrtInstanceRetention") && src.contains("VRT_RETENTION_POLICY"),
+        "VRT engine fork carries per-instance retention overrides"
+    );
     let wrapped = std::str::from_utf8(vrt_config::workflows::WRAPPED_BINDING_JS).unwrap();
     assert!(
         wrapped.contains("makeBinding"),

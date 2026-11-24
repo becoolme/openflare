@@ -55,8 +55,8 @@ client input.
   instances are deleted seven days after reaching the terminal status by
   default (`binding.vrt.worker.js` alarm). `default_retention`
   (`successRetention` / `errorRetention`, max 30 days) can override this
-  through the signed workflow declaration; per-instance `retention` is
-  not wired yet.
+  through the signed workflow declaration. `create({retention: {successRetention,
+  errorRetention}})` overrides it per instance (max 30 days).
 - Deploy-time static gate: for same-worker classes, `class_name` must
   be a named export AND lexically `extends` a chain rooted at
   `WorkflowEntrypoint` (`vrt-local/src/wf_scan.rs`). Unresolvable shapes
