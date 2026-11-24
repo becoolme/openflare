@@ -33,8 +33,8 @@ LOCK = pathlib.Path(__file__).parent.parent.parent / "deploy" / "docker" / "work
 # https://raw.githubusercontent.com/cloudflare/workerd/<upstream.commit>/src/workerd/io/compatibility-date.capnp
 # The fork release's own `workerd.capnp` asset is the config schema, NOT
 # this list — vendoring it would drop every `$compatEnableFlag`.
-SOURCE_WORKERD_VERSION = "1.20261120.1"
-SOURCE_CAPNP_SHA256 = "f32e296b75fdae441ad7a60aed3325f822ee63a23abfc513cf0267251a806764"
+SOURCE_WORKERD_VERSION = "1.20261123.1"
+SOURCE_CAPNP_SHA256 = "d57805b521720436eb28797e55968e7a9a3dfda8558bc3247494b0e5ae91a785"
 
 _lock = json.loads(LOCK.read_text())
 # A fork pin names its own release (vrt-<date>-<sha>); the workerd version it is based on lives in
