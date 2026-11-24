@@ -565,6 +565,57 @@ async fn s2z_durable_object_tenant_never_hibernates() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VRT_WORKERD_BIN"]
+async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
+    init_logs();
+    if workerd_bin_or_skip().is_none() {
+        return;
+    }
+    let _g = WORKERD_TEST_LOCK.lock().await;
+    let fx = Fixture::new();
+    let do_dir = fx.dir.path().join("do-root").join("t1");
+    mkdir700(&do_dir);
+    let (a, b, c) = (free_port(), free_port(), free_port());
+    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO_ALARM, false, Some("EventLog"));
+    r.spec.do_storage = Some(DoStorageSpec {
+        tenant_dir: do_dir,
+        worker_classes: BTreeMap::new(),
+        transfer_sources: BTreeMap::new(),
+    });
+    let rt = TenantRuntime::new("t1");
+    // The cell alarm index says this class has no due alarm: sleep allowed.
+    rt.set_alarm_gate(true, Duration::from_secs(60));
+    let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), s2z_params());
+    wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
+
+    // Arm a 30 s alarm, then let the tenant idle out.
+    let (status, _) = get(a, "/alarm").await.unwrap();
+    assert_eq!(status, 200);
+    wait_state(&rt, TenantState::Hibernated, Duration::from_secs(10)).await;
+    assert!(!pid_alive(rt.active_pid()));
+
+    // The controller's alarm waker asks the host to start the generation.
+    rt.await_wake(0, 64, 1 << 20, vrt_host::hibernate::WakeSourceKind::Alarm)
+        .await
+        .expect("alarm wake");
+    wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
+
+    // workerd reloads `_cf_ALARM` and fires the overdue alarm.
+    let mut hits = 0;
+    for _ in 0..40 {
+        if let Some((200, body)) = get(a, "/alarm-hits").await {
+            hits = body.trim().parse().unwrap_or(0);
+            if hits > 0 {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(hits, 1, "alarm fires exactly once after wake");
+    shutdown(&rt, h).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires VRT_WORKERD_BIN"]
 async fn s2z_pending_waituntil_defers_hibernate() {
     init_logs();
     if workerd_bin_or_skip().is_none() {
@@ -767,6 +818,33 @@ async fn get_dbg(port: u16, path: &str, dbg: bool) -> Option<(u16, String)> {
 
 /// DO extending the native `DurableObject` base (the production
 /// regression: a Proxy ctx fails workerd's constructor type check).
+const MOD_DO_ALARM: &str = r#"
+import { DurableObject } from "cloudflare:workers";
+export class EventLog extends DurableObject {
+  async fetch(req) {
+    const u = new URL(req.url);
+    if (u.pathname === "/alarm") {
+      await this.ctx.storage.setAlarm(Date.now() + 30000);
+      return new Response("armed");
+    }
+    if (u.pathname === "/alarm-hits") {
+      return new Response(String((await this.ctx.storage.get("hits")) ?? 0));
+    }
+    return new Response("ok");
+  }
+  async alarm() {
+    const n = ((await this.ctx.storage.get("hits")) ?? 0) + 1;
+    await this.ctx.storage.put("hits", n);
+  }
+}
+export default {
+  async fetch(req, env) {
+    const stub = env.EVLOG.get(env.EVLOG.idFromName("a"));
+    return stub.fetch(req);
+  },
+};
+"#;
+
 const MOD_DO: &str = r#"
 import { DurableObject } from "cloudflare:workers";
 export class EventLog extends DurableObject {
