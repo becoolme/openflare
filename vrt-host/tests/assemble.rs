@@ -205,6 +205,9 @@ fn stub_do_storage_classes_cover_workflows_and_dos() {
         class_name: "OrderFlow".into(),
         unique_key: wf_ukey.clone(),
         limits_steps: Some(0),
+        success_retention_ms: None,
+        error_retention_ms: None,
+        concurrency_limit: None,
     }];
     let mut wf_only = worker("w2", "b.test", &digest);
     wf_only.workflows = vec![snapshot_protocol::compute_desired::WorkflowDesired {
@@ -214,6 +217,9 @@ fn stub_do_storage_classes_cover_workflows_and_dos() {
         class_name: "F".into(),
         unique_key: "f".repeat(64),
         limits_steps: Some(0),
+        success_retention_ms: None,
+        error_retention_ms: None,
+        concurrency_limit: None,
     }];
     let spec = assembler
         .assemble(&tenant("t1", vec![w, wf_only]), 1, 1)

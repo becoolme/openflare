@@ -43,19 +43,20 @@ client input.
 
 ## Known differences from Cloudflare
 
-- **Fixed per-Workflow concurrency limit.** A per-Workflow coordinator
-  DO caps active instances at 4,500 by default; `create()` over the cap
-  fails with `workflow.concurrency_limit` instead of queueing. The slot
-  is released on completion/error/termination or explicit delete. This is
-  a per-Workflow cap, not Cloudflare's account-wide quota; the limit is
-  not yet configurable through the binding.
+- **Per-Workflow concurrency limit.** A per-Workflow coordinator DO caps
+  active instances (default 4,500; `concurrencyLimit` in the signed
+  workflow declaration can lower it to 1). `create()` over the cap fails
+  with `workflow.concurrency_limit` instead of queueing. The slot is
+  released on completion/error/termination or explicit delete. This is a
+  per-Workflow cap, not Cloudflare's account-wide quota.
 - **No per-step subrequest budget.** The signed config carries only
   `limits.steps`; workerd's worker-wide subrequest quota still applies.
-- **Fixed terminal-instance retention.** Completed, terminated and errored
-  instances are deleted seven days after reaching the terminal status
-  (`binding.vrt.worker.js` alarm). Per-Workflow `default_retention` and
-  per-instance `retention` are not wired yet, so the duration is not
-  configurable through the binding.
+- **Terminal-instance retention.** Completed, terminated and errored
+  instances are deleted seven days after reaching the terminal status by
+  default (`binding.vrt.worker.js` alarm). `default_retention`
+  (`successRetention` / `errorRetention`, max 30 days) can override this
+  through the signed workflow declaration; per-instance `retention` is
+  not wired yet.
 - Deploy-time static gate: for same-worker classes, `class_name` must
   be a named export AND lexically `extends` a chain rooted at
   `WorkflowEntrypoint` (`vrt-local/src/wf_scan.rs`). Unresolvable shapes

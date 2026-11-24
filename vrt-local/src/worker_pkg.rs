@@ -1856,6 +1856,9 @@ pub fn assemble(
                 service_worker_id,
                 unique_key: derive_wf_unique_key(&ctx.pepper, tenant_id, &defining, &w.name),
                 limits_steps: w.limits_steps,
+                success_retention_ms: None,
+                error_retention_ms: None,
+                concurrency_limit: None,
             });
         }
     }
