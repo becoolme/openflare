@@ -1401,6 +1401,7 @@ pub fn assemble(
                     name: binding.clone(),
                     database_id: digest[..26].to_string(),
                     epoch: 1,
+                    writer_addr: None,
                     permissions: read_write.clone(),
                 },
             ));

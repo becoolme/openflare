@@ -200,8 +200,12 @@ impl D1Client {
         body: Bytes,
         session_headers: Vec<(String, String)>,
     ) -> Result<(u16, Option<String>, Bytes), ProviderError> {
-        let (database_id, epoch) = match ctx.resource() {
-            BindingResource::D1Database { id, epoch } => (id.clone(), *epoch),
+        let (database_id, epoch, writer_addr) = match ctx.resource() {
+            BindingResource::D1Database {
+                id,
+                epoch,
+                writer_addr,
+            } => (id.clone(), *epoch, writer_addr.clone()),
             _ => {
                 return Err(ProviderError::Forbidden(
                     crate::error::ForbiddenReason::BindingKindMismatch,
@@ -308,8 +312,9 @@ impl D1Client {
             );
             return Err(ProviderError::ResourceUnavailable);
         }
+        let writer = writer_addr.as_deref().unwrap_or(&self.addr);
         self.attempt(
-            &self.addr,
+            writer,
             &path_query,
             &auth,
             &session_headers,
@@ -432,6 +437,14 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn ctx(budget_ms: u64) -> BindingContext {
+        ctx_with_writer(budget_ms, 1, None)
+    }
+
+    fn ctx_with_writer(
+        budget_ms: u64,
+        epoch: u64,
+        writer_addr: Option<String>,
+    ) -> BindingContext {
         BindingContext::grant(
             "t".into(),
             "w".into(),
@@ -440,7 +453,8 @@ mod tests {
             "DB".into(),
             BindingResource::D1Database {
                 id: "a".repeat(26),
-                epoch: 1,
+                epoch,
+                writer_addr,
             },
             Permissions {
                 read: true,
@@ -638,6 +652,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_addr_override_routes_to_the_promoted_writer() {
+        let primary = spawn_fake(200, "STATIC").await;
+        let promoted = spawn_fake(200, "PROMOTED").await;
+        let c = client(&primary.addr, vec![]);
+        let ctx = ctx_with_writer(2_000, 2, Some(promoted.addr.clone()));
+        let (status, _, out) = c
+            .forward(&ctx, "execute", "", Bytes::from_static(b"[]"), vec![])
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(&out[..], b"PROMOTED");
+        assert_eq!(primary.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(promoted.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn writer_addr_override_applies_after_the_replica_falls_back() {
+        let primary = spawn_fake(200, "STATIC").await;
+        let promoted = spawn_fake(200, "PROMOTED").await;
+        let replica = spawn_fake(409, r#"{"code":"VRT_REPLICA_STALE"}"#).await;
+        let c = client(&primary.addr, vec![replica.addr.clone()]);
+        let ctx = ctx_with_writer(2_000, 2, Some(promoted.addr.clone()));
+        let (_, _, out) = c
+            .forward(&ctx, "query", "", Bytes::from_static(b"[]"), vec![])
+            .await
+            .unwrap();
+        assert_eq!(&out[..], b"PROMOTED");
+        assert_eq!(replica.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(primary.hits.load(Ordering::SeqCst), 0);
+        assert_eq!(promoted.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn first_primary_skips_the_replica() {
         let primary = spawn_fake(200, "PRIMARY").await;
         let replica = spawn_fake(200, "REPLICA").await;
@@ -830,6 +877,7 @@ mod tests {
                 BindingResource::D1Database {
                     id: DB.into(),
                     epoch: 1,
+                    writer_addr: None,
                 },
                 Permissions {
                     read: true,

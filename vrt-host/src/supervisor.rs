@@ -533,6 +533,12 @@ pub struct TenantRuntime {
     pub wake: crate::hibernate::WakeFlight,
     /// Scale-to-zero: how long a waiter holds for one wake (ms).
     wake_wait_ms: AtomicU64,
+    /// Cell alarm-index verdict for this tenant: `(safe, expires_at)`.
+    /// Missing/expired = unsafe (fail closed).
+    alarm_gate: std::sync::Mutex<Option<(bool, Instant)>>,
+    /// Wakes the actor when the gate changes so a structural backoff does
+    /// not delay the re-evaluation.
+    pub gate_notify: Notify,
 }
 
 impl TenantRuntime {
@@ -566,6 +572,8 @@ impl TenantRuntime {
             last_activity_ms: AtomicU64::new(0),
             wake: crate::hibernate::WakeFlight::new(Duration::from_secs(5)),
             wake_wait_ms: AtomicU64::new(30_000),
+            alarm_gate: std::sync::Mutex::new(None),
+            gate_notify: Notify::new(),
         })
     }
 
@@ -600,6 +608,30 @@ impl TenantRuntime {
     /// Scale-to-zero: the longest a request waits for one wake.
     pub fn wake_wait(&self) -> Duration {
         Duration::from_millis(self.wake_wait_ms.load(Ordering::Relaxed))
+    }
+
+    /// Store the cell alarm-index verdict. `ttl` bounds how long the host
+    /// trusts it; an expired gate is unsafe.
+    pub fn set_alarm_gate(&self, safe: bool, ttl: Duration) {
+        let expires = Instant::now() + ttl;
+        let mut gate = self.alarm_gate.lock().unwrap_or_else(|e| e.into_inner());
+        *gate = Some((safe, expires));
+        drop(gate);
+        self.gate_notify.notify_one();
+    }
+
+    /// Drop the gate (a new generation must be re-scanned).
+    pub fn clear_alarm_gate(&self) {
+        let mut gate = self.alarm_gate.lock().unwrap_or_else(|e| e.into_inner());
+        *gate = None;
+        drop(gate);
+        self.gate_notify.notify_one();
+    }
+
+    /// Whether DO sleep is currently permitted by the alarm gate.
+    pub fn alarm_safe(&self) -> bool {
+        let gate = self.alarm_gate.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(*gate, Some((true, expires)) if Instant::now() < expires)
     }
 
     /// Scale-to-zero: hold ONE request until the tenant is awake. The
@@ -2281,6 +2313,10 @@ impl Actor {
                     self.service_hibernate(Instant::now());
                     self.check_stopped();
                 }
+                _ = self.runtime.gate_notify.notified() => {
+                    self.hib_next_eval = Instant::now();
+                    self.service_hibernate(Instant::now());
+                }
                 _ = self.runtime.wake.notify.notified() => {
                     self.service_wake();
                 }
@@ -2534,6 +2570,8 @@ impl Actor {
             tracing::warn!(tenant = %self.tenant_id, "ignoring apply while draining/stopped");
             return;
         }
+        // A new generation must be re-scanned before DO sleep is allowed.
+        self.runtime.clear_alarm_gate();
         let digest = spec.config_digest.clone();
         // MIG-4: exclusions + stderr attributions are keyed to ONE
         // desired content — a different digest (fix, revert, worker
@@ -7081,12 +7119,13 @@ impl Actor {
         [&gen.slots, &gen.qconsumer_slots, &gen.wfops_slots, &gen.cron_slots]
     }
 
-    fn structural_facts(gen: &LiveGen) -> crate::hibernate::StructuralFacts {
+    fn structural_facts(&self, gen: &LiveGen) -> crate::hibernate::StructuralFacts {
         crate::hibernate::StructuralFacts {
             durable_objects: gen.spec.do_storage.is_some(),
             cron: !gen.spec.cron_endpoints.is_empty(),
             queue_consumers: !gen.spec.qconsumer_endpoints.is_empty(),
             workflows: !gen.spec.wfops_endpoints.is_empty(),
+            alarm_safe: self.runtime.alarm_safe(),
         }
     }
 
@@ -7138,7 +7177,7 @@ impl Actor {
             IdleVerdict::Hibernate => {
                 let ctx = BlockContext {
                     in_flight,
-                    structural: Self::structural_facts(gen),
+                    structural: self.structural_facts(gen),
                     wait_until: WaitUntilFact::NotProbed,
                 };
                 if let Some(reason) = s2z.blockers.first_block(BlockPhase::Admission, &ctx) {
@@ -7267,7 +7306,7 @@ impl Actor {
         };
         let ctx = BlockContext {
             in_flight: Self::gen_total_in_flight(gen),
-            structural: Self::structural_facts(gen),
+            structural: self.structural_facts(gen),
             wait_until,
         };
         if let Some(reason) = s2z.blockers.first_block(BlockPhase::Commit, &ctx) {

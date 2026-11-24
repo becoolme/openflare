@@ -9,8 +9,8 @@ use vrt_objstore::{MemoryStore, ObjectStore};
 use vrt_sql::clock::{Clock, TestClock};
 use vrt_sql::engine::{EngineError, EngineRegistry, PersisterPair, ResultsFormat, SqlStmt, TxnCtx};
 use vrt_sql::follower::{Follower, FollowerError, FollowerPhase};
-use vrt_sql::paths::ResourceKind::D1;
 use vrt_sql::paths::queue_root_for;
+use vrt_sql::paths::ResourceKind::D1;
 use vrt_sql::persist::{PersistConfig, Persister};
 use vrt_sql::seg;
 
@@ -74,14 +74,7 @@ fn writer(
 }
 
 fn follower(store: Arc<dyn ObjectStore>, clock: Arc<TestClock>, root: PathBuf) -> Follower {
-    Follower::new(
-        store,
-        D1,
-        DB,
-        root,
-        clock as Arc<dyn Clock>,
-    )
-    .unwrap()
+    Follower::new(store, D1, DB, root, clock as Arc<dyn Clock>).unwrap()
 }
 
 fn count_conn(conn: &Connection) -> i64 {
@@ -343,14 +336,20 @@ fn prunes_old_generations_and_keeps_the_previous_one() {
     f.sync_once().unwrap();
     let gen3 = f.state().unwrap().unwrap().generation;
     assert_ne!(gen3, gen2);
-    assert!(path2.exists(), "previous generation is retained for in-flight readers");
+    assert!(
+        path2.exists(),
+        "previous generation is retained for in-flight readers"
+    );
 
     write(&e, "INSERT INTO t VALUES (3)").unwrap();
     f.sync_once().unwrap();
     let gen4 = f.state().unwrap().unwrap().generation;
     assert!(root.join(&gen3).exists());
     assert!(root.join(&gen4).exists());
-    assert!(!path2.exists(), "generation older than the retention window is pruned");
+    assert!(
+        !path2.exists(),
+        "generation older than the retention window is pruned"
+    );
 }
 
 #[test]
@@ -551,7 +550,73 @@ fn promote_resumes_local_adoption_after_a_crash_between_cas_and_install() {
         .promote_from_generation(DB, plan.expected_epoch, plan.expected_lsn, &generation)
         .unwrap();
     assert!(retry.resumed);
-    assert_eq!(retry.epoch, first.epoch, "resume must not bump the epoch again");
+    assert_eq!(
+        retry.epoch, first.epoch,
+        "resume must not bump the epoch again"
+    );
     assert!(retry.db_file.exists());
     assert_eq!(count(&f), 1);
+}
+
+#[tokio::test]
+async fn promote_http_cas_requires_service_auth_and_promotes() {
+    use std::sync::Arc as StdArc;
+    use tower::ServiceExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store: Arc<dyn ObjectStore> = Arc::new(MemoryStore::new());
+    let clock = Arc::new(TestClock::new(1_000_000));
+    let reg = writer(store.clone(), clock.clone(), tmp.path().join("writer"), 0);
+    let e = reg.get(D1, DB).unwrap();
+    write(&e, "CREATE TABLE t(v INTEGER)").unwrap();
+    write(&e, "INSERT INTO t VALUES (1)").unwrap();
+
+    let f = StdArc::new(follower(
+        store.clone(),
+        clock.clone(),
+        tmp.path().join("replica"),
+    ));
+    f.sync_once().unwrap();
+    let p = StdArc::new(promoter(
+        store,
+        clock,
+        tmp.path().join("promoted"),
+        "promoter",
+    ));
+    let auth = vrt_sql::service::ServiceAuth::new(b"test-secret".to_vec());
+    let app = vrt_sql::promote_http::router(f.clone(), p, auth.clone());
+    let path = format!("/internal/dbs/{DB}/promote");
+    let body = b"{}".to_vec();
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.clone()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+    let sig = auth.sign("POST", &path, &body, None, None);
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-type", "application/json")
+        .header(vrt_sql::service::AUTH_HEADER, sig)
+        .body(axum::body::Body::from(body))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), axum::http::StatusCode::OK);
+    let bytes = http_body_util_body(res).await;
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["epoch"], 2);
+    assert_eq!(body["lsn"], 2);
+    assert_eq!(body["released"], true);
+}
+
+async fn http_body_util_body(res: axum::response::Response) -> Vec<u8> {
+    axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap()
+        .to_vec()
 }

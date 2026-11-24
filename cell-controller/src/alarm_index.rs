@@ -69,7 +69,11 @@ pub struct AlarmObservation {
 struct IndexState {
     entries: BTreeMap<(String, String, String, String), AlarmEntry>,
     unknown: BTreeSet<AlarmClass>,
-    truncated: bool,
+    /// Classes whose scan hit [`MAX_ENTRIES`] and may be missing alarms.
+    truncated: BTreeSet<AlarmClass>,
+    /// Classes observed since this process opened the index. Deliberately
+    /// in-memory: a restart must re-scan before a class can be sleep-safe.
+    observed: BTreeMap<AlarmClass, u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,7 +85,7 @@ struct IndexDoc {
     #[serde(default)]
     unknown: Vec<AlarmClass>,
     #[serde(default)]
-    truncated: bool,
+    truncated_classes: Vec<AlarmClass>,
 }
 
 /// The persistent index. Cheap to share (`Arc`); every mutation is serialized
@@ -99,7 +103,8 @@ impl std::fmt::Debug for AlarmIndex {
             .field("path", &self.path)
             .field("entries", &state.entries.len())
             .field("unknown", &state.unknown.len())
-            .field("truncated", &state.truncated)
+            .field("truncated", &state.truncated.len())
+            .field("observed", &state.observed.len())
             .finish()
     }
 }
@@ -134,7 +139,7 @@ impl AlarmIndex {
                             );
                         }
                         state.unknown.extend(doc.unknown);
-                        state.truncated = doc.truncated;
+                        state.truncated.extend(doc.truncated_classes);
                     }
                     Ok(doc) => tracing::warn!(
                         path = %path.display(),
@@ -184,7 +189,8 @@ impl AlarmIndex {
             tenant != &class.tenant_id || worker != &class.worker_id || key != &class.class_key
         });
         state.unknown.remove(class);
-        state.truncated = false;
+        state.truncated.remove(class);
+        state.observed.insert(class.clone(), now_ms);
 
         let mut truncated = false;
         for observation in observations {
@@ -223,12 +229,14 @@ impl AlarmIndex {
                 },
             );
         }
-        state.truncated = truncated;
+        if truncated {
+            state.truncated.insert(class.clone());
+        }
         let doc = IndexDoc {
             v: INDEX_VERSION,
             entries: state.entries.values().cloned().collect(),
             unknown: state.unknown.iter().cloned().collect(),
-            truncated: state.truncated,
+            truncated_classes: state.truncated.iter().cloned().collect(),
         };
         drop(state);
         self.persist(&doc)
@@ -237,14 +245,16 @@ impl AlarmIndex {
     /// Mark a class unreadable without replacing its known entries. Used when
     /// the host scan failed, was truncated, or the class was not declared:
     /// consumers must not let the class sleep until a complete scan clears it.
-    pub fn mark_unknown(&self, class: &AlarmClass, _now_ms: u64) -> Result<(), String> {
+    pub fn mark_unknown(&self, class: &AlarmClass, now_ms: u64) -> Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.unknown.insert(class.clone());
+        state.observed.insert(class.clone(), now_ms);
+        state.truncated.remove(class);
         let doc = IndexDoc {
             v: INDEX_VERSION,
             entries: state.entries.values().cloned().collect(),
             unknown: state.unknown.iter().cloned().collect(),
-            truncated: state.truncated,
+            truncated_classes: state.truncated.iter().cloned().collect(),
         };
         drop(state);
         self.persist(&doc)
@@ -306,7 +316,7 @@ impl AlarmIndex {
     /// no unknown read, no pending alarm and no truncation for this class.
     pub fn is_safe_to_sleep(&self, class: &AlarmClass) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.truncated || state.unknown.contains(class) {
+        if state.truncated.contains(class) || state.unknown.contains(class) {
             return false;
         }
         !state.entries.values().any(|e| {
@@ -314,6 +324,36 @@ impl AlarmIndex {
                 && e.worker_id == class.worker_id
                 && e.class_key == class.class_key
         })
+    }
+
+    /// Stage-2 sleep gate: the class was fully observed since this process
+    /// opened the index, is not unknown/truncated, and has no alarm due inside
+    /// the lead window. Future alarms are allowed — the alarm waker handles
+    /// them after the tenant sleeps.
+    pub fn is_safe_to_sleep_stage2(&self, class: &AlarmClass, now_ms: u64, lead_ms: u64) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.unknown.contains(class) || state.truncated.contains(class) {
+            return false;
+        }
+        if !state.observed.contains_key(class) {
+            return false;
+        }
+        let horizon = now_ms.saturating_add(lead_ms);
+        !state.entries.values().any(|e| {
+            e.tenant_id == class.tenant_id
+                && e.worker_id == class.worker_id
+                && e.class_key == class.class_key
+                && e.at_ms <= horizon
+        })
+    }
+
+    /// Whether this class has been observed since the index process started.
+    pub fn observed(&self, class: &AlarmClass) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observed
+            .contains_key(class)
     }
 
     /// Snapshot of every known alarm (for diagnostics/tests).
@@ -330,10 +370,12 @@ impl AlarmIndex {
 
     /// Whether any class/entry was dropped past [`MAX_ENTRIES`].
     pub fn truncated(&self) -> bool {
-        self.state
+        !self
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .truncated
+            .is_empty()
     }
 
     /// Persist the current state (used when the path was set after opening).
@@ -343,7 +385,7 @@ impl AlarmIndex {
             v: INDEX_VERSION,
             entries: state.entries.values().cloned().collect(),
             unknown: state.unknown.iter().cloned().collect(),
-            truncated: state.truncated,
+            truncated_classes: state.truncated.iter().cloned().collect(),
         };
         drop(state);
         self.persist(&doc)
@@ -470,6 +512,42 @@ mod tests {
         assert!(index.truncated());
         assert!(!index.is_safe_to_sleep(&other_class()));
         assert_eq!(index.earliest_for_class(&class()).unwrap().at_ms, 50);
+    }
+
+    #[test]
+    fn stage2_gate_requires_a_fresh_observation_and_allows_future_alarms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = AlarmIndex::open(Some(index_path(tmp.path())));
+        // Never observed -> unsafe even with no entries.
+        assert!(!index.is_safe_to_sleep_stage2(&class(), 1_000, 10));
+        index
+            .observe_class(&class(), &[obs("01", Some(5_000))], 1_000)
+            .unwrap();
+        // Future alarm outside the lead window is sleep-safe at stage 2.
+        assert!(index.is_safe_to_sleep_stage2(&class(), 1_000, 1_000));
+        assert!(!index.is_safe_to_sleep(&class()));
+        // Inside the lead window it is not.
+        assert!(!index.is_safe_to_sleep_stage2(&class(), 4_500, 1_000));
+    }
+
+    #[test]
+    fn truncation_is_per_class() {
+        let tmp = tempfile::tempdir().unwrap();
+        let index = AlarmIndex::open(Some(index_path(tmp.path()))).with_max_entries(1);
+        index
+            .observe_class(&class(), &[obs("01", Some(50))], 0)
+            .unwrap();
+        index
+            .observe_class(&other_class(), &[obs("02", Some(60))], 0)
+            .unwrap();
+        assert!(index.truncated());
+        assert!(!index.is_safe_to_sleep_stage2(&other_class(), 0, 0));
+        // Observing a different class must not clear another class's mark.
+        index
+            .observe_class(&class(), &[obs("01", None)], 1)
+            .unwrap();
+        assert!(!index.is_safe_to_sleep_stage2(&other_class(), 0, 0));
+        assert!(index.is_safe_to_sleep_stage2(&class(), 0, 0));
     }
 
     #[test]

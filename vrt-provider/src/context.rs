@@ -60,8 +60,10 @@ pub enum BindingResource {
     D1Database {
         /// Platform database id (26 lowercase alnum).
         id: String,
-        /// Writer epoch from the signed snapshot (T34: 1).
+        /// Writer epoch from the signed snapshot.
         epoch: u64,
+        /// Optional per-database writer endpoint from the signed snapshot.
+        writer_addr: Option<String>,
     },
     /// `{"type":"queue"}` — server-assigned queue id (T37).
     Queue {

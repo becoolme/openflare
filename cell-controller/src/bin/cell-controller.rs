@@ -560,10 +560,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let ctl = controller.dispatch_handle();
                 let cell = config.cell_id.clone();
                 let every = std::time::Duration::from_secs(report_cfg.interval_secs);
-                let alarm_index = alarm_index.clone();
+                let report_index = alarm_index.clone();
                 tokio::spawn(async move {
                     let mut reporter = cell_controller::report::Reporter::new(io, cell)
-                        .with_alarm_index(alarm_index);
+                        .with_alarm_index(report_index);
                     let mut tick = tokio::time::interval(every);
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
@@ -586,6 +586,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "cell report pushed with collection errors"
                             ),
                             Err(e) => tracing::warn!(%e, "cell report push failed"),
+                        }
+                    }
+                });
+                // Stage 2: consume the alarm index and wake due tenants. The
+                // host owns workerd's alarm scheduler; this task only starts
+                // the generation, then the next class scan clears the entry.
+                let wake_pods = pods.clone();
+                let wake_index = alarm_index.clone();
+                let ctl_wake = controller.dispatch_handle();
+                tokio::spawn(async move {
+                    let transport = match cell_controller::alarm_wake::HttpAlarmWake::new(
+                        &wake_pods,
+                        std::time::Duration::from_secs(15),
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::error!(%e, "do alarm wake transport init failed");
+                            return;
+                        }
+                    };
+                    let waker = cell_controller::alarm_wake::AlarmWaker::new(wake_index);
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        tick.tick().await;
+                        let (_, _, assignments) = ctl_wake.snapshot();
+                        let now_ms = Utc::now().timestamp_millis().max(0) as u64;
+                        let out = waker
+                            .tick(&assignments, &transport, std::time::Instant::now(), now_ms)
+                            .await;
+                        if out.sent > 0 || out.failed > 0 || out.unassigned > 0 {
+                            tracing::info!(
+                                due = out.due,
+                                sent = out.sent,
+                                ok = out.ok,
+                                failed = out.failed,
+                                unassigned = out.unassigned,
+                                "do alarm wake tick"
+                            );
                         }
                     }
                 });

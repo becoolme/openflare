@@ -106,6 +106,11 @@ pub struct FollowerServiceConfig {
     /// reads but returns no bookmark and rejects bookmark constraints.
     #[serde(default)]
     pub bookmark_secret_file: Option<PathBuf>,
+    /// Opt-in: local writer `dbRoot` for `POST /internal/dbs/{id}/promote`.
+    /// The route is absent unless this is set; when set, the follower process
+    /// may CAS the manifest and adopt a generation into this root.
+    #[serde(default)]
+    pub promote_writer_db_root: Option<PathBuf>,
 }
 
 impl FollowerServiceConfig {
@@ -118,7 +123,12 @@ impl FollowerServiceConfig {
         self.follower.validate()?;
         match (self.unix_dir.is_some(), self.listen_tcp.is_some()) {
             (true, true) => return Err("follower unixDir|listenTcp: at most one"),
-            (false, false) => return Ok(()),
+            (false, false) => {
+                if self.promote_writer_db_root.is_some() {
+                    return Err("follower listenTcp|unixDir required when promote is enabled");
+                }
+                return Ok(());
+            }
             _ => {}
         }
         if self.auth_secret_file.is_none() {
@@ -128,6 +138,9 @@ impl FollowerServiceConfig {
             if addr.parse::<std::net::SocketAddr>().is_err() {
                 return Err("follower.listenTcp invalid");
             }
+        }
+        if self.promote_writer_db_root.is_some() && self.auth_secret_file.is_none() {
+            return Err("follower authSecretFile required when promote is enabled");
         }
         Ok(())
     }

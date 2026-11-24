@@ -1,6 +1,7 @@
 # D1 failover: staged design
 
-Status: stage 1 (manual promotion) implemented. Stages 2–3 are design only.
+Status: stages 1–2 implemented (manual promotion + provider routing). Stage 3
+(automatic failover) is design only.
 
 ## Goal
 
@@ -32,10 +33,15 @@ to the new writer.
      generation sha256, so a rerun only completes the local adoption.
    - Fencing test: old writer's next commit fails; new writer accepts.
    - Tests: `vrt-sql/tests/follower_tests.rs` (`promote_*`).
-2. **Provider routing**
-   - Follower status exposes generation/epoch.
-   - Provider re-resolves writer endpoint after epoch change; stale-read
-     fallback stays bounded.
+2. **Provider routing — implemented**
+   - The signed D1 binding carries `epoch` and an optional `writerAddr`.
+     The provider uses `writerAddr` for the writer attempt and falls back to
+     `[vrtSql].addr` when absent; replicas keep the existing bounded fallback.
+   - The promoted epoch and address must be published together (one signed
+     desired revision) after the new writer is serving.
+   - The data plane rejects a request whose signed epoch differs from the
+     current writer lease epoch (`VRT_FENCED`), so an old provider snapshot
+     cannot write against the promoted writer.
 3. **Automatic failover**
    - Cell-controller health probe + lease-aware promotion with a cooldown.
    - Requires a witness (object-store CAS is enough for single-writer; no
@@ -48,7 +54,9 @@ zero-RPO failover. The current follower is asynchronous.
 
 ## Tests
 
-- Promotion CAS vs stale writer.
+- Promotion CAS vs stale writer (`vrt-sql/tests/follower_tests.rs`).
 - Crash between CAS and baseline publish (resume idempotently).
 - Stale follower refused.
-- Provider endpoint switch under concurrent reads/writes.
+- Provider writer-address override and replica fallback
+  (`vrt-provider/src/d1.rs` unit tests).
+- Stale writer epoch rejected at the wire (`vrt-sql/src/wire.rs`).

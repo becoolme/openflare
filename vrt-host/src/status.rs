@@ -379,6 +379,8 @@ pub fn control_router(
         .merge(crate::cron_trigger::router_with_hold(registry.clone(), hold))
         .merge(crate::queue_dispatch::router_with_hold(registry.clone(), hold))
         .merge(crate::wfops::router_with_hold(registry.clone(), hold))
+        // Cell alarm index: DO alarm wake + sleep gate.
+        .merge(crate::do_alarm::router(registry.clone(), hold))
         // Control-plane stats report: read-only instance listing for the
         // declared class dirs (workflow + DO instance indexes).
         .merge(crate::introspect::router(registry.clone()))

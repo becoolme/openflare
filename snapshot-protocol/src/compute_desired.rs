@@ -747,9 +747,16 @@ pub struct D1Binding {
     pub name: String,
     /// Server-side database id (`^[a-z0-9]{26}$`, validated in vrt-sql).
     pub database_id: String,
-    /// Current writer epoch (T34: fixed 1; fencing lands with leases).
+    /// Current writer epoch (advances on a manual promotion; providers sign
+    /// every request with it and the writer rejects stale epochs).
     #[serde(default = "default_d1_epoch")]
     pub epoch: u64,
+    /// Optional writer endpoint for this database. When present the provider
+    /// routes the writer attempt here instead of its static `vrtSql.addr`.
+    /// Published atomically with `epoch` so a promoted writer moves traffic in
+    /// one signed revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_addr: Option<String>,
     /// Access grant for this binding.
     pub permissions: BindingPermissions,
 }
@@ -1972,6 +1979,16 @@ impl WorkerDesired {
                     }
                     if d1.epoch == 0 {
                         return Err(DesiredError::Identifier("bindings.epoch"));
+                    }
+                    if let Some(addr) = &d1.writer_addr {
+                        if addr.is_empty()
+                            || addr.len() > 256
+                            || addr.ends_with('/')
+                            || addr.chars().any(|c| c.is_whitespace() || c.is_control())
+                            || !(addr.starts_with("http://") || addr.starts_with("https://"))
+                        {
+                            return Err(DesiredError::Identifier("bindings.writerAddr"));
+                        }
                     }
                 }
                 BindingDesired::Ratelimit(r) => {

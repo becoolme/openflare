@@ -160,6 +160,7 @@ fn binding_resource(binding: &BindingDesired) -> BindingResource {
         BindingDesired::D1(b) => BindingResource::D1Database {
             id: b.database_id.clone(),
             epoch: b.epoch,
+            writer_addr: b.writer_addr.clone(),
         },
         BindingDesired::Queue(b) => BindingResource::Queue {
             id: b.queue_id.clone(),

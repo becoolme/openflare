@@ -37,6 +37,10 @@ pub struct D1SqlConfig {
     /// Per-request timeout seconds (default 5).
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// Opt-in: follower promote endpoint (`http://follower:8092`). When
+    /// absent, `PROMOTE` ops fail with a typed error instead of hanging.
+    #[serde(default)]
+    pub promote_endpoint: Option<String>,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -164,7 +168,7 @@ impl D1OrderGuard {
 
 /// Kinds routed to the D1 executor on the generic channel.
 pub fn is_d1_kind(kind: &str) -> bool {
-    matches!(kind, "EXECUTE" | "MIGRATIONS_APPLY" | "DROP")
+    matches!(kind, "EXECUTE" | "MIGRATIONS_APPLY" | "DROP" | "PROMOTE")
 }
 
 /// K2 stream data ops on the generic channel — payload
@@ -197,6 +201,7 @@ impl D1Op {
             "EXECUTE" => D1OpKind::Execute,
             "MIGRATIONS_APPLY" => D1OpKind::MigrationsApply,
             "DROP" => D1OpKind::Drop,
+            "PROMOTE" => D1OpKind::Promote,
             _ => return None,
         };
         Some(Self {
@@ -219,6 +224,8 @@ pub enum D1OpKind {
     MigrationsApply,
     #[serde(rename = "DROP")]
     Drop,
+    #[serde(rename = "PROMOTE")]
+    Promote,
 }
 
 /// Terminal result of one op, ACKed back.
@@ -351,6 +358,7 @@ fn is_cluster_service_host(host: &str) -> bool {
 pub struct D1OpsExecutor {
     http: reqwest::Client,
     endpoint: String,
+    promote_endpoint: Option<String>,
     signer: vrt_provider::d1::SqlAuthSigner,
     timeout: Duration,
 }
@@ -367,6 +375,13 @@ impl D1OpsExecutor {
     pub fn new(config: &D1SqlConfig) -> Result<Self, String> {
         let endpoint = validate_data_plane_endpoint(&config.endpoint)
             .map_err(|e| format!("d1sql.endpoint {e}"))?;
+        let promote_endpoint = match &config.promote_endpoint {
+            Some(ep) => Some(
+                validate_data_plane_endpoint(ep)
+                    .map_err(|e| format!("d1sql.promote_endpoint {e}"))?,
+            ),
+            None => None,
+        };
         let secret = vrt_securefs::load_service_secret(
             std::path::Path::new(&config.auth_secret_file),
             vrt_securefs::SecretPurpose::ServiceHmac,
@@ -384,6 +399,7 @@ impl D1OpsExecutor {
         Ok(Self {
             http,
             endpoint,
+            promote_endpoint,
             signer: vrt_provider::d1::SqlAuthSigner::new(secret),
             timeout,
         })
@@ -706,7 +722,54 @@ impl D1OpsExecutor {
                 Ok(v) => done(op, v),
                 Err(e) => fail(op, &e),
             },
+            D1OpKind::Promote => match self.promote_db(op).await {
+                Ok(v) => done(op, v),
+                Err(e) => fail(op, &e),
+            },
         }
+    }
+
+    /// `POST {promoteEndpoint}/internal/dbs/<id>/promote` — the follower
+    /// process holds the generation + object-store credentials and performs
+    /// the same CAS/adoption as `vrt-sql promote`.
+    async fn promote_db(&self, op: &D1Op) -> Result<serde_json::Value, String> {
+        let Some(endpoint) = &self.promote_endpoint else {
+            return Err("promote endpoint not configured".into());
+        };
+        let payload = promote_payload(&op.payload)?;
+        let path = format!("/internal/dbs/{}/promote", op.database_id);
+        let body = serde_json::to_vec(&payload).map_err(|e| format!("promote payload: {e}"))?;
+        // The promote listener has no engine epoch/seq; the shared ServiceAuth
+        // signature covers "0"/"0" headers.
+        let auth = self.signer.sign("POST", &path, &body, 0, 0);
+        let resp = tokio::time::timeout(
+            self.timeout,
+            self.http
+                .post(format!("{endpoint}{path}"))
+                .header(vrt_provider::d1::SQL_AUTH_HEADER, auth)
+                .header(vrt_provider::d1::SQL_EPOCH_HEADER, "0")
+                .header(vrt_provider::d1::SQL_SEQ_HEADER, "0")
+                .header("content-type", "application/json")
+                .body(body)
+                .send(),
+        )
+        .await
+        .map_err(|_| "request timeout".to_string())?
+        .map_err(|e| format!("transport: {e}"))?;
+        let value = Self::read_engine_body(resp).await?;
+        if value.get("success") == Some(&serde_json::json!(false)) {
+            let code = value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("promote failed");
+            let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            return Err(if message.is_empty() {
+                code.to_string()
+            } else {
+                format!("{code}: {message}")
+            });
+        }
+        Ok(value)
     }
 
     /// `POST /dbs/<id>/drop` — restricted delete on the local vrt-sql
@@ -782,6 +845,58 @@ fn drop_path(database_id: &str, payload: &serde_json::Value) -> Result<String, S
 /// strict result schema rejects — wrap it as `{results: [...]}`.
 /// Already-typed object bodies (`{success:false,error,code,retryable}`,
 /// `{truncated,bytes}`, `{success,dropped}`) pass through unchanged.
+/// Strict promote payload. `reason` is audit-only and never forwarded.
+fn promote_payload(payload: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let Some(obj) = payload.as_object() else {
+        return Err("promote payload must be an object".into());
+    };
+    for key in obj.keys() {
+        if !matches!(
+            key.as_str(),
+            "expectedEpoch" | "expectedLsn" | "generation" | "reason"
+        ) {
+            return Err(format!("promote payload key '{key}' unknown"));
+        }
+    }
+    let expected = match (obj.get("expectedEpoch"), obj.get("expectedLsn")) {
+        (Some(e), Some(l)) => Some((
+            e.as_u64().ok_or("expectedEpoch must be u64")?,
+            l.as_u64().ok_or("expectedLsn must be u64")?,
+        )),
+        (None, None) => None,
+        _ => return Err("expectedEpoch/expectedLsn must be supplied together".into()),
+    };
+    let generation = match obj.get("generation") {
+        Some(v) => {
+            let g = v.as_str().ok_or("generation must be a string")?;
+            let ok = g.len() == 4 + 16 + 1 + 16 + 7
+                && g.starts_with("gen-")
+                && g.ends_with(".sqlite")
+                && g.as_bytes()[20] == b'-'
+                && g[4..20]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                && g[21..37]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+            if !ok {
+                return Err("generation must be gen-<16 hex>-<16 hex>.sqlite".into());
+            }
+            Some(g.to_string())
+        }
+        None => None,
+    };
+    let mut out = serde_json::Map::new();
+    if let Some((e, l)) = expected {
+        out.insert("expectedEpoch".into(), serde_json::json!(e));
+        out.insert("expectedLsn".into(), serde_json::json!(l));
+    }
+    if let Some(g) = generation {
+        out.insert("generation".into(), serde_json::json!(g));
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
 pub fn normalize_execute_body(body: serde_json::Value) -> serde_json::Value {
     match body {
         serde_json::Value::Array(results) => serde_json::json!({ "results": results }),
@@ -1031,6 +1146,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             auth_secret_file: p.to_string_lossy().into(),
             timeout_secs: 1,
+            promote_endpoint: None,
         };
         // trailing newline -> accepted and identical key to vrt-sql/provider
         let nl = dir.path().join("nl");
@@ -1039,12 +1155,18 @@ mod tests {
         for (name, body, mode) in [
             ("short", &b"tooshort\n"[..], 0o600),
             ("inner", &b"0123456789abcdef 0123456789abcdef"[..], 0o600),
-            ("ph", &b"REPLACE_ME_REPLACE_ME_REPLACE_ME_REPLACE"[..], 0o600),
+            (
+                "ph",
+                &b"REPLACE_ME_REPLACE_ME_REPLACE_ME_REPLACE"[..],
+                0o600,
+            ),
             ("mode", &b"0123456789abcdef0123456789abcdef"[..], 0o644),
         ] {
             let p = dir.path().join(name);
             vrt_securefs::atomic_write(&p, body, mode).unwrap();
-            let err = D1OpsExecutor::new(&mk(&p)).err().unwrap_or_else(|| panic!("{name} accepted"));
+            let err = D1OpsExecutor::new(&mk(&p))
+                .err()
+                .unwrap_or_else(|| panic!("{name} accepted"));
             assert!(!err.contains("0123456789abcdef"), "{err}");
         }
     }
@@ -1105,6 +1227,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(), // nothing listens
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
+            promote_endpoint: None,
         })
         .unwrap();
         let ack = exec
@@ -1128,6 +1251,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
+            promote_endpoint: None,
         })
         .unwrap();
         let ack = exec
@@ -1151,6 +1275,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
+            promote_endpoint: None,
         })
         .unwrap();
         for payload in [
@@ -1177,6 +1302,7 @@ mod tests {
             endpoint: "http://10.0.0.5:8090".into(),
             auth_secret_file: "/nonexistent".into(),
             timeout_secs: 5,
+            promote_endpoint: None,
         };
         assert!(D1OpsExecutor::new(&cfg).is_err());
     }
@@ -1245,6 +1371,7 @@ mod tests {
             endpoint: ep.into(),
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
+            promote_endpoint: None,
         };
         assert!(D1OpsExecutor::new(&mk("http://vrt-sql.vrt-system.svc:8082")).is_ok());
         let err = D1OpsExecutor::new(&mk("http://example.com:8082")).err().unwrap();
@@ -1254,6 +1381,7 @@ mod tests {
             endpoint: "http://vrt-sql.vrt-system.svc:8082".into(),
             auth_secret_file: dir.path().join("nope").to_string_lossy().into(),
             timeout_secs: 1,
+            promote_endpoint: None,
         };
         assert!(D1OpsExecutor::new(&missing).is_err());
     }
@@ -1264,6 +1392,7 @@ mod tests {
             endpoint: "http://127.0.0.1:1".into(),
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 1,
+            promote_endpoint: None,
         })
         .unwrap()
     }
@@ -1425,13 +1554,32 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn is_d1_kind_routes_only_the_three() {
-        for k in ["EXECUTE", "MIGRATIONS_APPLY", "DROP"] {
+    fn is_d1_kind_routes_the_d1_kinds() {
+        for k in ["EXECUTE", "MIGRATIONS_APPLY", "DROP", "PROMOTE"] {
             assert!(is_d1_kind(k), "{k}");
         }
         for k in ["WF_GET", "WF_CREATE", "execute", "", "DROP_TABLE"] {
             assert!(!is_d1_kind(k), "{k}");
         }
+    }
+
+    #[test]
+    fn promote_payload_is_strict_and_bounded() {
+        let ok = promote_payload(&serde_json::json!({
+            "expectedEpoch": 2,
+            "expectedLsn": 42,
+            "generation": format!("gen-{:016x}-{:016x}.sqlite", 2, 42),
+            "reason": "manual failover"
+        }))
+        .unwrap();
+        assert_eq!(ok["expectedEpoch"], 2);
+        assert!(ok.get("reason").is_none(), "audit reason is not forwarded");
+        assert!(promote_payload(&serde_json::json!({"expectedEpoch": 2})).is_err());
+        assert!(promote_payload(&serde_json::json!({"cmd": "rm"})).is_err());
+        assert!(promote_payload(&serde_json::json!({
+            "generation": "gen-2-42.sqlite"
+        }))
+        .is_err());
     }
 
     #[test]
@@ -1557,6 +1705,7 @@ mod tests {
             endpoint: base.clone(),
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 2,
+            promote_endpoint: None,
         })
         .unwrap();
         let src =
@@ -1632,6 +1781,7 @@ mod tests {
             endpoint: base.clone(),
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 2,
+            promote_endpoint: None,
         })
         .unwrap();
         let src =
@@ -1685,6 +1835,7 @@ mod tests {
             endpoint: base.clone(),
             auth_secret_file: secret.to_string_lossy().into(),
             timeout_secs: 2,
+            promote_endpoint: None,
         })
         .unwrap();
         let src = crate::wfops::HttpCellOpsSource::new(

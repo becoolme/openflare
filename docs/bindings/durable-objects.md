@@ -64,13 +64,12 @@ exposed; `new_sqlite_classes` sets `enableSql = true`.
 - `new_classes` objects run on the same SQLite store as
   `new_sqlite_classes`; they just lack `state.storage.sql`. On
   Cloudflare they use a distinct KV-backed store.
-- **No scale-to-zero and no hibernation for DO tenants (yet).** A worker that
-  declares DO classes never hibernates — alarms cannot wake the host
-  (`vrt-host/src/hibernate.rs`, `StructuralDurableObject`). The same
-  applies to workflow-declaring workers. Cloudflare evicts idle objects
-  and wakes them on alarm; here the tenant process stays resident. The cell
-  controller now keeps a persistent alarm index (`do-alarm-index.json`, fed by
-  the host's `_cf_METADATA` scan), but it is not yet a wake path.
+- **DO hibernation is gated.** A DO tenant may sleep only when the cell
+  controller pushes a fresh safe alarm gate (`POST /v1/do-alarm/gate`) backed by
+  the persistent alarm index. Due alarms wake the tenant through
+  `/v1/do-alarm/wake`; workerd delivers the persisted `_cf_ALARM` on startup.
+  Without a gate (older controller, failed scan, unknown class) the tenant
+  stays resident. Workflow-declaring tenants still never hibernate.
 - Cloudflare's WebSocket-hibernation eviction is not emulated: an open
   Durable Object WebSocket session holds the tenant's in-flight guard,
   keeping the tenant awake until it closes (see

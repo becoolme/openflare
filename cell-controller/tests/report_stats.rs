@@ -59,6 +59,7 @@ async fn report_stats_round_trip_through_vrt_sql_auth() {
         endpoint: format!("http://{addr}"),
         auth_secret_file: secret_file.to_string_lossy().into(),
         timeout_secs: 5,
+            promote_endpoint: None,
     })
     .unwrap();
     let value = exec
