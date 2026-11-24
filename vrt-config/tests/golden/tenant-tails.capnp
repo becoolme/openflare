@@ -207,7 +207,7 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/facade-kv.js", esModule = embed "sys/8d67b68ac0ad90a075cda7f4b1c49f7bf10254a8f1bca4e8af8ff3acf98893e4"),
+        (name = "facade/facade-kv.js", esModule = embed "sys/274cca28c79bf68bda11461893edb4cf6c8694578191a407048ab6e10275ca49"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
         (name = "third_party/open-compute/facade/bindings/json-body.js", esModule = embed "sys/d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"),
         (name = "third_party/open-compute/facade/kv/native-adapter.js", esModule = embed "sys/312c11e42c98ee866c2582d8e4a5c6762750c481a6da10112d35d46bfdf417c2"),
