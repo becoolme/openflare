@@ -1,0 +1,22 @@
+# TLS router — every HTTPS request lands on vrt-host's ingress, which
+# routes by Host header to the owning worker. certResolver issues one
+# Let's Encrypt certificate per SNI hostname at first handshake
+# (on-demand; covers `of hostnames add` hosts and `[preview] domain`
+# subdomains without reloads).
+#
+# To restrict issuance to your own base domain, replace the catch-all
+# rule with e.g.:
+#   rule: "HostSuffix(`.apps.example.com`) || Host(`example.com`)"
+http:
+  routers:
+    vrt-ingress:
+      rule: "PathPrefix(`/`)"
+      entryPoints: [websecure]
+      service: vrt-ingress
+      tls:
+        certResolver: le
+  services:
+    vrt-ingress:
+      loadBalancer:
+        servers:
+          - url: "http://vrt-host:8080"
