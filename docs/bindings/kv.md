@@ -57,9 +57,10 @@ config.
   becomes the namespace identifier in the local store — a Cloudflare
   resource id is never contacted. With no `id`, the namespace is derived
   from the binding name.
-- `cacheTtl` on `get` is range-validated (`>= 30` seconds, matching the
-  Cloudflare rule) but there is no edge-cache tier, so it has no
-  behavioral effect beyond validation.
+- `cacheTtl` on `get` / `getWithMetadata` (>= 30 seconds) drives a
+  bounded process-local read cache in the KV facade. It is not the
+  distributed Cloudflare edge cache: entries are per facade process,
+  invalidated by writes through that process, and disappear on restart.
 - API surface: `get`, `getWithMetadata`, bulk `get` (up to 100 keys),
   `put` (`expiration`, `expirationTtl`, `metadata`), `delete`, `list`
   with a signed, TTL'd cursor.

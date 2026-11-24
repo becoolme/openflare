@@ -221,3 +221,21 @@ test("fetch() entrypoint serves the native KV wire (list)", async () => {
   assert.equal(body.keys.length, 1);
   assert.equal(body.keys[0].name, "a");
 });
+
+test("explicit cacheTtl caches reads and writes invalidate them", async () => {
+  const props = makeProps();
+  let gets = 0;
+  const { ns } = kv((req) => {
+    if (req.url.endsWith("/get")) {
+      gets++;
+      return kvs1(bytes("cached"));
+    }
+    return new Response(null, { status: 200 });
+  }, props);
+  assert.equal(await ns.get("k", { cacheTtl: 60 }), "cached");
+  assert.equal(await ns.get("k", { cacheTtl: 60 }), "cached");
+  assert.equal(gets, 1);
+  await ns.put("k", "next");
+  assert.equal(await ns.get("k", { cacheTtl: 60 }), "cached");
+  assert.equal(gets, 2);
+});
