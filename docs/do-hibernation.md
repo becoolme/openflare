@@ -31,8 +31,10 @@ SQLite state, or WebSocket sessions, and wake them from:
    tenant through the shared `WakeFlight`; workerd itself loads
    `metadata.sqlite:_cf_ALARM` and fires overdue alarms. The controller
    consumes `AlarmIndex::due` every 5s and re-scans the class after a wake.
-3. **DO storage quiescence**: no in-flight requests, no open WebSocket, no
-   storage transaction; otherwise skip sleep.
+3. **DO storage quiescence — partially implemented**: the waitUntil probe now
+   also counts active `alarm()` handlers (`pending + alarms`), so a handler that
+   already cleared its alarm but is still running blocks sleep. Open sockets and
+   storage transactions still keep the tenant resident.
 4. **WebSocket detach/re-attach**: either reject sleep with open sockets
    (stage 1) or persist session metadata and reattach on wake (stage 2).
 5. **Workflow engine special case**: workflow DOs must wake on alarms/ops, and

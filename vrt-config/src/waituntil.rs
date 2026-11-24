@@ -66,12 +66,19 @@ pub const PROBE_BINDING_PREFIX: &str = "VRT_WU_";
 pub const PRELUDE_JS: &str = r#"// vrt platform waitUntil accounting (MIG-12). Platform-owned module —
 // tenants cannot reach this scope; DO NOT rename bindings.
 let __n = 0;
+let __alarms = 0;
 export function __track(p) {
   __n += 1;
   const d = () => { __n -= 1; };
   try { Promise.resolve(p).then(d, d); } catch { d(); }
 }
 export function __pending() { return __n; }
+// An alarm handler is not an HTTP request and is not necessarily in
+// ctx.waitUntil: track it separately so a handler that cleared its own
+// alarm cannot be slept through.
+export function __alarmStart() { __alarms += 1; }
+export function __alarmEnd() { __alarms -= 1; }
+export function __alarmsPending() { return __alarms; }
 // In-place wrap: workerd's native base classes (DurableObject,
 // WorkerEntrypoint, WorkflowEntrypoint) type-check constructor
 // parameter 1, so the REAL ctx object must be passed down — a Proxy
@@ -137,7 +144,7 @@ pub fn entry_js(main: &str, classes: &[String]) -> String {
     let mut out = String::with_capacity(PRELUDE_JS.len() + 1024);
     out.push_str("// vrt platform waitUntil wrapper (MIG-12) — modules[0] entry.\n");
     out.push_str(&format!(
-        "import {{ __track, __pending, __wrapCtx, __wrapFailed, __listenersOf }} from {};\n",
+        "import {{ __track, __pending, __alarmStart, __alarmEnd, __alarmsPending, __wrapCtx, __wrapFailed, __listenersOf }} from {};\n",
         js_str(&format!("./{PRELUDE_MODULE}"))
     ));
     out.push_str("import { WorkerEntrypoint } from \"cloudflare:workers\";\n");
@@ -201,12 +208,12 @@ export default __wrapDefault(__user.default);
     );
     out.push_str(&format!("export * from {};\n", js_str(&spec)));
     out.push_str(&format!(
-        "export class {PROBE_ENTRYPOINT} extends WorkerEntrypoint {{\n  fetch() {{\n    return Response.json({{ pending: __pending(), wrapped: __wrapped && !__wrapFailed() }});\n  }}\n}}\n"
+        "export class {PROBE_ENTRYPOINT} extends WorkerEntrypoint {{\n  fetch() {{\n    return Response.json({{ pending: __pending(), alarms: __alarmsPending(), wrapped: __wrapped && !__wrapFailed() }});\n  }}\n}}\n"
     ));
     for (i, class) in classes.iter().enumerate() {
         let key = js_str(class);
         out.push_str(&format!(
-            "const __WU{i} = typeof __user[{key}] === \"function\"\n  ? class extends __user[{key}] {{\n      constructor(ctx, env, ...rest) {{ super(__wrapCtx(ctx), env, ...rest); }}\n    }}\n  : __user[{key}];\nexport {{ __WU{i} as {class} }};\n"
+            "const __WU{i} = typeof __user[{key}] === \"function\"\n  ? (typeof __user[{key}].prototype.alarm === \"function\"\n    ? class extends __user[{key}] {{\n        constructor(ctx, env, ...rest) {{ super(__wrapCtx(ctx), env, ...rest); }}\n        async alarm(...a) {{\n          __alarmStart();\n          try {{ return await super.alarm(...a); }} finally {{ __alarmEnd(); }}\n        }}\n      }}\n    : class extends __user[{key}] {{\n        constructor(ctx, env, ...rest) {{ super(__wrapCtx(ctx), env, ...rest); }}\n      }})\n  : __user[{key}];\nexport {{ __WU{i} as {class} }};\n"
         ));
     }
     out
@@ -227,7 +234,7 @@ pub fn probe_js(binding_names: &[String]) -> String {
     }
     targets.push(']');
     format!(
-        "// vrt platform waitUntil aggregate probe (MIG-12). No tenant\n// bindings, deny-all globalOutbound — platform-only by construction.\nconst __TARGETS = {targets};\nexport default {{\n  async fetch(req, env) {{\n    const out = {{ pending: 0, failed: 0 }};\n    await Promise.all(__TARGETS.map(async (k) => {{\n      try {{\n        const r = await env[k].fetch(\"http://vrt-wu{PROBE_PATH}\", {{\n          signal: AbortSignal.timeout(1500),\n        }});\n        const j = await r.json();\n        if (!r.ok || typeof j.pending !== \"number\" || j.wrapped === false) {{\n          out.failed += 1;\n          return;\n        }}\n        out.pending += j.pending;\n      }} catch {{\n        out.failed += 1;\n      }}\n    }}));\n    return Response.json(out);\n  }},\n}};\n"
+        "// vrt platform waitUntil aggregate probe (MIG-12). No tenant\n// bindings, deny-all globalOutbound — platform-only by construction.\nconst __TARGETS = {targets};\nexport default {{\n  async fetch(req, env) {{\n    const out = {{ pending: 0, alarms: 0, failed: 0 }};\n    await Promise.all(__TARGETS.map(async (k) => {{\n      try {{\n        const r = await env[k].fetch(\"http://vrt-wu{PROBE_PATH}\", {{\n          signal: AbortSignal.timeout(1500),\n        }});\n        const j = await r.json();\n        if (!r.ok || typeof j.pending !== \"number\" || j.wrapped === false) {{\n          out.failed += 1;\n          return;\n        }}\n        out.pending += j.pending;\n        out.alarms += typeof j.alarms === \"number\" ? j.alarms : 0;\n      }} catch {{\n        out.failed += 1;\n      }}\n    }}));\n    return Response.json(out);\n  }},\n}};\n"
     )
 }
 
@@ -246,6 +253,8 @@ mod tests {
         assert!(js.contains("export { __WU0 as Counter };"));
         assert!(js.contains("export { __WU1 as OrderFlow };"));
         assert!(js.contains("typeof __user[\"Counter\"] === \"function\""));
+        assert!(js.contains("__alarmStart()"));
+        assert!(js.contains("typeof __user[\"Counter\"].prototype.alarm === \"function\""));
     }
 
     #[test]
@@ -253,6 +262,12 @@ mod tests {
         let js = entry_js("src/main.mjs", &[]);
         assert!(js.contains("import * as __user from \"./src/main.mjs\";"));
         assert!(!js.contains("__WU0"));
+    }
+
+    #[test]
+    fn probe_js_aggregates_alarm_handlers() {
+        let js = probe_js(&["VRT_WU_0".into()]);
+        assert!(js.contains("out.alarms += typeof j.alarms"));
     }
 
     #[test]

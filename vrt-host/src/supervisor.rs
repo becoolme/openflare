@@ -1637,13 +1637,15 @@ fn wu_pending_probe(endpoint: &WorkerEndpoint, timeout: Duration) -> Option<u64>
     struct WuReply {
         pending: u64,
         #[serde(default)]
+        alarms: u64,
+        #[serde(default)]
         failed: u64,
     }
     let reply: WuReply = serde_json::from_str(body.trim()).ok()?;
     if reply.failed > 0 {
         return None;
     }
-    Some(reply.pending)
+    Some(reply.pending.saturating_add(reply.alarms))
 }
 
 enum Ev {
