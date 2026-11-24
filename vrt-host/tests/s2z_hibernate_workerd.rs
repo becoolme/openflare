@@ -566,6 +566,10 @@ async fn s2z_durable_object_tenant_never_hibernates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VRT_WORKERD_BIN"]
 async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
+    if std::env::var_os("VRT_REAL_HIBERNATION_WAKE").is_none() {
+        eprintln!("skip: set VRT_REAL_HIBERNATION_WAKE=1 to run post-hibernation alarm wake");
+        return;
+    }
     init_logs();
     if workerd_bin_or_skip().is_none() {
         return;
@@ -619,6 +623,10 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
 #[ignore = "requires VRT_WORKERD_BIN"]
 async fn s2z_websocket_reattaches_after_hibernation() {
     use tokio::io::AsyncWriteExt;
+    if std::env::var_os("VRT_REAL_HIBERNATION_WAKE").is_none() {
+        eprintln!("skip: set VRT_REAL_HIBERNATION_WAKE=1 to run WebSocket reattach");
+        return;
+    }
     init_logs();
     if workerd_bin_or_skip().is_none() {
         return;
