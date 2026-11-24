@@ -112,14 +112,15 @@ async fn run() -> ExitCode {
     }
     // Secret file validation (0600) -- missing/insecure fails closed immediately;
     // contents never enter logs.
-    let bookmark_key = match load_secret_0600(&config.bookmark_secret_file, SecretPurpose::ServiceHmac) {
-        Ok(k) => k,
-        Err(e) => {
-            tracing::error!(error = %e, path = %config.bookmark_secret_file.display(),
+    let bookmark_key =
+        match load_secret_0600(&config.bookmark_secret_file, SecretPurpose::ServiceHmac) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!(error = %e, path = %config.bookmark_secret_file.display(),
                 "bookmark secret file unusable");
-            return ExitCode::FAILURE;
-        }
-    };
+                return ExitCode::FAILURE;
+            }
+        };
     let auth_secret = match load_secret_0600(&config.auth_secret_file, SecretPurpose::ServiceHmac) {
         Ok(k) => k,
         Err(e) => {
@@ -327,9 +328,9 @@ async fn run_time_travel(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let config: TimeTravelConfig = match serde_json::from_slice(&raw).or_else(|_| {
-        toml::from_str::<TimeTravelConfig>(std::str::from_utf8(&raw).unwrap_or(""))
-    }) {
+    let config: TimeTravelConfig = match serde_json::from_slice(&raw)
+        .or_else(|_| toml::from_str::<TimeTravelConfig>(std::str::from_utf8(&raw).unwrap_or("")))
+    {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "time-travel config parse failed (JSON or TOML expected)");
@@ -407,7 +408,11 @@ async fn run_time_travel(args: &[String]) -> ExitCode {
             } else {
                 println!(
                     "{} {} -> epoch {} lsn {} (at {} ms), snapshot {}, segments {}",
-                    if o.dry_run { "would restore" } else { "restored" },
+                    if o.dry_run {
+                        "would restore"
+                    } else {
+                        "restored"
+                    },
                     o.database_id,
                     o.new_epoch,
                     o.new_lsn,
@@ -477,7 +482,7 @@ async fn run_promote_check(config_path: PathBuf) -> ExitCode {
     };
     let clock: Arc<dyn vrt_sql::clock::Clock> = Arc::new(vrt_sql::clock::SystemClock);
     let follower = match Follower::new(
-        store,
+        store.clone(),
         ResourceKind::D1,
         config.follower.database_id.clone(),
         config.db_root.clone(),
@@ -683,7 +688,7 @@ async fn run_follower(config_path: PathBuf) -> ExitCode {
     };
     let clock: Arc<dyn vrt_sql::clock::Clock> = Arc::new(vrt_sql::clock::SystemClock);
     let follower = match Follower::new(
-        store,
+        store.clone(),
         ResourceKind::D1,
         config.follower.database_id.clone(),
         config.db_root.clone(),
@@ -720,7 +725,7 @@ async fn run_follower(config_path: PathBuf) -> ExitCode {
             }
         };
         let mut state = vrt_sql::replica::ReplicaState::new(follower.clone())
-            .with_auth(vrt_sql::service::ServiceAuth::new(auth_secret));
+            .with_auth(vrt_sql::service::ServiceAuth::new(auth_secret.clone()));
         if let Some(path) = &config.bookmark_secret_file {
             let raw = match load_secret_0600(path, SecretPurpose::ServiceHmac) {
                 Ok(s) => s,
@@ -738,7 +743,25 @@ async fn run_follower(config_path: PathBuf) -> ExitCode {
             key.copy_from_slice(&raw[..32]);
             state = state.with_signer(vrt_sql::bookmark::BookmarkSigner::new(key));
         }
-        let app = vrt_sql::replica::app(state);
+        let mut app = vrt_sql::replica::app(state);
+        if let Some(root) = config.promote_writer_db_root.clone() {
+            let persister = Arc::new(vrt_sql::persist::Persister::new(
+                store.clone(),
+                config.persistence.persist_config(),
+                Arc::new(vrt_sql::clock::SystemClock),
+                root,
+                ResourceKind::D1,
+            ));
+            app = app.merge(vrt_sql::promote_http::router(
+                follower.clone(),
+                persister,
+                vrt_sql::service::ServiceAuth::new(auth_secret),
+            ));
+            tracing::warn!(
+                db = %config.follower.database_id,
+                "follower promote endpoint enabled (writer CAS + local adoption)"
+            );
+        }
         let stop = shutdown.clone();
         if let Some(dir) = &config.unix_dir {
             if let Err(e) = vrt_securefs::ensure_secure_dir(dir) {

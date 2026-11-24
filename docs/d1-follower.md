@@ -92,6 +92,16 @@ Promotion:
    the `.vrt-lsn` sidecar;
 5. releases the new lease so `vrt-sql serve` can claim it immediately.
 
+For the control plane / cell path, the same operation is available as
+`POST /internal/dbs/{id}/promote` on the follower listener when
+`follower.promoteWriterDbRoot` is configured (opt-in; requires the service
+auth secret). The cell-controller turns a `PROMOTE` D1 op into that call when
+`[d1sql].promoteEndpoint` is set.
+
+After promotion, publish the new `epoch` (and optionally `writerAddr`) in the
+signed D1 binding. The provider then routes writes to the new writer; a stale
+provider epoch is rejected by the data plane.
+
 If the process crashes between the manifest CAS and local adoption, rerunning
 the same command resumes only the adoption (the manifest stores the generation
 sha256). A follower that is behind, ahead, or whose manifest moved fails closed

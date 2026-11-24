@@ -13,6 +13,7 @@ pub mod follower;
 pub mod k2;
 pub mod metrics;
 pub mod paths;
+pub mod promote_http;
 pub mod persist;
 pub mod queue;
 pub mod replica;
