@@ -586,12 +586,13 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
     rt.set_alarm_gate(true, Duration::from_secs(60));
     let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), s2z_params());
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
+    let pid = rt.active_pid();
 
     // Arm a 30 s alarm, then let the tenant idle out.
     let (status, _) = get(a, "/alarm").await.unwrap();
     assert_eq!(status, 200);
     wait_state(&rt, TenantState::Hibernated, Duration::from_secs(10)).await;
-    assert!(!pid_alive(rt.active_pid()));
+    wait_for(|| !pid_alive(pid), Duration::from_secs(5), "workerd pid exited").await;
 
     // The controller's alarm waker asks the host to start the generation.
     rt.await_wake(0, 64, 1 << 20, vrt_host::hibernate::WakeSourceKind::Alarm)
@@ -629,6 +630,7 @@ async fn s2z_websocket_reattaches_after_hibernation() {
     let rt = TenantRuntime::new("t1");
     let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), s2z_params());
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
+    let pid = rt.active_pid();
     let ingress = ingress_for(&rt).with_ws_hibernation(true, 64 * 1024);
     let ig = start_ingress(&ingress).await;
 
@@ -643,7 +645,7 @@ async fn s2z_websocket_reattaches_after_hibernation() {
 
     // No frames -> idle -> the tenant sleeps while the client socket stays open.
     wait_state(&rt, TenantState::Hibernated, Duration::from_secs(15)).await;
-    assert!(!pid_alive(rt.active_pid()));
+    wait_for(|| !pid_alive(pid), Duration::from_secs(5), "workerd pid exited").await;
 
     // A client frame wakes the tenant and is replayed to a fresh generation.
     s.write_all(&ws_text_frame("after-sleep")).await.unwrap();
