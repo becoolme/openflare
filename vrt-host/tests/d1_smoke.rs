@@ -2298,7 +2298,7 @@ fn real_workerd_do_wal_restart_residual() {
         std::fs::read_to_string(&log).unwrap_or_default()
     );
 
-    let wal_path = || -> PathBuf {
+    let wal_paths = || -> Vec<PathBuf> {
         fn walk(d: &Path, out: &mut Vec<PathBuf>) {
             for e in std::fs::read_dir(d).unwrap().flatten() {
                 let p = e.path();
@@ -2311,10 +2311,11 @@ fn real_workerd_do_wal_restart_residual() {
         }
         let mut found = vec![];
         walk(Path::new(&disk_dir), &mut found);
+        assert!(!found.is_empty(), "no -wal under {disk_dir}");
+        // Stable order — read_dir order is arbitrary and several wal
+        // files can coexist (class metadata.sqlite + the object db).
+        found.sort();
         found
-            .first()
-            .cloned()
-            .unwrap_or_else(|| panic!("no -wal under {disk_dir}"))
     };
     // Minimal percent-encoding for the pragma query (space & parens).
     let enc = |q: &str| -> String {
@@ -2345,47 +2346,87 @@ fn real_workerd_do_wal_restart_residual() {
     let (st, b) = http_get(port, "/inc");
     assert_eq!(st, 200, "{b}");
 
-    let walp = wal_path();
-    let f = std::fs::read(&walp).unwrap();
+    // The auto-checkpoint + restart write that produces residue races
+    // this read: sampled mid-flight the file still shows ONE valid
+    // generation (valid_end == len), or a partial frame at the frontier
+    // whose salt bytes coincidentally differ. Poll every wal file until
+    // one exhibits the full residue shape — valid frames ending BEFORE
+    // file end, and a different salt at the boundary — bounded at 10s.
+    // Failure prints the last observed state of every candidate.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut last_seen = String::new();
+    let proven = loop {
+        let mut notes = Vec::new();
+        let mut satisfied = false;
+        for walp in wal_paths() {
+            // The wal can be deleted+recreated between the walk and
+            // this read (checkpoint/restart) — a failed read is a
+            // transient, not a verdict.
+            let Ok(f) = std::fs::read(&walp) else {
+                notes.push(format!("{}: unreadable (recreated?)", walp.display()));
+                continue;
+            };
+            if f.len() <= 4096 + 32 {
+                notes.push(format!("{}: len={} (no residue)", walp.display(), f.len()));
+                continue;
+            }
+            let Some(hdr) = vrt_sql::wal::wal_header(&f[..32]) else {
+                notes.push(format!("{}: unparseable header", walp.display()));
+                continue;
+            };
+            let salt = (hdr.salt1, hdr.salt2);
+            let ck0 = (
+                u32::from_be_bytes(f[24..28].try_into().unwrap()),
+                u32::from_be_bytes(f[28..32].try_into().unwrap()),
+            );
+            // Scan the CURRENT generation from offset 32 — identical to
+            // the tailer's frontier logic. The valid region must end
+            // BEFORE the file end: the byte-range after it is residue.
+            let (vend, heads, _ck) = vrt_sql::wal::scan_frames(
+                &f[32..],
+                0,
+                hdr.page_size(),
+                hdr.cksum_be(),
+                salt,
+                ck0,
+            );
+            let valid_end = 32 + vend;
+            // The frame at the residue boundary must carry a DIFFERENT salt.
+            let resid_salt1 = (valid_end as usize + 4 <= f.len())
+                .then(|| {
+                    u32::from_be_bytes(
+                        f[valid_end as usize..valid_end as usize + 4]
+                            .try_into()
+                            .unwrap(),
+                    )
+                })
+                .unwrap_or(0);
+            notes.push(format!(
+                "{}: len={} valid_end={} heads={} salt1={:#x} resid_salt1={:#x}",
+                walp.display(),
+                f.len(),
+                valid_end,
+                heads.len(),
+                salt.0,
+                resid_salt1
+            ));
+            if !heads.is_empty() && valid_end < f.len() as u64 && resid_salt1 != salt.0 {
+                eprintln!("workerd wal residue proven: {}", notes.last().unwrap());
+                satisfied = true;
+                break;
+            }
+        }
+        last_seen = notes.join("\n  ");
+        if satisfied {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    };
     assert!(
-        f.len() > 4096 + 32,
-        "wal must hold residue (len={})",
-        f.len()
-    );
-    let hdr = vrt_sql::wal::wal_header(&f[..32]).expect("wal header");
-    let salt = (hdr.salt1, hdr.salt2);
-    let ck0 = (
-        u32::from_be_bytes(f[24..28].try_into().unwrap()),
-        u32::from_be_bytes(f[28..32].try_into().unwrap()),
-    );
-    // Scan the CURRENT generation from offset 32 — identical to
-    // the tailer's frontier logic. The valid region must end
-    // BEFORE the file end: the byte-range after it is residue.
-    let (vend, heads, _ck) =
-        vrt_sql::wal::scan_frames(&f[32..], 0, hdr.page_size(), hdr.cksum_be(), salt, ck0);
-    assert!(!heads.is_empty(), "current generation must have frames");
-    let valid_end = 32 + vend;
-    assert!(
-        valid_end < f.len() as u64,
-        "expected old-generation residue after valid end {valid_end} (len={})",
-        f.len()
-    );
-    // The frame at the residue boundary must carry a DIFFERENT salt.
-    let resid_salt1 = u32::from_be_bytes(
-        f[valid_end as usize..valid_end as usize + 4]
-            .try_into()
-            .unwrap(),
-    );
-    assert_ne!(
-        resid_salt1, salt.0,
-        "residual frame must be an older generation (different salt1)"
-    );
-    eprintln!(
-        "workerd wal: len={} valid_end={} residue={}B salt1={:#x} resid_salt1={:#x}",
-        f.len(),
-        valid_end,
-        f.len() as u64 - valid_end,
-        salt.0,
-        resid_salt1
+        proven,
+        "no wal exhibited old-generation residue within 10s:\n  {last_seen}"
     );
 }
