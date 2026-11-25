@@ -103,13 +103,18 @@ struct Parsed {
     wire_metadata: Option<String>,
     onerror_redirect: bool,
     /// `draw=((...),(...))` overlay entries — each fetched same-origin
-    /// and posted as a `draw_image` field (`frames[1..]` on the wire).
+    /// and posted as `draw_image` or `draw_text`+`draw_font` fields
+    /// (`frames[1..]` on the wire).
     draws: Vec<DrawEntry>,
 }
 
 struct DrawEntry {
-    /// Resolved same-origin overlay path.
+    /// Resolved same-origin fetch path — the overlay image, or the
+    /// font file for text entries.
     path: String,
+    /// Text entries carry the `draw_text` spec JSON; their fetched
+    /// bytes land as `draw_font` instead of `draw_image`.
+    text_spec: Option<String>,
     /// Position/blend keys → `{drawImageIndex, targetImageIndex, ...}`
     /// op; indices are stamped at emit time.
     draw_op: serde_json::Map<String, serde_json::Value>,
@@ -404,13 +409,17 @@ fn draw_url_path(url: &str, host: &str) -> Result<String, u32> {
     Ok(format!("/{url_path}"))
 }
 
-/// One `(k=v,...)` draw entry → its fetch path + the two wire ops it
-/// emits. Entries share the option vocabulary: `url` (required) plus
-/// positioning (`top/left/bottom/right`), blending (`opacity`,
-/// `repeat`, `composite`) and overlay optimization params. Text
-/// overlays need a font stack the vendored engine lacks — fail closed.
+/// One `(k=v,...)` draw entry → its fetch path + the wire ops it
+/// emits. Image entries take `url` plus positioning
+/// (`top/left/bottom/right`), blending (`opacity`, `repeat`,
+/// `composite`) and overlay optimization params. Text entries take
+/// `text` + `font=(url=...)` + `size`/`color` plus the positioning
+/// and blending keys — transform params are image-overlay-only and
+/// fail closed.
 fn draw_entry(inner: &str, host: &str) -> Result<DrawEntry, u32> {
     let mut url: Option<String> = None;
+    let mut font: Option<String> = None;
+    let mut spec = serde_json::Map::new();
     let mut draw_op = serde_json::Map::new();
     let mut transform = serde_json::Map::new();
     for pair in split_draw(inner) {
@@ -422,8 +431,39 @@ fn draw_entry(inner: &str, host: &str) -> Result<DrawEntry, u32> {
         let (k, v) = (k.trim(), v.trim());
         match k {
             "url" => url = Some(unquote(v).to_string()),
-            // Text overlays need harfbuzz/freetype — not vendored.
-            "text" | "font" | "color" | "size" => return Err(9401),
+            "text" => {
+                let t = unquote(v);
+                if t.is_empty() || t.chars().count() > 1000 {
+                    return Err(9423);
+                }
+                spec.insert("text".into(), t.into());
+            }
+            // `font=(url='...')` — the only documented group shape.
+            "font" => {
+                let Some(gi) = group_inner(v) else {
+                    return Err(9423);
+                };
+                let mut f: Option<String> = None;
+                for (sk, sv) in group_pairs(gi)? {
+                    match sk {
+                        "url" => f = Some(unquote(sv).to_string()),
+                        _ => return Err(9423),
+                    }
+                }
+                font = Some(f.ok_or(9423u32)?);
+            }
+            // Spec leaves pass through — the facade's parseTextSpec
+            // applies the strict color/size validation (9423).
+            "color" => {
+                spec.insert("color".into(), unquote(v).into());
+            }
+            "size" => {
+                let n = parse_num(unquote(v), 0.0, f64::MAX)?;
+                if n <= 0.0 {
+                    return Err(9423);
+                }
+                spec.insert("size".into(), n.into());
+            }
             "top" | "left" | "bottom" | "right" => {
                 let n = parse_num(unquote(v), -16384.0, 16384.0)?;
                 draw_op.insert(k.into(), n.into());
@@ -562,9 +602,6 @@ fn draw_entry(inner: &str, host: &str) -> Result<DrawEntry, u32> {
             _ => return Err(9423),
         }
     }
-    let Some(u) = url else {
-        return Err(9423);
-    };
     // Upstream errors when an axis carries both edge offsets.
     if draw_op.contains_key("left") && draw_op.contains_key("right") {
         return Err(9423);
@@ -572,9 +609,34 @@ fn draw_entry(inner: &str, host: &str) -> Result<DrawEntry, u32> {
     if draw_op.contains_key("top") && draw_op.contains_key("bottom") {
         return Err(9423);
     }
+    if spec.contains_key("text") {
+        // Text overlay: the font fetches like an overlay image; the
+        // spec rides `draw_text`. Transform params and a second
+        // `url` source are image-entry-only.
+        if url.is_some() || !transform.is_empty() {
+            return Err(9423);
+        }
+        let Some(f) = font else {
+            return Err(9423);
+        };
+        return Ok(DrawEntry {
+            path: draw_url_path(&f, host)?,
+            text_spec: Some(serde_json::Value::Object(spec).to_string()),
+            draw_op,
+            transform,
+        });
+    }
+    // font/color/size without `text` — or no source at all.
+    if font.is_some() || !spec.is_empty() {
+        return Err(9423);
+    }
+    let Some(u) = url else {
+        return Err(9423);
+    };
     let path = draw_url_path(&u, host)?;
     Ok(DrawEntry {
         path,
+        text_spec: None,
         draw_op,
         transform,
     })
@@ -1241,9 +1303,10 @@ async fn run_transform(
                 .or_else(|_| Ok(error_body(9420, StatusCode::UNSUPPORTED_MEDIA_TYPE)));
         }
 
-        // Draw overlays fetch through the same tenant socket — their
-        // same-origin paths resolve exactly like the source did, and
-        // the same status/size rules apply.
+        // Draw payloads fetch through the same tenant socket — overlay
+        // images and text-entry fonts alike; their same-origin paths
+        // resolve exactly like the source did, and the same
+        // status/size rules apply.
         let mut overlays: Vec<Bytes> = Vec::with_capacity(parsed.draws.len());
         for e in &parsed.draws {
             let get = Request::builder()
@@ -1306,8 +1369,15 @@ async fn run_transform(
         if let Some(md) = &parsed.wire_metadata {
             field("metadata", None, md.as_bytes());
         }
-        for over in &overlays {
-            field("draw_image", Some("overlay"), over);
+        for (e, over) in parsed.draws.iter().zip(&overlays) {
+            if let Some(spec) = &e.text_spec {
+                // draw_text must precede its draw_font file — the
+                // facade rasterizes on the font field.
+                field("draw_text", None, spec.as_bytes());
+                field("draw_font", Some("font"), over);
+            } else {
+                field("draw_image", Some("overlay"), over);
+            }
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
@@ -1861,8 +1931,13 @@ mod tests {
     #[test]
     fn draw_bad_entries_fail_closed() {
         for (raw, code) in [
-            ("draw=((text='HI'))", 9401),           // font stack not vendored
-            ("draw=((font=(url='/f.otf')))", 9401), // text-only key, no url
+            ("draw=((text='HI'))", 9423),           // font required
+            ("draw=((font=(url='/f.otf')))", 9423), // text-only key, no url
+            ("draw=((text='HI',url='/l.png',font=(url='/f.otf')))", 9423), // url is image-only
+            ("draw=((text='HI',font=(url='/f.otf'),width=50))", 9423), // transform on text
+            ("draw=((text='HI',font='/f.otf'))", 9423), // font must be a group
+            ("draw=((text='HI',font=(href='/f.otf')))", 9423), // font group url only
+            ("draw=((size=20))", 9423),             // text key without text
             ("draw=((bottom=5))", 9423),            // url required
             ("draw=((url='/l.png',left=1,right=2))", 9423), // axis conflict
             ("draw=((url='/l.png',top=0,bottom=0))", 9423),
@@ -1872,6 +1947,10 @@ mod tests {
             ("draw=((url='/l.png',width=0p))", 9423),
             ("draw=foo", 9423),                              // not a group
             ("draw=((url='https://evil.com/l.png'))", 9401), // foreign host
+            (
+                "draw=((text='HI',font=(url='https://evil.com/f.otf')))",
+                9401,
+            ), // foreign font
         ] {
             assert_eq!(
                 parse_options(raw, &HeaderMap::new(), "example.com")
@@ -1881,6 +1960,37 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn draw_text_entry_maps_to_spec_and_font_path() {
+        // A text entry fetches its font same-origin like an overlay;
+        // the spec rides `draw_text` and emits only the draw op
+        // (transform params are image-entry-only).
+        let p = opts("draw=((text='HI',font=(url='/f.otf'),color=rgb(0,0,0),size=96,top=40))");
+        assert_eq!(p.draws.len(), 1);
+        assert_eq!(p.draws[0].path, "/f.otf");
+        assert_eq!(
+            p.draws[0].text_spec.as_deref(),
+            Some(r#"{"color":"rgb(0,0,0)","size":96.0,"text":"HI"}"#)
+        );
+        let ops = ops_of(&p);
+        assert_eq!(ops.as_array().unwrap().len(), 2);
+        assert_eq!(
+            ops[1],
+            serde_json::json!({"drawImageIndex": 1, "targetImageIndex": 0, "top": 40.0})
+        );
+        // Mixed image+text entries keep one index space in order.
+        let p2 = opts("draw=((url='/o.png',top=0),(text='T',font=(url='/f.otf'),left=4))");
+        assert_eq!(p2.draws.len(), 2);
+        assert!(p2.draws[0].text_spec.is_none());
+        assert_eq!(p2.draws[1].text_spec.as_deref(), Some(r#"{"text":"T"}"#));
+        let ops2 = ops_of(&p2);
+        assert_eq!(ops2[1]["drawImageIndex"], 1);
+        assert_eq!(ops2[2]["drawImageIndex"], 2);
+        // dpr scales pixel offsets on text ops too.
+        let p3 = opts("dpr=2,draw=((text='HI',font=(url='/f.otf'),top=10))");
+        assert_eq!(ops_of(&p3)[1]["top"], 20.0);
     }
 
     #[test]

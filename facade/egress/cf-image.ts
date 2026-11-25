@@ -14,6 +14,8 @@
 // values reject the tenant's fetch() with TypeError, matching CF's
 // invalid-option behavior.
 
+import { TEXT_MAX_CHARS, TEXT_MAX_DIM, validColor } from "../text-spec.js";
+
 const OPT_KEYS = new Set([
   "anim", "background", "blur", "border", "brightness", "compression",
   "contrast", "dpr", "draw", "fit", "flip", "format", "gamma", "gravity",
@@ -26,15 +28,21 @@ const SRC_MAX = 64 * 1024 * 1024;
 /** `draw` entry cap mirrors the wire's MAX_DRAW_IMAGES. */
 const MAX_DRAW = 16;
 
-/** Draw-entry vocabulary: an image overlay (`url` + optimization
- * params + positioning/blending) or a text overlay (`text` + font —
- * unsupported without a vendored font stack). */
-const DRAW_ENTRY_KEYS = new Set([
-  "url", "text", "font", "color", "size",
-  "top", "left", "bottom", "right", "opacity", "repeat", "composite",
+/** Transform vocabulary a draw entry borrows from the top level —
+ * image-overlay-only per upstream docs (text overlays take just
+ * positioning/blending keys). */
+const TRANSFORM_KEYS = new Set([
   "width", "height", "fit", "gravity", "rotate", "blur", "background",
   "brightness", "contrast", "gamma", "saturation", "flip", "sharpen",
   "trim", "border", "padding", "zoom", "segment",
+]);
+/** Draw-entry vocabulary: an image overlay (`url` + optimization
+ * params + positioning/blending) or a text overlay (`text` +
+ * `font:{url}` + `size`/`color` + positioning/blending). */
+const DRAW_ENTRY_KEYS = new Set([
+  "url", "text", "font", "color", "size",
+  "top", "left", "bottom", "right", "opacity", "repeat", "composite",
+  ...TRANSFORM_KEYS,
 ]);
 const COMPOSITES = new Set(["over", "in", "atop", "out", "xor", "lighter"]);
 
@@ -298,11 +306,18 @@ function transformOp(
   return op;
 }
 
+/** What the egress worker fetches per draw entry, in draw order —
+ * image overlays become `draw_image` fields; text entries fetch their
+ * font and emit `draw_text` (spec) + `draw_font` (bytes) pairs. */
+export type DrawFetch =
+  | { kind: "image"; url: string }
+  | { kind: "text"; spec: string; fontUrl: string };
+
 export interface CfImagePlan {
   transforms: string;
-  /** Overlay URLs to fetch, in draw order — each lands as a
-   * `draw_image` multipart field (`frames[1..]` on the wire). */
-  draws: string[];
+  /** Overlay/font URLs to fetch, in draw order — payloads land as
+   * `draw_image`/`draw_text`+`draw_font` multipart fields. */
+  draws: DrawFetch[];
   outputFormat?: string;
   outputQuality?: number;
   anim: boolean;
@@ -389,7 +404,7 @@ export function cfImagePlan(request: Request): CfImagePlan | undefined {
   // `draw` overlays ride the wire as draw_image attachments +
   // per-entry ops: `[mainOp, overOp1, drawOp1, ...]` — the ops apply
   // in order so the last entry composites topmost.
-  const draws: string[] = [];
+  const draws: DrawFetch[] = [];
   const ops: Record<string, unknown>[] = [op];
   if (o.draw !== undefined) {
     if (!Array.isArray(o.draw)) throw new TypeError("cf.image: draw must be an array");
@@ -405,27 +420,6 @@ export function cfImagePlan(request: Request): CfImagePlan | undefined {
         }
       }
       const entry = e as Record<string, unknown>;
-      // Text overlays need a harfbuzz/freetype stack — not vendored.
-      if (entry.text !== undefined) {
-        throw new TypeError("cf.image: draw text is not supported");
-      }
-      for (const k of ["font", "color", "size"]) {
-        if (entry[k] !== undefined) {
-          throw new TypeError(`cf.image: draw.${k} applies to text overlays`);
-        }
-      }
-      if (typeof entry.url !== "string" || entry.url === "") {
-        throw new TypeError("cf.image: invalid draw.url");
-      }
-      let proto: string;
-      try {
-        proto = new URL(entry.url).protocol;
-      } catch {
-        throw new TypeError("cf.image: invalid draw.url");
-      }
-      if (proto !== "http:" && proto !== "https:") {
-        throw new TypeError("cf.image: invalid draw.url");
-      }
       const drawOp: Record<string, unknown> = {
         drawImageIndex: i + 1,
         targetImageIndex: 0,
@@ -466,6 +460,74 @@ export function cfImagePlan(request: Request): CfImagePlan | undefined {
         }
         drawOp.composite = v;
       }
+      if (entry.text !== undefined) {
+        // Text overlay: {text, font:{url}, color?, size?} + the
+        // positioning/blending keys above. Transform options are
+        // documented image-overlay-only → TypeError (fail closed).
+        if (typeof entry.text !== "string" || entry.text === "" || entry.text.length > TEXT_MAX_CHARS) {
+          throw new TypeError("cf.image: invalid draw.text");
+        }
+        if (entry.url !== undefined) {
+          throw new TypeError("cf.image: draw.url applies to image overlays");
+        }
+        for (const k of TRANSFORM_KEYS) {
+          if (entry[k] !== undefined) {
+            throw new TypeError(`cf.image: draw.${k} applies to image overlays`);
+          }
+        }
+        const f = entry.font;
+        if (typeof f !== "object" || f === null || Array.isArray(f)) {
+          throw new TypeError("cf.image: draw.font required for text overlays");
+        }
+        const fontUrl = (f as Record<string, unknown>).url;
+        if (typeof fontUrl !== "string" || fontUrl === "") {
+          throw new TypeError("cf.image: invalid draw.font.url");
+        }
+        let proto: string;
+        try {
+          proto = new URL(fontUrl).protocol;
+        } catch {
+          throw new TypeError("cf.image: invalid draw.font.url");
+        }
+        if (proto !== "http:" && proto !== "https:") {
+          throw new TypeError("cf.image: invalid draw.font.url");
+        }
+        const spec: Record<string, unknown> = { text: entry.text };
+        if (entry.size !== undefined) {
+          const v = entry.size;
+          if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v > TEXT_MAX_DIM) {
+            throw new TypeError("cf.image: invalid draw.size");
+          }
+          spec.size = v;
+        }
+        if (entry.color !== undefined) {
+          const v = entry.color;
+          if (typeof v !== "string" || !validColor(v)) {
+            throw new TypeError("cf.image: invalid draw.color");
+          }
+          spec.color = v;
+        }
+        ops.push(drawOp);
+        draws.push({ kind: "text", spec: JSON.stringify(spec), fontUrl });
+        continue;
+      }
+      for (const k of ["font", "color", "size"]) {
+        if (entry[k] !== undefined) {
+          throw new TypeError(`cf.image: draw.${k} applies to text overlays`);
+        }
+      }
+      if (typeof entry.url !== "string" || entry.url === "") {
+        throw new TypeError("cf.image: invalid draw.url");
+      }
+      let proto: string;
+      try {
+        proto = new URL(entry.url).protocol;
+      } catch {
+        throw new TypeError("cf.image: invalid draw.url");
+      }
+      if (proto !== "http:" && proto !== "https:") {
+        throw new TypeError("cf.image: invalid draw.url");
+      }
       // Overlay optimization params share the top-level vocabulary;
       // percentBasis marks `"Np"` dims for base-canvas resolution.
       const overOp = transformOp(entry, dpr, true);
@@ -475,7 +537,7 @@ export function cfImagePlan(request: Request): CfImagePlan | undefined {
         ops.push(overOp);
       }
       ops.push(drawOp);
-      draws.push(entry.url);
+      draws.push({ kind: "image", url: entry.url });
     }
   }
   return {
@@ -490,13 +552,15 @@ export function cfImagePlan(request: Request): CfImagePlan | undefined {
   };
 }
 
-/** Multipart body for the facade-images `/transform` wire. `overlays`
- * are the fetched draw-entry images, appended in plan.draws order —
- * each becomes `frames[i+1]` for the per-entry draw ops. */
+/** Multipart body for the facade-images `/transform` wire. `payloads`
+ * are the fetched draw-entry bytes in plan.draws order — overlay
+ * bytes for image entries (`draw_image`), font bytes for text
+ * entries (`draw_text` spec + `draw_font` file). All become
+ * `frames[i+1]` for the per-entry draw ops. */
 export function cfImageBody(
   src: Uint8Array,
   plan: CfImagePlan,
-  overlays: Uint8Array[] = [],
+  payloads: Uint8Array[] = [],
 ): FormData {
   const fd = new FormData();
   fd.append("image", new Blob([src as BlobPart]), "source");
@@ -507,8 +571,16 @@ export function cfImageBody(
   if (plan.outputQuality !== undefined) fd.append("output_quality", String(plan.outputQuality));
   if (plan.anim) fd.append("anim", "true");
   if (plan.metadata !== null) fd.append("metadata", plan.metadata);
-  for (const over of overlays) {
-    fd.append("draw_image", new Blob([over as BlobPart]), "overlay");
+  for (let i = 0; i < plan.draws.length; i++) {
+    const draw = plan.draws[i];
+    if (draw.kind === "text") {
+      // draw_text must precede its draw_font file — the wire handler
+      // rasterizes on the font field.
+      fd.append("draw_text", draw.spec);
+      fd.append("draw_font", new Blob([payloads[i] as BlobPart]), "font");
+    } else {
+      fd.append("draw_image", new Blob([payloads[i] as BlobPart]), "overlay");
+    }
   }
   return fd;
 }

@@ -3,6 +3,8 @@ import { imagesError, sniffImage, sniffSvg, IMAGES_BODY_MAX_BYTES, IMAGES_MAX_PI
 import { EngineError, decodeImage, encodeImage, parseColor, composite } from "./images-engine.js";
 import { applyTransforms, IMAGES_TRANSFORM_MAX_PIXELS } from "./images-transform.js";
 import { attachMetadata, extractMetadata, METADATA_MODES } from "./images-metadata.js";
+import { parseTextSpec } from "./text-spec.js";
+import { rasterizeText } from "./text-rasterize.js";
 const DECODE_FORMATS = new Set([
     "jpeg",
     "png",
@@ -40,8 +42,15 @@ async function decodeField(file, what) {
     if (!DECODE_FORMATS.has(sniffed.format)) {
         throw new EngineError(9401, `images: ${what} format ${sniffed.format} has no vendored decoder`);
     }
+    let frame;
+    try {
+        frame = await decodeImage(bytes, sniffed.format);
+    } catch (e) {
+        if (e instanceof EngineError) throw e;
+        throw new EngineError(9420, `images: ${what} decode failed`);
+    }
     return {
-        frame: await decodeImage(bytes, sniffed.format),
+        frame,
         format: sniffed.format,
         bytes
     };
@@ -106,16 +115,6 @@ export class ImagesFacade extends WorkerEntrypoint {
             case "/transform":
                 {
                     try {
-                        if (form.get("text_input") !== null) {
-                            return imagesError(9401, "images: text_input rasterization is not supported", 415);
-                        }
-                        if (form.get("draw_text") !== null) {
-                            return imagesError(9401, "images: draw_text rasterization is not supported", 415);
-                        }
-                        const image = form.get("image");
-                        if (!(image instanceof File)) {
-                            return imagesError(9423, "images: missing `image` field", 400);
-                        }
                         const raw = form.get("transforms");
                         if (typeof raw !== "string") {
                             return imagesError(9423, "images: missing `transforms` field", 400);
@@ -128,15 +127,51 @@ export class ImagesFacade extends WorkerEntrypoint {
                         } catch  {
                             return imagesError(9423, "images: malformed `transforms` JSON", 400);
                         }
-                        const { frame: canvas, format: canvasFormat, bytes: canvasBytes } = await decodeField(image, "canvas image");
+                        const image = form.get("image");
+                        const textInput = form.get("text_input");
+                        const textFont = form.get("text_font");
+                        let canvas;
+                        let canvasFormat;
+                        let canvasBytes;
+                        if (textInput !== null || textFont !== null) {
+                            if (image !== null || typeof textInput !== "string" || !(textFont instanceof File)) {
+                                return imagesError(9423, "images: malformed `text_input`/`text_font` fields", 400);
+                            }
+                            canvas = await rasterizeText(parseTextSpec(textInput), new Uint8Array(await textFont.arrayBuffer()));
+                        } else {
+                            if (!(image instanceof File)) {
+                                return imagesError(9423, "images: missing `image` field", 400);
+                            }
+                            const decoded = await decodeField(image, "canvas image");
+                            canvas = decoded.frame;
+                            canvasFormat = decoded.format;
+                            canvasBytes = decoded.bytes;
+                        }
                         const frames = [
                             canvas
                         ];
-                        for (const field of form.getAll("draw_image")){
-                            if (!(field instanceof File)) {
-                                return imagesError(9423, "images: malformed `draw_image` field", 400);
+                        let pendingText;
+                        for (const [name, field] of form.entries()){
+                            if (name === "draw_image") {
+                                if (pendingText !== undefined || !(field instanceof File)) {
+                                    return imagesError(9423, "images: malformed overlay fields", 400);
+                                }
+                                frames.push((await decodeField(field, `draw_image ${frames.length}`)).frame);
+                            } else if (name === "draw_text") {
+                                if (pendingText !== undefined || typeof field !== "string") {
+                                    return imagesError(9423, "images: malformed `draw_text` field", 400);
+                                }
+                                pendingText = parseTextSpec(field);
+                            } else if (name === "draw_font") {
+                                if (pendingText === undefined || !(field instanceof File)) {
+                                    return imagesError(9423, "images: `draw_font` without `draw_text`", 400);
+                                }
+                                frames.push(await rasterizeText(pendingText, new Uint8Array(await field.arrayBuffer())));
+                                pendingText = undefined;
                             }
-                            frames.push((await decodeField(field, `draw_image ${frames.length}`)).frame);
+                        }
+                        if (pendingText !== undefined) {
+                            return imagesError(9423, "images: `draw_text` missing its `draw_font`", 400);
                         }
                         if (canvas.width * canvas.height > IMAGES_TRANSFORM_MAX_PIXELS) {
                             return imagesError(9401, "images: source exceeds the transform pixel cap", 413);
@@ -176,7 +211,7 @@ export class ImagesFacade extends WorkerEntrypoint {
                             255
                         ]) : done;
                         const { bytes, contentType } = await encodeImage(finalImage, format, quality);
-                        const srcMeta = extractMetadata(canvasBytes, canvasFormat);
+                        const srcMeta = canvasBytes !== undefined && canvasFormat !== undefined ? extractMetadata(canvasBytes, canvasFormat) : {};
                         const outBytes = attachMetadata(bytes, format, srcMeta, metadata, finalImage.width, finalImage.height);
                         return new Response(outBytes, {
                             status: 200,

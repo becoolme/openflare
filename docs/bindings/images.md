@@ -201,12 +201,18 @@ const r = await fetch("https://cdn.example.com/cat.png", {
   failure for a 302 to the original URL. Malformed options (unknown
   key, out-of-range value) reject `fetch()` with `TypeError`, matching
   CF's invalid-option behavior.
-- `draw` accepts up to 16 entries (`{url, top/left/bottom/right,
-  opacity, repeat, composite}` plus per-overlay transform options);
-  overlay URLs are fetched through the same egress policy as the
+- `draw` accepts up to 16 entries. Image overlays (`{url,
+  top/left/bottom/right, opacity, repeat, composite}` plus per-overlay
+  transform options) fetch through the same egress policy as the
   source and ride `draw_image` multipart fields into the engine.
-  `image`, `origin-auth` and `slow-connection-quality` are recognized
-  but unsupported → `TypeError` (fail closed).
+  Text overlays (`{text, font:{url}, size, color}` + the positioning/
+  blending keys) fetch their font through the same policy and ride
+  `draw_text` spec + `draw_font` byte pairs, sharing the
+  `drawImageIndex` space with `draw_image`; per-entry transform
+  options and `url` are image-entry-only → `TypeError` (upstream
+  documents them on image overlays only). `image`, `origin-auth`
+  and `slow-connection-quality` are recognized but unsupported →
+  `TypeError` (fail closed).
 - The upstream fetch still runs through the egress policy, so
   `cf.image` can only transform origins the tenant was already allowed
   to fetch — it grants no new network reach.
@@ -272,8 +278,17 @@ resource-identifying keys besides `binding`.
   per-overlay transform ops (fit/gravity/blur/rotate/…) including
   `"Np"` percent-of-base dimensions. `/cdn-cgi/` draw URLs stay
   same-origin like the source; `cf.image` draw URLs go through the
-  egress policy. `draw_text`/`text_input` rasterization is not
-  implemented → `err=9401` / `TypeError`.
+  egress policy. `draw_text`/`text_input` rasterize through the
+  vendored resvg-wasm stack (`facade/text-rasterize.ts` — fontdb on
+  wire-carried font bytes, rustybuzz shaping, tiny-skia, premultiply
+  → straight-alpha conversion): `cf.image` text entries and
+  `/cdn-cgi/` `draw=((text=...,font=(url=...)))` work end to end —
+  the font fetches like an overlay (egress policy / same-origin),
+  `size` defaults 12, `color` `#000000`, text ≤ 1000 chars, raster
+  ≤ 4096². The binding's `.text()` still needs the workerd-fork
+  `images-api` shim patched to fetch `font.url` into a `text_font`
+  field (upstream fetches shim-side too); until then a binding text
+  source fails `err=9423` for its missing font field.
 - **Gravity**: named gravity (`top`/`left`/`center`/…/`auto`) and
   `{x,y}` coordinate gravity work; face/entropy segment gravity
   (`gravity: "auto"` uses entropy-centre, not CF's ML saliency) is an
@@ -308,8 +323,9 @@ resource-identifying keys besides `binding`.
   option→transform JSON mapping (structured groups, percent-decoding,
   client-hints quality/width, dpr scaling), same-origin source
   resolution, `draw=((k=v,...))` group parsing with same-origin
-  overlay fetch, svg-hush sanitize pass-through for SVG sources,
-  facade socket fan-out, `ERROR <code>` shaping (23 unit tests).
+  overlay + font fetch (`text`/`font=(url=)` entries → `draw_text`/
+  `draw_font`), svg-hush sanitize pass-through for SVG sources,
+  facade socket fan-out, `ERROR <code>` shaping (24 unit tests).
 - `facade/svg-hush.ts` — TypeScript port of upstream's svg-hush for the
   `cf.image` egress path (the `/cdn-cgi/` path uses the crate itself):
   allowlisted elements/attributes, xlink→href, same-origin URL
@@ -321,9 +337,14 @@ resource-identifying keys besides `binding`.
   (wrapped module + inner fetcher service name).
 - `facade/test/images.test.mjs` — `/info` shape cases plus end-to-end
   `/transform` coverage: real PNG→WebP resize round-trip,
-  crop-gravity+rotate→JPEG, `draw_image` alpha compositing, GIF/BMP
-  input decode, AVIF output, and the fail-closed edges (unknown op
-  key, corrupt input, text ops, `anim`, GIF output).
+  crop-gravity+rotate→JPEG, `draw_image` alpha compositing,
+  `text_input`/`draw_text` rasterization and field-pairing rules,
+  GIF/BMP input decode, AVIF output, and the fail-closed edges
+  (unknown op key, corrupt input, `anim`, GIF output).
+- `facade/test/text-rasterize.test.mjs` — `text-spec` validation
+  vectors (spec JSON, CSS color shapes, font magics) and resvg-wasm
+  rasterization on an OFL-licensed test font
+  (`facade/test/fixtures/test-sans.ttf`).
 - `facade/test/images-structured.test.mjs` — the structured-parameter
   surface on real pixels: box vs gaussian sharpen (incl. `threshold`
   gating), `trim` color/area/rect/percent/fraction forms,

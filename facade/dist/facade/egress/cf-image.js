@@ -1,3 +1,4 @@
+import { TEXT_MAX_CHARS, TEXT_MAX_DIM, validColor } from "../text-spec.js";
 const OPT_KEYS = new Set([
     "anim",
     "background",
@@ -31,19 +32,7 @@ const OPT_KEYS = new Set([
 ]);
 const SRC_MAX = 64 * 1024 * 1024;
 const MAX_DRAW = 16;
-const DRAW_ENTRY_KEYS = new Set([
-    "url",
-    "text",
-    "font",
-    "color",
-    "size",
-    "top",
-    "left",
-    "bottom",
-    "right",
-    "opacity",
-    "repeat",
-    "composite",
+const TRANSFORM_KEYS = new Set([
     "width",
     "height",
     "fit",
@@ -62,6 +51,21 @@ const DRAW_ENTRY_KEYS = new Set([
     "padding",
     "zoom",
     "segment"
+]);
+const DRAW_ENTRY_KEYS = new Set([
+    "url",
+    "text",
+    "font",
+    "color",
+    "size",
+    "top",
+    "left",
+    "bottom",
+    "right",
+    "opacity",
+    "repeat",
+    "composite",
+    ...TRANSFORM_KEYS
 ]);
 const COMPOSITES = new Set([
     "over",
@@ -465,30 +469,6 @@ export function cfImagePlan(request) {
                 }
             }
             const entry = e;
-            if (entry.text !== undefined) {
-                throw new TypeError("cf.image: draw text is not supported");
-            }
-            for (const k of [
-                "font",
-                "color",
-                "size"
-            ]){
-                if (entry[k] !== undefined) {
-                    throw new TypeError(`cf.image: draw.${k} applies to text overlays`);
-                }
-            }
-            if (typeof entry.url !== "string" || entry.url === "") {
-                throw new TypeError("cf.image: invalid draw.url");
-            }
-            let proto;
-            try {
-                proto = new URL(entry.url).protocol;
-            } catch  {
-                throw new TypeError("cf.image: invalid draw.url");
-            }
-            if (proto !== "http:" && proto !== "https:") {
-                throw new TypeError("cf.image: invalid draw.url");
-            }
             const drawOp = {
                 drawImageIndex: i + 1,
                 targetImageIndex: 0
@@ -533,6 +513,81 @@ export function cfImagePlan(request) {
                 }
                 drawOp.composite = v;
             }
+            if (entry.text !== undefined) {
+                if (typeof entry.text !== "string" || entry.text === "" || entry.text.length > TEXT_MAX_CHARS) {
+                    throw new TypeError("cf.image: invalid draw.text");
+                }
+                if (entry.url !== undefined) {
+                    throw new TypeError("cf.image: draw.url applies to image overlays");
+                }
+                for (const k of TRANSFORM_KEYS){
+                    if (entry[k] !== undefined) {
+                        throw new TypeError(`cf.image: draw.${k} applies to image overlays`);
+                    }
+                }
+                const f = entry.font;
+                if (typeof f !== "object" || f === null || Array.isArray(f)) {
+                    throw new TypeError("cf.image: draw.font required for text overlays");
+                }
+                const fontUrl = f.url;
+                if (typeof fontUrl !== "string" || fontUrl === "") {
+                    throw new TypeError("cf.image: invalid draw.font.url");
+                }
+                let proto;
+                try {
+                    proto = new URL(fontUrl).protocol;
+                } catch  {
+                    throw new TypeError("cf.image: invalid draw.font.url");
+                }
+                if (proto !== "http:" && proto !== "https:") {
+                    throw new TypeError("cf.image: invalid draw.font.url");
+                }
+                const spec = {
+                    text: entry.text
+                };
+                if (entry.size !== undefined) {
+                    const v = entry.size;
+                    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v > TEXT_MAX_DIM) {
+                        throw new TypeError("cf.image: invalid draw.size");
+                    }
+                    spec.size = v;
+                }
+                if (entry.color !== undefined) {
+                    const v = entry.color;
+                    if (typeof v !== "string" || !validColor(v)) {
+                        throw new TypeError("cf.image: invalid draw.color");
+                    }
+                    spec.color = v;
+                }
+                ops.push(drawOp);
+                draws.push({
+                    kind: "text",
+                    spec: JSON.stringify(spec),
+                    fontUrl
+                });
+                continue;
+            }
+            for (const k of [
+                "font",
+                "color",
+                "size"
+            ]){
+                if (entry[k] !== undefined) {
+                    throw new TypeError(`cf.image: draw.${k} applies to text overlays`);
+                }
+            }
+            if (typeof entry.url !== "string" || entry.url === "") {
+                throw new TypeError("cf.image: invalid draw.url");
+            }
+            let proto;
+            try {
+                proto = new URL(entry.url).protocol;
+            } catch  {
+                throw new TypeError("cf.image: invalid draw.url");
+            }
+            if (proto !== "http:" && proto !== "https:") {
+                throw new TypeError("cf.image: invalid draw.url");
+            }
             const overOp = transformOp(entry, dpr, true);
             if (Object.keys(overOp).length > 0) {
                 overOp.imageIndex = i + 1;
@@ -540,7 +595,10 @@ export function cfImagePlan(request) {
                 ops.push(overOp);
             }
             ops.push(drawOp);
-            draws.push(entry.url);
+            draws.push({
+                kind: "image",
+                url: entry.url
+            });
         }
     }
     return {
@@ -554,7 +612,7 @@ export function cfImagePlan(request) {
         onerrorRedirect: o.onerror === "redirect"
     };
 }
-export function cfImageBody(src, plan, overlays = []) {
+export function cfImageBody(src, plan, payloads = []) {
     const fd = new FormData();
     fd.append("image", new Blob([
         src
@@ -564,10 +622,18 @@ export function cfImageBody(src, plan, overlays = []) {
     if (plan.outputQuality !== undefined) fd.append("output_quality", String(plan.outputQuality));
     if (plan.anim) fd.append("anim", "true");
     if (plan.metadata !== null) fd.append("metadata", plan.metadata);
-    for (const over of overlays){
-        fd.append("draw_image", new Blob([
-            over
-        ]), "overlay");
+    for(let i = 0; i < plan.draws.length; i++){
+        const draw = plan.draws[i];
+        if (draw.kind === "text") {
+            fd.append("draw_text", draw.spec);
+            fd.append("draw_font", new Blob([
+                payloads[i]
+            ]), "font");
+        } else {
+            fd.append("draw_image", new Blob([
+                payloads[i]
+            ]), "overlay");
+        }
     }
     return fd;
 }
