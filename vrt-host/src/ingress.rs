@@ -1983,6 +1983,18 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
     }
 }
 
+/// Completes as soon as the tenant starts hibernating, so a WebSocket
+/// relay can detach while the client half is still usable.
+async fn wait_sleeping(runtime: &crate::supervisor::TenantRuntime) {
+    loop {
+        let state = runtime.state();
+        if state.is_asleep() || state == crate::state::TenantState::Hibernating {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_idle(started: Instant, last_ms: Arc<AtomicU64>, idle_ms: u64) {
     loop {
         let last = last_ms.load(Ordering::Relaxed);
@@ -2081,6 +2093,11 @@ impl WsTunnel {
         use hyper_util::rt::TokioIo;
         let reg = crate::metrics::registry();
         let w = self.worker_id.as_str();
+        // A hibernation-enabled session must not pin the tenant resident from
+        // the moment the upstream 101 is relayed. Release the in-flight guard
+        // BEFORE awaiting the upgraded halves: the server has already answered
+        // the request, and a slow upgrade future must not block sleep.
+        let mut guard = (!self.hibernation.enabled).then_some(guard);
         let client = match tokio::time::timeout(self.upgrade_wait, client).await {
             Ok(Ok(u)) => TokioIo::new(u),
             _ => {
@@ -2109,13 +2126,6 @@ impl WsTunnel {
 
         let idle_ms = self.idle_timeout.as_millis() as u64;
         let max_at = tokio::time::Instant::now() + self.max_duration;
-        // Hibernation-enabled sessions must not pin the tenant resident for
-        // their whole lifetime; idle activity is tracked separately.
-        let mut guard = if self.hibernation.enabled {
-            None
-        } else {
-            Some(guard)
-        };
         let reason = 'session: loop {
             let up = match upstream.as_mut() {
                 Some(up) => up,
@@ -2128,11 +2138,22 @@ impl WsTunnel {
                 },
                 _ = wait_idle(started, last_ms.clone(), idle_ms) => "idle_timeout",
                 _ = tokio::time::sleep_until(max_at) => "max_duration",
+                // Stop relaying BEFORE workerd closes the upstream: once
+                // `copy_bidirectional` observes that EOF it also shuts down
+                // the client's write half, which would strand a socket we
+                // want to keep across hibernation.
+                _ = wait_sleeping(&self.runtime) => "hibernating",
             };
             let asleep = self.runtime.state().is_asleep()
                 || self.runtime.state() == crate::state::TenantState::Hibernating;
-            if reason == "idle_timeout" || reason == "max_duration" || !self.hibernation.enabled
-                || !asleep || self.reconnect.is_none()
+            // Hibernation stops workerd underneath the tunnel, so the relay
+            // usually ends with `closed`/`error` rather than the idle timer.
+            // When the tenant is asleep and can be reconnected, keep the
+            // client session and wait for its next frame instead of closing.
+            if reason == "max_duration"
+                || !self.hibernation.enabled
+                || !asleep
+                || self.reconnect.is_none()
             {
                 break reason;
             }
