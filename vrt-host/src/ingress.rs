@@ -2085,17 +2085,7 @@ impl WsTunnel {
         // the moment the upstream 101 is relayed. Release the in-flight guard
         // BEFORE awaiting the upgraded halves: the server has already answered
         // the request, and a slow upgrade future must not block sleep.
-        let mut guard = if self.hibernation.enabled {
-            None
-        } else {
-            Some(guard)
-        };
-        tracing::info!(
-            worker = %w,
-            hibernation = self.hibernation.enabled,
-            guard_held = guard.is_some(),
-            "ws tunnel start"
-        );
+        let mut guard = (!self.hibernation.enabled).then_some(guard);
         let client = match tokio::time::timeout(self.upgrade_wait, client).await {
             Ok(Ok(u)) => TokioIo::new(u),
             _ => {

@@ -7163,21 +7163,6 @@ impl Actor {
             && !self.runtime.switch_gate.active()
             && self.do_wait_since.is_none();
         if !eligible {
-            tracing::info!(
-                tenant = %self.tenant_id,
-                state = ?self.state,
-                active = self.active.is_some(),
-                hib = self.hib.is_some(),
-                wake = self.wake_run.is_some(),
-                pending = self.pending.is_some(),
-                preflight = self.preflight.is_some(),
-                prewarm = self.prewarm.is_some(),
-                draining = self.draining.len(),
-                retry = self.retry_at.is_some(),
-                switch = self.runtime.switch_gate.active(),
-                do_wait = self.do_wait_since.is_some(),
-                "idle eval: not eligible"
-            );
             self.hib_next_eval = now + s2z.blocked_recheck;
             return;
         }
@@ -7189,7 +7174,6 @@ impl Actor {
             // In-flight work IS activity (approximation: completion
             // time is not tracked, so every evaluation touches).
             self.runtime.touch();
-            tracing::info!(tenant = %self.tenant_id, in_flight, "idle eval: in flight");
         }
         let inputs = IdleInputs {
             now,
@@ -7210,12 +7194,6 @@ impl Actor {
                     wait_until: WaitUntilFact::NotProbed,
                 };
                 if let Some(reason) = s2z.blockers.first_block(BlockPhase::Admission, &ctx) {
-                    tracing::info!(
-                        tenant = %self.tenant_id,
-                        ?reason,
-                        in_flight,
-                        "idle eval: blocker"
-                    );
                     self.record_hibernate_blocked(reason);
                     self.hib_next_eval = now
                         + if reason.is_structural() {
