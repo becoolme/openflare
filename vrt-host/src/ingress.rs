@@ -2081,6 +2081,15 @@ impl WsTunnel {
         use hyper_util::rt::TokioIo;
         let reg = crate::metrics::registry();
         let w = self.worker_id.as_str();
+        // A hibernation-enabled session must not pin the tenant resident from
+        // the moment the upstream 101 is relayed. Release the in-flight guard
+        // BEFORE awaiting the upgraded halves: the server has already answered
+        // the request, and a slow upgrade future must not block sleep.
+        let mut guard = if self.hibernation.enabled {
+            None
+        } else {
+            Some(guard)
+        };
         let client = match tokio::time::timeout(self.upgrade_wait, client).await {
             Ok(Ok(u)) => TokioIo::new(u),
             _ => {
@@ -2109,13 +2118,6 @@ impl WsTunnel {
 
         let idle_ms = self.idle_timeout.as_millis() as u64;
         let max_at = tokio::time::Instant::now() + self.max_duration;
-        // Hibernation-enabled sessions must not pin the tenant resident for
-        // their whole lifetime; idle activity is tracked separately.
-        let mut guard = if self.hibernation.enabled {
-            None
-        } else {
-            Some(guard)
-        };
         let reason = 'session: loop {
             let up = match upstream.as_mut() {
                 Some(up) => up,
