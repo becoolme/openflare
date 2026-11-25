@@ -1,0 +1,32 @@
+# Example external notification config for the standalone monitoring
+# profile. Copy outside the repository (or into an operator overlay),
+# fill the URL, then point the compose stack at it:
+#
+#   ALERTMANAGER_CONFIG=/etc/openflare/alertmanager.yml \
+#     docker compose --profile monitoring up -d
+#
+# Do NOT commit a real webhook URL or credentials.
+route:
+  receiver: openflare-webhook
+  group_by: [alertname, cell_id]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+
+receivers:
+  - name: openflare-webhook
+    webhook_configs:
+      - url: https://alerts.example.com/openflare
+        send_resolved: true
+        max_alerts: 0
+
+# Common alternatives:
+#
+#   slack_configs:
+#     - api_url: https://hooks.slack.com/services/REPLACE/ME
+#       channel: '#openflare-alerts'
+#       send_resolved: true
+#
+#   pagerduty_configs:
+#     - routing_key: REPLACE_ME
+#       send_resolved: true

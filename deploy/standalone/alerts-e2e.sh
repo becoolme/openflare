@@ -17,6 +17,17 @@ export ALERTMANAGER_BIND=127.0.0.1 ALERTMANAGER_PORT="${ALERTMANAGER_PORT:-19093
 cleanup() { "${DC[@]}" down -v --remove-orphans >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
+echo "== external notifier/config overrides resolve"
+export VMALERT_NOTIFIER_URL=http://am.example:9093
+export VMALERT_DATASOURCE_URL=http://vm.example:8428
+export ALERTMANAGER_CONFIG=./monitoring/alertmanager.webhook.example.yml
+rendered="$("${DC[@]}" --profile monitoring config)"
+unset VMALERT_NOTIFIER_URL VMALERT_DATASOURCE_URL ALERTMANAGER_CONFIG
+grep -q 'am.example:9093' <<<"$rendered" || {
+  echo "VMALERT_NOTIFIER_URL not rendered" >&2
+  exit 1
+}
+
 echo "== promtool: validate deploy/alerts/openflare-runtime.yaml"
 docker run --rm --entrypoint promtool \
   -v "$ROOT/deploy/alerts:/rules:ro" prom/prometheus:v3.2.1 \

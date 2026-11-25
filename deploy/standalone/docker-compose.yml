@@ -246,7 +246,7 @@ services:
       - --storage.path=/alertmanager
       - --web.listen-address=0.0.0.0:9093
     volumes:
-      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - ${ALERTMANAGER_CONFIG:-./monitoring/alertmanager.yml}:/etc/alertmanager/alertmanager.yml:ro
       - alertmanager-data:/alertmanager
     ports:
       - "${ALERTMANAGER_BIND:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093"
@@ -260,10 +260,10 @@ services:
     restart: unless-stopped
     command:
       - -rule=/etc/vmalert/openflare-runtime.yaml
-      - -datasource.url=http://victoria-metrics:8428
-      - -remoteRead.url=http://victoria-metrics:8428
-      - -remoteWrite.url=http://victoria-metrics:8428
-      - -notifier.url=http://alertmanager:9093
+      - -datasource.url=${VMALERT_DATASOURCE_URL:-http://victoria-metrics:8428}
+      - -remoteRead.url=${VMALERT_DATASOURCE_URL:-http://victoria-metrics:8428}
+      - -remoteWrite.url=${VMALERT_REMOTE_WRITE_URL:-http://victoria-metrics:8428}
+      - -notifier.url=${VMALERT_NOTIFIER_URL:-http://alertmanager:9093}
       - -evaluationInterval=30s
       - -httpListenAddr=0.0.0.0:8880
     volumes:
