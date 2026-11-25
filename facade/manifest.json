@@ -534,8 +534,8 @@
           "name": "facade/facade-images.js",
           "dist": "facade/dist/facade/facade-images.js",
           "source": "facade/facade-images.ts",
-          "sourceSha256": "5df2736096d63b7383cf0467fbaed8cb8391ea4bc61839592979ea42fbb7aba0",
-          "sha256": "1b3ef36b70634426f9198a34381caa60e34248e176cb377f2a066660126e11f0"
+          "sourceSha256": "24c5c377c8e9791f9fc77a2f6887eb8ebdeeb5903ee5b5ed3b5725ea21e8481d",
+          "sha256": "ba8bb3d0db40c543fca7e60ac7e230c8584c2c05c8023d227987a76c9b751aa3"
         },
         {
           "name": "facade/images-decode.js",
@@ -550,6 +550,13 @@
           "source": "facade/images-engine.ts",
           "sourceSha256": "54c7697155bf30c4f85718ee4e307ad9e3414ce66ecc479a6a767c693163c277",
           "sha256": "2d9afc9330930e841172a4e90e428d6b3e9a35358709bc8c1e038e0df9b2a596"
+        },
+        {
+          "name": "facade/images-metadata.js",
+          "dist": "facade/dist/facade/images-metadata.js",
+          "source": "facade/images-metadata.ts",
+          "sourceSha256": "1eea40641872cbe6422d5eff2fd7a47720d779199f236e0d0203b02a6179d275",
+          "sha256": "660a826bc2471eb40958631cb981e65d45c27e6fb9956a119fbed929c21776dc"
         },
         {
           "name": "facade/images-transform.js",
@@ -871,8 +878,8 @@
           "name": "facade/egress/cf-image.js",
           "dist": "facade/dist/facade/egress/cf-image.js",
           "source": "facade/egress/cf-image.ts",
-          "sourceSha256": "e90a46c5cc6901c66d640b538628801bcf68981017ad0f3437b8ecf50657aa61",
-          "sha256": "53e822f938f6a9801a33e2f928ed0b7a66fe4072a2e8259f9e154489452c40e3"
+          "sourceSha256": "a268c4bc784d7490c9b9765157622f71d05741b19e33a70f23ab156f0c3a2b01",
+          "sha256": "42426c2d2c18a19a8cf5c8aab3e182118a05689d88f6bed8f4e386856439596d"
         },
         {
           "name": "facade/egress/egress.js",

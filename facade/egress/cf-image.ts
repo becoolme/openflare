@@ -155,9 +155,11 @@ export function cfImagePlan(request: Request): CfImagePlan | undefined {
     outputQuality = num("quality", 1, 100);
   }
   const anim = o.anim === true;
+  // Absent → null (facade defaults to `copyright`, matching upstream);
+  // `none` must reach the wire explicitly or it would be ignored.
   const metadata =
-    o.metadata === undefined || o.metadata === "none" ? null
-    : o.metadata === "keep" || o.metadata === "copyright" ? o.metadata as string
+    o.metadata === undefined ? null
+    : o.metadata === "none" || o.metadata === "keep" || o.metadata === "copyright" ? o.metadata as string
     : (() => { throw new TypeError("cf.image: invalid metadata"); })();
   return {
     transforms: JSON.stringify([op]),
@@ -180,6 +182,7 @@ export function cfImageBody(src: Uint8Array, plan: CfImagePlan): FormData {
   fd.append("output_format", plan.outputFormat ?? "image/jpeg");
   if (plan.outputQuality !== undefined) fd.append("output_quality", String(plan.outputQuality));
   if (plan.anim) fd.append("anim", "true");
+  if (plan.metadata !== null) fd.append("metadata", plan.metadata);
   return fd;
 }
 
