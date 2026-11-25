@@ -2090,6 +2090,12 @@ impl WsTunnel {
         } else {
             Some(guard)
         };
+        tracing::info!(
+            worker = %w,
+            hibernation = self.hibernation.enabled,
+            guard_held = guard.is_some(),
+            "ws tunnel start"
+        );
         let client = match tokio::time::timeout(self.upgrade_wait, client).await {
             Ok(Ok(u)) => TokioIo::new(u),
             _ => {

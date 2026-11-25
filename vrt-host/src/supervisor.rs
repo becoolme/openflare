@@ -7189,6 +7189,7 @@ impl Actor {
             // In-flight work IS activity (approximation: completion
             // time is not tracked, so every evaluation touches).
             self.runtime.touch();
+            tracing::info!(tenant = %self.tenant_id, in_flight, "idle eval: in flight");
         }
         let inputs = IdleInputs {
             now,
