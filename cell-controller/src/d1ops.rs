@@ -873,7 +873,7 @@ fn promote_payload(payload: &serde_json::Value) -> Result<serde_json::Value, Str
     for key in obj.keys() {
         if !matches!(
             key.as_str(),
-            "expectedEpoch" | "expectedLsn" | "generation" | "reason"
+            "expectedEpoch" | "expectedLsn" | "generation" | "writerAddr" | "reason"
         ) {
             return Err(format!("promote payload key '{key}' unknown"));
         }
@@ -1613,6 +1613,11 @@ mod tests {
         .unwrap();
         assert_eq!(ok["expectedEpoch"], 2);
         assert!(ok.get("reason").is_none(), "audit reason is not forwarded");
+        let with_addr = promote_payload(&serde_json::json!({
+            "writerAddr": "http://vrt-sql-writer-1:8082"
+        }))
+        .unwrap();
+        assert!(with_addr.get("writerAddr").is_none(), "writerAddr is audit/routing data for the control plane");
         assert!(promote_payload(&serde_json::json!({"expectedEpoch": 2})).is_err());
         assert!(promote_payload(&serde_json::json!({"cmd": "rm"})).is_err());
         assert!(promote_payload(&serde_json::json!({
