@@ -30,30 +30,50 @@ const OPT_KEYS = new Set([
     "zoom"
 ]);
 const SRC_MAX = 64 * 1024 * 1024;
-export function cfImagePlan(request) {
-    const cf = request.cf;
-    if (cf === undefined || cf === null || typeof cf !== "object") return undefined;
-    const image = cf.image;
-    if (image === undefined || image === null) return undefined;
-    if (typeof image !== "object") {
-        throw new TypeError("cf.image must be an object");
-    }
-    const o = image;
-    for (const k of Object.keys(o)){
-        if (!OPT_KEYS.has(k)) throw new TypeError(`cf.image: unknown option ${k}`);
-    }
-    for (const k of [
-        "draw",
-        "image",
-        "origin-auth",
-        "slow-connection-quality"
-    ]){
-        if (o[k] !== undefined) {
-            throw new TypeError(`cf.image: ${k} is not supported`);
-        }
-    }
+const MAX_DRAW = 16;
+const DRAW_ENTRY_KEYS = new Set([
+    "url",
+    "text",
+    "font",
+    "color",
+    "size",
+    "top",
+    "left",
+    "bottom",
+    "right",
+    "opacity",
+    "repeat",
+    "composite",
+    "width",
+    "height",
+    "fit",
+    "gravity",
+    "rotate",
+    "blur",
+    "background",
+    "brightness",
+    "contrast",
+    "gamma",
+    "saturation",
+    "flip",
+    "sharpen",
+    "trim",
+    "border",
+    "padding",
+    "zoom",
+    "segment"
+]);
+const COMPOSITES = new Set([
+    "over",
+    "in",
+    "atop",
+    "out",
+    "xor",
+    "lighter"
+]);
+function transformOp(src, dpr, percentDims) {
     const num = (k, min, max)=>{
-        const v = o[k];
+        const v = src[k];
         if (v === undefined) return undefined;
         if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
             throw new TypeError(`cf.image: invalid ${k}`);
@@ -61,13 +81,27 @@ export function cfImagePlan(request) {
         return v;
     };
     const op = {};
-    const dpr = num("dpr", 0.1, 2) ?? 1;
-    const w = num("width", 1, 16384);
-    const h = num("height", 1, 16384);
-    if (w !== undefined) op.width = Math.max(1, Math.round(w * dpr));
-    if (h !== undefined) op.height = Math.max(1, Math.round(h * dpr));
-    if (o.fit !== undefined) {
-        const f = o.fit;
+    const dim = (k)=>{
+        const v = src[k];
+        if (v === undefined) return undefined;
+        if (percentDims && typeof v === "string" && v.endsWith("p")) {
+            const n = Number(v.slice(0, -1));
+            if (v.length < 2 || !Number.isFinite(n) || n <= 0) {
+                throw new TypeError(`cf.image: invalid ${k}`);
+            }
+            return v;
+        }
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 1 || v > 16384) {
+            throw new TypeError(`cf.image: invalid ${k}`);
+        }
+        return Math.max(1, Math.round(v * dpr));
+    };
+    const w = dim("width");
+    const h = dim("height");
+    if (w !== undefined) op.width = w;
+    if (h !== undefined) op.height = h;
+    if (src.fit !== undefined) {
+        const f = src.fit;
         if (typeof f === "string") {
             op.fit = f;
         } else if (typeof f === "object" && f !== null && !Array.isArray(f)) {
@@ -81,14 +115,14 @@ export function cfImagePlan(request) {
             throw new TypeError("cf.image: invalid fit");
         }
     }
-    if (o.flip !== undefined) {
-        if (o.flip !== "h" && o.flip !== "v" && o.flip !== "hv") {
+    if (src.flip !== undefined) {
+        if (src.flip !== "h" && src.flip !== "v" && src.flip !== "hv") {
             throw new TypeError("cf.image: invalid flip");
         }
-        op.flip = o.flip;
+        op.flip = src.flip;
     }
-    if (o.gravity !== undefined) {
-        const g = o.gravity;
+    if (src.gravity !== undefined) {
+        const g = src.gravity;
         if (typeof g === "string") {
             op.gravity = g;
         } else if (typeof g === "object" && g !== null && typeof g.x === "number" && typeof g.y === "number") {
@@ -102,7 +136,7 @@ export function cfImagePlan(request) {
             throw new TypeError("cf.image: invalid gravity");
         }
     }
-    if (o.rotate !== undefined) {
+    if (src.rotate !== undefined) {
         const r = num("rotate", 0, 360);
         if (![
             0,
@@ -112,9 +146,9 @@ export function cfImagePlan(request) {
         ].includes(r)) throw new TypeError("cf.image: invalid rotate");
         op.rotate = r;
     }
-    if (o.blur !== undefined) op.blur = num("blur", 1, 250);
-    if (o.sharpen !== undefined) {
-        const s = o.sharpen;
+    if (src.blur !== undefined) op.blur = num("blur", 1, 250);
+    if (src.sharpen !== undefined) {
+        const s = src.sharpen;
         if (typeof s === "number") {
             op.sharpen = num("sharpen", 0, 10);
         } else if (typeof s === "object" && s !== null && !Array.isArray(s)) {
@@ -159,20 +193,20 @@ export function cfImagePlan(request) {
             throw new TypeError("cf.image: invalid sharpen");
         }
     }
-    if (o.brightness !== undefined) op.brightness = num("brightness", 0, 3);
-    if (o.contrast !== undefined) op.contrast = num("contrast", 0, 3);
-    if (o.gamma !== undefined) op.gamma = num("gamma", 0.01, 10);
-    if (o.saturation !== undefined) op.saturation = num("saturation", 0, 3);
-    if (o.zoom !== undefined) op.zoom = num("zoom", 0.1, 8);
-    if (o.background !== undefined) {
-        if (typeof o.background !== "string" || o.background.length > 64) {
+    if (src.brightness !== undefined) op.brightness = num("brightness", 0, 3);
+    if (src.contrast !== undefined) op.contrast = num("contrast", 0, 3);
+    if (src.gamma !== undefined) op.gamma = num("gamma", 0.01, 10);
+    if (src.saturation !== undefined) op.saturation = num("saturation", 0, 3);
+    if (src.zoom !== undefined) op.zoom = num("zoom", 0.1, 8);
+    if (src.background !== undefined) {
+        if (typeof src.background !== "string" || src.background.length > 64) {
             throw new TypeError("cf.image: invalid background");
         }
-        op.background = o.background;
+        op.background = src.background;
     }
-    if (o.segment !== undefined) op.segment = o.segment;
-    if (o.trim !== undefined) {
-        const t = o.trim;
+    if (src.segment !== undefined) op.segment = src.segment;
+    if (src.trim !== undefined) {
+        const t = src.trim;
         const trimNum = (v, key)=>{
             if (typeof v === "string" && v.endsWith("p")) {
                 const n = Number(v.slice(0, -1));
@@ -281,9 +315,9 @@ export function cfImagePlan(request) {
         "border",
         "padding"
     ]){
-        if (o[k] !== undefined) {
-            const v = o[k];
-            const color = k === "padding" ? typeof o.background === "string" ? o.background : "rgba(0,0,0,0)" : undefined;
+        if (src[k] !== undefined) {
+            const v = src[k];
+            const color = k === "padding" ? typeof src.background === "string" ? src.background : "rgba(0,0,0,0)" : undefined;
             if (typeof v === "number") {
                 if (!Number.isFinite(v) || v < 0) throw new TypeError(`cf.image: invalid ${k}`);
                 op.border = {
@@ -326,6 +360,39 @@ export function cfImagePlan(request) {
             }
         }
     }
+    return op;
+}
+export function cfImagePlan(request) {
+    const cf = request.cf;
+    if (cf === undefined || cf === null || typeof cf !== "object") return undefined;
+    const image = cf.image;
+    if (image === undefined || image === null) return undefined;
+    if (typeof image !== "object") {
+        throw new TypeError("cf.image must be an object");
+    }
+    const o = image;
+    for (const k of Object.keys(o)){
+        if (!OPT_KEYS.has(k)) throw new TypeError(`cf.image: unknown option ${k}`);
+    }
+    for (const k of [
+        "image",
+        "origin-auth",
+        "slow-connection-quality"
+    ]){
+        if (o[k] !== undefined) {
+            throw new TypeError(`cf.image: ${k} is not supported`);
+        }
+    }
+    const num = (k, min, max)=>{
+        const v = o[k];
+        if (v === undefined) return undefined;
+        if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max) {
+            throw new TypeError(`cf.image: invalid ${k}`);
+        }
+        return v;
+    };
+    const dpr = num("dpr", 0.1, 2) ?? 1;
+    const op = transformOp(o, dpr, false);
     if (o.compression !== undefined && o.compression !== "fast") {
         throw new TypeError("cf.image: invalid compression");
     }
@@ -380,10 +447,105 @@ export function cfImagePlan(request) {
     const metadata = o.metadata === undefined ? null : o.metadata === "none" || o.metadata === "keep" || o.metadata === "copyright" ? o.metadata : (()=>{
         throw new TypeError("cf.image: invalid metadata");
     })();
+    const draws = [];
+    const ops = [
+        op
+    ];
+    if (o.draw !== undefined) {
+        if (!Array.isArray(o.draw)) throw new TypeError("cf.image: draw must be an array");
+        if (o.draw.length > MAX_DRAW) throw new TypeError("cf.image: too many draw entries");
+        for(let i = 0; i < o.draw.length; i++){
+            const e = o.draw[i];
+            if (typeof e !== "object" || e === null || Array.isArray(e)) {
+                throw new TypeError(`cf.image: invalid draw entry`);
+            }
+            for (const k of Object.keys(e)){
+                if (!DRAW_ENTRY_KEYS.has(k)) {
+                    throw new TypeError(`cf.image: unknown draw option ${k}`);
+                }
+            }
+            const entry = e;
+            if (entry.text !== undefined) {
+                throw new TypeError("cf.image: draw text is not supported");
+            }
+            for (const k of [
+                "font",
+                "color",
+                "size"
+            ]){
+                if (entry[k] !== undefined) {
+                    throw new TypeError(`cf.image: draw.${k} applies to text overlays`);
+                }
+            }
+            if (typeof entry.url !== "string" || entry.url === "") {
+                throw new TypeError("cf.image: invalid draw.url");
+            }
+            let proto;
+            try {
+                proto = new URL(entry.url).protocol;
+            } catch  {
+                throw new TypeError("cf.image: invalid draw.url");
+            }
+            if (proto !== "http:" && proto !== "https:") {
+                throw new TypeError("cf.image: invalid draw.url");
+            }
+            const drawOp = {
+                drawImageIndex: i + 1,
+                targetImageIndex: 0
+            };
+            for (const k of [
+                "top",
+                "left",
+                "bottom",
+                "right"
+            ]){
+                const v = entry[k];
+                if (v === undefined) continue;
+                if (typeof v !== "number" || !Number.isFinite(v)) {
+                    throw new TypeError(`cf.image: invalid draw.${k}`);
+                }
+                drawOp[k] = Math.round(v * dpr);
+            }
+            if (entry.left !== undefined && entry.right !== undefined) {
+                throw new TypeError("cf.image: draw left+right conflict");
+            }
+            if (entry.top !== undefined && entry.bottom !== undefined) {
+                throw new TypeError("cf.image: draw top+bottom conflict");
+            }
+            if (entry.opacity !== undefined) {
+                const v = entry.opacity;
+                if (typeof v !== "number" || !Number.isFinite(v) || v < 0 || v > 1) {
+                    throw new TypeError("cf.image: invalid draw.opacity");
+                }
+                drawOp.opacity = v;
+            }
+            if (entry.repeat !== undefined) {
+                const v = entry.repeat;
+                if (v !== true && v !== "x" && v !== "y") {
+                    throw new TypeError("cf.image: invalid draw.repeat");
+                }
+                drawOp.repeat = v;
+            }
+            if (entry.composite !== undefined) {
+                const v = entry.composite;
+                if (typeof v !== "string" || !COMPOSITES.has(v)) {
+                    throw new TypeError("cf.image: invalid draw.composite");
+                }
+                drawOp.composite = v;
+            }
+            const overOp = transformOp(entry, dpr, true);
+            if (Object.keys(overOp).length > 0) {
+                overOp.imageIndex = i + 1;
+                overOp.percentBasis = 0;
+                ops.push(overOp);
+            }
+            ops.push(drawOp);
+            draws.push(entry.url);
+        }
+    }
     return {
-        transforms: JSON.stringify([
-            op
-        ]),
+        transforms: JSON.stringify(ops),
+        draws,
         outputFormat,
         outputQuality,
         anim,
@@ -392,7 +554,7 @@ export function cfImagePlan(request) {
         onerrorRedirect: o.onerror === "redirect"
     };
 }
-export function cfImageBody(src, plan) {
+export function cfImageBody(src, plan, overlays = []) {
     const fd = new FormData();
     fd.append("image", new Blob([
         src
@@ -402,6 +564,11 @@ export function cfImageBody(src, plan) {
     if (plan.outputQuality !== undefined) fd.append("output_quality", String(plan.outputQuality));
     if (plan.anim) fd.append("anim", "true");
     if (plan.metadata !== null) fd.append("metadata", plan.metadata);
+    for (const over of overlays){
+        fd.append("draw_image", new Blob([
+            over
+        ]), "overlay");
+    }
     return fd;
 }
 export { SRC_MAX };

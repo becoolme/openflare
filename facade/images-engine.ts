@@ -649,15 +649,24 @@ export function composite(
   }
 }
 
-/** Composite with tiling for `repeat` ('x' | 'y' | 'xy' | true). */
+/** Composite with tiling for `repeat` ('x' | 'y' | 'xy' | true).
+ * No position keys centers the overlay on the base (upstream default). */
 export function drawImage(
   base: ImageDataLike,
   over: ImageDataLike,
   { top, left, bottom, right, opacity = 1, repeat, composite: mode = "over" }:
     { top?: number; left?: number; bottom?: number; right?: number; opacity?: number; repeat?: boolean | string; composite?: CompositeMode },
 ): ImageDataLike {
-  const dx = left !== undefined ? Math.round(left) : right !== undefined ? base.width - over.width - Math.round(right) : 0;
-  const dy = top !== undefined ? Math.round(top) : bottom !== undefined ? base.height - over.height - Math.round(bottom) : 0;
+  const dx = left !== undefined
+    ? Math.round(left)
+    : right !== undefined
+      ? base.width - over.width - Math.round(right)
+      : Math.round((base.width - over.width) / 2);
+  const dy = top !== undefined
+    ? Math.round(top)
+    : bottom !== undefined
+      ? base.height - over.height - Math.round(bottom)
+      : Math.round((base.height - over.height) / 2);
   const repX = repeat === true || repeat === "x" || repeat === "xy";
   const repY = repeat === true || repeat === "y" || repeat === "xy";
   if (!repX && !repY) {

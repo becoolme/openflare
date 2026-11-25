@@ -201,8 +201,12 @@ const r = await fetch("https://cdn.example.com/cat.png", {
   failure for a 302 to the original URL. Malformed options (unknown
   key, out-of-range value) reject `fetch()` with `TypeError`, matching
   CF's invalid-option behavior.
-- `draw`, `image`, `origin-auth` and `slow-connection-quality` are
-  recognized but unsupported → `TypeError` (fail closed).
+- `draw` accepts up to 16 entries (`{url, top/left/bottom/right,
+  opacity, repeat, composite}` plus per-overlay transform options);
+  overlay URLs are fetched through the same egress policy as the
+  source and ride `draw_image` multipart fields into the engine.
+  `image`, `origin-auth` and `slow-connection-quality` are recognized
+  but unsupported → `TypeError` (fail closed).
 - The upstream fetch still runs through the egress policy, so
   `cf.image` can only transform origins the tenant was already allowed
   to fetch — it grants no new network reach.
@@ -259,10 +263,17 @@ resource-identifying keys besides `binding`.
   `image/avif` (single-threaded encoder, speed 6), plus the wire
   `rgb`/`rgba` raw frames. `image/gif` output has no vendored encoder
   → `err=9401`.
-- **Draw coverage**: `draw_image` overlays (alpha compositing,
+- **Draw coverage**: `draw_image` overlays work on all three entry
+  points — the binding shim's `draw()`, `cf.image.draw[]` URL
+  entries, and `/cdn-cgi/` `draw=((k=v,...))` groups — with alpha
+  compositing (Porter–Duff `over`/`in`/`atop`/`out`/`xor`/`lighter`),
   `repeat` tiling, `top`/`left`/`bottom`/`right`/`width`/`height`/
-  `opacity`) work; `draw_text`/`text_input` rasterization is not
-  implemented → `err=9401`.
+  `opacity`, centered placement when no edge is anchored, and
+  per-overlay transform ops (fit/gravity/blur/rotate/…) including
+  `"Np"` percent-of-base dimensions. `/cdn-cgi/` draw URLs stay
+  same-origin like the source; `cf.image` draw URLs go through the
+  egress policy. `draw_text`/`text_input` rasterization is not
+  implemented → `err=9401` / `TypeError`.
 - **Gravity**: named gravity (`top`/`left`/`center`/…/`auto`) and
   `{x,y}` coordinate gravity work; face/entropy segment gravity
   (`gravity: "auto"` uses entropy-centre, not CF's ML saliency) is an
@@ -279,10 +290,10 @@ resource-identifying keys besides `binding`.
   paths (`none`/`copyright`/`keep`, upstream default `copyright`) —
   see `facade/images-metadata.ts` for the container surgery; AVIF
   writes EXIF only, GIF output / HEIC-TIFF sources have no
-  encoder/decoder. `draw`/`image`/`origin-auth` reject with
-  `TypeError`; `cf.image.slow-connection-quality` is unsupported
-  (upstream gates it to the URL interface anyway) and URL `draw=`
-  overlay fetch + `format=json` are not implemented.
+  encoder/decoder. `image`/`origin-auth` reject with `TypeError`;
+  `cf.image.slow-connection-quality` is unsupported (upstream gates
+  it to the URL interface anyway) and URL `format=json` is not
+  implemented.
 - **Perceptual quality tiers** (`low`/`medium-low`/`medium-high`/
   `high`) map to 40/60/80/90 — upstream publishes no integer mapping;
   the anchors match other CF-compat implementations.
@@ -296,8 +307,9 @@ resource-identifying keys besides `binding`.
 - `vrt-host/src/cdn_cgi.rs` — `/cdn-cgi/image/` ingress interception:
   option→transform JSON mapping (structured groups, percent-decoding,
   client-hints quality/width, dpr scaling), same-origin source
-  resolution, svg-hush sanitize pass-through for SVG sources, facade
-  socket fan-out, `ERROR <code>` shaping (18 unit tests).
+  resolution, `draw=((k=v,...))` group parsing with same-origin
+  overlay fetch, svg-hush sanitize pass-through for SVG sources,
+  facade socket fan-out, `ERROR <code>` shaping (23 unit tests).
 - `facade/svg-hush.ts` — TypeScript port of upstream's svg-hush for the
   `cf.image` egress path (the `/cdn-cgi/` path uses the crate itself):
   allowlisted elements/attributes, xlink→href, same-origin URL

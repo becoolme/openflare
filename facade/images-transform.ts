@@ -539,6 +539,9 @@ function applyDraw(frames: ImageDataLike[], op: Record<string, unknown>): void {
   const targetIdx = num(op.targetImageIndex, "targetImageIndex", { min: 0, int: true });
   if (drawIdx === undefined || targetIdx === undefined) bad("draw indices");
   if (drawIdx >= frames.length || targetIdx >= frames.length) bad("draw index out of range");
+  // Upstream errors when an axis carries both edge offsets.
+  if (op.left !== undefined && op.right !== undefined) bad("draw left+right");
+  if (op.top !== undefined && op.bottom !== undefined) bad("draw top+bottom");
   const mode = op.composite ?? "over";
   if (typeof mode !== "string" || !COMPOSITES.has(mode)) bad("composite");
   const opacity = num(op.opacity, "opacity", { min: 0, max: 1 }) ?? 1;
@@ -577,6 +580,23 @@ export async function applyTransforms(frames: ImageDataLike[], ops: unknown[]): 
     } else {
       const idx = num(op.imageIndex, "imageIndex", { min: 0, int: true }) ?? 0;
       if (idx >= frames.length) bad("imageIndex out of range");
+      // Draw-entry `"Np"` dims are relative to the BASE canvas
+      // (upstream `width:"25p"` = 25% of the base axis), not the
+      // overlay's own axis like trim percents — resolve them against
+      // frames[percentBasis] before the op runs.
+      if (op.percentBasis !== undefined) {
+        const basis = num(op.percentBasis, "percentBasis", { min: 0, int: true });
+        if (basis === undefined || basis >= frames.length) bad("percentBasis out of range");
+        for (const dim of ["width", "height"] as const) {
+          const v = op[dim];
+          if (typeof v === "string" && v.endsWith("p")) {
+            const n = Number(v.slice(0, -1));
+            if (!Number.isFinite(n) || n <= 0 || v.length < 2) bad(`draw ${dim} percent`);
+            op[dim] = Math.max(1, Math.round((n / 100) * frames[basis][dim]));
+          }
+        }
+        delete op.percentBasis;
+      }
       frames[idx] = await applyTransform(frames[idx], op);
     }
   }
