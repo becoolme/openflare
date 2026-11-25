@@ -2218,16 +2218,19 @@ fn emit_email_binding(
 
 /// `images` — `wrapped` binding over `cloudflare-internal:images-api`
 /// (the upstream Miniflare module name); the inner `fetcher` points at
-/// the facade-images system worker, which runs the vendored WASM
-/// engine in-worker — no provider hop, no signed props needed (the
-/// facade holds no secrets and transforms only its input bytes).
+/// the egress worker, which relays `js.images.cloudflare.com` posts to
+/// facade-images — for `/transform` it resolves text-source `font.url`
+/// into `text_font`/`draw_font` bytes under the egress policy first
+/// (the facade is deny-routed and cannot fetch; the upstream service
+/// resolved font URLs service-side too). Non-transform posts pass
+/// through raw.
 fn emit_images_binding(
     out: &mut String,
     img: &snapshot_protocol::compute_desired::ImagesBinding,
     _worker: &WorkerDesired,
     input: &TenantRenderInput<'_>,
 ) -> Result<(), ConfigError> {
-    let facade = &input.params.facades.images;
+    let egress = &input.params.egress;
     out.push_str(&format!(
         "        (name = {}, wrapped = (moduleName = {}, innerBindings = [
             (name = \"fetcher\", service = (name = {}, entrypoint = {}))
@@ -2235,8 +2238,8 @@ fn emit_images_binding(
 ",
         capnp_text(&img.name),
         capnp_text("cloudflare-internal:images-api"),
-        capnp_text(&facade.service),
-        capnp_text(&facade.entrypoint),
+        capnp_text(&egress.service),
+        capnp_text(&egress.entrypoint),
     ));
     Ok(())
 }

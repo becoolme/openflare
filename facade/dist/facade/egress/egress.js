@@ -3,6 +3,7 @@ import { connect as upstreamConnect } from "cloudflare:sockets";
 import { evaluateTarget, evaluateTcpTarget, parseEgressPolicy } from "./policy.js";
 import { classifyUpstreamError, closeQuietly, DENIED_HEADER, ERROR_HEADER, logTcpClose, logTcpDeny, logUpstreamError, POLICY_BINDING, stripInternalHeaders, tcpDenied, upstreamFetchError } from "./shared.js";
 import { cfImageBody, cfImagePlan, SRC_MAX } from "./cf-image.js";
+import { IMAGES_BINDING_HOST, relayImagesBinding } from "./images-binding.js";
 import { sniffImage, sniffSvg } from "../images-wire.js";
 import { hushFilter, HushError } from "../svg-hush.js";
 function denied(code, detail) {
@@ -132,6 +133,13 @@ export class EgressProxy extends WorkerEntrypoint {
         this.#policy = parseEgressPolicy(raw);
     }
     async fetch(request) {
+        let bindingHost = "";
+        try {
+            bindingHost = new URL(request.url).hostname;
+        } catch  {}
+        if (bindingHost === IMAGES_BINDING_HOST) {
+            return this.#imagesBinding(request);
+        }
         const decision = evaluateTarget(request.url, this.#policy);
         if (!decision.allow) return denied(decision.code, decision.detail);
         let upstream;
@@ -171,6 +179,19 @@ export class EgressProxy extends WorkerEntrypoint {
             statusText: upstream.statusText,
             headers: stripInternalHeaders(upstream.headers)
         });
+    }
+    async #imagesBinding(request) {
+        const svc = this.#env?.["VRT_IMAGES"];
+        if (svc === undefined || typeof svc.fetch !== "function") {
+            return new Response("ERROR 9523\n", {
+                status: 500,
+                headers: {
+                    "content-type": "text/plain",
+                    "cf-images-binding": "err=9523"
+                }
+            });
+        }
+        return relayImagesBinding(request, svc, this.#policy);
     }
     async #transformImage(request, upstream, plan) {
         const url = new URL(request.url);

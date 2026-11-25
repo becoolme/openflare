@@ -1418,8 +1418,9 @@ fn worker_loader_binding_renders_native_loader() {
 
 /// `images` renders a `wrapped` binding over the upstream Miniflare
 /// module name `cloudflare-internal:images-api`, whose inner `fetcher`
-/// reaches the facade-images system worker — the transform engine is
-/// vendored WASM in-worker, so no provider socket is wired.
+/// reaches vrt-egress — it relays js.images.cloudflare.com posts to
+/// facade-images, resolving text-source `font.url`s into font bytes
+/// under the egress policy (the facade cannot fetch).
 #[test]
 fn images_binding_renders_wrapped_images_api() {
     let mut tenant = tenant();
@@ -1438,8 +1439,10 @@ fn images_binding_renders_wrapped_images_api() {
         "images must render the wrapped images-api module:\n{out}"
     );
     assert!(
-        out.contains("service = (name = \"facade-images\""),
-        "inner fetcher must reach facade-images:\n{out}"
+        out.contains(
+            "(name = \"fetcher\", service = (name = \"vrt-egress\", entrypoint = \"EgressProxy\"))"
+        ),
+        "inner fetcher must reach vrt-egress (the facade-images relay):\n{out}"
     );
     // IMG1: the ingress `/cdn-cgi/image/` transform endpoint renders as
     // a loopback socket pointing at the same facade service.

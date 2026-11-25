@@ -221,6 +221,22 @@ export default {
           .transform({}).output({ format: "image/avif" });
         return out.response();
       }
+      if (p === "/text") {
+        // .text() serializes to a `text_input` spec whose font.url the
+        // vrt-egress relay must evaluate — a private literal denies at
+        // the policy layer before any dial, deterministically surfacing
+        // the typed 9420 through ImagesError.code. Proves the shim's
+        // text_input emission reaches the relay under real workerd.
+        try {
+          const r = await env.IMAGES.text("HI", {
+            font: { url: "http://10.0.0.1/font.ttf" },
+            size: 20,
+          }).output({ format: "image/png" });
+          return new Response("no-error:" + r.contentType());
+        } catch (e) {
+          return new Response("err:" + e.code + ":" + String(e.message).slice(0, 60));
+        }
+      }
       return new Response("ok");
     } catch (e) {
       return new Response("unexpected:" + String(e && e.stack || e), { status: 500 });
@@ -537,6 +553,17 @@ fn images_binding_info_and_transform_end_to_end() {
     assert!(
         body.starts_with("err:9420"),
         "truncated gif must fail closed with 9420: {body}"
+    );
+
+    // .text() canvas: the shim's `text_input` spec posts through the
+    // fetcher → vrt-egress relay; its private-literal font URL denies
+    // at the policy layer (before any dial) → typed 9420.
+    let (st, body) = http_get(port, "/text");
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(st, 200, "text probe failed: {body}");
+    assert!(
+        body.starts_with("err:9420"),
+        "policy-denied font must fail closed with 9420: {body}"
     );
 
     let log = log_text(&proc);

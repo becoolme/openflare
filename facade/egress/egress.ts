@@ -51,6 +51,11 @@ import {
   upstreamFetchError,
 } from "./shared.js";
 import { cfImageBody, cfImagePlan, SRC_MAX, type CfImagePlan } from "./cf-image.js";
+import {
+  IMAGES_BINDING_HOST,
+  relayImagesBinding,
+  type ImagesFacade,
+} from "./images-binding.js";
 import { sniffImage, sniffSvg } from "../images-wire.js";
 import { hushFilter, HushError } from "../svg-hush.js";
 
@@ -268,6 +273,20 @@ export class EgressProxy extends WorkerEntrypoint {
   }
 
   async fetch(request: Request): Promise<Response> {
+    // The images binding's inner `fetcher` lands here — the upstream
+    // shim posts to the synthetic js.images.cloudflare.com host, which
+    // is never a tenant-routable destination, so intercept before the
+    // egress policy evaluates it. Malformed URLs skip the probe and
+    // get evaluateTarget's own deny below.
+    let bindingHost = "";
+    try {
+      bindingHost = new URL(request.url).hostname;
+    } catch {
+      // fall through
+    }
+    if (bindingHost === IMAGES_BINDING_HOST) {
+      return this.#imagesBinding(request);
+    }
     const decision = evaluateTarget(request.url, this.#policy);
     if (!decision.allow) return denied(decision.code, decision.detail);
     let upstream: Response;
@@ -329,6 +348,25 @@ export class EgressProxy extends WorkerEntrypoint {
       statusText: upstream.statusText,
       headers: stripInternalHeaders(upstream.headers),
     });
+  }
+
+  /** Images binding posts → facade-images via the relay module. */
+  async #imagesBinding(request: Request): Promise<Response> {
+    const svc = (this.#env as Record<string, unknown>)?.["VRT_IMAGES"] as
+      | ImagesFacade
+      | undefined;
+    if (svc === undefined || typeof svc.fetch !== "function") {
+      // Misconfigured bundle — surface as the binding channel's
+      // transport-level code like #transformImage's 9490→9523 family.
+      return new Response("ERROR 9523\n", {
+        status: 500,
+        headers: {
+          "content-type": "text/plain",
+          "cf-images-binding": "err=9523",
+        },
+      });
+    }
+    return relayImagesBinding(request, svc, this.#policy);
   }
 
   /** POST the upstream body to facade-images over the service binding. */
