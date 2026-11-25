@@ -578,7 +578,7 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
     let (a, b, c) = (free_port(), free_port(), free_port());
     let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO_ALARM, false, Some("EventLog"), true);
     r.spec.do_storage = Some(DoStorageSpec {
-        tenant_dir: do_dir,
+        tenant_dir: do_dir.clone(),
         worker_classes: BTreeMap::new(),
         transfer_sources: BTreeMap::new(),
     });
@@ -594,6 +594,7 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
     assert_eq!(status, 200);
     wait_state(&rt, TenantState::Hibernated, Duration::from_secs(10)).await;
     wait_for(|| !pid_alive(pid), Duration::from_secs(5), "workerd pid exited").await;
+    dump_alarm_rows(&do_dir, "after hibernate");
 
     // The controller's alarm waker asks the host to start the generation.
     rt.await_wake(0, 64, 1 << 20, vrt_host::hibernate::WakeSourceKind::Alarm)
@@ -601,6 +602,7 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
         .expect("alarm wake");
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
+    dump_alarm_rows(&do_dir, "after wake");
     // workerd reloads `_cf_ALARM` and fires the overdue alarm.
     let mut hits = 0;
     for _ in 0..160 {
@@ -913,6 +915,30 @@ async fn get_dbg(port: u16, path: &str, dbg: bool) -> Option<(u16, String)> {
 
 /// DO extending the native `DurableObject` base (the production
 /// regression: a Proxy ctx fails workerd's constructor type check).
+fn dump_alarm_rows(do_dir: &Path, when: &str) {
+    let path = do_dir
+        .join(W1)
+        .join("e".repeat(64))
+        .join("metadata.sqlite");
+    let Ok(conn) = rusqlite::Connection::open(&path) else {
+        eprintln!("alarm probe {when}: cannot open {}", path.display());
+        return;
+    };
+    let mut rows: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT actor_id, scheduled_time FROM _cf_ALARM") {
+        if let Ok(iter) = stmt.query_map([], |r| {
+            let id: Vec<u8> = r.get(0)?;
+            let t: i64 = r.get(1)?;
+            Ok(format!("{}@{t}", hex::encode(id)))
+        }) {
+            for row in iter.flatten() {
+                rows.push(row);
+            }
+        }
+    }
+    eprintln!("alarm probe {when}: {} rows {:?}", rows.len(), rows);
+}
+
 const MOD_WS: &str = r#"
 export default {
   async fetch(req) {
