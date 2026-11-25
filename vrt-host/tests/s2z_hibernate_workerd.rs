@@ -576,7 +576,7 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
     }
     let _g = WORKERD_TEST_LOCK.lock().await;
     let fx = Fixture::new();
-    let do_dir = fx.dir.path().join("do");
+    let do_dir = fx.dir.path().join("do-root").join("t1");
     mkdir700(&do_dir);
     let (a, b, c) = (free_port(), free_port(), free_port());
     let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO_ALARM, false, Some("EventLog"));
