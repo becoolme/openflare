@@ -22,7 +22,11 @@
 // real Cloudflare service.
 import { evaluateTarget, type EgressPolicy } from "./policy.js";
 import { SRC_MAX } from "./cf-image.js";
-import { stripInternalHeaders } from "./shared.js";
+import {
+  policyFetch,
+  readCappedBody,
+  stripInternalHeaders,
+} from "./shared.js";
 
 export const IMAGES_BINDING_HOST = "js.images.cloudflare.com";
 const FACADE_BASE = "http://vrt-images.internal";
@@ -56,24 +60,28 @@ function specFontUrl(spec: string): string | undefined {
 }
 
 // Same fetch shape as the draw-payload loop in egress.ts: the target
-// re-runs the egress policy, any response body is treated as font
-// bytes (a 404 HTML page fails fontdb parsing at the facade → 9420),
-// and SRC_MAX caps the wire like the other payload fields.
+// re-runs the egress policy on every redirect hop, any response body
+// is treated as font bytes (a 404 HTML page fails fontdb parsing at
+// the facade → 9420), and SRC_MAX caps the wire like the other
+// payload fields — enforced while streaming, not after buffering.
 async function fetchFont(
   url: string,
   policy: EgressPolicy | null,
 ): Promise<Uint8Array | Response> {
-  if (!evaluateTarget(url, policy).allow) return bindingError(9420, 502);
+  const resp = await policyFetch(
+    url,
+    (u) => evaluateTarget(u, policy).allow,
+    policy?.requestTimeoutMs ?? 30_000,
+  );
+  if (resp === undefined) return bindingError(9420, 502);
+  let bytes: Uint8Array | undefined;
   try {
-    const resp = await fetch(url, {
-      signal: AbortSignal.timeout(policy?.requestTimeoutMs ?? 30_000),
-    });
-    const buf = new Uint8Array(await resp.arrayBuffer());
-    if (buf.length > SRC_MAX) return bindingError(9424, 413);
-    return buf;
+    bytes = await readCappedBody(resp, SRC_MAX);
   } catch {
     return bindingError(9420, 502);
   }
+  if (bytes === undefined) return bindingError(9424, 413);
+  return bytes;
 }
 
 function relayResponse(resp: Response): Response {

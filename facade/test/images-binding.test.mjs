@@ -445,6 +445,37 @@ test("relay: multiple draw_text specs pair fonts in order", async () => {
   );
 });
 
+test("relay: font redirect re-runs the policy per hop", async () => {
+  const { svc, calls } = makeSvc();
+  const restore = stubFetch(async (url) => {
+    const u = String(url);
+    if (u === "https://fonts.example/f.ttf") {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "http://blocked.example/f.ttf" },
+      });
+    }
+    throw new Error("must not dial a denied redirect target: " + u);
+  });
+  try {
+    const resp = await relayImagesBinding(
+      post("/transform", {
+        text_input: JSON.stringify({
+          text: "HI",
+          font: { url: "https://fonts.example/f.ttf" },
+        }),
+        transforms: "[]",
+      }),
+      svc,
+      PARSED_POLICY,
+    );
+    assert.equal(resp.headers.get("cf-images-binding"), "err=9420");
+    assert.equal(calls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
 test("relay: a dead facade surfaces err=9523, not a bare rejection", async () => {
   const svc = {
     async fetch() {

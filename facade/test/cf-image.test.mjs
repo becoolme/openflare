@@ -535,6 +535,63 @@ test("cf.image draw: policy-denied overlay → ERROR 9420", async () => {
   });
 });
 
+test("cf.image draw: overlay redirect re-runs policy per hop", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  const prev = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url === PNG_URL) return new Response(await sourcePng(), { status: 200 });
+    if (url === OVER_URL) {
+      // Allowed host 302s to a private literal — must not be dialed.
+      return new Response(null, {
+        status: 302,
+        headers: { location: "http://169.254.169.254/o.png" },
+      });
+    }
+    throw new TypeError("fetch failed: " + url);
+  };
+  try {
+    const resp = await proxy.fetch(pngReq({ draw: [{ url: OVER_URL }] }));
+    assert.equal(resp.headers.get("cf-resized"), "err=9420");
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+test("cf.image draw: overlay follows an allowed redirect hop", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  const { bytes: over } = await eng.encodeImage(
+    {
+      data: new Uint8ClampedArray(2 * 2 * 4).fill(255),
+      width: 2,
+      height: 2,
+    },
+    "png",
+    100,
+  );
+  const prev = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (url === PNG_URL) return new Response(await sourcePng(), { status: 200 });
+    if (url === OVER_URL) {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://cdn.example.com/over-real.png" },
+      });
+    }
+    if (url === "https://cdn.example.com/over-real.png") {
+      return new Response(over, { status: 200 });
+    }
+    throw new TypeError("fetch failed: " + url);
+  };
+  try {
+    const resp = await proxy.fetch(pngReq({ draw: [{ url: OVER_URL }] }));
+    assert.equal(resp.status, 200);
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
 // ---- draw text overlays -------------------------------------------------
 
 const FONT_URL = "https://cdn.example.com/font.ttf";
