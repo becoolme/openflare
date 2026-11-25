@@ -19,6 +19,7 @@ import {
   resizeExact,
   rotateImage,
   sharpenImage,
+  gaussianSharpenImage,
   type ImageDataLike,
 } from "./images-engine.js";
 
@@ -61,7 +62,7 @@ const DRAW_KEYS = new Set([
   "right",
 ]);
 
-const FITS = new Set(["scale-down", "contain", "pad", "squeeze", "cover", "crop"]);
+const FITS = new Set(["scale-down", "contain", "pad", "squeeze", "cover", "crop", "aspect-crop", "scale-up"]);
 const COMPOSITES = new Set(["over", "in", "atop", "out", "xor", "lighter"]);
 
 function bad(msg: string): never {
@@ -183,16 +184,20 @@ function cropRectFor(
   };
 }
 
-/** Auto-trim of a near-uniform border within `tolerance`; keeps `keep`
- * pixels of margin. */
+/** Auto-trim of a near-uniform border. `tolerance` is a slack value —
+ * pixels within `dist <= tolerance` (per-channel euclidean) count as
+ * border. With no `refColor` the top-left pixel is the detected border
+ * color, the local stand-in for upstream's auto-detection. Keeps
+ * `keep` pixels of margin. */
 function trimBorder(
   img: ImageDataLike,
   tolerance: number,
   keep: number,
+  refColor?: [number, number, number],
 ): ImageDataLike {
   const { width: w, height: h, data } = img;
   const tol2 = tolerance * tolerance * 3;
-  const ref = [data[0], data[1], data[2]];
+  const ref = refColor ?? [data[0], data[1], data[2]];
   const near = (i: number) => {
     const dr = data[i] - ref[0];
     const dg = data[i + 1] - ref[1];
@@ -227,36 +232,132 @@ function trimBorder(
   return cropImage(img, x, y, nw, nh);
 }
 
+/** A trim length: integer pixel count, a `0 < v < 1` fraction of the
+ * axis, or a `"Np"` percentage string (upstream's three forms). */
+function trimLength(v: unknown, total: number, key: string): number {
+  if (typeof v === "string" && v.endsWith("p")) {
+    const n = Number(v.slice(0, -1));
+    if (Number.isFinite(n) && n >= 0 && n <= 100 && v.length > 1) {
+      return Math.round((n / 100) * total);
+    }
+  }
+  if (typeof v === "string" && v !== "" && !Number.isNaN(Number(v))) {
+    v = Number(v); // numeric strings ride the same rules as numbers
+  }
+  if (typeof v !== "number" || !Number.isFinite(v) || v < 0) bad(key);
+  const n = v as number;
+  if (n > 0 && n < 1) return Math.round(n * total);
+  return Math.min(Math.round(n), total);
+}
+
+function trimColorMode(img: ImageDataLike, t: Record<string, unknown>): ImageDataLike {
+  const ref = t.color === undefined
+    ? undefined
+    : (typeof t.color === "string" ? parseColor(t.color) : null) ?? bad("trim.color");
+  // Upstream documents tolerance as "how closely pixels must match"
+  // on a 0..255 scale; the slack reading (0 = exact match) is what
+  // the documented examples mean.
+  const tolerance = num(t.tolerance, "trim.tolerance", { min: 0, max: 255, int: true }) ?? 16;
+  const keep = num(t.keep, "trim.keep", { min: 0, max: 4096, int: true }) ?? 0;
+  return trimBorder(img, tolerance, keep, ref === undefined ? undefined : [ref[0], ref[1], ref[2]]);
+}
+
 function applyTrim(img: ImageDataLike, trim: unknown): ImageDataLike {
   if (trim === undefined) return img;
-  if (trim === "border") return trimBorder(img, 16, 0);
+  // `border` is the pre-rename upstream string; `color` is the current one.
+  if (trim === "border" || trim === "color") return trimBorder(img, 16, 0);
   if (typeof trim !== "object" || trim === null) bad("trim");
   const t = trim as Record<string, unknown>;
   for (const k of Object.keys(t)) {
-    if (!["top", "bottom", "left", "right", "width", "height", "border"].includes(k)) bad(`trim.${k}`);
+    if (!["mode", "top", "bottom", "left", "right", "width", "height", "border", "color", "tolerance", "keep"].includes(k)) {
+      bad(`trim.${k}`);
+    }
   }
-  if (t.border !== undefined) {
-    // Border-trim with explicit tolerance/keep/color.
+  const mode = t.mode;
+  if (mode === "color") {
+    for (const k of Object.keys(t)) {
+      if (!["mode", "color", "tolerance", "keep"].includes(k)) bad(`trim.${k}`);
+    }
+    return trimColorMode(img, t);
+  }
+  // Legacy internal form `{border:{color,tolerance,keep}}` — the
+  // pre-rename upstream binding shape; still accepted on the wire.
+  if (t.border !== undefined && mode === undefined) {
     const b = t.border === true ? {} : t.border;
     if (typeof b !== "object" || b === null) bad("trim.border");
     const bo = b as Record<string, unknown>;
     for (const k of Object.keys(bo)) {
       if (!["color", "tolerance", "keep"].includes(k)) bad(`trim.border.${k}`);
     }
-    const tolerance = num(bo.tolerance, "trim.border.tolerance", { min: 0, max: 255 }) ?? 16;
-    const keep = num(bo.keep, "trim.border.keep", { min: 0, max: 4096 }) ?? 0;
-    return trimBorder(img, tolerance, keep);
+    return trimColorMode(img, bo);
   }
-  // Explicit trim: pixel amounts per side, or crop to width/height.
-  const top = num(t.top, "trim.top", { min: 0, max: img.height - 1 }) ?? 0;
-  const bottom = num(t.bottom, "trim.bottom", { min: 0, max: img.height - 1 }) ?? 0;
-  const left = num(t.left, "trim.left", { min: 0, max: img.width - 1 }) ?? 0;
-  const right = num(t.right, "trim.right", { min: 0, max: img.width - 1 }) ?? 0;
-  let w = img.width - left - right;
-  let h = img.height - top - bottom;
-  if (t.width !== undefined) w = num(t.width, "trim.width", { min: 1, max: w })!;
-  if (t.height !== undefined) h = num(t.height, "trim.height", { min: 1, max: h })!;
+  // Area mode: explicit `mode:"area"` or inferred from bare side/rect
+  // keys (upstream infers `trim={left:800}` as area).
+  if (mode !== undefined && mode !== "area") bad("trim.mode");
+  for (const k of Object.keys(t)) {
+    if (!["mode", "top", "bottom", "left", "right", "width", "height"].includes(k)) bad(`trim.${k}`);
+  }
+  if (t.width !== undefined || t.height !== undefined) {
+    // Preserve-rectangle form: left/top position the window, width/
+    // height size it (both required to pin the rect).
+    if (t.right !== undefined || t.bottom !== undefined) bad("trim rect mixes side keys");
+    const x = t.left === undefined ? 0 : trimLength(t.left, img.width, "trim.left");
+    const y = t.top === undefined ? 0 : trimLength(t.top, img.height, "trim.top");
+    const w = trimLength(t.width, img.width, "trim.width");
+    const h = trimLength(t.height, img.height, "trim.height");
+    if (w < 1 || h < 1) bad("trim rect is empty");
+    if (x + w > img.width || y + h > img.height) bad("trim rect exceeds the image");
+    return cropImage(img, x, y, w, h);
+  }
+  const top = t.top === undefined ? 0 : trimLength(t.top, img.height, "trim.top");
+  const bottom = t.bottom === undefined ? 0 : trimLength(t.bottom, img.height, "trim.bottom");
+  const left = t.left === undefined ? 0 : trimLength(t.left, img.width, "trim.left");
+  const right = t.right === undefined ? 0 : trimLength(t.right, img.width, "trim.right");
+  const w = img.width - left - right;
+  const h = img.height - top - bottom;
+  if (w < 1 || h < 1) bad("trim removes the whole image");
   return cropImage(img, left, top, w, h);
+}
+
+/** A border width: integer pixel count or a `"Np"` percent of the
+ * side's axis (`total`). Unlike trim lengths, pixel counts are not
+ * capped by the axis — a border adds area beyond the image. */
+function borderLen(v: unknown, total: number, key: string): number | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v === "string" && v.endsWith("p")) {
+    const n = Number(v.slice(0, -1));
+    if (Number.isFinite(n) && n >= 0 && n <= 100 && v.length > 1) {
+      return Math.round((n / 100) * total);
+    }
+  }
+  return num(v, key, { min: 0, max: 4096 });
+}
+
+/** `sharpen` — scalar means the legacy box filter; the structured
+ * form picks `box` or `gaussian` by `mode` (upstream 2026-11-19
+ * "Gaussian sharpening"). `amount` is always required in the object
+ * form; `sigma`/`threshold` belong to gaussian only. */
+function applySharpen(img: ImageDataLike, sharpen: unknown): ImageDataLike {
+  if (typeof sharpen === "number") {
+    return sharpenImage(img, num(sharpen, "sharpen", { min: 0, max: 10 })!);
+  }
+  if (typeof sharpen !== "object" || sharpen === null || Array.isArray(sharpen)) bad("sharpen");
+  const s = sharpen as Record<string, unknown>;
+  for (const k of Object.keys(s)) {
+    if (!["mode", "amount", "sigma", "threshold"].includes(k)) bad(`sharpen.${k}`);
+  }
+  const mode = s.mode ?? "box";
+  if (mode !== "box" && mode !== "gaussian") bad("sharpen.mode");
+  const amount = num(s.amount, "sharpen.amount", { min: 0, max: 10 });
+  if (amount === undefined) bad("sharpen.amount");
+  if (mode === "box") {
+    if (s.sigma !== undefined || s.threshold !== undefined) bad("sharpen: box takes no sigma/threshold");
+    return sharpenImage(img, amount);
+  }
+  const sigma = num(s.sigma, "sharpen.sigma", { min: Number.MIN_VALUE, max: 5 });
+  if (sigma === undefined || sigma <= 0) bad("sharpen.sigma");
+  const threshold = num(s.threshold, "sharpen.threshold", { min: 0, max: 255, int: true }) ?? 0;
+  return gaussianSharpenImage(img, amount, sigma, threshold);
 }
 
 /** One `{imageIndex, ...ImageTransform}` op against a frame. */
@@ -274,8 +375,26 @@ async function applyTransform(img: ImageDataLike, op: Record<string, unknown>): 
   // 2. geometry: gravity crop + fit resize (+ pad letterbox)
   const tw = num(op.width, "width", { min: 1, max: 16384 });
   const th = num(op.height, "height", { min: 1, max: 16384 });
-  const fit = op.fit === undefined ? "scale-down" : op.fit;
-  if (typeof fit !== "string" || !FITS.has(fit)) bad("fit");
+  const fitSrc = op.fit === undefined ? "scale-down" : op.fit;
+  let fit: string;
+  if (typeof fitSrc === "string") {
+    fit = fitSrc;
+  } else if (typeof fitSrc === "object" && fitSrc !== null && !Array.isArray(fitSrc)) {
+    // Structured form `{mode, upscale}` (2026-11-18 "consistent
+    // language"). `upscale: "generate"` is AI upscaling — no model is
+    // vendored, so it fails closed; "interpolate" is our path anyway.
+    const f = fitSrc as Record<string, unknown>;
+    for (const k of Object.keys(f)) {
+      if (k !== "mode" && k !== "upscale") bad(`fit.${k}`);
+    }
+    if (f.upscale === "generate") unsupported("upscale=generate needs the ESRGAN model, not vendored");
+    if (f.upscale !== undefined && f.upscale !== "interpolate") bad("fit.upscale");
+    if (typeof f.mode !== "string") bad("fit.mode");
+    fit = f.mode;
+  } else {
+    bad("fit");
+  }
+  if (!FITS.has(fit)) bad("fit");
   const anchor = gravityAnchor(op.gravity);
   const bgColor = op.background !== undefined
     ? (typeof op.background === "string" ? parseColor(op.background) : null) ?? bad("background color")
@@ -324,10 +443,39 @@ async function applyTransform(img: ImageDataLike, op: Record<string, unknown>): 
         img = await resizeExact(img, Math.max(1, Math.round(sw * scale)), Math.max(1, Math.round(sh * scale)));
         break;
       }
+      case "scale-up": {
+        // Contain, but only when the source is smaller — it never
+        // downscales (a larger source is returned at its own size).
+        const scale = Math.min(w / sw, h / sh);
+        if (scale > 1) {
+          img = await resizeExact(img, Math.max(1, Math.round(sw * scale)), Math.max(1, Math.round(sh * scale)));
+        }
+        break;
+      }
+      case "aspect-crop": {
+        // Match the target aspect without upscaling: downscale just
+        // enough to still fill the target, then crop to w:h at the
+        // anchor. The output keeps the cropped source dims — it is
+        // NOT resized to the requested box (upstream semantics).
+        const scale = Math.min(1, Math.max(w / sw, h / sh));
+        if (scale < 1) {
+          img = await resizeExact(img, Math.max(1, Math.round(sw * scale)), Math.max(1, Math.round(sh * scale)));
+        }
+        const aspect = w / h;
+        let cw = img.width;
+        let ch = Math.round(img.width / aspect);
+        if (ch > img.height) {
+          ch = img.height;
+          cw = Math.round(img.height * aspect);
+        }
+        const r = cropRectFor(img, cw, ch, anchor);
+        img = cropImage(img, r.x, r.y, r.w, r.h);
+        break;
+      }
     }
   } else if (op.gravity !== undefined || fit === "crop") {
     // Gravity without dims only matters under crop semantics.
-    if (op.fit === "crop") {
+    if (fit === "crop") {
       const r = cropRectFor(img, img.width, img.height, anchor);
       img = cropImage(img, r.x, r.y, r.w, r.h);
     }
@@ -354,7 +502,7 @@ async function applyTransform(img: ImageDataLike, op: Record<string, unknown>): 
 
   // 5. blur / sharpen
   if (op.blur !== undefined) img = blurImage(img, num(op.blur, "blur", { min: 1, max: 250 })!);
-  if (op.sharpen !== undefined) img = sharpenImage(img, num(op.sharpen, "sharpen", { min: 0, max: 10 })!);
+  if (op.sharpen !== undefined) img = applySharpen(img, op.sharpen);
 
   // 6. border paint (after resize/effects, CF semantics)
   if (op.border !== undefined) {
@@ -366,11 +514,13 @@ async function applyTransform(img: ImageDataLike, op: Record<string, unknown>): 
     const color = b.color !== undefined
       ? (typeof b.color === "string" ? parseColor(b.color) : null) ?? bad("border.color")
       : ([0, 0, 0, 255] as [number, number, number, number]);
-    const uniform = num(b.width, "border.width", { min: 0, max: 4096 });
-    const l = num(b.left, "border.left", { min: 0, max: 4096 }) ?? uniform ?? 0;
-    const t = num(b.top, "border.top", { min: 0, max: 4096 }) ?? uniform ?? 0;
-    const r = num(b.right, "border.right", { min: 0, max: 4096 }) ?? uniform ?? 0;
-    const bo = num(b.bottom, "border.bottom", { min: 0, max: 4096 }) ?? uniform ?? 0;
+    // Widths are px ints or `"Np"` percents resolved against each
+    // side's own axis (upstream `border=(width=10p)`); `width` is the
+    // uniform fallback resolved per-side.
+    const l = borderLen(b.left ?? b.width, img.width, "border.left") ?? 0;
+    const t = borderLen(b.top ?? b.width, img.height, "border.top") ?? 0;
+    const r = borderLen(b.right ?? b.width, img.width, "border.right") ?? 0;
+    const bo = borderLen(b.bottom ?? b.width, img.height, "border.bottom") ?? 0;
     img = padImage(img, l, t, r, bo, color);
   }
 

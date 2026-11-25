@@ -126,16 +126,33 @@ GET /cdn-cgi/image/width=300,fit=cover,format=auto/uploads/cat.png
 - Tenants **without** an `images` binding keep `/cdn-cgi/` as an
   ordinary path (conservative gating — CF intercepts unconditionally,
   but a silent 4xx on tenants that never opted in would fork behavior).
-- Options map onto the same op vocabulary: `width`, `height`, `fit`,
-  `gravity` (named anchors or `XxY` fractions), `rotate`, `blur`,
-  `sharpen`, `brightness`, `contrast`, `gamma`, `saturation`,
-  `background`, `trim` (`TxRxBxL` or `border`), `border` (`WxCOLOR`),
-  `padding`, `dpr`, `quality`, `format` (`auto` negotiates on the
-  request `Accept` header — avif > webp > jpeg), `anim`, `metadata`
-  (returns the `/info` JSON), `zoom`, `segment`, `onerror=redirect`.
-  Unknown or malformed keys fail closed `ERROR 9423`; keys the engine
-  lacks (`zoom`, `segment`, `anim`) reach the facade and surface its
-  typed `ERROR 9401`.
+- Options map onto the same op vocabulary. Scalar and the upstream
+  structured group syntax (`param=(k=v,...)`, with `(a,b)` lists and
+  percent-decoded values) are both accepted:
+  `width`/`w` (px, `auto`, or `(mode=auto,mobile=,desktop=,breakpoints=(...))`
+  resolved from `viewport-width`/`sec-ch-viewport-width` client hints
+  or a user-agent heuristic), `height`/`h`, `dpr` (≤2 — scales
+  width/height and every pixel length in trim/border/padding),
+  `fit` (string mode incl. `aspect-crop`/`scale-up`, or `(mode=,upscale=)`),
+  `flip` (`h`/`v`/`hv`), `gravity`/`g` (named anchors, `XxY` fractions,
+  or `(x=,y=)`), `rotate`, `blur`, `sharpen` (scalar box or
+  `(mode=box|gaussian,amount,sigma,threshold)`), `brightness`,
+  `contrast`, `gamma`, `saturation`, `background`,
+  `trim` (`color`/`border`, `T;R;B;L`/`TxRxBxL` insets, `(mode=color|area,...)`
+  with px/`Np`/`0<v<1` lengths, rect form, plus the legacy dotted
+  `trim.X=`/`trim.border.X=` keys), `border` (`WxCOLOR` or
+  `(color=,width=|top,right,bottom,left)` with `Np` percents),
+  `padding` (sides painted with `background` or transparent),
+  `quality`/`q` (1–100, perceptual `low`/`medium-low`/`medium-high`/`high`,
+  or `(level=,slow-connection=)` gated on `rtt`/`save-data`/`ect`/
+  `downlink` client hints; `slow-connection-quality`/`scq` too),
+  `compression` (`fast` → JPEG), `format`/`f` (`auto` negotiates on the
+  request `Accept` header — avif > webp > jpeg), `anim`,
+  `metadata` (`none`/`copyright`/`keep` ride the transform wire;
+  `exif` returns the `/info` JSON), `zoom`, `segment`,
+  `onerror=redirect`. Unknown or malformed keys fail closed
+  `ERROR 9423`; keys the engine lacks (`zoom`, `segment`, `anim`)
+  reach the facade and surface its typed `ERROR 9401`.
 - Errors render in CF's own shape: `ERROR <code>` text bodies with the
   facade's status; `onerror=redirect` swaps any failure for a 302 to
   the original source path. Upstream fetch failures collapse to
@@ -159,12 +176,23 @@ const r = await fetch("https://cdn.example.com/cat.png", {
 // r.body is the transformed WebP, not the original PNG.
 ```
 
-- Options map onto the same op vocabulary: `width`, `height`, `dpr`,
-  `fit`, `gravity` (named or `{x,y,mode}`), `rotate`, `blur`,
-  `sharpen`, `brightness`, `contrast`, `gamma`, `saturation`,
-  `background`, `trim`, `border`, `padding`, `zoom`, `segment`,
-  `quality`, `format` (`avif`/`webp`/`jpeg`/`baseline-jpeg`/`png`/
-  `png-force`/`json`/`gif`/`rgb`/`rgba`), `anim`, `metadata`, `onerror`.
+- Options map onto the same op vocabulary: `width`, `height`, `dpr`
+  (≤2, scaling `width`/`height` and pixel lengths in `trim`/`border`/
+  `padding`), `fit` (string mode incl. `aspect-crop`/`scale-up`, or
+  `{mode, upscale}` — `upscale:"generate"` fails closed, no ESRGAN is
+  vendored), `flip` (`"h"`/`"v"`/`"hv"`), `gravity` (named or
+  `{x,y,mode}`), `rotate`, `blur`, `sharpen` (scalar box or
+  `{mode, amount, sigma, threshold}` — 2026-11-19 gaussian sharpen),
+  `brightness`, `contrast`, `gamma`, `saturation`, `background`,
+  `trim` (`"color"`/`"border"`, `"T,R,B,L"` inset, or the structured
+  `{mode:"color"|"area", ...}` forms incl. `{left:N}` inference and
+  px/fraction/`"Np"` lengths), `border`/`padding` (px or per-side
+  objects; `padding` paints with `background` or transparent),
+  `zoom`, `segment`, `quality` (1–100 or perceptual
+  `"low"`/`"medium-low"`/`"medium-high"`/`"high"`), `compression`
+  (`"fast"` → JPEG, overriding `format`),
+  `format` (`avif`/`webp`/`jpeg`/`baseline-jpeg`/`png`/`png-force`/
+  `json`/`gif`/`rgb`/`rgba`), `anim`, `metadata`, `onerror`.
 - `format: "json"` returns the **transformed** result's metadata
   (`{width, height, format, size}`), not an image body.
 - Failure shape mirrors CF: transform errors return `ERROR <code>`
@@ -243,19 +271,29 @@ resource-identifying keys besides `binding`.
   (9490 engine-internal).
 - **`cf.image` / `/cdn-cgi/` nuances**: `cf.image` transforms any
   policy-allowed upstream (the fetch already reached it), while
-  `/cdn-cgi/` stays same-origin only. `cf.image` metadata options
-  (`keep`/`copyright`) are parsed but metadata stripping behavior is
-  the community engine's default — CF's EXIF-preserving modes are not
-  reproduced. `draw`/`image`/`origin-auth`/`slow-connection-quality`
-  reject with `TypeError`.
+  `/cdn-cgi/` stays same-origin only. `metadata` is wired on both
+  paths (`none`/`copyright`/`keep`, upstream default `copyright`) —
+  see `facade/images-metadata.ts` for the container surgery; AVIF
+  writes EXIF only, GIF output / HEIC-TIFF sources have no
+  encoder/decoder. `draw`/`image`/`origin-auth` reject with
+  `TypeError`; `cf.image.slow-connection-quality` is unsupported
+  (upstream gates it to the URL interface anyway) and URL `draw=`
+  overlay fetch + `format=json` are not implemented.
+- **Perceptual quality tiers** (`low`/`medium-low`/`medium-high`/
+  `high`) map to 40/60/80/90 — upstream publishes no integer mapping;
+  the anchors match other CF-compat implementations.
+- **`upscale: "generate"`** in the structured `fit` form needs the
+  ESRGAN model — not vendored → `err=9401` (fail closed).
 
 ## Examples and tests
 
 - `vrt-local/src/project_cfg.rs` — `[images]` normalization
   (accept `binding`/`remote`, reject everything else).
 - `vrt-host/src/cdn_cgi.rs` — `/cdn-cgi/image/` ingress interception:
-  option→transform JSON mapping, same-origin source resolution, facade
-  socket fan-out, `ERROR <code>` shaping (5 unit tests).
+  option→transform JSON mapping (structured groups, percent-decoding,
+  client-hints quality/width, dpr scaling), same-origin source
+  resolution, facade socket fan-out, `ERROR <code>` shaping
+  (14 unit tests).
 - `vrt-config/tests/render.rs` — `images_binding_renders_wrapped_images_api`
   (wrapped module + inner fetcher service name).
 - `facade/test/images.test.mjs` — `/info` shape cases plus end-to-end
@@ -263,6 +301,12 @@ resource-identifying keys besides `binding`.
   crop-gravity+rotate→JPEG, `draw_image` alpha compositing, GIF/BMP
   input decode, AVIF output, and the fail-closed edges (unknown op
   key, corrupt input, text ops, `anim`, GIF output).
+- `facade/test/images-structured.test.mjs` — the structured-parameter
+  surface on real pixels: box vs gaussian sharpen (incl. `threshold`
+  gating), `trim` color/area/rect/percent/fraction forms,
+  `aspect-crop`/`scale-up` geometry, `flip`, percent borders.
+- `facade/test/images-metadata.test.mjs` — `metadata` keep/copyright/
+  none across JPEG/PNG/WebP/AVIF containers incl. IPTC→XMP mapping.
 - `vrt-host/tests/images_workerd.rs` — real-workerd smoke (`VRT_WORKERD_BIN`
   gated): the rendered `wasm = embed` modules instantiate in the
   pinned binary and `env.IMAGES` info/transform round-trip through the
