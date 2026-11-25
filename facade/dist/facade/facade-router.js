@@ -71,11 +71,11 @@ export class AssetsRouter extends WorkerEntrypoint {
         const pathname = normalizePath(rawPath);
         if (pathname === null) return toUserWorker();
         const navigate = request.headers.get("sec-fetch-mode") === "navigate";
-        const fetchable = await this.#fetchable(request, pathname, rawPath, navigate, hasStaticRouting, cfg.manifestDigest);
+        const fetchable = await this.#fetchable(request, pathname, rawPath, navigate, hasStaticRouting, cfg.manifestDigest, cfg.basePath);
         if (fetchable.error) return ROUTE_UNREACHABLE(fetchable.error);
         return fetchable.value ? toAssets() : toUserWorker();
     }
-    async #fetchable(request, pathname, rawPath, navigate, hasStaticRouting, digest) {
+    async #fetchable(request, pathname, rawPath, navigate, hasStaticRouting, digest, basePath) {
         const env = this.env;
         let slot = cacheGet(digest);
         if (slot === undefined) {
@@ -131,7 +131,7 @@ export class AssetsRouter extends WorkerEntrypoint {
             };
         }
         return {
-            value: intentFetchable(slot.index, pathname, navigate, hasStaticRouting, rawPath)
+            value: intentFetchable(slot.index, pathname, navigate, hasStaticRouting, rawPath, basePath)
         };
     }
     async #probe(request, hasStaticRouting, digest) {

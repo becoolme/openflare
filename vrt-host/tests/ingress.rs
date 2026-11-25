@@ -1056,6 +1056,7 @@ async fn assets_first_route_counts_marker_as_asset_hit() {
                 },
                 assets_first: Some(true),
                 run_worker_first: None,
+                base_path: None,
             },
         ));
     let mut d = desired_with_routes();
@@ -1135,6 +1136,7 @@ async fn assets_route_error_reason_lands_on_metric_label() {
                 },
                 assets_first: Some(true),
                 run_worker_first: None,
+                base_path: None,
             },
         ));
     let mut d = desired_with_routes();

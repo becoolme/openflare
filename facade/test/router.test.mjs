@@ -888,3 +888,119 @@ test("sleep honours AbortSignal on both implementations", async () => {
   await new Promise((r) => setTimeout(r, 0));
   assert.equal(core.__timersPendingForTest.n, before);
 });
+
+// ── assets.base_path (Wrangler 4.148+) ────────────────────────────
+// The router strips the mount prefix before manifest lookups; rules
+// (`_redirects`, `_routes.json`, run_worker_first) keep matching the
+// full public path. Out-of-base requests fall through to the user
+// worker exactly like a manifest miss.
+
+test("basePath: under-base paths route to assets, out-of-base to worker", async () => {
+  const u = [], a = [];
+  const idx = { ...INDEX, paths: ["/app.js", "/docs/index.html"] };
+  const cfg = { basePath: "/blog/" };
+  const res = await hit(env(cfg, userWorker(u), assetsWorker(a, idx)), req("/blog/app.js"));
+  assert.equal(res.headers.get(HDR), "assets");
+  assert.deepEqual(a, ["http://w.test/blog/app.js"]);
+  for (const p of ["/app.js", "/other/app.js", "/blogx/app.js"]) {
+    const res = await hit(env(cfg, userWorker(u), assetsWorker(a, idx)), req(p));
+    assert.equal(await res.text(), "worker", p);
+  }
+});
+
+test("basePath: base root and html intents resolve under the mount", async () => {
+  const u = [], a = [];
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "none",
+    paths: ["/index.html", "/docs/index.html"],
+  };
+  const cfg = { basePath: "/blog/" };
+  // `/blog` and `/blog/` both map to the asset path `/`.
+  for (const p of ["/blog", "/blog/"]) {
+    const res = await hit(env(cfg, userWorker(u), assetsWorker(a, idx)), req(p));
+    assert.equal(res.headers.get(HDR), "assets", p);
+  }
+  // `/blog/docs` strips to `/docs` → `/docs/index.html` intent.
+  const res = await hit(env(cfg, userWorker(u), assetsWorker(a, idx)), req("/blog/docs"));
+  assert.equal(res.headers.get(HDR), "assets");
+});
+
+test("basePath: not-found handling stays asset-relative", async () => {
+  const u = [], a = [];
+  const idx = {
+    htmlHandling: "auto-trailing-slash",
+    notFoundHandling: "single-page-application",
+    paths: ["/index.html"],
+  };
+  const cfg = { basePath: "/blog/" };
+  const nav = { "sec-fetch-mode": "navigate" };
+  // SPA fallback answers the mounted /index.html for an in-base miss…
+  const res = await hit(
+    env(cfg, userWorker(u), assetsWorker(a, idx)),
+    req("/blog/deep/route", nav),
+  );
+  assert.equal(res.headers.get(HDR), "assets");
+  // …but an out-of-base path still falls to the user worker.
+  const res2 = await hit(
+    env(cfg, userWorker(u), assetsWorker(a, idx)),
+    req("/deep/route", nav),
+  );
+  assert.equal(await res2.text(), "worker");
+});
+
+test("basePath: routes/_redirects/run_worker_first match the public path", async () => {
+  const u = [], a = [];
+  // `_routes.json` include patterns see the PUBLIC path (upstream
+  // parity — the worker-first decision predates stripping).
+  const idx = {
+    ...INDEX,
+    paths: ["/app.js"],
+    routes: { include: ["/blog/worker/*"], exclude: [] },
+  };
+  const cfg = { basePath: "/blog/" };
+  const res = await hit(env(cfg, userWorker(u), assetsWorker(a, idx)), req("/blog/worker/x"));
+  assert.equal(await res.text(), "worker");
+  // A redirect source under the mount still claims the request even
+  // when the asset path itself would miss.
+  const idx2 = {
+    ...INDEX,
+    paths: ["/app.js"],
+    redirects: [{ source: "/blog/go", status: 301 }],
+  };
+  const res2 = await hit(env(cfg, userWorker(u), assetsWorker(a, idx2)), req("/blog/go"));
+  assert.equal(res2.headers.get(HDR), "assets");
+});
+
+test("basePath: invalid canonical form fails cfg compile closed", async () => {
+  const u = [], a = [];
+  for (const bad of ["blog/", "/blog", "//", "/a//b/", "/a/../b/", 5]) {
+    const res = await hit(
+      env({ basePath: bad }, userWorker(u), assetsWorker(a, INDEX)),
+      req("/blog/app.js"),
+    );
+    assert.equal(res.status, 503, String(bad));
+  }
+});
+
+test("stripBase/validBasePath: canonical semantics", async () => {
+  const { stripBase, validBasePath } = await import(facadeModule("router-core.js"));
+  for (const [pub, base, want] of [
+    ["/x", "/", "/x"],
+    ["/blog", "/blog/", "/"],
+    ["/blog/", "/blog/", "/"],
+    ["/blog/x", "/blog/", "/x"],
+    ["/blog/a/b", "/blog/", "/a/b"],
+    ["/x", "/blog/", null],
+    ["/blogx", "/blog/", null],
+    ["/blogx/y", "/blog/", null],
+  ]) {
+    assert.equal(stripBase(pub, base), want, `${pub} @ ${base}`);
+  }
+  for (const v of ["/", "/a/", "/a/b/", "/é/"]) {
+    assert.equal(validBasePath(v), true, v);
+  }
+  for (const v of ["", "x", "/a", "a/", "//", "/a//", "/./a/", "/../a/"]) {
+    assert.equal(validBasePath(v), false, v);
+  }
+});

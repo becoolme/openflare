@@ -2923,7 +2923,7 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 for k in a.keys() {
                     match k.as_str() {
                         "directory" | "binding" | "html_handling" | "not_found_handling"
-                        | "run_worker_first" => {}
+                        | "run_worker_first" | "base_path" => {}
                         _ => return Err(unsupported(&format!("assets.{k}"), None)),
                     }
                 }
@@ -2947,6 +2947,12 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 }
                 if let Some(r) = a.get("run_worker_first") {
                     assets.insert("runWorkerFirst".into(), normalize_run_worker_first(r)?);
+                }
+                if let Some(b) = a.get("base_path") {
+                    assets.insert(
+                        "basePath".into(),
+                        Value::from(normalize_base_path(b, "assets.base_path")?),
+                    );
                 }
                 out.insert("assets".into(), Value::Object(assets));
             }
@@ -3410,6 +3416,75 @@ fn normalize_run_worker_first(value: &Value) -> Result<Value, ProjectConfigError
             "must be a boolean or an array of pattern strings",
         )),
     }
+}
+
+/// `assets.base_path` (Wrangler 4.148+) — port of workers-shared
+/// `utils/base-path.ts::normalizeBasePath`. Canonical form: `/` or an
+/// absolute pathname with leading AND trailing slashes (`/subpath/`).
+/// Relative and absolute inputs are accepted; `.`/`..`/empty segments
+/// resolve before slashes are applied. URL-shaped values, `?`/`#`,
+/// backslashes, control characters, `%` escapes and empty input are
+/// rejected; unicode pathname characters are allowed.
+pub(crate) fn normalize_base_path(v: &Value, field: &str) -> Result<String, ProjectConfigError> {
+    let raw = match v {
+        Value::String(s) if s == "/" => return Ok("/".to_string()),
+        Value::String(s) => s.as_str(),
+        _ => return Err(invalid(field, "must be a string")),
+    };
+    if raw.is_empty() {
+        return Err(invalid(field, "must not be empty"));
+    }
+    // `//host` or `scheme:` — a URL, not a pathname.
+    if raw.starts_with("//") || is_url_scheme(raw) {
+        return Err(invalid(field, "must be a pathname, not a URL"));
+    }
+    if raw.contains('\\') {
+        return Err(invalid(field, "must not contain backslashes"));
+    }
+    // Upstream's CONTROL_CHARACTER is U+0000..U+001F + U+007F
+    // exactly -- C1 controls (U+0080..U+009F) are NOT rejected.
+    if raw.chars().any(|c| c <= '\u{1f}' || c == '\u{7f}') {
+        return Err(invalid(field, "must not contain control characters"));
+    }
+    if raw.contains('?') || raw.contains('#') {
+        return Err(invalid(field, "must not contain query strings or fragments"));
+    }
+    if raw.contains('%') {
+        return Err(invalid(field, "must not contain percent-encoded sequences"));
+    }
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in raw.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            _ => segs.push(seg),
+        }
+    }
+    Ok(if segs.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}/", segs.join("/"))
+    })
+}
+
+/// `/^[a-zA-Z][a-zA-Z\d+.-]*:/` — an absolute-URL scheme prefix.
+fn is_url_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    for c in chars {
+        if c == ':' {
+            return true;
+        }
+        if !(c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-')) {
+            return false;
+        }
+    }
+    false
 }
 
 /// File selection + parse + env-resolve + normalize — the wrangler path.
@@ -5702,6 +5777,53 @@ console.log("after the payload");
                 "must reject {bad:?}"
             );
         }
+    }
+
+    /// `assets.base_path` normalize — canonical form `"/"` or
+    /// `"/seg/…/"`; relative/absolute inputs resolve `.`/`..`/empty
+    /// segments; URLs, backslashes, controls, `?`/`#`, `%` and empty
+    /// input fail closed (workers-shared `normalizeBasePath` parity).
+    #[test]
+    fn normalize_base_path_cases() {
+        let ok = |raw: &str| {
+            normalize_base_path(&Value::from(raw), "assets.base_path")
+                .unwrap_or_else(|e| panic!("{raw:?}: {e:?}"))
+        };
+        let err = |v: Value| normalize_base_path(&v, "assets.base_path").is_err();
+
+        assert_eq!(ok("/"), "/");
+        assert_eq!(ok("/blog"), "/blog/");
+        assert_eq!(ok("/blog/"), "/blog/");
+        assert_eq!(ok("blog"), "/blog/");
+        assert_eq!(ok("blog/sub"), "/blog/sub/");
+        // `.`/`..`/empty segments resolve before slashes are applied.
+        assert_eq!(ok("/a/./b//c/"), "/a/b/c/");
+        assert_eq!(ok("/a/../b"), "/b/");
+        assert_eq!(ok("/.."), "/");
+        assert_eq!(ok("/./"), "/");
+        assert_eq!(ok("/a/../../b"), "/b/"); // leading `..` pops empty
+        // Unicode pathname characters are allowed.
+        assert_eq!(ok("/b\u{e9}ta"), "/b\u{e9}ta/");
+
+        for bad in [
+            "",
+            "//host/x",
+            "https://x/y",
+            "a:b",
+            "C:\\x",
+            "/a\\b",
+            "/a?x",
+            "/a#f",
+            "/a%20b",
+            "/a\u{7}b",
+            "/a\u{7f}b",
+        ] {
+            assert!(err(Value::from(bad)), "must reject {bad:?}");
+        }
+        // C1 controls are NOT upstream-rejected — they normalize.
+        assert_eq!(ok("/a\u{85}b"), "/a\u{85}b/");
+        assert!(err(Value::from(3.0)));
+        assert!(err(Value::Bool(true)));
     }
 }
 

@@ -96,6 +96,7 @@ async fn assets_backend_reports_storage_unavailable() {
                         },
                         assets_first: None,
                         run_worker_first: None,
+                        base_path: None,
                     })],
                 )],
             )],
