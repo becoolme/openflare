@@ -387,7 +387,10 @@ test("cfImagePlan: draw entry → url list + paired ops", () => {
       ],
     }),
   );
-  assert.deepEqual(plan.draws, [OVER_URL, "https://cdn.example.com/wm.png"]);
+  assert.deepEqual(plan.draws, [
+    { kind: "image", url: OVER_URL },
+    { kind: "image", url: "https://cdn.example.com/wm.png" },
+  ]);
   const ops = JSON.parse(plan.transforms);
   assert.equal(ops.length, 4); // main + over + draw, over + draw
   assert.deepEqual(ops[0], { width: 100 });
@@ -428,8 +431,16 @@ test("cfImagePlan: invalid draw entries throw TypeError", () => {
     "not-an-array",
     [{ url: OVER_URL, left: 1, right: 2 }], // axis conflict
     [{ url: OVER_URL, top: 0, bottom: 0 }],
-    [{ text: "HELLO" }], // font stack not vendored
+    [{ text: "HELLO" }], // font required for text
+    [{ text: "HELLO", font: { url: OVER_URL }, url: OVER_URL }], // url is image-only
+    [{ text: "HELLO", font: { url: OVER_URL }, width: 50 }], // transform on text
+    [{ text: "HELLO", font: { url: OVER_URL }, color: "var(--x)" }],
+    [{ text: "HELLO", font: { url: OVER_URL }, size: 0 }],
+    [{ text: "HELLO", font: { url: "file:///etc/passwd" } }],
+    [{ text: "HELLO", font: "x" }],
+    [{ text: "" }],
     [{ url: OVER_URL, font: { url: "x" } }], // text-only key on image entry
+    [{ url: OVER_URL, size: 20 }],
     [{ bottom: 5 }], // url required
     [{ url: "notaurl" }],
     [{ url: "file:///etc/passwd" }],
@@ -522,4 +533,122 @@ test("cf.image draw: policy-denied overlay → ERROR 9420", async () => {
     );
     assert.equal(resp.headers.get("cf-resized"), "err=9420");
   });
+});
+
+// ---- draw text overlays -------------------------------------------------
+
+const FONT_URL = "https://cdn.example.com/font.ttf";
+const FONT_BYTES = new Uint8Array(
+  (await import("node:fs")).readFileSync(
+    new URL("./fixtures/test-sans.ttf", import.meta.url),
+  ),
+);
+
+test("cfImagePlan: text draw entry → spec + fontUrl, draw op only", () => {
+  const plan = cfImagePlan(
+    pngReq({
+      draw: [
+        { text: "HI", font: { url: FONT_URL }, size: 40, color: "#ff0000", top: 2, left: 4 },
+      ],
+    }),
+  );
+  assert.deepEqual(plan.draws, [
+    {
+      kind: "text",
+      spec: '{"text":"HI","size":40,"color":"#ff0000"}',
+      fontUrl: FONT_URL,
+    },
+  ]);
+  const ops = JSON.parse(plan.transforms);
+  assert.equal(ops.length, 2); // main + draw — text entries emit no transform op
+  assert.deepEqual(ops[1], {
+    drawImageIndex: 1, targetImageIndex: 0, top: 2, left: 4,
+  });
+});
+
+test("cfImagePlan: text defaults leave spec minimal; dpr scales offsets", () => {
+  const plan = cfImagePlan(
+    pngReq({ dpr: 2, draw: [{ text: "T", font: { url: FONT_URL }, top: 5 }] }),
+  );
+  assert.equal(plan.draws[0].spec, '{"text":"T"}');
+  assert.equal(JSON.parse(plan.transforms)[1].top, 10);
+});
+
+test("cfImageBody: text entry emits draw_text before draw_font", () => {
+  const plan = cfImagePlan(
+    pngReq({
+      draw: [
+        { url: OVER_URL, top: 0 },
+        { text: "T", font: { url: FONT_URL }, top: 1 },
+      ],
+    }),
+  );
+  const fd = cfImageBody(new Uint8Array([1]), plan, [
+    new Uint8Array([2]),
+    new Uint8Array([3]),
+  ]);
+  assert.deepEqual(
+    [...fd.entries()].map(([k, v]) => [k, typeof v]),
+    [
+      ["image", "object"],
+      ["transforms", "string"],
+      ["output_format", "string"],
+      ["draw_image", "object"],
+      ["draw_text", "string"],
+      ["draw_font", "object"],
+    ],
+  );
+  assert.equal(fd.get("draw_text"), '{"text":"T"}');
+});
+
+test("cf.image draw e2e: text overlay composites font-colored glyphs", async () => {
+  const base = await sourcePng();
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withUrlMap(
+    { [PNG_URL]: [base, 200], [FONT_URL]: [FONT_BYTES, 200] },
+    async () => {
+      const resp = await proxy.fetch(
+        pngReq({
+          format: "png",
+          draw: [
+            { text: "HI", font: { url: FONT_URL }, size: 10, color: "#ff0000", top: 0, left: 0 },
+          ],
+        }),
+      );
+      assert.equal(resp.status, 200);
+      const out = await eng.decodeImage(
+        new Uint8Array(await resp.arrayBuffer()),
+        "png",
+      );
+      let red = 0;
+      for (let i = 0; i < out.data.length; i += 4) {
+        if (out.data[i] > 200 && out.data[i + 1] < 100) red++;
+      }
+      assert.ok(red > 0, "glyph pixels composited");
+    },
+  );
+});
+
+test("cf.image draw: unfetchable font → ERROR 9420", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withUrlMap({ [PNG_URL]: [await sourcePng(), 200] }, async () => {
+    const resp = await proxy.fetch(
+      pngReq({ draw: [{ text: "HI", font: { url: FONT_URL } }] }),
+    );
+    assert.equal(resp.headers.get("cf-resized"), "err=9420");
+    assert.match(await resp.text(), /^ERROR 9420/);
+  });
+});
+
+test("cf.image draw: garbage font bytes → facade err=9420", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withUrlMap(
+    { [PNG_URL]: [await sourcePng(), 200], [FONT_URL]: [new Uint8Array(64), 200] },
+    async () => {
+      const resp = await proxy.fetch(
+        pngReq({ draw: [{ text: "HI", font: { url: FONT_URL } }] }),
+      );
+      assert.equal(resp.headers.get("cf-resized"), "err=9420");
+    },
+  );
 });

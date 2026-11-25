@@ -383,26 +383,29 @@ export class EgressProxy extends WorkerEntrypoint {
           });
         }
       }
-      // Draw overlays are fetched here — the egress worker is the only
+      // Draw payloads are fetched here — the egress worker is the only
       // layer that can reach tenant-specified URLs, and each fetch
-      // re-runs the egress policy like the source URL did. The bytes
-      // ride to the facade as `draw_image` fields whose indices line
-      // up with the per-entry ops in plan.transforms. An overlay that
-      // cannot be fetched is a source-level failure: ERROR 9420
-      // (unfetchable image), honoring onerror:"redirect" like the
-      // other transform error paths.
-      const overlays: Uint8Array[] = [];
-      for (const drawUrl of plan.draws) {
-        let over: Uint8Array | undefined;
-        if (evaluateTarget(drawUrl, this.#policy).allow) {
+      // re-runs the egress policy like the source URL did. Image-entry
+      // bytes ride to the facade as `draw_image` fields, text-entry
+      // font bytes as `draw_font` (paired with the entry's draw_text
+      // spec); indices line up with the per-entry ops in
+      // plan.transforms. A payload that cannot be fetched is a
+      // source-level failure: ERROR 9420 (unfetchable image),
+      // honoring onerror:"redirect" like the other transform error
+      // paths.
+      const payloads: Uint8Array[] = [];
+      for (const draw of plan.draws) {
+        const url = draw.kind === "text" ? draw.fontUrl : draw.url;
+        let bytes: Uint8Array | undefined;
+        if (evaluateTarget(url, this.#policy).allow) {
           try {
-            const resp = await fetch(drawUrl, {
+            const resp = await fetch(url, {
               signal: AbortSignal.timeout(
                 this.#policy?.requestTimeoutMs ?? 30_000,
               ),
             });
-            const bytes = new Uint8Array(await resp.arrayBuffer());
-            if (bytes.length > SRC_MAX) {
+            const buf = new Uint8Array(await resp.arrayBuffer());
+            if (buf.length > SRC_MAX) {
               if (plan.onerrorRedirect) return redirect();
               return new Response("ERROR 9424\n", {
                 status: 413,
@@ -412,12 +415,12 @@ export class EgressProxy extends WorkerEntrypoint {
                 },
               });
             }
-            over = bytes;
+            bytes = buf;
           } catch {
-            over = undefined;
+            bytes = undefined;
           }
         }
-        if (over === undefined) {
+        if (bytes === undefined) {
           if (plan.onerrorRedirect) return redirect();
           return new Response("ERROR 9420\n", {
             status: 502,
@@ -427,11 +430,11 @@ export class EgressProxy extends WorkerEntrypoint {
             },
           });
         }
-        overlays.push(over);
+        payloads.push(bytes);
       }
       out = await svc.fetch("http://vrt-images.internal/transform", {
         method: "POST",
-        body: cfImageBody(src, plan, overlays),
+        body: cfImageBody(src, plan, payloads),
       });
     } catch {
       // Transport-level failure to the facade — CF surfaces these as

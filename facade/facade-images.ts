@@ -9,7 +9,9 @@
 // `info()` parses container headers in pure TS (cheap, no decode).
 // `transform()` runs the vendored jSquash WASM engine
 // (facade/images-engine.ts) — decode → op chain → encode entirely
-// inside this worker. `text_input`/`draw_text` rasterization, animated
+// inside this worker. `text_input`/`draw_text` rasterize through the
+// vendored resvg-wasm font stack (facade/text-rasterize.ts) with the
+// font bytes riding `text_font`/`draw_font` fields. Animated
 // multi-frame output, GIF encode, SVG rasterization, and `segment`
 // gravity fail closed — never a silent identity passthrough.
 import { WorkerEntrypoint } from "cloudflare:workers";
@@ -38,6 +40,11 @@ import {
   METADATA_MODES,
   type MetadataMode,
 } from "./images-metadata.js";
+import {
+  parseTextSpec,
+  type TextSpec,
+} from "./text-spec.js";
+import { rasterizeText } from "./text-rasterize.js";
 
 const DECODE_FORMATS = new Set(["jpeg", "png", "webp", "avif", "gif", "bmp"]);
 const OUTPUT_FORMATS: Record<string, string> = {
@@ -77,7 +84,16 @@ async function decodeField(
   if (!DECODE_FORMATS.has(sniffed.format)) {
     throw new EngineError(9401, `images: ${what} format ${sniffed.format} has no vendored decoder`);
   }
-  return { frame: await decodeImage(bytes, sniffed.format), format: sniffed.format, bytes };
+  let frame: ImageDataLike;
+  try {
+    frame = await decodeImage(bytes, sniffed.format);
+  } catch (e) {
+    // Codec-level failures (corrupt payload on a sniffed format)
+    // surface as the same 9420 class upstream publishes.
+    if (e instanceof EngineError) throw e;
+    throw new EngineError(9420, `images: ${what} decode failed`);
+  }
+  return { frame, format: sniffed.format, bytes };
 }
 
 /** Alpha-flatten onto `color` for opaque output formats. */
@@ -141,17 +157,6 @@ export class ImagesFacade extends WorkerEntrypoint {
       }
       case "/transform": {
         try {
-          // Text-source canvases need a font rasterizer — none vendored.
-          if (form.get("text_input") !== null) {
-            return imagesError(9401, "images: text_input rasterization is not supported", 415);
-          }
-          if (form.get("draw_text") !== null) {
-            return imagesError(9401, "images: draw_text rasterization is not supported", 415);
-          }
-          const image = form.get("image");
-          if (!(image instanceof File)) {
-            return imagesError(9423, "images: missing `image` field", 400);
-          }
           const raw = form.get("transforms");
           if (typeof raw !== "string") {
             return imagesError(9423, "images: missing `transforms` field", 400);
@@ -165,14 +170,60 @@ export class ImagesFacade extends WorkerEntrypoint {
             return imagesError(9423, "images: malformed `transforms` JSON", 400);
           }
 
-          const { frame: canvas, format: canvasFormat, bytes: canvasBytes } =
-            await decodeField(image, "canvas image");
-          const frames = [canvas];
-          for (const field of form.getAll("draw_image")) {
-            if (!(field instanceof File)) {
-              return imagesError(9423, "images: malformed `draw_image` field", 400);
+          // The canvas is either an `image` file or a `text_input`
+          // JSON spec paired with a `text_font` file — the upstream
+          // wire's XOR sources.
+          const image = form.get("image");
+          const textInput = form.get("text_input");
+          const textFont = form.get("text_font");
+          let canvas: ImageDataLike;
+          let canvasFormat: string | undefined;
+          let canvasBytes: Uint8Array | undefined;
+          if (textInput !== null || textFont !== null) {
+            // The wire's canvas sources are XOR — image OR text.
+            if (image !== null || typeof textInput !== "string" || !(textFont instanceof File)) {
+              return imagesError(9423, "images: malformed `text_input`/`text_font` fields", 400);
             }
-            frames.push((await decodeField(field, `draw_image ${frames.length}`)).frame);
+            canvas = await rasterizeText(
+              parseTextSpec(textInput),
+              new Uint8Array(await textFont.arrayBuffer()),
+            );
+          } else {
+            if (!(image instanceof File)) {
+              return imagesError(9423, "images: missing `image` field", 400);
+            }
+            const decoded = await decodeField(image, "canvas image");
+            canvas = decoded.frame;
+            canvasFormat = decoded.format;
+            canvasBytes = decoded.bytes;
+          }
+          // Overlay frames fill in multipart order — draw_image and
+          // draw_text+draw_font pairs share the drawImageIndex space.
+          const frames = [canvas];
+          let pendingText: TextSpec | undefined;
+          for (const [name, field] of form.entries()) {
+            if (name === "draw_image") {
+              if (pendingText !== undefined || !(field instanceof File)) {
+                return imagesError(9423, "images: malformed overlay fields", 400);
+              }
+              frames.push((await decodeField(field, `draw_image ${frames.length}`)).frame);
+            } else if (name === "draw_text") {
+              if (pendingText !== undefined || typeof field !== "string") {
+                return imagesError(9423, "images: malformed `draw_text` field", 400);
+              }
+              pendingText = parseTextSpec(field);
+            } else if (name === "draw_font") {
+              if (pendingText === undefined || !(field instanceof File)) {
+                return imagesError(9423, "images: `draw_font` without `draw_text`", 400);
+              }
+              frames.push(
+                await rasterizeText(pendingText, new Uint8Array(await field.arrayBuffer())),
+              );
+              pendingText = undefined;
+            }
+          }
+          if (pendingText !== undefined) {
+            return imagesError(9423, "images: `draw_text` missing its `draw_font`", 400);
           }
           if (canvas.width * canvas.height > IMAGES_TRANSFORM_MAX_PIXELS) {
             return imagesError(9401, "images: source exceeds the transform pixel cap", 413);
@@ -223,7 +274,10 @@ export class ImagesFacade extends WorkerEntrypoint {
             ? flatten(done, bg ?? [255, 255, 255, 255])
             : done;
           const { bytes, contentType } = await encodeImage(finalImage, format, quality);
-          const srcMeta = extractMetadata(canvasBytes, canvasFormat);
+          const srcMeta =
+            canvasBytes !== undefined && canvasFormat !== undefined
+              ? extractMetadata(canvasBytes, canvasFormat)
+              : {};
           const outBytes = attachMetadata(
             bytes, format, srcMeta, metadata,
             finalImage.width, finalImage.height,

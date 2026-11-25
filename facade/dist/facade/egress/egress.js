@@ -221,16 +221,17 @@ export class EgressProxy extends WorkerEntrypoint {
                     });
                 }
             }
-            const overlays = [];
-            for (const drawUrl of plan.draws){
-                let over;
-                if (evaluateTarget(drawUrl, this.#policy).allow) {
+            const payloads = [];
+            for (const draw of plan.draws){
+                const url = draw.kind === "text" ? draw.fontUrl : draw.url;
+                let bytes;
+                if (evaluateTarget(url, this.#policy).allow) {
                     try {
-                        const resp = await fetch(drawUrl, {
+                        const resp = await fetch(url, {
                             signal: AbortSignal.timeout(this.#policy?.requestTimeoutMs ?? 30_000)
                         });
-                        const bytes = new Uint8Array(await resp.arrayBuffer());
-                        if (bytes.length > SRC_MAX) {
+                        const buf = new Uint8Array(await resp.arrayBuffer());
+                        if (buf.length > SRC_MAX) {
                             if (plan.onerrorRedirect) return redirect();
                             return new Response("ERROR 9424\n", {
                                 status: 413,
@@ -240,12 +241,12 @@ export class EgressProxy extends WorkerEntrypoint {
                                 }
                             });
                         }
-                        over = bytes;
+                        bytes = buf;
                     } catch  {
-                        over = undefined;
+                        bytes = undefined;
                     }
                 }
-                if (over === undefined) {
+                if (bytes === undefined) {
                     if (plan.onerrorRedirect) return redirect();
                     return new Response("ERROR 9420\n", {
                         status: 502,
@@ -255,11 +256,11 @@ export class EgressProxy extends WorkerEntrypoint {
                         }
                     });
                 }
-                overlays.push(over);
+                payloads.push(bytes);
             }
             out = await svc.fetch("http://vrt-images.internal/transform", {
                 method: "POST",
-                body: cfImageBody(src, plan, overlays)
+                body: cfImageBody(src, plan, payloads)
             });
         } catch  {
             if (plan.onerrorRedirect) return redirect();

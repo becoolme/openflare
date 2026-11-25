@@ -8,6 +8,14 @@ const { sniffImage, sniffSvg } = await import(facadeModule("images-wire.js"));
 
 const facade = new ImagesFacade({}, {});
 
+// OFL-licensed Kanit subset renamed "VRT Test Sans" (license records
+// retained in its name table) — real glyphs for rasterization tests.
+const FONT_BYTES = new Uint8Array(
+  (await import("node:fs")).readFileSync(
+    new URL("./fixtures/test-sans.ttf", import.meta.url),
+  ),
+);
+
 function png({ width = 3, height = 2 } = {}) {
   const buf = new Uint8Array(33);
   const dv = new DataView(buf.buffer);
@@ -275,13 +283,93 @@ test("transform: anim on a gif source fails closed err=9401", async () => {
   assert.equal(errCode(resp), 9401);
 });
 
-test("transform: text_input/draw_text fail closed err=9401", async () => {
+test("transform: text fields pair strictly — orphans/mismatch err=9423", async () => {
+  // text_input without its text_font file.
   const a = await post("/transform", {
-    text_input: JSON.stringify({ text: "hi", font: "x" }),
+    text_input: JSON.stringify({ text: "hi" }),
     transforms: "[]",
     output_format: "image/png",
   });
-  assert.equal(errCode(a), 9401);
+  assert.equal(errCode(a), 9423);
+  // Orphan/mismatch cases need a decodable canvas — encode a real one.
+  const eng = await import(facadeModule("images-engine.js"));
+  const real = (await eng.encodeImage(solidFrame(4, 4), "png", 90)).bytes;
+  // draw_text without a following draw_font.
+  const b = await post("/transform", {
+    image: imageField(real),
+    draw_text: JSON.stringify({ text: "hi" }),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(errCode(b), 9423);
+  // draw_font with no pending draw_text spec.
+  const c = await post("/transform", {
+    image: imageField(real),
+    draw_font: new File([new Uint8Array(4)], "f"),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(errCode(c), 9423);
+  // text_input and image canvas are mutually exclusive.
+  const d = await post("/transform", {
+    image: imageField(real),
+    text_input: JSON.stringify({ text: "hi" }),
+    text_font: new File([FONT_BYTES], "f"),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(errCode(d), 9423);
+});
+
+test("transform: text_input canvas + draw_text overlay rasterize", async () => {
+  // Text canvas: transparent RGBA bounds sized to the glyphs.
+  const a = await post("/transform", {
+    text_input: JSON.stringify({ text: "HI", size: 20, color: "#ff0000" }),
+    text_font: new File([FONT_BYTES], "f"),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(a.status, 200, await a.clone().text());
+  const eng = await import(facadeModule("images-engine.js"));
+  const out = await eng.decodeImage(
+    new Uint8Array(await a.arrayBuffer()),
+    "png",
+  );
+  assert.ok(out.width > 10 && out.height > 5, `text canvas ${out.width}x${out.height}`);
+
+  // Text overlay composites onto an image canvas — glyphs land as
+  // red pixels over the solid base.
+  const src = await eng.encodeImage(solidFrame(40, 40, [200, 200, 200, 255]), "png", 90);
+  const b = await post("/transform", {
+    image: imageField(src.bytes),
+    draw_text: JSON.stringify({ text: "HI", size: 30, color: "#ff0000" }),
+    draw_font: new File([FONT_BYTES], "f"),
+    transforms: JSON.stringify([
+      {},
+      { drawImageIndex: 1, targetImageIndex: 0, top: 0, left: 0 },
+    ]),
+    output_format: "image/png",
+  });
+  assert.equal(b.status, 200, await b.clone().text());
+  const over = await eng.decodeImage(
+    new Uint8Array(await b.arrayBuffer()),
+    "png",
+  );
+  let red = 0;
+  for (let i = 0; i < over.data.length; i += 4) {
+    if (over.data[i] > 200 && over.data[i + 1] < 100) red++;
+  }
+  assert.ok(red > 0, "glyph pixels composited");
+});
+
+test("transform: unparseable font bytes → err=9420", async () => {
+  const a = await post("/transform", {
+    text_input: JSON.stringify({ text: "hi" }),
+    text_font: new File([new Uint8Array(64).fill(65)], "f"),
+    transforms: "[]",
+    output_format: "image/png",
+  });
+  assert.equal(errCode(a), 9420);
 });
 
 test("transform: avif output encodes; gif output still fails closed err=9401", async () => {

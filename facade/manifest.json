@@ -534,8 +534,8 @@
           "name": "facade/facade-images.js",
           "dist": "facade/dist/facade/facade-images.js",
           "source": "facade/facade-images.ts",
-          "sourceSha256": "24c5c377c8e9791f9fc77a2f6887eb8ebdeeb5903ee5b5ed3b5725ea21e8481d",
-          "sha256": "ba8bb3d0db40c543fca7e60ac7e230c8584c2c05c8023d227987a76c9b751aa3"
+          "sourceSha256": "fd2dd4421cad6afddc95fa2400951cd6e21d1565946c6cd11dc3fa05d949010c",
+          "sha256": "253f67ec1afe019dd4c0b05ef270578adb79e0f3ecdb0054a294d64d0e960fe5"
         },
         {
           "name": "facade/images-decode.js",
@@ -571,6 +571,20 @@
           "source": "facade/images-wire.ts",
           "sourceSha256": "e507393a1ce88bb1c38bcbc7fec3bb6bca7b964bdd6b473168e104b3d32c90ef",
           "sha256": "e9cf80365a712a15e370ebeddfa22248c6d6f11ac952045f9db04298efb28c09"
+        },
+        {
+          "name": "facade/text-rasterize.js",
+          "dist": "facade/dist/facade/text-rasterize.js",
+          "source": "facade/text-rasterize.ts",
+          "sourceSha256": "d4c5885075a8714a01dce70557765be6a7cb1e74f94c49e0894a63a33441d75a",
+          "sha256": "50f4362a0236019914e78dda66ef26044f9fa16229c56ae4fdb57f7893db8c2c"
+        },
+        {
+          "name": "facade/text-spec.js",
+          "dist": "facade/dist/facade/text-spec.js",
+          "source": "facade/text-spec.ts",
+          "sourceSha256": "5b6182d4b039c59c2ffe253d00497118338b971998e1ef259f429355947f7b55",
+          "sha256": "83e15c5309b09d2132cfde681bc15d89b7e40c69c1af8e7175bfb83f12013181"
         },
         {
           "name": "third_party/jsquash/avif/avif_dec.js",
@@ -690,6 +704,21 @@
           "source": "third_party/jsquash/webp/webp_enc_simd.wasm",
           "sourceSha256": "39c279269ec1163b987b6d69749458e3d5b03b9585f58b6ca5455b76b504a305",
           "sha256": "39c279269ec1163b987b6d69749458e3d5b03b9585f58b6ca5455b76b504a305",
+          "type": "wasm"
+        },
+        {
+          "name": "third_party/resvg/index.js",
+          "dist": "facade/dist/third_party/resvg/index.js",
+          "source": "third_party/resvg/index.js",
+          "sourceSha256": "5bdf291ac0ea0bbe78cdcbfe6a3dcdd23bc77f146ac502022040e133eae0e3f3",
+          "sha256": "5bdf291ac0ea0bbe78cdcbfe6a3dcdd23bc77f146ac502022040e133eae0e3f3"
+        },
+        {
+          "name": "third_party/resvg/index_bg.wasm",
+          "dist": "facade/dist/third_party/resvg/index_bg.wasm",
+          "source": "third_party/resvg/index_bg.wasm",
+          "sourceSha256": "22bf6e9f9a100d972da0411a69c5ba504367fc1fa87b3b64e3f35e53926d2d70",
+          "sha256": "22bf6e9f9a100d972da0411a69c5ba504367fc1fa87b3b64e3f35e53926d2d70",
           "type": "wasm"
         }
       ]
@@ -878,15 +907,15 @@
           "name": "facade/egress/cf-image.js",
           "dist": "facade/dist/facade/egress/cf-image.js",
           "source": "facade/egress/cf-image.ts",
-          "sourceSha256": "9dcadec97734acaf12eda05a80f7fe1b630ad5b29ea6f1e191c8c86a516b3074",
-          "sha256": "e3b7cff5ee7818eb3a850911cdf121e609b2b2db574e762aabc01b414e098d14"
+          "sourceSha256": "7574c884278adbab1d306377e666c0288c6cad738fea180c790465048397dc7c",
+          "sha256": "67b037e4b374347b2a3d581df88b29e9e522db5af5fb33f117cd6e7f9916ba0e"
         },
         {
           "name": "facade/egress/egress.js",
           "dist": "facade/dist/facade/egress/egress.js",
           "source": "facade/egress/egress.ts",
-          "sourceSha256": "8f6d73c8f6ccbc205f846472970195efa8a7dd0d42569b733a8cbb924f2900c2",
-          "sha256": "6c0d0332e35e53415b1e305c5c477f5fb1b66f786b99e1c43affccd13c73c5e8"
+          "sourceSha256": "8fa5c13318aceaa225090a018f243ec5d13c662981ca1489e5df859d49829f87",
+          "sha256": "f5b0887963183625798d6ccd4e39c52e0b81facdfc2e2cbaaf4659d9fdf124d3"
         },
         {
           "name": "facade/egress/ip.js",
@@ -922,6 +951,13 @@
           "source": "facade/svg-hush.ts",
           "sourceSha256": "94c48632e1d17b9df70db3379ad25d38b53adabf7564571203988e305d6b2321",
           "sha256": "2251aaae598975058943d5e3fee903b840de20b2f0c9b9aacb6bd659f67a1161"
+        },
+        {
+          "name": "facade/text-spec.js",
+          "dist": "facade/dist/facade/text-spec.js",
+          "source": "facade/text-spec.ts",
+          "sourceSha256": "5b6182d4b039c59c2ffe253d00497118338b971998e1ef259f429355947f7b55",
+          "sha256": "83e15c5309b09d2132cfde681bc15d89b7e40c69c1af8e7175bfb83f12013181"
         }
       ]
     },

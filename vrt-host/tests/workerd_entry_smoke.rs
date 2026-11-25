@@ -122,9 +122,15 @@ fn write_capnp(
         let file = format!("m{i}.js");
         let dst = dir.join(&file);
         std::fs::copy(src, &dst).unwrap();
+        let decl = if name.ends_with(".wasm") {
+            "wasm"
+        } else {
+            "esModule"
+        };
         mods.push_str(&format!(
-            "(name = \"{}\", esModule = embed \"{}\"),",
+            "(name = \"{}\", {} = embed \"{}\"),",
             escape(name),
+            decl,
             escape(&file)
         ));
     }
@@ -184,10 +190,20 @@ fn spawn_extra(bin: &Path, cfg: &Path, dir: &Path, extra: &[&str]) -> WorkerProc
     }
 }
 
-fn wait_ready(port: u16) -> bool {
+/// A bare connect is not enough: `free_port` releases its probe
+/// before the spawn can bind, and a concurrently-running test's
+/// server can grab the port — a connect then succeeds against the
+/// FOREIGN listener, whose later exit resets our request. Require
+/// this spawned workerd's own `Listening on ...:<port>` log line.
+fn wait_ready(port: u16, proc: &mut WorkerProc) -> bool {
     for _ in 0..100 {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+            && log_text(proc).contains(&format!("127.0.0.1:{port}"))
+        {
             return true;
+        }
+        if matches!(proc.child.try_wait(), Ok(Some(_))) {
+            return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -429,8 +445,8 @@ fn real_workerd_worker_loader() {
     // `workerLoader` bindings are experimental-gated upstream;
     // vrt-host's assemble adds `--experimental` to argv for tenants
     // that declare `[[worker_loaders]]` — same flag here.
-    let proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "worker_loader: never listened\n-- workerd.log --\n{}",
             log_text(&proc)
@@ -558,8 +574,8 @@ fn real_workerd_unsafe_eval() {
     write_deny_stub(&dir);
     let port = free_port();
     let cfg = write_unsafe_capnp(&dir, port, true);
-    let proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "unsafe_eval(bound): never listened\n-- workerd.log --\n{}",
             log_text(&proc)
@@ -584,8 +600,8 @@ fn real_workerd_unsafe_eval() {
     write_deny_stub(&dir);
     let port = free_port();
     let cfg = write_unsafe_capnp(&dir, port, false);
-    let proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(&bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "unsafe_eval(unbound): never listened\n-- workerd.log --\n{}",
             log_text(&proc)
@@ -875,8 +891,8 @@ fn rendered_smoke(bin: &Path, assets_binding_name: &str) {
         &"c".repeat(64),
         BACKEND_STUB,
     );
-    let proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "workerd never listened on {port} (binding {assets_binding_name})
 -- workerd.log --
@@ -1026,8 +1042,8 @@ fn smoke_concurrent_fanin(bin: &Path) {
         &"d".repeat(64),
         &BACKEND_STUB_TIMED.replace("<DELAY>", "150"),
     );
-    let proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "workerd never listened on {port}
 -- workerd.log --
@@ -1082,8 +1098,8 @@ fn smoke_owner_disconnect(bin: &Path) {
         &"e".repeat(64),
         &BACKEND_STUB_TIMED.replace("<DELAY>", "1200"),
     );
-    let proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "workerd never listened on {port}
 -- workerd.log --
@@ -1159,8 +1175,8 @@ fn smoke_teardown_lifecycle(bin: &Path) {
     };
     let port = free_port();
     let cfg = render_and_write(&dir, "ASSETS", port, &"b".repeat(64), &BACKEND_STUB);
-    let proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "workerd never listened on {port}
 -- workerd.log --
@@ -1206,8 +1222,8 @@ fn smoke_route_index_timeout(bin: &Path) {
         &"f".repeat(64),
         &BACKEND_STUB_TIMED.replace("<DELAY>", "8000"),
     );
-    let proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
-    if !wait_ready(port) {
+    let mut proc = spawn_extra(bin, &cfg, &dir, &["--experimental"]);
+    if !wait_ready(port, &mut proc) {
         panic!(
             "workerd never listened on {port}
 -- workerd.log --
@@ -1274,17 +1290,23 @@ fn real_workerd_router_routes_and_all_entries_load() {
             return;
         };
         write_deny_stub(&dir);
-        let port = free_port();
-        let cfg = write_capnp(&dir, worker, &manifest_modules(worker), worker, port);
-        let proc = spawn(&bin, &cfg, &dir);
-        if !wait_ready(port) {
-            panic!(
-                "{worker}: never listened
--- workerd.log --
-{}",
-                log_text(&proc)
-            );
+        // Port theft: a foreign process can grab the free_port probe's
+        // port before our spawn binds — respawn on a fresh port.
+        let mut spawned = None;
+        let mut last_log = String::new();
+        for _ in 0..3 {
+            let p_port = free_port();
+            let cfg = write_capnp(&dir, worker, &manifest_modules(worker), worker, p_port);
+            let mut p = spawn(&bin, &cfg, &dir);
+            if wait_ready(p_port, &mut p) {
+                spawned = Some((p, p_port));
+                break;
+            }
+            last_log = log_text(&p);
         }
+        let Some((proc, port)) = spawned else {
+            panic!("{worker}: never listened\n-- workerd.log --\n{last_log}");
+        };
         let (status, body) = http_get(port, "/");
         assert!(status > 0, "{worker}: no HTTP response");
         if worker != "vrt-no-network" {
