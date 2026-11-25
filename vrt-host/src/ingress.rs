@@ -2100,6 +2100,7 @@ impl WsTunnel {
                 return;
             }
         };
+        tracing::info!(worker = %w, "ws tunnel upgrades ready");
         let started = Instant::now();
         let last_ms = Arc::new(AtomicU64::new(0));
         let from_client = Arc::new(AtomicU64::new(0));
@@ -2127,8 +2128,17 @@ impl WsTunnel {
                 _ = wait_idle(started, last_ms.clone(), idle_ms) => "idle_timeout",
                 _ = tokio::time::sleep_until(max_at) => "max_duration",
             };
-            let asleep = self.runtime.state().is_asleep()
-                || self.runtime.state() == crate::state::TenantState::Hibernating;
+            let sleeping = self.runtime.state();
+            let asleep = sleeping.is_asleep()
+                || sleeping == crate::state::TenantState::Hibernating;
+            tracing::info!(
+                worker = %w,
+                reason,
+                ?sleeping,
+                enabled = self.hibernation.enabled,
+                reconnect = self.reconnect.is_some(),
+                "ws tunnel relay ended"
+            );
             // Hibernation stops workerd underneath the tunnel, so the relay
             // usually ends with `closed`/`error` rather than the idle timer.
             // When the tenant is asleep and can be reconnected, keep the
