@@ -603,7 +603,7 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
 
     // workerd reloads `_cf_ALARM` and fires the overdue alarm.
     let mut hits = 0;
-    for _ in 0..40 {
+    for _ in 0..160 {
         if let Some((200, body)) = get(a, "/alarm-hits").await {
             hits = body.trim().parse().unwrap_or(0);
             if hits > 0 {
@@ -933,7 +933,7 @@ export class EventLog extends DurableObject {
   async fetch(req) {
     const u = new URL(req.url);
     if (u.pathname === "/alarm") {
-      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      await this.ctx.storage.setAlarm(Date.now() + 15000);
       return new Response("armed");
     }
     if (u.pathname === "/alarm-hits") {
