@@ -57,10 +57,17 @@ export default {
 The binding renders as a workerd `wrapped` binding over
 `cloudflare-internal:images-api` — the upstream workerd shim, shipped
 unmodified in the pinned fork — whose inner `fetcher` service binding
-points at the `facade-images` system worker (`vrt-config/src/capnp.rs`,
-`facade/facade-images.ts`). The facade is deny-routed (no network
-egress): it only receives the image bytes the tenant worker streams
-in.
+points at `vrt-egress` (`vrt-config/src/capnp.rs`). The shim POSTs to
+the synthetic host `js.images.cloudflare.com`; the egress worker
+intercepts that hostname ahead of its policy evaluation and relays to
+`facade-images` (`facade/egress/images-binding.ts`). For `/transform`
+bodies carrying `text_input`/`draw_text` JSON specs it resolves each
+spec's `font.url` through the egress policy and injects the bytes as
+adjacent `text_font`/`draw_font` file fields — the facade is
+deny-routed (no network egress) and cannot fetch fonts itself, and
+upstream resolves font URLs service-side too. Requests without text
+specs forward as raw bytes; the facade only ever receives the image
+bytes the tenant worker streams in.
 
 The facade speaks the shim's own upstream protocol verbatim —
 multipart/form-data POSTs to `/info` and `/transform` (the `image`
@@ -99,7 +106,8 @@ and the rest of the upstream op set).
 | op | implementation |
 | --- | --- |
 | `info(stream)` | Pure-TS container sniffer (`facade/images-wire.ts`) — reads PNG IHDR, JPEG SOFn, WebP VP8/VP8L/VP8X, GIF and BMP headers, ISO-BMFF `ftyp`+`ispe` for AVIF/HEIC; SVG markup returns the dim-less `{format: "image/svg+xml"}` shape. Returns the wire `{file_size, format, width, height}` the shim maps to `fileSize`/`width`/`height`/`format`; the pixel engine never runs. |
-| `input().transform()/.draw().output()` | The upstream shim serializes the op chain into the `transforms` multipart field (plus `output_format`/`output_quality`/`background`/`anim`/`text_input`/`draw_*`). The facade validates, decodes every `image`/`draw_image` file, applies the ops, flattens alpha over `background` when required, and encodes. `input()`'s `encoding: "base64"` decode and `text()` sources are handled inside the shim already. |
+| `input().transform()/.draw().output()` | The upstream shim serializes the op chain into the `transforms` multipart field (plus `output_format`/`output_quality`/`background`/`anim`/`text_input`/`draw_*`). The facade validates, decodes every `image`/`draw_image` file, applies the ops, flattens alpha over `background` when required, and encodes. `input()`'s `encoding: "base64"` decode is handled inside the shim already. |
+| `text(content, {font:{url}, size, color})` | Shim emits a `text_input` (canvas) or `draw_text` (`.draw()` overlay) JSON spec; the egress relay fetches `font.url` through the tenant's egress policy and injects `text_font`/`draw_font` bytes; the facade rasterizes via vendored `@resvg/resvg-wasm` (fontdb + rustybuzz shaping). Spec limits: ≤1000 chars, result ≤4096×4096 px, font ≤20 MiB, `size` default 12, `color` default `#000000`. |
 | `hosted.*` (`env.IMAGES.hosted.image()/.upload()/.list()/.createDirectUpload()`) | Cloudflare Images **product** RPC surface — not implemented; the facade exposes no such methods so calls reject. |
 
 ## Request-path transforms (`/cdn-cgi/image/`)

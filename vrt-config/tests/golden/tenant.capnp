@@ -267,8 +267,9 @@ const config :Workerd.Config = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
-        (name = "facade/egress/egress.js", esModule = embed "sys/f5b0887963183625798d6ccd4e39c52e0b81facdfc2e2cbaaf4659d9fdf124d3"),
+        (name = "facade/egress/egress.js", esModule = embed "sys/58b8194f759f25f0a50f8fdda76abc532147257e2f89a51a1b6556e34e078c90"),
         (name = "facade/egress/cf-image.js", esModule = embed "sys/67b037e4b374347b2a3d581df88b29e9e522db5af5fb33f117cd6e7f9916ba0e"),
+        (name = "facade/egress/images-binding.js", esModule = embed "sys/d25d599b1ecd5777c259c70356b82c65649fc85fd879b4c34fadd75dcbc3f599"),
         (name = "facade/egress/ip.js", esModule = embed "sys/6575c6e66245aebea369d5e97ae7ffc6783652044ed2adc2be462c9df3e7b97b"),
         (name = "facade/egress/policy.js", esModule = embed "sys/e6dc4ee5d55668354c4a180e570142fb0a0df195e6228baa038c4d7a96d72fef"),
         (name = "facade/egress/shared.js", esModule = embed "sys/353d7aa02d71f0745c83d132dd884378b3ff2fc2ec2215ebdd8e08d5e4ab89dc"),

@@ -914,8 +914,15 @@
           "name": "facade/egress/egress.js",
           "dist": "facade/dist/facade/egress/egress.js",
           "source": "facade/egress/egress.ts",
-          "sourceSha256": "8fa5c13318aceaa225090a018f243ec5d13c662981ca1489e5df859d49829f87",
-          "sha256": "f5b0887963183625798d6ccd4e39c52e0b81facdfc2e2cbaaf4659d9fdf124d3"
+          "sourceSha256": "2ba5c4b5b98a9c50ddc1a158cd9a442088440b6cf7c4d4040d1bc28f05c028fc",
+          "sha256": "58b8194f759f25f0a50f8fdda76abc532147257e2f89a51a1b6556e34e078c90"
+        },
+        {
+          "name": "facade/egress/images-binding.js",
+          "dist": "facade/dist/facade/egress/images-binding.js",
+          "source": "facade/egress/images-binding.ts",
+          "sourceSha256": "bfea5eaf66b8eb759a8c50fc1bbb59a7d28a2a3c4fe8b1eb5958ac82de59462b",
+          "sha256": "d25d599b1ecd5777c259c70356b82c65649fc85fd879b4c34fadd75dcbc3f599"
         },
         {
           "name": "facade/egress/ip.js",
