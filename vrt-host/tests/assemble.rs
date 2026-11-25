@@ -304,6 +304,7 @@ fn assemble_test_params(sys_digest: String) -> vrt_config::RuntimeParams {
                 digest: sys_digest.clone(),
             }],
             needs_binding_backend: false,
+            cpu_ms: 0,
         }],
         system_compat_date: "2024-01-01".to_string(),
         system_compat_flags: vec![],
@@ -726,6 +727,7 @@ fn experimental_params(sys_digest: &str) -> vrt_config::RuntimeParams {
                 digest: sys_digest.to_string(),
             }],
             needs_binding_backend: false,
+            cpu_ms: 0,
         }],
         system_compat_date: "2024-01-01".to_string(),
         system_compat_flags: vec!["experimental".to_string()],
@@ -812,6 +814,7 @@ fn params_with_flags(sys_digest: &str, flags: &[&str]) -> vrt_config::RuntimePar
             digest: sys_digest.to_string(),
         }],
         needs_binding_backend: false,
+        cpu_ms: 0,
     });
     p
 }
@@ -975,6 +978,7 @@ fn binding_backend_dir_derives_per_tenant_socket() {
             }],
             // Emits the binding-backend external addr.
             needs_binding_backend: true,
+            cpu_ms: 0,
         }],
         system_compat_date: "2024-01-01".to_string(),
         system_compat_flags: vec![],
@@ -1110,6 +1114,39 @@ fn binding_backend_dir_rekeys_fingerprint() {
         .unwrap();
     assert_ne!(none, a);
     assert_ne!(a, b, "binding-backend dir must rekey the fingerprint");
+}
+
+/// `cpu_ms` renders into `limits = (cpuMs = N)` — a manifest change
+/// that touches ONLY a system worker's budget must still rekey the
+/// fingerprint, or the stale generation keeps serving the old budget.
+#[test]
+fn system_worker_cpu_ms_rekeys_fingerprint() {
+    let fx = Fixture::new();
+    let source = Arc::new(MemoryBundleSource::default());
+    let cache = Arc::new(BundleCache::new(fx.dir.path().join("cache")));
+
+    let mk = |cpu_ms: u32| {
+        let mut p = experimental_params("b".repeat(64).as_str());
+        p.system_workers[0].cpu_ms = cpu_ms;
+        Assembler::new(
+            PathBuf::from("/bin/true"),
+            fx.work_root(),
+            cache.clone(),
+            source.clone(),
+            EmitMode::Capnp { params: p },
+            Default::default(),
+            Default::default(),
+            vec![],
+            std::sync::Arc::new(vrt_host::render_inputs::StaticRenderInputs(
+                Default::default(),
+            )),
+        )
+    };
+    let unlimited = mk(0).params_fingerprint().unwrap();
+    let capped = mk(1_000).params_fingerprint().unwrap();
+    let bigger = mk(10_000).params_fingerprint().unwrap();
+    assert_ne!(unlimited, capped, "cpu_ms must rekey the fingerprint");
+    assert_ne!(capped, bigger, "cpu_ms value must rekey the fingerprint");
 }
 
 /// A tenant declaring `[[worker_loaders]]` renders capnp `workerLoader`

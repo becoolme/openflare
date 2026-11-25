@@ -261,6 +261,108 @@ fn rejects_missing_deny_outbound() {
 }
 
 #[test]
+fn cpu_ms_values_match_manifest_tiers() {
+    let parsed = parse_facade_manifest(MANIFEST_JSON).expect("real manifest parses");
+    let get = |name: &str| {
+        parsed
+            .system_workers
+            .iter()
+            .find(|w| w.service_name == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+            .cpu_ms
+    };
+    // Platform-declared budgets — the tiers gen-manifest.mjs emits.
+    assert_eq!(get("facade-images"), 10_000);
+    assert_eq!(get("vrt-egress"), 2_000);
+    for thin in [
+        "facade-kv",
+        "facade-r2",
+        "facade-assets",
+        "facade-pg",
+        "facade-d1",
+        "facade-queue",
+        "facade-k2",
+        "facade-email",
+        "facade-vectorize",
+        "facade-ratelimit",
+        "facade-qconsumer",
+        "facade-router",
+        "vrt-no-network",
+    ] {
+        assert_eq!(get(thin), 1_000, "{thin}");
+    }
+}
+
+#[test]
+fn cpu_ms_parsing_and_bounds() {
+    // Absent → unset (no `limits` group rendered downstream).
+    let workers = minimal();
+    let parsed = parse_facade_manifest(&wire(workers)).unwrap();
+    assert!(
+        parsed.system_workers.iter().all(|w| w.cpu_ms == 0),
+        "absent cpuMs must stay unset"
+    );
+
+    // 0 is accepted but stays unset — same semantic as the capnp
+    // field and WorkerQuotas: zero never renders as a budget.
+    let mut workers = minimal();
+    let mut w = worker(serde_json::json!([module("facade/x.js")]));
+    w["cpuMs"] = serde_json::json!(0);
+    workers
+        .as_object_mut()
+        .unwrap()
+        .insert("facade-kv".into(), w);
+    let parsed = parse_facade_manifest(&wire(workers)).unwrap();
+    assert_eq!(
+        parsed
+            .system_workers
+            .iter()
+            .find(|w| w.service_name == "facade-kv")
+            .unwrap()
+            .cpu_ms,
+        0
+    );
+
+    for (value, expect) in [
+        (serde_json::json!(1), Ok(1)),
+        (serde_json::json!(300_000), Ok(300_000)), // protocol cap edge
+        (serde_json::json!(300_001), Err("workers.cpuMs")),
+        // Wrong types fail at the serde boundary, not the bound check.
+        (serde_json::json!(-1), Err("systemManifest")),
+        (serde_json::json!("500"), Err("systemManifest")),
+        (serde_json::json!(1.5), Err("systemManifest")),
+    ] {
+        let mut workers = minimal();
+        let mut w = worker(serde_json::json!([module("facade/x.js")]));
+        w["cpuMs"] = value;
+        workers
+            .as_object_mut()
+            .unwrap()
+            .insert("facade-kv".into(), w);
+        match expect {
+            Ok(v) => {
+                let parsed = parse_facade_manifest(&wire(workers)).unwrap();
+                assert_eq!(
+                    parsed
+                        .system_workers
+                        .iter()
+                        .find(|w| w.service_name == "facade-kv")
+                        .unwrap()
+                        .cpu_ms,
+                    v
+                );
+            }
+            Err(field) => {
+                assert!(matches!(
+                    parse_facade_manifest(&wire(workers)),
+                    Err(ConfigError::Identifier(f)) if f == field
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn rejects_worker_field_violations() {
     // mainModule not present in modules.
     let mut workers = minimal();

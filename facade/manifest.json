@@ -11,6 +11,7 @@
       "entrypoint": "KVNamespace",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-kv.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/facade-kv.js",
@@ -74,6 +75,7 @@
       "entrypoint": "R2Transport",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-r2.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/facade-r2.js",
@@ -151,6 +153,7 @@
       "entrypoint": "AssetTransport",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-assets.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/facade-assets.js",
@@ -207,6 +210,7 @@
       "entrypoint": "PgTransport",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-pg.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/deadline.js",
@@ -263,6 +267,7 @@
       "entrypoint": "D1Facade",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-d1.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/d1-wire.js",
@@ -326,6 +331,7 @@
       "entrypoint": "QueueFacade",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-queue.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/deadline.js",
@@ -389,6 +395,7 @@
       "entrypoint": "K2Facade",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-k2.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/deadline.js",
@@ -459,6 +466,7 @@
       "entrypoint": "EmailFacade",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-email.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/deadline.js",
@@ -529,6 +537,7 @@
       "entrypoint": "ImagesFacade",
       "needsBindingBackend": false,
       "mainModule": "facade/facade-images.js",
+      "cpuMs": 10000,
       "modules": [
         {
           "name": "facade/facade-images.js",
@@ -727,6 +736,7 @@
       "entrypoint": "VectorizeFacade",
       "needsBindingBackend": true,
       "mainModule": "facade/facade-vectorize.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/deadline.js",
@@ -797,6 +807,7 @@
       "entrypoint": "RateLimiter",
       "needsBindingBackend": false,
       "mainModule": "facade/facade-ratelimit.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/facade-ratelimit.js",
@@ -846,6 +857,7 @@
       "entrypoint": "QueueConsumerFacade",
       "needsBindingBackend": false,
       "mainModule": "facade/facade-qconsumer.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/deadline.js",
@@ -874,6 +886,7 @@
       "entrypoint": "AssetsRouter",
       "needsBindingBackend": false,
       "mainModule": "facade/facade-router.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/facade-router.js",
@@ -902,6 +915,7 @@
       "entrypoint": "EgressProxy",
       "needsBindingBackend": false,
       "mainModule": "facade/egress/egress.js",
+      "cpuMs": 2000,
       "modules": [
         {
           "name": "facade/egress/cf-image.js",
@@ -972,6 +986,7 @@
       "entrypoint": "DenyAll",
       "needsBindingBackend": false,
       "mainModule": "facade/egress/deny.js",
+      "cpuMs": 1000,
       "modules": [
         {
           "name": "facade/egress/deny.js",
