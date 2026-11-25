@@ -91,3 +91,55 @@ export async function closeQuietly(socket) {
         await socket?.close?.();
     } catch  {}
 }
+export async function policyFetch(url, allowTarget, timeoutMs, maxHops = 5) {
+    let target = url;
+    for(let hop = 0;; hop++){
+        if (!allowTarget(target)) return undefined;
+        let resp;
+        try {
+            resp = await fetch(target, {
+                redirect: "manual",
+                signal: AbortSignal.timeout(timeoutMs)
+            });
+        } catch  {
+            return undefined;
+        }
+        if (resp.status < 300 || resp.status >= 400) return resp;
+        const loc = resp.headers.get("location");
+        if (loc === null || hop >= maxHops) return undefined;
+        try {
+            target = new URL(loc, target).toString();
+        } catch  {
+            return undefined;
+        }
+        resp.body?.cancel().catch(()=>{});
+    }
+}
+export async function readCappedBody(resp, max) {
+    const declared = Number(resp.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > max) {
+        resp.body?.cancel().catch(()=>{});
+        return undefined;
+    }
+    if (resp.body === null) return new Uint8Array(0);
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let total = 0;
+    for(;;){
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > max) {
+            reader.cancel().catch(()=>{});
+            return undefined;
+        }
+        chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const chunk of chunks){
+        out.set(chunk, off);
+        off += chunk.byteLength;
+    }
+    return out;
+}

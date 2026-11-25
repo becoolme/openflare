@@ -1260,3 +1260,80 @@ test("MIG-15: internalTcpTargets schema fails closed on malformed entries", () =
 test("MIG-15: policies predating internalTcpTargets still parse (rolling upgrade)", () => {
   assert.notEqual(parseEgressPolicy(POLICY_JSON), null);
 });
+
+// ---- payload-fetch helpers (policyFetch / readCappedBody) ---------
+
+const { policyFetch, readCappedBody } = await import(
+  facadeModule("egress/shared.js")
+);
+
+test("readCappedBody: declared oversize skips the read entirely", async () => {
+  const resp = new Response(new Uint8Array(100), {
+    headers: { "content-length": "100" },
+  });
+  assert.equal(await readCappedBody(resp, 50), undefined);
+  // Fast path never acquires a reader — stream stays unlocked.
+  assert.equal(resp.body.locked, false);
+});
+
+test("readCappedBody: chunked stream cut mid-read at the cap", async () => {
+  // Content-length absent — only the streaming cap catches it.
+  const resp = new Response(
+    new ReadableStream({
+      start(c) {
+        c.enqueue(new Uint8Array(40));
+        c.enqueue(new Uint8Array(40));
+        c.close();
+      },
+    }),
+  );
+  assert.equal(await readCappedBody(resp, 50), undefined);
+});
+
+test("readCappedBody: under-cap and empty bodies drain fully", async () => {
+  const small = new Response(new Uint8Array([1, 2, 3]));
+  assert.deepEqual([...(await readCappedBody(small, 10))], [1, 2, 3]);
+  assert.deepEqual([...(await readCappedBody(new Response(null), 1))], []);
+});
+
+test("policyFetch: every redirect hop re-runs the target check", async () => {
+  const allow = (u) => !u.includes("denied");
+  const prev = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url === "https://a.example/x") {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "/y" },
+      });
+    }
+    if (url === "https://a.example/y") {
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://denied.example/z" },
+      });
+    }
+    if (url === "https://denied.example/z") {
+      throw new Error("must not dial a denied redirect target");
+    }
+    return new Response("direct", { status: 200 });
+  };
+  try {
+    // Relative hop allowed, absolute hop denied — no dial to B.
+    assert.equal(
+      await policyFetch("https://a.example/x", allow, 1000),
+      undefined,
+    );
+    const ok = await policyFetch("https://ok.example/direct", allow, 1000);
+    assert.equal(ok.status, 200);
+    // Redirect loop → hop cap → undefined.
+    globalThis.fetch = async () =>
+      new Response(null, { status: 302, headers: { location: "/loop" } });
+    assert.equal(
+      await policyFetch("https://ok.example/loop", allow, 1000),
+      undefined,
+    );
+  } finally {
+    globalThis.fetch = prev;
+  }
+});

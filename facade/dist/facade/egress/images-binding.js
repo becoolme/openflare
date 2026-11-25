@@ -1,6 +1,6 @@
 import { evaluateTarget } from "./policy.js";
 import { SRC_MAX } from "./cf-image.js";
-import { stripInternalHeaders } from "./shared.js";
+import { policyFetch, readCappedBody, stripInternalHeaders } from "./shared.js";
 export const IMAGES_BINDING_HOST = "js.images.cloudflare.com";
 const FACADE_BASE = "http://vrt-images.internal";
 function bindingError(code, status) {
@@ -22,17 +22,16 @@ function specFontUrl(spec) {
     }
 }
 async function fetchFont(url, policy) {
-    if (!evaluateTarget(url, policy).allow) return bindingError(9420, 502);
+    const resp = await policyFetch(url, (u)=>evaluateTarget(u, policy).allow, policy?.requestTimeoutMs ?? 30_000);
+    if (resp === undefined) return bindingError(9420, 502);
+    let bytes;
     try {
-        const resp = await fetch(url, {
-            signal: AbortSignal.timeout(policy?.requestTimeoutMs ?? 30_000)
-        });
-        const buf = new Uint8Array(await resp.arrayBuffer());
-        if (buf.length > SRC_MAX) return bindingError(9424, 413);
-        return buf;
+        bytes = await readCappedBody(resp, SRC_MAX);
     } catch  {
         return bindingError(9420, 502);
     }
+    if (bytes === undefined) return bindingError(9424, 413);
+    return bytes;
 }
 function relayResponse(resp) {
     const headers = stripInternalHeaders(resp.headers);

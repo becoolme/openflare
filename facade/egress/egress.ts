@@ -46,6 +46,8 @@ import {
   logTcpDeny,
   logUpstreamError,
   POLICY_BINDING,
+  policyFetch,
+  readCappedBody,
   stripInternalHeaders,
   tcpDenied,
   upstreamFetchError,
@@ -392,8 +394,8 @@ export class EgressProxy extends WorkerEntrypoint {
     }
     let out: Response;
     try {
-      const src = new Uint8Array(await upstream.arrayBuffer());
-      if (src.length > SRC_MAX) {
+      const src = await readCappedBody(upstream, SRC_MAX);
+      if (src === undefined) {
         return new Response("ERROR 9424\n", {
           status: 413,
           headers: { "content-type": "text/plain", "cf-resized": "err=9424" },
@@ -434,16 +436,17 @@ export class EgressProxy extends WorkerEntrypoint {
       const payloads: Uint8Array[] = [];
       for (const draw of plan.draws) {
         const url = draw.kind === "text" ? draw.fontUrl : draw.url;
+        const resp = await policyFetch(
+          url,
+          (u) => evaluateTarget(u, this.#policy).allow,
+          this.#policy?.requestTimeoutMs ?? 30_000,
+        );
         let bytes: Uint8Array | undefined;
-        if (evaluateTarget(url, this.#policy).allow) {
+        if (resp !== undefined) {
           try {
-            const resp = await fetch(url, {
-              signal: AbortSignal.timeout(
-                this.#policy?.requestTimeoutMs ?? 30_000,
-              ),
-            });
-            const buf = new Uint8Array(await resp.arrayBuffer());
-            if (buf.length > SRC_MAX) {
+            bytes = await readCappedBody(resp, SRC_MAX);
+            if (bytes === undefined) {
+              // over SRC_MAX — same shape as the oversized source read
               if (plan.onerrorRedirect) return redirect();
               return new Response("ERROR 9424\n", {
                 status: 413,
@@ -453,9 +456,8 @@ export class EgressProxy extends WorkerEntrypoint {
                 },
               });
             }
-            bytes = buf;
           } catch {
-            bytes = undefined;
+            bytes = undefined; // mid-stream transport error → 9420 below
           }
         }
         if (bytes === undefined) {

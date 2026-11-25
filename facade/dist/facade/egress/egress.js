@@ -1,7 +1,7 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { connect as upstreamConnect } from "cloudflare:sockets";
 import { evaluateTarget, evaluateTcpTarget, parseEgressPolicy } from "./policy.js";
-import { classifyUpstreamError, closeQuietly, DENIED_HEADER, ERROR_HEADER, logTcpClose, logTcpDeny, logUpstreamError, POLICY_BINDING, stripInternalHeaders, tcpDenied, upstreamFetchError } from "./shared.js";
+import { classifyUpstreamError, closeQuietly, DENIED_HEADER, ERROR_HEADER, logTcpClose, logTcpDeny, logUpstreamError, POLICY_BINDING, policyFetch, readCappedBody, stripInternalHeaders, tcpDenied, upstreamFetchError } from "./shared.js";
 import { cfImageBody, cfImagePlan, SRC_MAX } from "./cf-image.js";
 import { IMAGES_BINDING_HOST, relayImagesBinding } from "./images-binding.js";
 import { sniffImage, sniffSvg } from "../images-wire.js";
@@ -213,8 +213,8 @@ export class EgressProxy extends WorkerEntrypoint {
         }
         let out;
         try {
-            const src = new Uint8Array(await upstream.arrayBuffer());
-            if (src.length > SRC_MAX) {
+            const src = await readCappedBody(upstream, SRC_MAX);
+            if (src === undefined) {
                 return new Response("ERROR 9424\n", {
                     status: 413,
                     headers: {
@@ -245,14 +245,12 @@ export class EgressProxy extends WorkerEntrypoint {
             const payloads = [];
             for (const draw of plan.draws){
                 const url = draw.kind === "text" ? draw.fontUrl : draw.url;
+                const resp = await policyFetch(url, (u)=>evaluateTarget(u, this.#policy).allow, this.#policy?.requestTimeoutMs ?? 30_000);
                 let bytes;
-                if (evaluateTarget(url, this.#policy).allow) {
+                if (resp !== undefined) {
                     try {
-                        const resp = await fetch(url, {
-                            signal: AbortSignal.timeout(this.#policy?.requestTimeoutMs ?? 30_000)
-                        });
-                        const buf = new Uint8Array(await resp.arrayBuffer());
-                        if (buf.length > SRC_MAX) {
+                        bytes = await readCappedBody(resp, SRC_MAX);
+                        if (bytes === undefined) {
                             if (plan.onerrorRedirect) return redirect();
                             return new Response("ERROR 9424\n", {
                                 status: 413,
@@ -262,7 +260,6 @@ export class EgressProxy extends WorkerEntrypoint {
                                 }
                             });
                         }
-                        bytes = buf;
                     } catch  {
                         bytes = undefined;
                     }

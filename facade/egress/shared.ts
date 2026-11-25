@@ -164,3 +164,80 @@ export async function closeQuietly(
     // the socket is already dead — nothing left to do
   }
 }
+
+// Policy-checked outbound fetch for tenant-specified payload URLs
+// (draw overlays, text fonts). Unlike the tenant passthrough — which
+// returns 3xx to the tenant so each hop re-runs the policy — these
+// fetches resolve redirects in-worker, so EVERY hop must re-run the
+// target check: an allowlisted A 302-ing to a denyNames B must not
+// fetch B. Layer-1 restrictPeers still guards the resolved IP at
+// dial; this layer guards names and ports.
+//
+// Returns the first non-redirect response, or undefined on deny,
+// transport failure, bad location, or too many hops.
+export async function policyFetch(
+  url: string,
+  allowTarget: (url: string) => boolean,
+  timeoutMs: number,
+  maxHops = 5,
+): Promise<Response | undefined> {
+  let target = url;
+  for (let hop = 0; ; hop++) {
+    if (!allowTarget(target)) return undefined;
+    let resp: Response;
+    try {
+      resp = await fetch(target, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch {
+      return undefined;
+    }
+    if (resp.status < 300 || resp.status >= 400) return resp;
+    const loc = resp.headers.get("location");
+    if (loc === null || hop >= maxHops) return undefined;
+    try {
+      target = new URL(loc, target).toString();
+    } catch {
+      return undefined;
+    }
+    resp.body?.cancel().catch(() => {});
+  }
+}
+
+// Drain a response body under a hard cap — payload fetchers must not
+// buffer unbounded bodies before checking size. Returns undefined
+// once `max` bytes are exceeded (the content-length fast path skips
+// the read entirely); transport errors mid-stream throw like
+// arrayBuffer() would.
+export async function readCappedBody(
+  resp: Response,
+  max: number,
+): Promise<Uint8Array | undefined> {
+  const declared = Number(resp.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) {
+    resp.body?.cancel().catch(() => {});
+    return undefined;
+  }
+  if (resp.body === null) return new Uint8Array(0);
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > max) {
+      reader.cancel().catch(() => {});
+      return undefined;
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, off);
+    off += chunk.byteLength;
+  }
+  return out;
+}
