@@ -28,6 +28,7 @@ fn s2z(idle_ms: u64) -> ScaleToZero {
         wake_deadline: Duration::from_secs(8),
         blocked_recheck: Duration::from_millis(200),
         quiesce_poll: Duration::from_millis(20),
+        alarm_wake_grace: Duration::from_secs(60),
     }
 }
 

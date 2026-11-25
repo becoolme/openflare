@@ -286,6 +286,11 @@ pub struct ScaleToZeroConfig {
     /// Bound on one whole wake (queue + launch + ready).
     #[serde(default = "default_s2z_wake_ms")]
     pub wake_deadline_ms: u64,
+    /// How long an alarm wake keeps the tenant awake (gate held unsafe
+    /// after the generation is Ready) so workerd can deliver the
+    /// persisted overdue alarm before the idle policy sleeps it again.
+    #[serde(default = "default_s2z_alarm_grace_ms")]
+    pub alarm_wake_grace_ms: u64,
 }
 
 fn default_s2z_idle_ms() -> u64 {
@@ -306,6 +311,9 @@ fn default_s2z_drain_ms() -> u64 {
 fn default_s2z_wake_ms() -> u64 {
     30_000
 }
+fn default_s2z_alarm_grace_ms() -> u64 {
+    60_000
+}
 
 impl Default for ScaleToZeroConfig {
     fn default() -> Self {
@@ -317,6 +325,7 @@ impl Default for ScaleToZeroConfig {
             max_wake_queue: default_s2z_queue(),
             drain_timeout_ms: default_s2z_drain_ms(),
             wake_deadline_ms: default_s2z_wake_ms(),
+            alarm_wake_grace_ms: default_s2z_alarm_grace_ms(),
         }
     }
 }
@@ -356,6 +365,11 @@ impl ScaleToZeroConfig {
                 "scaleToZero.wakeDeadlineMs must be 1s..10min",
             ));
         }
+        if self.alarm_wake_grace_ms < 1_000 || self.alarm_wake_grace_ms > 600_000 {
+            return Err(ConfigError::Invalid(
+                "scaleToZero.alarmWakeGraceMs must be 1s..10min",
+            ));
+        }
         Ok(())
     }
 
@@ -377,6 +391,7 @@ impl ScaleToZeroConfig {
             wake_deadline: Duration::from_millis(self.wake_deadline_ms),
             blocked_recheck: Duration::from_secs(60),
             quiesce_poll: Duration::from_millis(250),
+            alarm_wake_grace: Duration::from_millis(self.alarm_wake_grace_ms),
         })
     }
 }
@@ -3014,6 +3029,17 @@ mod tests {
         assert_eq!(on.idle_ms, 600_000);
         assert_eq!(on.min_residency_ms, 120_000);
         assert_eq!(on.max_concurrent_wakes, 4);
+        assert_eq!(s.alarm_wake_grace, Duration::from_secs(60));
+        let custom = ScaleToZeroConfig {
+            enabled: true,
+            alarm_wake_grace_ms: 5_000,
+            ..Default::default()
+        };
+        custom.validate().unwrap();
+        assert_eq!(
+            custom.build().unwrap().alarm_wake_grace,
+            Duration::from_secs(5)
+        );
 
         let bad = [
             ScaleToZeroConfig {
@@ -3039,6 +3065,11 @@ mod tests {
             ScaleToZeroConfig {
                 enabled: true,
                 max_wake_queue: 100_001,
+                ..Default::default()
+            },
+            ScaleToZeroConfig {
+                enabled: true,
+                alarm_wake_grace_ms: 999,
                 ..Default::default()
             },
         ];

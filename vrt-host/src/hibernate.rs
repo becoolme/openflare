@@ -51,6 +51,8 @@ pub struct ScaleToZero {
     pub blocked_recheck: Duration,
     /// Cadence at which quiescing polls in-flight counts.
     pub quiesce_poll: Duration,
+    /// How long an alarm wake holds the gate unsafe after Ready.
+    pub alarm_wake_grace: Duration,
 }
 
 impl fmt::Debug for ScaleToZero {
@@ -412,14 +414,6 @@ pub const QUEUE_WAKE_MAX_WAIT: Duration = Duration::from_secs(20);
 /// forwarded op so a typed result is returned before 15s.
 pub const WORKFLOW_WAKE_MAX_WAIT: Duration = Duration::from_secs(8);
 
-/// How long an alarm wake keeps the tenant awake. The controller's alarm
-/// index scan may still report the alarm as due (or not yet have re-scanned
-/// the generation), so the host itself must not let the tenant sleep before
-/// workerd's alarm scheduler has a chance to deliver the overdue alarm.
-///
-/// Long enough for a cold workerd boot plus the alarm handler; the cell
-/// gate replaces it on the next authoritative scan.
-pub const ALARM_WAKE_GRACE: Duration = Duration::from_secs(60);
 
 /// Closed set of wake triggers. `Http`, `Cron`, `Queue`, `Workflow` and
 /// `Alarm` are all implemented; never a string.
