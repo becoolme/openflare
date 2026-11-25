@@ -383,9 +383,55 @@ export class EgressProxy extends WorkerEntrypoint {
           });
         }
       }
+      // Draw overlays are fetched here — the egress worker is the only
+      // layer that can reach tenant-specified URLs, and each fetch
+      // re-runs the egress policy like the source URL did. The bytes
+      // ride to the facade as `draw_image` fields whose indices line
+      // up with the per-entry ops in plan.transforms. An overlay that
+      // cannot be fetched is a source-level failure: ERROR 9420
+      // (unfetchable image), honoring onerror:"redirect" like the
+      // other transform error paths.
+      const overlays: Uint8Array[] = [];
+      for (const drawUrl of plan.draws) {
+        let over: Uint8Array | undefined;
+        if (evaluateTarget(drawUrl, this.#policy).allow) {
+          try {
+            const resp = await fetch(drawUrl, {
+              signal: AbortSignal.timeout(
+                this.#policy?.requestTimeoutMs ?? 30_000,
+              ),
+            });
+            const bytes = new Uint8Array(await resp.arrayBuffer());
+            if (bytes.length > SRC_MAX) {
+              if (plan.onerrorRedirect) return redirect();
+              return new Response("ERROR 9424\n", {
+                status: 413,
+                headers: {
+                  "content-type": "text/plain",
+                  "cf-resized": "err=9424",
+                },
+              });
+            }
+            over = bytes;
+          } catch {
+            over = undefined;
+          }
+        }
+        if (over === undefined) {
+          if (plan.onerrorRedirect) return redirect();
+          return new Response("ERROR 9420\n", {
+            status: 502,
+            headers: {
+              "content-type": "text/plain",
+              "cf-resized": "err=9420",
+            },
+          });
+        }
+        overlays.push(over);
+      }
       out = await svc.fetch("http://vrt-images.internal/transform", {
         method: "POST",
-        body: cfImageBody(src, plan),
+        body: cfImageBody(src, plan, overlays),
       });
     } catch {
       // Transport-level failure to the facade — CF surfaces these as

@@ -84,7 +84,7 @@ pub async fn maybe_handle(
         }
         format!("/{url_path}")
     };
-    let parsed = match parse_options(opts_raw, headers) {
+    let parsed = match parse_options(opts_raw, headers, host) {
         Ok(p) => p,
         Err(code) => return Some(Ok(error_body(code, StatusCode::BAD_REQUEST))),
     };
@@ -102,6 +102,20 @@ struct Parsed {
     /// `metadata=none|copyright|keep` — sent on the transform wire.
     wire_metadata: Option<String>,
     onerror_redirect: bool,
+    /// `draw=((...),(...))` overlay entries — each fetched same-origin
+    /// and posted as a `draw_image` field (`frames[1..]` on the wire).
+    draws: Vec<DrawEntry>,
+}
+
+struct DrawEntry {
+    /// Resolved same-origin overlay path.
+    path: String,
+    /// Position/blend keys → `{drawImageIndex, targetImageIndex, ...}`
+    /// op; indices are stamped at emit time.
+    draw_op: serde_json::Map<String, serde_json::Value>,
+    /// Overlay optimization params → `{imageIndex, percentBasis, ...}`
+    /// op (skipped when empty).
+    transform: serde_json::Map<String, serde_json::Value>,
 }
 
 /// `quality` value: fixed 1-100 or a perceptual tier. Upstream
@@ -201,6 +215,85 @@ fn group_pairs(inner: &str) -> Result<Vec<(&str, &str)>, u32> {
         .collect()
 }
 
+/// Comma split that also treats `'...'`/`"..."` quoting as opaque —
+/// `draw` entries carry quoted URLs/text where commas and parens are
+/// literal content, unlike the top-level option grammar.
+fn split_draw(raw: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    for (i, c) in raw.char_indices() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    out.push(&raw[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&raw[start..]);
+    out
+}
+
+/// One layer of matching `'...'`/`"..."` quotes off a value.
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 2 {
+        let (f, l) = (s.as_bytes()[0], s.as_bytes()[s.len() - 1]);
+        if (f == b'\'' || f == b'"') && l == f {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Scalar leaf → JSON: unquoted, then number/bool/string by shape.
+fn leaf_json(v: &str) -> serde_json::Value {
+    let v = unquote(v);
+    if let Ok(n) = v.parse::<f64>() {
+        if n.is_finite() {
+            return n.into();
+        }
+    }
+    match v {
+        "true" => true.into(),
+        "false" => false.into(),
+        _ => v.into(),
+    }
+}
+
+/// `(k=v,...)` group → a JSON object — the generic form for draw-entry
+/// structured values (`sharpen=(..)`, `border=(..)`); leaf values type
+/// by shape and nested groups recurse.
+fn group_to_json(inner: &str) -> Result<serde_json::Value, u32> {
+    let mut m = serde_json::Map::new();
+    for pair in split_draw(inner) {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').ok_or(9423u32)?;
+        let v = v.trim();
+        let val = match group_inner(v) {
+            Some(nested) => group_to_json(nested)?,
+            None => leaf_json(v),
+        };
+        m.insert(k.trim().to_string(), val);
+    }
+    Ok(serde_json::Value::Object(m))
+}
+
 /// Chromium client hints for `quality.slow-connection` (upstream
 /// applies it when rtt>150ms, save-data=on, ect is 2g-class, or
 /// downlink<5Mbps).
@@ -283,12 +376,216 @@ fn scale_px(v: &mut serde_json::Value, dpr: f64) {
     }
 }
 
+/// Overlay `url=` → its same-origin path, mirroring the source-URL
+/// resolution in `maybe_handle`: `/path` and bare relative segments
+/// ride the tenant origin; `http(s)://<request-host>/...` rewrites to
+/// its path. Any other absolute host is refused — draw entries have
+/// no remote-fetch allowlist either.
+fn draw_url_path(url: &str, host: &str) -> Result<String, u32> {
+    if url.starts_with('/') {
+        return Ok(url.to_string());
+    }
+    if !url.contains("://") {
+        return Ok(format!("/{url}"));
+    }
+    let Some((scheme, tail)) = url.split_once("://") else {
+        return Err(9423);
+    };
+    if scheme != "http" && scheme != "https" {
+        return Err(9423);
+    }
+    let Some((url_host, url_path)) = tail.split_once('/') else {
+        return Err(9423);
+    };
+    let url_host = url_host.split(':').next().unwrap_or_default();
+    if !url_host.eq_ignore_ascii_case(host) {
+        return Err(9401);
+    }
+    Ok(format!("/{url_path}"))
+}
+
+/// One `(k=v,...)` draw entry → its fetch path + the two wire ops it
+/// emits. Entries share the option vocabulary: `url` (required) plus
+/// positioning (`top/left/bottom/right`), blending (`opacity`,
+/// `repeat`, `composite`) and overlay optimization params. Text
+/// overlays need a font stack the vendored engine lacks — fail closed.
+fn draw_entry(inner: &str, host: &str) -> Result<DrawEntry, u32> {
+    let mut url: Option<String> = None;
+    let mut draw_op = serde_json::Map::new();
+    let mut transform = serde_json::Map::new();
+    for pair in split_draw(inner) {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').ok_or(9423u32)?;
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "url" => url = Some(unquote(v).to_string()),
+            // Text overlays need harfbuzz/freetype — not vendored.
+            "text" | "font" | "color" | "size" => return Err(9401),
+            "top" | "left" | "bottom" | "right" => {
+                let n = parse_num(unquote(v), -16384.0, 16384.0)?;
+                draw_op.insert(k.into(), n.into());
+            }
+            "opacity" => {
+                draw_op.insert("opacity".into(), parse_num(unquote(v), 0.0, 1.0)?.into());
+            }
+            "repeat" => match unquote(v) {
+                "true" => {
+                    draw_op.insert("repeat".into(), true.into());
+                }
+                s @ ("x" | "y") => {
+                    draw_op.insert("repeat".into(), s.into());
+                }
+                _ => return Err(9423),
+            },
+            "composite" => match unquote(v) {
+                s @ ("over" | "in" | "atop" | "out" | "xor" | "lighter") => {
+                    draw_op.insert("composite".into(), s.into());
+                }
+                _ => return Err(9423),
+            },
+            // Overlay dims: integer px or a `"Np"` percent of the base
+            // canvas — the op's `percentBasis` marks it for the facade.
+            "width" | "height" => {
+                let u = unquote(v);
+                if let Some(p) = u.strip_suffix('p') {
+                    let n = parse_num(p, 0.0, f64::MAX)?;
+                    if n <= 0.0 {
+                        return Err(9423);
+                    }
+                    transform.insert(k.into(), u.into());
+                } else {
+                    transform.insert(k.into(), parse_num(u, 1.0, 16384.0)?.into());
+                }
+            }
+            // `XxY` fractions and `(x=,y=)` groups map onto the
+            // binding's coordinate-gravity object like the top-level
+            // arm does (facade requires `mode:"remainder"`).
+            "gravity" | "g" => {
+                if let Some(gi) = group_inner(v) {
+                    let (mut x, mut y) = (None, None);
+                    for (sk, sv) in group_pairs(gi)? {
+                        match sk {
+                            "x" => x = Some(parse_num(unquote(sv), 0.0, 1.0)?),
+                            "y" => y = Some(parse_num(unquote(sv), 0.0, 1.0)?),
+                            _ => return Err(9423),
+                        }
+                    }
+                    let (Some(x), Some(y)) = (x, y) else {
+                        return Err(9423);
+                    };
+                    transform.insert(
+                        "gravity".into(),
+                        serde_json::json!({"x": x, "y": y, "mode": "remainder"}),
+                    );
+                } else {
+                    let u = unquote(v);
+                    match u {
+                        "auto" | "entropy" | "face" | "center" | "top" | "bottom" | "left"
+                        | "right" => {
+                            transform.insert("gravity".into(), u.into());
+                        }
+                        _ => {
+                            let (x, y) = u.split_once('x').ok_or(9423u32)?;
+                            let (x, y) = (parse_num(x, 0.0, 1.0)?, parse_num(y, 0.0, 1.0)?);
+                            transform.insert(
+                                "gravity".into(),
+                                serde_json::json!({"x": x, "y": y, "mode": "remainder"}),
+                            );
+                        }
+                    }
+                }
+            }
+            // Inset scalars the top-level `trim`/`border` arms accept —
+            // `T;R;B;L` / `TxRxBxL` and `<width>x<hex>` — normalized to
+            // the object forms the wire carries.
+            "trim" => {
+                if let Some(gi) = group_inner(v) {
+                    transform.insert("trim".into(), group_to_json(gi)?);
+                } else {
+                    let u = unquote(v);
+                    match u {
+                        "border" | "color" => {
+                            transform.insert("trim".into(), u.into());
+                        }
+                        _ => {
+                            let sep = if u.contains(';') {
+                                ';'
+                            } else if u.contains('x') {
+                                'x'
+                            } else {
+                                ','
+                            };
+                            let nums: Vec<&str> = u.split(sep).collect();
+                            if nums.len() != 4 {
+                                return Err(9423);
+                            }
+                            let mut m = serde_json::Map::new();
+                            m.insert("mode".into(), "area".into());
+                            for (k, s) in ["top", "right", "bottom", "left"].iter().zip(nums) {
+                                m.insert((*k).into(), trim_len(s.trim())?);
+                            }
+                            transform.insert("trim".into(), m.into());
+                        }
+                    }
+                }
+            }
+            "border" => {
+                if let Some(gi) = group_inner(v) {
+                    transform.insert("border".into(), group_to_json(gi)?);
+                } else {
+                    let u = unquote(v);
+                    let (w, c) = u.split_once('x').ok_or(9423u32)?;
+                    let w = parse_num(w, 0.0, 4096.0)?;
+                    if c.len() > 32 {
+                        return Err(9423);
+                    }
+                    transform.insert(
+                        "border".into(),
+                        serde_json::json!({"width": w, "color": format!("#{c}")}),
+                    );
+                }
+            }
+            // Remaining optimization params pass through generically:
+            // leaves type by shape, `(k=v,...)` groups become objects —
+            // the facade applies its strict per-op validation.
+            "fit" | "rotate" | "blur" | "background" | "brightness" | "contrast" | "gamma"
+            | "saturation" | "flip" | "sharpen" | "zoom" | "segment" => {
+                let val = match group_inner(v) {
+                    Some(gi) => group_to_json(gi)?,
+                    None => leaf_json(v),
+                };
+                transform.insert(k.into(), val);
+            }
+            _ => return Err(9423),
+        }
+    }
+    let Some(u) = url else {
+        return Err(9423);
+    };
+    // Upstream errors when an axis carries both edge offsets.
+    if draw_op.contains_key("left") && draw_op.contains_key("right") {
+        return Err(9423);
+    }
+    if draw_op.contains_key("top") && draw_op.contains_key("bottom") {
+        return Err(9423);
+    }
+    let path = draw_url_path(&u, host)?;
+    Ok(DrawEntry {
+        path,
+        draw_op,
+        transform,
+    })
+}
+
 /// Translate `k=v,k=v` URL options into the facade `transforms` op JSON.
 /// Structured groups `(k=v,...)` mirror the cf.image object form;
 /// the older compact forms keep working. Keys with no vendored-engine
 /// support pass through so the facade fails closed with the typed
 /// code (`segment`, `zoom`, `anim`→9401).
-fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
+fn parse_options(raw: &str, headers: &HeaderMap, host: &str) -> Result<Parsed, u32> {
     let mut op = serde_json::Map::new();
     let mut p = Parsed {
         transforms: String::new(),
@@ -298,6 +595,7 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
         info: false,
         wire_metadata: None,
         onerror_redirect: false,
+        draws: Vec::new(),
     };
     let mut dpr = 1.0f64;
     let mut width: Option<f64> = None;
@@ -761,6 +1059,32 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
             "segment" => {
                 op.insert("segment".into(), v.into());
             }
+            "draw" => {
+                // `draw=((k=v,...),(k=v,...))` — parenthesized overlay
+                // entries sharing the option grammar; a bare
+                // `draw=(k=v,...)` reads as a single entry.
+                let Some(inner) = group_inner(v) else {
+                    return Err(9423);
+                };
+                let elems: Vec<&str> = split_draw(inner)
+                    .into_iter()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let all_groups =
+                    !elems.is_empty() && elems.iter().all(|e| group_inner(e).is_some());
+                let entry_inners: Vec<&str> = if all_groups {
+                    elems.iter().filter_map(|e| group_inner(e)).collect()
+                } else {
+                    vec![inner]
+                };
+                if entry_inners.len() > 16 {
+                    return Err(9423);
+                }
+                for ei in entry_inners {
+                    p.draws.push(draw_entry(ei, host)?);
+                }
+            }
             _ => return Err(9423),
         }
     }
@@ -790,7 +1114,31 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
         // JPEG — overriding an explicit `format`.
         p.output_format = Some("image/jpeg".into());
     }
-    p.transforms = serde_json::json!([serde_json::Value::Object(op)]).to_string();
+    // `[mainOp, overOp1?, drawOp1, overOp2?, drawOp2, ...]` — the ops
+    // apply in order so the last draw entry composites topmost. Pixel
+    // offsets and px dims scale with dpr like the main op's values.
+    let scaled = |m: &serde_json::Map<String, serde_json::Value>| {
+        let mut v = serde_json::Value::Object(m.clone());
+        scale_px(&mut v, dpr);
+        match v {
+            serde_json::Value::Object(o) => o,
+            _ => serde_json::Map::new(),
+        }
+    };
+    let mut ops = vec![serde_json::Value::Object(op)];
+    for (i, e) in p.draws.iter().enumerate() {
+        let mut ov = scaled(&e.transform);
+        if !ov.is_empty() {
+            ov.insert("imageIndex".into(), (i + 1).into());
+            ov.insert("percentBasis".into(), 0.into());
+            ops.push(serde_json::Value::Object(ov));
+        }
+        let mut d = scaled(&e.draw_op);
+        d.insert("drawImageIndex".into(), (i + 1).into());
+        d.insert("targetImageIndex".into(), 0.into());
+        ops.push(serde_json::Value::Object(d));
+    }
+    p.transforms = serde_json::json!(ops).to_string();
     Ok(p)
 }
 
@@ -890,12 +1238,43 @@ async fn run_transform(
                         .body(Body::from(out))
                         .unwrap_or_else(|_| Response::new(Body::empty()))
                 })
-                .or_else(|_| {
-                    Ok(error_body(9420, StatusCode::UNSUPPORTED_MEDIA_TYPE))
-                });
+                .or_else(|_| Ok(error_body(9420, StatusCode::UNSUPPORTED_MEDIA_TYPE)));
         }
 
-        // 2. Multipart POST to the facade-images socket.
+        // Draw overlays fetch through the same tenant socket — their
+        // same-origin paths resolve exactly like the source did, and
+        // the same status/size rules apply.
+        let mut overlays: Vec<Bytes> = Vec::with_capacity(parsed.draws.len());
+        for e in &parsed.draws {
+            let get = Request::builder()
+                .method("GET")
+                .uri(&e.path)
+                .header(header::HOST, host)
+                .header(header::ACCEPT, "*/*")
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(axum::Error::new)
+                        .boxed_unsync(),
+                )
+                .map_err(|_| 9411u16)?;
+            let io = worker_ep.connect().await.map_err(|_| 9411u16)?;
+            let over_resp = http1(io, get).await.map_err(|_| 9411u16)?;
+            if !over_resp.status().is_success() {
+                return Err(over_resp.status().as_u16());
+            }
+            let over = over_resp
+                .into_body()
+                .collect()
+                .await
+                .map_err(|_| 9411u16)?
+                .to_bytes();
+            if over.len() > MAX_SRC_BYTES {
+                return Err(9424u16);
+            }
+            overlays.push(over);
+        }
+
+        // 3. Multipart POST to the facade-images socket.
         let boundary = "vrtcdnimage0a1b2c3d4e5f60718293a4b5c6d7e8f9";
         let mut body = Vec::with_capacity(src.len() + 1024);
         let mut field = |name: &str, filename: Option<&str>, value: &[u8]| {
@@ -926,6 +1305,9 @@ async fn run_transform(
         }
         if let Some(md) = &parsed.wire_metadata {
             field("metadata", None, md.as_bytes());
+        }
+        for over in &overlays {
+            field("draw_image", Some("overlay"), over);
         }
         body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
@@ -1026,7 +1408,7 @@ mod tests {
     use super::*;
 
     fn opts(raw: &str) -> Parsed {
-        parse_options(raw, &HeaderMap::new()).expect(raw)
+        parse_options(raw, &HeaderMap::new(), "example.com").expect(raw)
     }
 
     #[test]
@@ -1067,7 +1449,10 @@ mod tests {
             "quality=101",
             "rotate=abc",
         ] {
-            assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
+            assert!(
+                parse_options(raw, &HeaderMap::new(), "example.com").is_err(),
+                "{raw}"
+            );
         }
     }
 
@@ -1075,9 +1460,9 @@ mod tests {
     fn format_auto_negotiates_on_accept() {
         let mut h = HeaderMap::new();
         h.insert(header::ACCEPT, "image/avif,image/webp".parse().unwrap());
-        let p = parse_options("format=auto", &h).unwrap();
+        let p = parse_options("format=auto", &h, "example.com").unwrap();
         assert_eq!(p.output_format.as_deref(), Some("image/avif"));
-        let p = parse_options("format=auto", &HeaderMap::new()).unwrap();
+        let p = parse_options("format=auto", &HeaderMap::new(), "example.com").unwrap();
         assert_eq!(p.output_format.as_deref(), Some("image/jpeg"));
     }
 
@@ -1107,7 +1492,10 @@ mod tests {
             "sharpen=(sigma=1)", // amount required
             "sharpen=(mode=box,amount=1,threshold=3)",
         ] {
-            assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
+            assert!(
+                parse_options(raw, &HeaderMap::new(), "example.com").is_err(),
+                "{raw}"
+            );
         }
     }
 
@@ -1163,7 +1551,10 @@ mod tests {
             "trim=(left=abc)",
             "trim=(mode=area,color=%23fff)",
         ] {
-            assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
+            assert!(
+                parse_options(raw, &HeaderMap::new(), "example.com").is_err(),
+                "{raw}"
+            );
         }
     }
 
@@ -1177,7 +1568,7 @@ mod tests {
             g["fit"],
             serde_json::json!({"mode": "contain", "upscale": "generate"})
         );
-        assert!(parse_options("fit=(upscale=generate)", &HeaderMap::new()).is_err());
+        assert!(parse_options("fit=(upscale=generate)", &HeaderMap::new(), "example.com").is_err());
     }
 
     #[test]
@@ -1186,8 +1577,8 @@ mod tests {
         assert_eq!(g["gravity"]["x"], 0.5);
         assert_eq!(g["gravity"]["y"], 0.3);
         assert_eq!(op_of(&opts("g=auto"))["gravity"], "auto");
-        assert!(parse_options("gravity=(x=0.5)", &HeaderMap::new()).is_err());
-        assert!(parse_options("gravity=(x=1.5,y=0.3)", &HeaderMap::new()).is_err());
+        assert!(parse_options("gravity=(x=0.5)", &HeaderMap::new(), "example.com").is_err());
+        assert!(parse_options("gravity=(x=1.5,y=0.3)", &HeaderMap::new(), "example.com").is_err());
     }
 
     #[test]
@@ -1230,18 +1621,27 @@ mod tests {
         // slow-connection applies only with slow client hints.
         let mut slow_h = HeaderMap::new();
         slow_h.insert("ect", "2g".parse().unwrap());
-        let p = parse_options("quality=(level=80,slow-connection=40)", &slow_h).unwrap();
+        let p = parse_options(
+            "quality=(level=80,slow-connection=40)",
+            &slow_h,
+            "example.com",
+        )
+        .unwrap();
         assert_eq!(p.output_quality, Some(40));
-        let fast =
-            parse_options("quality=(level=80,slow-connection=40)", &HeaderMap::new()).unwrap();
+        let fast = parse_options(
+            "quality=(level=80,slow-connection=40)",
+            &HeaderMap::new(),
+            "example.com",
+        )
+        .unwrap();
         assert_eq!(fast.output_quality, Some(80));
-        let short = parse_options("q=(v=80,sc=40)", &slow_h).unwrap();
+        let short = parse_options("q=(v=80,sc=40)", &slow_h, "example.com").unwrap();
         assert_eq!(short.output_quality, Some(40));
         // Top-level scq key + the other hint channels.
         let mut rtt = HeaderMap::new();
         rtt.insert("rtt", "400".parse().unwrap());
         assert_eq!(
-            parse_options("slow-connection-quality=30", &rtt)
+            parse_options("slow-connection-quality=30", &rtt, "example.com")
                 .unwrap()
                 .output_quality,
             Some(30)
@@ -1249,18 +1649,22 @@ mod tests {
         let mut sd = HeaderMap::new();
         sd.insert("save-data", "on".parse().unwrap());
         assert_eq!(
-            parse_options("scq=low", &sd).unwrap().output_quality,
+            parse_options("scq=low", &sd, "example.com")
+                .unwrap()
+                .output_quality,
             Some(40)
         );
         let mut dl = HeaderMap::new();
         dl.insert("downlink", "1".parse().unwrap());
         assert_eq!(
-            parse_options("scq=30", &dl).unwrap().output_quality,
+            parse_options("scq=30", &dl, "example.com")
+                .unwrap()
+                .output_quality,
             Some(30)
         );
         // scq ignored on fast connections.
         assert_eq!(
-            parse_options("scq=30", &HeaderMap::new())
+            parse_options("scq=30", &HeaderMap::new(), "example.com")
                 .unwrap()
                 .output_quality,
             None
@@ -1272,11 +1676,12 @@ mod tests {
         // Viewport-Width picks the smallest breakpoint >= it.
         let mut h = HeaderMap::new();
         h.insert("viewport-width", "700".parse().unwrap());
-        let p = parse_options("width=auto", &h).unwrap();
+        let p = parse_options("width=auto", &h, "example.com").unwrap();
         assert_eq!(op_of(&p)["width"], 768);
         // Beyond all breakpoints → the largest.
         h.insert("viewport-width", "4000".parse().unwrap());
-        let p = parse_options("width=(mode=auto,breakpoints=(400,800))", &h).unwrap();
+        let p =
+            parse_options("width=(mode=auto,breakpoints=(400,800))", &h, "example.com").unwrap();
         assert_eq!(op_of(&p)["width"], 800);
         // UA fallback: mobile → 768, desktop → 1200 (overridable).
         let mut mob = HeaderMap::new();
@@ -1285,15 +1690,16 @@ mod tests {
             "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)".parse().unwrap(),
         );
         assert_eq!(
-            op_of(&parse_options("width=auto", &mob).unwrap())["width"],
+            op_of(&parse_options("width=auto", &mob, "example.com").unwrap())["width"],
             768
         );
         assert_eq!(
-            op_of(&parse_options("width=(m=auto,mb=600,dt=1400)", &mob).unwrap())["width"],
+            op_of(&parse_options("width=(m=auto,mb=600,dt=1400)", &mob, "example.com").unwrap())
+                ["width"],
             600
         );
         assert_eq!(op_of(&opts("width=auto"))["width"], 1200);
-        assert!(parse_options("width=(mode=fixed)", &HeaderMap::new()).is_err());
+        assert!(parse_options("width=(mode=fixed)", &HeaderMap::new(), "example.com").is_err());
     }
 
     #[test]
@@ -1307,7 +1713,10 @@ mod tests {
         assert!(p.info);
         assert!(p.wire_metadata.is_none());
         for raw in ["metadata=true", "metadata=false"] {
-            assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
+            assert!(
+                parse_options(raw, &HeaderMap::new(), "example.com").is_err(),
+                "{raw}"
+            );
         }
         assert_eq!(
             opts("compression=fast").output_format.as_deref(),
@@ -1322,7 +1731,7 @@ mod tests {
         for f in ["h", "v", "hv"] {
             assert_eq!(op_of(&opts(&format!("flip={f}")))["flip"], f);
         }
-        assert!(parse_options("flip=d", &HeaderMap::new()).is_err());
+        assert!(parse_options("flip=d", &HeaderMap::new(), "example.com").is_err());
     }
 
     #[test]
@@ -1342,8 +1751,8 @@ mod tests {
         assert_eq!(op["trim"]["top"], "10p");
         assert_eq!(op["trim"]["left"], 0.1);
         // dpr is capped at 2 upstream.
-        assert!(parse_options("dpr=3", &HeaderMap::new()).is_err());
-        assert!(parse_options("dpr=2", &HeaderMap::new()).is_ok());
+        assert!(parse_options("dpr=3", &HeaderMap::new(), "example.com").is_err());
+        assert!(parse_options("dpr=2", &HeaderMap::new(), "example.com").is_ok());
     }
 
     #[test]
@@ -1390,5 +1799,110 @@ mod tests {
         // The sniff gate can pass a non-SVG XML doc — sanitize must
         // still fail closed (no acceptable root element).
         assert!(sanitize_svg(b"<?xml version=\"1.0\"?><html/>").is_err());
+    }
+
+    fn ops_of(p: &Parsed) -> serde_json::Value {
+        serde_json::from_str(&p.transforms).unwrap()
+    }
+
+    #[test]
+    fn draw_entry_maps_to_paired_ops() {
+        let p = opts("width=800,draw=((url='/logo.png',bottom=5,right=5,fit=contain,width=100,opacity=0.8),(url='/wm.png',repeat=x))");
+        assert_eq!(p.draws.len(), 2);
+        assert_eq!(p.draws[0].path, "/logo.png");
+        assert_eq!(p.draws[1].path, "/wm.png");
+        let ops = ops_of(&p);
+        assert_eq!(ops.as_array().unwrap().len(), 4);
+        assert_eq!(ops[0], serde_json::json!({"width": 800}));
+        // Overlay transform op carries imageIndex + percentBasis.
+        assert_eq!(
+            ops[1],
+            serde_json::json!({"imageIndex": 1, "percentBasis": 0, "fit": "contain", "width": 100.0})
+        );
+        assert_eq!(
+            ops[2],
+            serde_json::json!({"drawImageIndex": 1, "targetImageIndex": 0, "bottom": 5.0, "right": 5.0, "opacity": 0.8})
+        );
+        // No transform keys → draw op only.
+        assert_eq!(
+            ops[3],
+            serde_json::json!({"drawImageIndex": 2, "targetImageIndex": 0, "repeat": "x"})
+        );
+    }
+
+    #[test]
+    fn draw_percent_dims_and_dpr_scaling() {
+        let p = opts("dpr=2,draw=((url='/l.png',width='25p',height='50p',right=5))");
+        let ops = ops_of(&p);
+        // "Np" passes through for the facade to resolve against the
+        // base canvas; px values and offsets scale with dpr.
+        assert_eq!(ops[1]["width"], "25p");
+        assert_eq!(ops[1]["height"], "50p");
+        assert_eq!(ops[1]["percentBasis"], 0);
+        assert_eq!(ops[2]["right"], 10.0);
+        // px dims scale too.
+        let p2 = opts("dpr=2,draw=((url='/l.png',width=40))");
+        assert_eq!(ops_of(&p2)[1]["width"], 80.0);
+    }
+
+    #[test]
+    fn draw_unwrapped_single_entry_and_url_forms() {
+        // Bare `draw=(k=v,...)` reads as one entry.
+        let p = opts("draw=(url='/l.png',top=0)");
+        assert_eq!(p.draws.len(), 1);
+        // Same-origin absolute URL rewrites to its path.
+        let p2 = opts("draw=((url='https://example.com/a/b.png'))");
+        assert_eq!(p2.draws[0].path, "/a/b.png");
+        // Bare relative segment.
+        let p3 = opts("draw=((url='l.png'))");
+        assert_eq!(p3.draws[0].path, "/l.png");
+    }
+
+    #[test]
+    fn draw_bad_entries_fail_closed() {
+        for (raw, code) in [
+            ("draw=((text='HI'))", 9401),           // font stack not vendored
+            ("draw=((font=(url='/f.otf')))", 9401), // text-only key, no url
+            ("draw=((bottom=5))", 9423),            // url required
+            ("draw=((url='/l.png',left=1,right=2))", 9423), // axis conflict
+            ("draw=((url='/l.png',top=0,bottom=0))", 9423),
+            ("draw=((url='/l.png',bogus=1))", 9423),
+            ("draw=((url='/l.png',opacity=1.5))", 9423),
+            ("draw=((url='/l.png',composite=screen))", 9423),
+            ("draw=((url='/l.png',width=0p))", 9423),
+            ("draw=foo", 9423),                              // not a group
+            ("draw=((url='https://evil.com/l.png'))", 9401), // foreign host
+        ] {
+            assert_eq!(
+                parse_options(raw, &HeaderMap::new(), "example.com")
+                    .err()
+                    .unwrap(),
+                code,
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn draw_entry_groups_and_gravity_forms() {
+        // Structured groups inside entries type like the top-level
+        // options — gravity injects mode:"remainder" for the facade.
+        let p = opts("draw=((url='/l.png',gravity=(x=0.25,y=0.75),sharpen=(mode=gaussian,amount=2,sigma=1),fit=(mode=crop)))");
+        let ops = ops_of(&p);
+        assert_eq!(
+            ops[1]["gravity"],
+            serde_json::json!({"x": 0.25, "y": 0.75, "mode": "remainder"})
+        );
+        assert_eq!(
+            ops[1]["sharpen"],
+            serde_json::json!({"mode": "gaussian", "amount": 2.0, "sigma": 1.0})
+        );
+        assert_eq!(ops[1]["fit"], serde_json::json!({"mode": "crop"}));
+        // Bare gravity fractions map the same way.
+        let p2 = opts("draw=((url='/l.png',gravity=0.25x0.75))");
+        assert_eq!(
+            ops_of(&p2)[1]["gravity"],
+            serde_json::json!({"x": 0.25, "y": 0.75, "mode": "remainder"})
+        );
     }
 }

@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "generatedBy": "facade/tools/gen-manifest.mjs",
-  "nodeVersion": "24",
+  "nodeVersion": "22",
   "externals": {
     "cloudflare:sockets": "workerd-provided external",
     "cloudflare:workers": "workerd-provided external"
@@ -548,8 +548,8 @@
           "name": "facade/images-engine.js",
           "dist": "facade/dist/facade/images-engine.js",
           "source": "facade/images-engine.ts",
-          "sourceSha256": "7bf9de01ed24733fd5bb5326f7a1bb3c3812099f427380a0a395c87f334d825a",
-          "sha256": "a382a3c01fe07679b012749b7482c45a898df2b0f68f0bb3da34dfc5dd9360a7"
+          "sourceSha256": "86ba5243b97f20ae603260ad9c299839e6487c098f70bbfc65438c53f8bffb9b",
+          "sha256": "b6cdedbadfca07ddac27b40203c3286a47fc93a8c974e83fb75d05723166ee33"
         },
         {
           "name": "facade/images-metadata.js",
@@ -562,8 +562,8 @@
           "name": "facade/images-transform.js",
           "dist": "facade/dist/facade/images-transform.js",
           "source": "facade/images-transform.ts",
-          "sourceSha256": "a5ba35e3aadaa06ea8516b3ff712f2a940bcfd64e9bb8af3450434ef4b65862b",
-          "sha256": "94025b16fca0820712d5d376670a9b3bfa8056f6565868f09c5ec988ab2fe752"
+          "sourceSha256": "491ae80a66ce8a6404110fbb9e86c1f68787200afe38e894aa839a5af9dd7869",
+          "sha256": "d123fdba94d60fc13c3f0929a36d741c41c50eba29993bef82c5a23bb71f12af"
         },
         {
           "name": "facade/images-wire.js",
@@ -878,15 +878,15 @@
           "name": "facade/egress/cf-image.js",
           "dist": "facade/dist/facade/egress/cf-image.js",
           "source": "facade/egress/cf-image.ts",
-          "sourceSha256": "28d6812023887891b66031a8eeb3b0f967a6fbd459684cedf161fe3e21b49456",
-          "sha256": "46c055faf9b574c9c50f293360ec07d5278da969e4f1fb62e02ee94a9bb0f86a"
+          "sourceSha256": "9dcadec97734acaf12eda05a80f7fe1b630ad5b29ea6f1e191c8c86a516b3074",
+          "sha256": "e3b7cff5ee7818eb3a850911cdf121e609b2b2db574e762aabc01b414e098d14"
         },
         {
           "name": "facade/egress/egress.js",
           "dist": "facade/dist/facade/egress/egress.js",
           "source": "facade/egress/egress.ts",
-          "sourceSha256": "66ec56a9517a92977249f8f6b33b66abaabb6adead6b7817e4592437dfacef57",
-          "sha256": "244a20d15b307cb88d73b478ad46adf0cc53b1d350528072b7bba614296589bb"
+          "sourceSha256": "8f6d73c8f6ccbc205f846472970195efa8a7dd0d42569b733a8cbb924f2900c2",
+          "sha256": "6c0d0332e35e53415b1e305c5c477f5fb1b66f786b99e1c43affccd13c73c5e8"
         },
         {
           "name": "facade/egress/ip.js",

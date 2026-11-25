@@ -613,8 +613,8 @@ export function composite(base, over, dx, dy, opacity = 1, mode = "over") {
     }
 }
 export function drawImage(base, over, { top, left, bottom, right, opacity = 1, repeat, composite: mode = "over" }) {
-    const dx = left !== undefined ? Math.round(left) : right !== undefined ? base.width - over.width - Math.round(right) : 0;
-    const dy = top !== undefined ? Math.round(top) : bottom !== undefined ? base.height - over.height - Math.round(bottom) : 0;
+    const dx = left !== undefined ? Math.round(left) : right !== undefined ? base.width - over.width - Math.round(right) : Math.round((base.width - over.width) / 2);
+    const dy = top !== undefined ? Math.round(top) : bottom !== undefined ? base.height - over.height - Math.round(bottom) : Math.round((base.height - over.height) / 2);
     const repX = repeat === true || repeat === "x" || repeat === "xy";
     const repY = repeat === true || repeat === "y" || repeat === "xy";
     if (!repX && !repY) {

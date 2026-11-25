@@ -221,9 +221,45 @@ export class EgressProxy extends WorkerEntrypoint {
                     });
                 }
             }
+            const overlays = [];
+            for (const drawUrl of plan.draws){
+                let over;
+                if (evaluateTarget(drawUrl, this.#policy).allow) {
+                    try {
+                        const resp = await fetch(drawUrl, {
+                            signal: AbortSignal.timeout(this.#policy?.requestTimeoutMs ?? 30_000)
+                        });
+                        const bytes = new Uint8Array(await resp.arrayBuffer());
+                        if (bytes.length > SRC_MAX) {
+                            if (plan.onerrorRedirect) return redirect();
+                            return new Response("ERROR 9424\n", {
+                                status: 413,
+                                headers: {
+                                    "content-type": "text/plain",
+                                    "cf-resized": "err=9424"
+                                }
+                            });
+                        }
+                        over = bytes;
+                    } catch  {
+                        over = undefined;
+                    }
+                }
+                if (over === undefined) {
+                    if (plan.onerrorRedirect) return redirect();
+                    return new Response("ERROR 9420\n", {
+                        status: 502,
+                        headers: {
+                            "content-type": "text/plain",
+                            "cf-resized": "err=9420"
+                        }
+                    });
+                }
+                overlays.push(over);
+            }
             out = await svc.fetch("http://vrt-images.internal/transform", {
                 method: "POST",
-                body: cfImageBody(src, plan)
+                body: cfImageBody(src, plan, overlays)
             });
         } catch  {
             if (plan.onerrorRedirect) return redirect();

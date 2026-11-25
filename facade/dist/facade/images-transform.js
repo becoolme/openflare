@@ -623,6 +623,8 @@ function applyDraw(frames, op) {
     });
     if (drawIdx === undefined || targetIdx === undefined) bad("draw indices");
     if (drawIdx >= frames.length || targetIdx >= frames.length) bad("draw index out of range");
+    if (op.left !== undefined && op.right !== undefined) bad("draw left+right");
+    if (op.top !== undefined && op.bottom !== undefined) bad("draw top+bottom");
     const mode = op.composite ?? "over";
     if (typeof mode !== "string" || !COMPOSITES.has(mode)) bad("composite");
     const opacity = num(op.opacity, "opacity", {
@@ -663,6 +665,25 @@ export async function applyTransforms(frames, ops) {
                 int: true
             }) ?? 0;
             if (idx >= frames.length) bad("imageIndex out of range");
+            if (op.percentBasis !== undefined) {
+                const basis = num(op.percentBasis, "percentBasis", {
+                    min: 0,
+                    int: true
+                });
+                if (basis === undefined || basis >= frames.length) bad("percentBasis out of range");
+                for (const dim of [
+                    "width",
+                    "height"
+                ]){
+                    const v = op[dim];
+                    if (typeof v === "string" && v.endsWith("p")) {
+                        const n = Number(v.slice(0, -1));
+                        if (!Number.isFinite(n) || n <= 0 || v.length < 2) bad(`draw ${dim} percent`);
+                        op[dim] = Math.max(1, Math.round(n / 100 * frames[basis][dim]));
+                    }
+                }
+                delete op.percentBasis;
+            }
             frames[idx] = await applyTransform(frames[idx], op);
         }
     }

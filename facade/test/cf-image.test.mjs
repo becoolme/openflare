@@ -71,6 +71,22 @@ function withStubbedUpstream(bytes, fn) {
   });
 }
 
+/** Per-URL upstream stub for `draw` tests — overlay URLs fan out
+ * through the same globalThis.fetch as the source. A missing map key
+ * rejects (unreachable overlay). */
+function withUrlMap(map, fn) {
+  const prev = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = typeof input === "string" ? input : input.url;
+    if (map[url] === undefined) throw new TypeError("fetch failed");
+    const [bytes, status] = map[url];
+    return new Response(bytes, { status });
+  };
+  return fn().finally(() => {
+    globalThis.fetch = prev;
+  });
+}
+
 function makeProxy(env) {
   return new EgressProxy({ props: {} }, env);
 }
@@ -355,4 +371,155 @@ test("cf.image malformed SVG + onerror:\"redirect\" → 302 like transform error
       assert.equal(resp.headers.get("location"), PNG_URL);
     },
   );
+});
+
+// ---- draw overlays ----------------------------------------------------
+
+const OVER_URL = "https://cdn.example.com/logo.png";
+
+test("cfImagePlan: draw entry → url list + paired ops", () => {
+  const plan = cfImagePlan(
+    pngReq({
+      width: 100,
+      draw: [
+        { url: OVER_URL, bottom: 5, right: 5, fit: "contain", width: 50, opacity: 0.8 },
+        { url: "https://cdn.example.com/wm.png", repeat: "x", top: 0 },
+      ],
+    }),
+  );
+  assert.deepEqual(plan.draws, [OVER_URL, "https://cdn.example.com/wm.png"]);
+  const ops = JSON.parse(plan.transforms);
+  assert.equal(ops.length, 4); // main + over + draw, over + draw
+  assert.deepEqual(ops[0], { width: 100 });
+  // Overlay transform op: imageIndex + percentBasis marker.
+  assert.deepEqual(ops[1], {
+    imageIndex: 1, percentBasis: 0, fit: "contain", width: 50,
+  });
+  assert.deepEqual(ops[2], {
+    drawImageIndex: 1, targetImageIndex: 0, bottom: 5, right: 5, opacity: 0.8,
+  });
+  // No transform keys → no overlay op.
+  assert.deepEqual(ops[3], {
+    drawImageIndex: 2, targetImageIndex: 0, repeat: "x", top: 0,
+  });
+});
+
+test("cfImagePlan: draw percent dims pass through for base resolution", () => {
+  const plan = cfImagePlan(
+    pngReq({ draw: [{ url: OVER_URL, width: "25p", height: "50p" }] }),
+  );
+  const ops = JSON.parse(plan.transforms);
+  assert.equal(ops[1].width, "25p");
+  assert.equal(ops[1].height, "50p");
+  assert.equal(ops[1].percentBasis, 0);
+});
+
+test("cfImagePlan: draw entries scale px values with dpr", () => {
+  const plan = cfImagePlan(
+    pngReq({ dpr: 2, draw: [{ url: OVER_URL, right: 5, width: 40 }] }),
+  );
+  const ops = JSON.parse(plan.transforms);
+  assert.equal(ops[1].width, 80);
+  assert.equal(ops[2].right, 10);
+});
+
+test("cfImagePlan: invalid draw entries throw TypeError", () => {
+  for (const draw of [
+    "not-an-array",
+    [{ url: OVER_URL, left: 1, right: 2 }], // axis conflict
+    [{ url: OVER_URL, top: 0, bottom: 0 }],
+    [{ text: "HELLO" }], // font stack not vendored
+    [{ url: OVER_URL, font: { url: "x" } }], // text-only key on image entry
+    [{ bottom: 5 }], // url required
+    [{ url: "notaurl" }],
+    [{ url: "file:///etc/passwd" }],
+    [{ url: OVER_URL, opacity: 1.5 }],
+    [{ url: OVER_URL, repeat: "xy" }], // url-iface accepts true|x|y
+    [{ url: OVER_URL, composite: "screen" }],
+    [{ url: OVER_URL, bogus: 1 }],
+    [{ url: OVER_URL, width: "0p" }],
+    [{ url: OVER_URL, width: "nope" }],
+    [42],
+  ]) {
+    assert.throws(
+      () => cfImagePlan(pngReq({ draw })),
+      TypeError,
+      JSON.stringify(draw),
+    );
+  }
+});
+
+test("cfImagePlan: draw entry cap mirrors MAX_DRAW_IMAGES", () => {
+  const draw = Array.from({ length: 17 }, () => ({ url: OVER_URL }));
+  assert.throws(() => cfImagePlan(pngReq({ draw })), TypeError);
+  assert.doesNotThrow(() =>
+    cfImagePlan(pngReq({ draw: draw.slice(0, 16) })),
+  );
+});
+
+test("cf.image draw e2e: overlay composites bottom-right at 50%", async () => {
+  const base = await sourcePng();
+  // 2x2 red overlay on the 4x4 base.
+  const { bytes: over } = await eng.encodeImage(
+    { data: new Uint8ClampedArray(2 * 2 * 4).fill(0).map((_, i) => [255, 0, 0, 255][i % 4]), width: 2, height: 2 },
+    "png",
+    100,
+  );
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withUrlMap(
+    { [PNG_URL]: [base, 200], [OVER_URL]: [over, 200] },
+    async () => {
+      const resp = await proxy.fetch(
+        pngReq({ format: "png", draw: [{ url: OVER_URL, bottom: 0, right: 0, opacity: 0.5 }] }),
+      );
+      assert.equal(resp.status, 200);
+      const out = await eng.decodeImage(
+        new Uint8Array(await resp.arrayBuffer()),
+        "png",
+      );
+      const px = (x, y) => {
+        const i = (y * 4 + x) * 4;
+        return [out.data[i], out.data[i + 1]];
+      };
+      // bottom-right pixel blended 50% red over the gray source;
+      // top-left untouched.
+      const [r, g] = px(3, 3);
+      assert.ok(r > 150 && r > g, `corner blend ${px(3, 3)}`);
+      assert.equal(px(0, 0)[0], px(0, 0)[1]);
+    },
+  );
+});
+
+test("cf.image draw: unfetchable overlay → ERROR 9420 + cf-resized", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withUrlMap({ [PNG_URL]: [await sourcePng(), 200] }, async () => {
+    const resp = await proxy.fetch(
+      pngReq({ draw: [{ url: OVER_URL }] }),
+    );
+    assert.equal(resp.headers.get("cf-resized"), "err=9420");
+    assert.match(await resp.text(), /^ERROR 9420/);
+  });
+});
+
+test("cf.image draw: unfetchable overlay + onerror:redirect → 302", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withUrlMap({ [PNG_URL]: [await sourcePng(), 200] }, async () => {
+    const resp = await proxy.fetch(
+      pngReq({ onerror: "redirect", draw: [{ url: OVER_URL }] }),
+    );
+    assert.equal(resp.status, 302);
+    assert.equal(resp.headers.get("location"), PNG_URL);
+  });
+});
+
+test("cf.image draw: policy-denied overlay → ERROR 9420", async () => {
+  const proxy = makeProxy(
+    egressEnv(realImagesFetcher),
+  );
+  await withUrlMap({ [PNG_URL]: [await sourcePng(), 200] }, async () => {
+    const resp = await proxy.fetch(
+      pngReq({ draw: [{ url: "http://169.254.169.254/meta.png" }] }),
+    );
+    assert.equal(resp.headers.get("cf-resized"), "err=9420");
+  });
 });
