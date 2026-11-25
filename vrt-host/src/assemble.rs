@@ -418,10 +418,12 @@ impl Assembler {
                             s.service_name.clone(),
                             s.main_module.clone(),
                             s.needs_binding_backend,
-                            // cpuMs feeds the rendered `limits` group — a
-                            // budget-only manifest change must rekey the
-                            // fingerprint or the stale generation is reused.
+                            // cpuMs/memoryMb feed the rendered `limits`
+                            // group — a budget-only manifest change must
+                            // rekey the fingerprint or the stale
+                            // generation is reused.
                             s.cpu_ms,
+                            s.memory_mb,
                             mods,
                         )
                     })

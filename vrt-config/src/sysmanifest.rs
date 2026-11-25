@@ -75,6 +75,9 @@ struct WireWorker {
     /// manifest typo cannot render an effectively-unlimited huge number.
     #[serde(default)]
     cpu_ms: Option<u32>,
+    /// Same story for the memory budget (MB) — heap + external bytes.
+    #[serde(default)]
+    memory_mb: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -199,12 +202,17 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         if cpu_ms > snapshot_protocol::compute_desired::MAX_CPU_MS {
             return Err(ConfigError::Identifier("workers.cpuMs"));
         }
+        let memory_mb = worker.memory_mb.unwrap_or(0);
+        if memory_mb > snapshot_protocol::compute_desired::MAX_MEMORY_MB {
+            return Err(ConfigError::Identifier("workers.memoryMb"));
+        }
         system_workers.push(SystemWorkerRef {
             service_name: service_name.clone(),
             main_module: worker.main_module.clone(),
             modules,
             needs_binding_backend: worker.needs_binding_backend,
             cpu_ms,
+            memory_mb,
         });
     }
 
