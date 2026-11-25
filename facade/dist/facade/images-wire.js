@@ -113,7 +113,14 @@ export function sniffImage(buf) {
     return null;
 }
 export function sniffSvg(buf) {
-    const head = new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 4096)));
+    let head;
+    if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xfe) {
+        head = new TextDecoder("utf-16le").decode(buf.subarray(0, Math.min(buf.length, 8192)));
+    } else if (buf.length >= 4 && buf[0] === 0xfe && buf[1] === 0xff) {
+        head = new TextDecoder("utf-16be").decode(buf.subarray(0, Math.min(buf.length, 8192)));
+    } else {
+        head = new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 4096)));
+    }
     const trimmed = head.trimStart();
     return trimmed.startsWith("<svg") || trimmed.startsWith("<?xml");
 }

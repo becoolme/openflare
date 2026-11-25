@@ -297,3 +297,62 @@ test("cfImageBody: multipart fields match the binding wire", async () => {
 test("SRC_MAX mirrors the binding's 64MiB input cap", () => {
   assert.equal(SRC_MAX, 64 * 1024 * 1024);
 });
+
+// SVG sources are svg-hush sanitized + passed through upstream — the
+// transform POST never happens and every plan option is ignored.
+const SVG_SRC =
+  '<svg xmlns="http://www.w3.org/2000/svg">' +
+  '<script>alert(1)</script><rect width="4"/></svg>';
+const enc = new TextEncoder();
+
+test("cf.image SVG source → sanitized image/svg+xml, VRT_IMAGES untouched", async () => {
+  let called = 0;
+  const countingFetcher = {
+    fetch: (input, init) => {
+      called++;
+      return realImagesFetcher.fetch(input, init);
+    },
+  };
+  const proxy = makeProxy(egressEnv(countingFetcher));
+  await withStubbedUpstream(enc.encode(SVG_SRC), async () => {
+    const resp = await proxy.fetch(pngReq({ width: 2, format: "webp" }));
+    assert.equal(resp.status, 200);
+    assert.equal(resp.headers.get("content-type"), "image/svg+xml");
+    const body = await resp.text();
+    assert.ok(body.includes("<rect"));
+    assert.ok(!body.includes("script"));
+  });
+  assert.equal(called, 0);
+});
+
+test("cf.image SVG source + format:\"json\" → still image/svg+xml", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withStubbedUpstream(enc.encode(SVG_SRC), async () => {
+    const resp = await proxy.fetch(pngReq({ format: "json" }));
+    assert.equal(resp.headers.get("content-type"), "image/svg+xml");
+  });
+});
+
+test("cf.image malformed SVG → ERROR 9420 + cf-resized", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withStubbedUpstream(
+    enc.encode('<svg xmlns="http://www.w3.org/2000/svg"><rect'),
+    async () => {
+      const resp = await proxy.fetch(pngReq({ width: 2 }));
+      assert.equal(resp.headers.get("cf-resized"), "err=9420");
+      assert.match(await resp.text(), /ERROR 9420/);
+    },
+  );
+});
+
+test("cf.image malformed SVG + onerror:\"redirect\" → 302 like transform errors", async () => {
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withStubbedUpstream(
+    enc.encode('<svg xmlns="http://www.w3.org/2000/svg"><rect'),
+    async () => {
+      const resp = await proxy.fetch(pngReq({ onerror: "redirect" }));
+      assert.equal(resp.status, 302);
+      assert.equal(resp.headers.get("location"), PNG_URL);
+    },
+  );
+});

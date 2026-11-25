@@ -3,7 +3,8 @@ import { connect as upstreamConnect } from "cloudflare:sockets";
 import { evaluateTarget, evaluateTcpTarget, parseEgressPolicy } from "./policy.js";
 import { classifyUpstreamError, closeQuietly, DENIED_HEADER, ERROR_HEADER, logTcpClose, logTcpDeny, logUpstreamError, POLICY_BINDING, stripInternalHeaders, tcpDenied, upstreamFetchError } from "./shared.js";
 import { cfImageBody, cfImagePlan, SRC_MAX } from "./cf-image.js";
-import { sniffImage } from "../images-wire.js";
+import { sniffImage, sniffSvg } from "../images-wire.js";
+import { hushFilter, HushError } from "../svg-hush.js";
 function denied(code, detail) {
     const body = JSON.stringify({
         error: "EGRESS_DENIED",
@@ -200,6 +201,25 @@ export class EgressProxy extends WorkerEntrypoint {
                         "cf-resized": "err=9424"
                     }
                 });
+            }
+            if (sniffSvg(src)) {
+                try {
+                    return new Response(hushFilter(src), {
+                        headers: {
+                            "content-type": "image/svg+xml"
+                        }
+                    });
+                } catch (e) {
+                    if (!(e instanceof HushError)) throw e;
+                    if (plan.onerrorRedirect) return redirect();
+                    return new Response("ERROR 9420\n", {
+                        status: 415,
+                        headers: {
+                            "content-type": "text/plain",
+                            "cf-resized": "err=9420"
+                        }
+                    });
+                }
             }
             out = await svc.fetch("http://vrt-images.internal/transform", {
                 method: "POST",

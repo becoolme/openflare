@@ -248,9 +248,13 @@ resource-identifying keys besides `binding`.
   production Cloudflare output byte-for-byte.
 - **Decode coverage**: PNG, JPEG, WebP (lossy + lossless), AVIF, GIF
   (first frame only — pure-TS LZW decoder), and BMP (24/32bpp
-  uncompressed). SVG rasterization is not implemented → `err=9401`;
-  an `anim` request on an animated (GIF) source → `err=9401` since
-  multi-frame output is impossible.
+  uncompressed). SVG input matches upstream split by entry point:
+  the `transform()` binding rejects it (`err=9401` — upstream does
+  not support SVG through the binding at all), while `/cdn-cgi/image/`
+  and `cf.image` sanitize the markup with svg-hush and pass it through
+  as `image/svg+xml` with every transform option ignored (malformed
+  SVG → `err=9420`). An `anim` request on an animated (GIF) source →
+  `err=9401` since multi-frame output is impossible.
 - **Encode coverage**: `image/jpeg`, `image/png`, `image/webp`,
   `image/avif` (single-threaded encoder, speed 6), plus the wire
   `rgb`/`rgba` raw frames. `image/gif` output has no vendored encoder
@@ -292,8 +296,15 @@ resource-identifying keys besides `binding`.
 - `vrt-host/src/cdn_cgi.rs` — `/cdn-cgi/image/` ingress interception:
   option→transform JSON mapping (structured groups, percent-decoding,
   client-hints quality/width, dpr scaling), same-origin source
-  resolution, facade socket fan-out, `ERROR <code>` shaping
-  (14 unit tests).
+  resolution, svg-hush sanitize pass-through for SVG sources, facade
+  socket fan-out, `ERROR <code>` shaping (18 unit tests).
+- `facade/svg-hush.ts` — TypeScript port of upstream's svg-hush for the
+  `cf.image` egress path (the `/cdn-cgi/` path uses the crate itself):
+  allowlisted elements/attributes, xlink→href, same-origin URL
+  relativization, `data:` limited to image/{jpeg,png,gif}, CSS `url()`
+  filtering. `facade/test/svg-hush.test.mjs` replays upstream's own
+  unit-test vectors (urlfunc/css/url_filter/data:/VULN-144180) plus
+  byte-exact filter outputs diffed against the crate's CLI.
 - `vrt-config/tests/render.rs` — `images_binding_renders_wrapped_images_api`
   (wrapped module + inner fetcher service name).
 - `facade/test/images.test.mjs` — `/info` shape cases plus end-to-end

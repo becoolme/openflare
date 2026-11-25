@@ -51,7 +51,8 @@ import {
   upstreamFetchError,
 } from "./shared.js";
 import { cfImageBody, cfImagePlan, SRC_MAX, type CfImagePlan } from "./cf-image.js";
-import { sniffImage } from "../images-wire.js";
+import { sniffImage, sniffSvg } from "../images-wire.js";
+import { hushFilter, HushError } from "../svg-hush.js";
 
 function denied(code: string, detail?: string): Response {
   const body = JSON.stringify({
@@ -359,6 +360,28 @@ export class EgressProxy extends WorkerEntrypoint {
           status: 413,
           headers: { "content-type": "text/plain", "cf-resized": "err=9424" },
         });
+      }
+      // SVG sources are never transformed upstream — svg-hush sanitizes
+      // and passes them through as image/svg+xml with every plan option
+      // (including format:"json") ignored. Malformed markup is a
+      // source-level error: ERROR 9420, honoring onerror:"redirect"
+      // like the transform error paths below.
+      if (sniffSvg(src)) {
+        try {
+          return new Response(hushFilter(src), {
+            headers: { "content-type": "image/svg+xml" },
+          });
+        } catch (e) {
+          if (!(e instanceof HushError)) throw e;
+          if (plan.onerrorRedirect) return redirect();
+          return new Response("ERROR 9420\n", {
+            status: 415,
+            headers: {
+              "content-type": "text/plain",
+              "cf-resized": "err=9420",
+            },
+          });
+        }
       }
       out = await svc.fetch("http://vrt-images.internal/transform", {
         method: "POST",

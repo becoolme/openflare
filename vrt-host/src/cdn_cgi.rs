@@ -878,6 +878,23 @@ async fn run_transform(
             return Err(9424u16);
         }
 
+        // Upstream never rasterizes SVG: the image-resizing service
+        // sanitizes the source (svg-hush) and ignores every transform
+        // option. Malformed markup gets the corrupt-image error.
+        if looks_like_svg(&src) {
+            return sanitize_svg(&src)
+                .map(|out| {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "image/svg+xml")
+                        .body(Body::from(out))
+                        .unwrap_or_else(|_| Response::new(Body::empty()))
+                })
+                .or_else(|_| {
+                    Ok(error_body(9420, StatusCode::UNSUPPORTED_MEDIA_TYPE))
+                });
+        }
+
         // 2. Multipart POST to the facade-images socket.
         let boundary = "vrtcdnimage0a1b2c3d4e5f60718293a4b5c6d7e8f9";
         let mut body = Vec::with_capacity(src.len() + 1024);
@@ -969,6 +986,39 @@ async fn run_transform(
             ))
         }
     }
+}
+
+/// SVG has no binary magic — sniff the leading markup the same way
+/// `facade/images-wire.ts` does: `<svg` or `<?xml` after whitespace.
+/// UTF-16 BOMs decode like the sanitizer (xml-rs) does; UTF-8 damage
+/// stays a no-match, same as the lossy TextDecoder.
+fn looks_like_svg(src: &[u8]) -> bool {
+    let head = if src.starts_with(&[0xFF, 0xFE]) {
+        utf16_head(&src[..src.len().min(8192)], u16::from_le_bytes)
+    } else if src.starts_with(&[0xFE, 0xFF]) {
+        utf16_head(&src[..src.len().min(8192)], u16::from_be_bytes)
+    } else {
+        String::from_utf8_lossy(&src[..src.len().min(4096)]).into_owned()
+    };
+    let t = head.trim_start_matches('\u{FEFF}').trim_start();
+    t.starts_with("<svg") || t.starts_with("<?xml")
+}
+
+fn utf16_head(src: &[u8], f: fn([u8; 2]) -> u16) -> String {
+    let units: Vec<u16> = src.chunks_exact(2).map(|c| f([c[0], c[1]])).collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// svg-hush pass: the vendored crate is the upstream sanitizer
+/// verbatim — allowlisted elements/attributes, URLs relativized to
+/// same-origin, `data:` limited to image/{jpeg,png,gif}, scripts and
+/// foreign namespaces gone. Err on anything not well-formed SVG XML.
+fn sanitize_svg(src: &[u8]) -> Result<Vec<u8>, svg_hush::FError> {
+    let mut filter = svg_hush::Filter::new();
+    filter.set_data_url_filter(svg_hush::data_url_filter::allow_standard_images);
+    let mut out = Vec::new();
+    filter.filter(src, &mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -1294,5 +1344,51 @@ mod tests {
         // dpr is capped at 2 upstream.
         assert!(parse_options("dpr=3", &HeaderMap::new()).is_err());
         assert!(parse_options("dpr=2", &HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn looks_like_svg_sniffs_markup_not_magic() {
+        assert!(looks_like_svg(b"<svg xmlns=\"x\"/>"));
+        assert!(looks_like_svg(b"  \n<svg"));
+        assert!(looks_like_svg(b"<?xml version=\"1.0\"?><svg/>"));
+        // UTF-16 BOMs — xml-rs decodes them, so the gate must too.
+        assert!(looks_like_svg(b"\xFF\xFE<\x00s\x00v\x00g\x00"));
+        assert!(looks_like_svg(b"\xFE\xFF\x00<\x00?\x00x\x00m\x00l"));
+        assert!(!looks_like_svg(b"\x89PNG\r\n\x1a\n"));
+        assert!(!looks_like_svg(b"<html><svg/></html>")); // no leading <
+        assert!(!looks_like_svg(b"random text"));
+    }
+
+    #[test]
+    fn sanitize_svg_strips_scripts_and_event_handlers() {
+        let out = sanitize_svg(
+            br#"<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script><rect width="4" onload="x()"/></svg>"#,
+        )
+        .unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("script"), "{s}");
+        assert!(!s.contains("onload"), "{s}");
+        assert!(s.contains("<rect"), "{s}");
+    }
+
+    #[test]
+    fn sanitize_svg_relativizes_urls_and_filters_data() {
+        let out = sanitize_svg(
+            br##"<svg xmlns="http://www.w3.org/2000/svg"><feImage href="https://e.com/x.png"/><feImage href="data:text/html,xx"/><feImage href="data:image/png;base64,AAAA"/></svg>"##,
+        )
+        .unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("href=\"/x.png\""), "{s}");
+        assert!(s.contains("href=\"data:image/png;base64,AAAA\""), "{s}");
+        assert!(!s.contains("data:text/html"), "{s}");
+    }
+
+    #[test]
+    fn sanitize_svg_rejects_malformed_and_non_svg() {
+        assert!(sanitize_svg(b"<svg xmlns=\"x\"><rect").is_err());
+        assert!(sanitize_svg(b"<html><body>x</body></html>").is_err());
+        // The sniff gate can pass a non-SVG XML doc — sanitize must
+        // still fail closed (no acceptable root element).
+        assert!(sanitize_svg(b"<?xml version=\"1.0\"?><html/>").is_err());
     }
 }
