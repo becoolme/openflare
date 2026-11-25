@@ -569,8 +569,8 @@
           "name": "facade/images-wire.js",
           "dist": "facade/dist/facade/images-wire.js",
           "source": "facade/images-wire.ts",
-          "sourceSha256": "9ec45de3235dc7e8ea73733fbd97e2e0a5b257062a4aaaead7183ef23df3db92",
-          "sha256": "092f5e374b124771938623bed2c0c6cf908a64f4029118112519dcc11dcce483"
+          "sourceSha256": "e507393a1ce88bb1c38bcbc7fec3bb6bca7b964bdd6b473168e104b3d32c90ef",
+          "sha256": "e9cf80365a712a15e370ebeddfa22248c6d6f11ac952045f9db04298efb28c09"
         },
         {
           "name": "third_party/jsquash/avif/avif_dec.js",
@@ -885,8 +885,8 @@
           "name": "facade/egress/egress.js",
           "dist": "facade/dist/facade/egress/egress.js",
           "source": "facade/egress/egress.ts",
-          "sourceSha256": "e0b655422083f86eb01b51ec3f4396a54202e2a415c26c6cea248db6beea5498",
-          "sha256": "65ab2aa3980e197c3258f378238c395a9a83f205f4d8183b371f94e46295ff61"
+          "sourceSha256": "66ec56a9517a92977249f8f6b33b66abaabb6adead6b7817e4592437dfacef57",
+          "sha256": "244a20d15b307cb88d73b478ad46adf0cc53b1d350528072b7bba614296589bb"
         },
         {
           "name": "facade/egress/ip.js",
@@ -913,8 +913,15 @@
           "name": "facade/images-wire.js",
           "dist": "facade/dist/facade/images-wire.js",
           "source": "facade/images-wire.ts",
-          "sourceSha256": "9ec45de3235dc7e8ea73733fbd97e2e0a5b257062a4aaaead7183ef23df3db92",
-          "sha256": "092f5e374b124771938623bed2c0c6cf908a64f4029118112519dcc11dcce483"
+          "sourceSha256": "e507393a1ce88bb1c38bcbc7fec3bb6bca7b964bdd6b473168e104b3d32c90ef",
+          "sha256": "e9cf80365a712a15e370ebeddfa22248c6d6f11ac952045f9db04298efb28c09"
+        },
+        {
+          "name": "facade/svg-hush.js",
+          "dist": "facade/dist/facade/svg-hush.js",
+          "source": "facade/svg-hush.ts",
+          "sourceSha256": "94c48632e1d17b9df70db3379ad25d38b53adabf7564571203988e305d6b2321",
+          "sha256": "2251aaae598975058943d5e3fee903b840de20b2f0c9b9aacb6bd659f67a1161"
         }
       ]
     },

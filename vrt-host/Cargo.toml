@@ -49,6 +49,7 @@ vrt-sql = { path = "../vrt-sql" }
 # W6-r2: reclaim-time empty-DB check (`_cf_KV.INSTANCE_METADATA`)
 # in wf_delete — same pinned version as vrt-sql, no new dependency.
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+svg-hush = "0.9.7"
 
 [[bin]]
 name = "vrt-host"

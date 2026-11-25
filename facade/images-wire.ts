@@ -117,9 +117,23 @@ export function sniffImage(buf: Uint8Array): { format: ImageFormat; width: numbe
 
 /** SVG has no binary magic — the upstream mock and CF both report it
  * as a dim-less `{format}`-only info response; sniff the leading
- * markup instead. */
+ * markup instead. UTF-16 BOMs decode too — svg-hush (xml-rs) accepts
+ * them, so the resize paths must recognize them as SVG. */
 export function sniffSvg(buf: Uint8Array): boolean {
-  const head = new TextDecoder().decode(buf.subarray(0, Math.min(buf.length, 4096)));
+  let head: string;
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xfe) {
+    head = new TextDecoder("utf-16le").decode(
+      buf.subarray(0, Math.min(buf.length, 8192)),
+    );
+  } else if (buf.length >= 4 && buf[0] === 0xfe && buf[1] === 0xff) {
+    head = new TextDecoder("utf-16be").decode(
+      buf.subarray(0, Math.min(buf.length, 8192)),
+    );
+  } else {
+    head = new TextDecoder().decode(
+      buf.subarray(0, Math.min(buf.length, 4096)),
+    );
+  }
   const trimmed = head.trimStart();
   return trimmed.startsWith("<svg") || trimmed.startsWith("<?xml");
 }
