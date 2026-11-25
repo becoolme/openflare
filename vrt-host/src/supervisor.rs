@@ -536,6 +536,8 @@ pub struct TenantRuntime {
     /// Cell alarm-index verdict for this tenant: `(safe, expires_at)`.
     /// Missing/expired = unsafe (fail closed).
     alarm_gate: std::sync::Mutex<Option<(bool, Instant)>>,
+    /// How long an alarm wake holds the gate unsafe (ms).
+    alarm_wake_grace_ms: AtomicU64,
     /// Wakes the actor when the gate changes so a structural backoff does
     /// not delay the re-evaluation.
     pub gate_notify: Notify,
@@ -573,6 +575,7 @@ impl TenantRuntime {
             wake: crate::hibernate::WakeFlight::new(Duration::from_secs(5)),
             wake_wait_ms: AtomicU64::new(30_000),
             alarm_gate: std::sync::Mutex::new(None),
+            alarm_wake_grace_ms: AtomicU64::new(60_000),
             gate_notify: Notify::new(),
         })
     }
@@ -620,6 +623,14 @@ impl TenantRuntime {
         self.gate_notify.notify_one();
     }
 
+    /// Configure how long an alarm wake holds the gate unsafe.
+    pub fn set_alarm_wake_grace(&self, grace: Duration) {
+        self.alarm_wake_grace_ms.store(
+            grace.as_millis().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
     /// Drop the gate (a new generation must be re-scanned).
     pub fn clear_alarm_gate(&self) {
         let mut gate = self.alarm_gate.lock().unwrap_or_else(|e| e.into_inner());
@@ -664,7 +675,12 @@ impl TenantRuntime {
                     // tenant awake for a grace window so the restarted
                     // generation can deliver it before the idle policy puts
                     // it back to sleep.
-                    self.set_alarm_gate(false, crate::hibernate::ALARM_WAKE_GRACE);
+                    self.set_alarm_gate(
+                        false,
+                        Duration::from_millis(
+                            self.alarm_wake_grace_ms.load(Ordering::Relaxed),
+                        ),
+                    );
                     self.touch();
                 }
                 Ok(())
@@ -1948,6 +1964,7 @@ pub fn spawn_supervisor(
         actor
             .runtime
             .set_wake_params(cfg.wake_deadline + Duration::from_secs(1), WAKE_FAIL_COOLDOWN);
+        actor.runtime.set_alarm_wake_grace(cfg.alarm_wake_grace);
     }
     let task = tokio::spawn(actor.run());
     SupervisorHandle {
@@ -7540,7 +7557,11 @@ impl Actor {
             &[("source", run.source.label()), ("outcome", "ok")],
             1.0,
         );
-        r.observe("vrt_host_wake_seconds", &[], elapsed.as_secs_f64());
+        r.observe(
+            "vrt_host_wake_seconds",
+            &[("source", run.source.label())],
+            elapsed.as_secs_f64(),
+        );
         self.runtime.wake.complete(run.flight, Ok(()));
         drop(run.permit);
     }
