@@ -1,4 +1,4 @@
-import { EngineError } from "./images-engine.js";
+import { EngineError } from "./images-wire.js";
 export const TEXT_MAX_CHARS = 1000;
 export const TEXT_MAX_DIM = 4096;
 export const FONT_MAX_BYTES = 20 * 1024 * 1024;

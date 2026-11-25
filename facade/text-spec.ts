@@ -6,7 +6,10 @@
 // Upstream vocabulary: text ≤ 1000 chars, rendered result ≤ 4096² px,
 // font ≤ 20 MiB, `size` px (default 12), `color` CSS (default #000000).
 
-import { EngineError } from "./images-engine.js";
+// EngineError lives in images-wire (the leaf) — importing it via
+// images-engine would drag the whole jSquash closure into workers
+// that only need spec validation (vrt-egress).
+import { EngineError } from "./images-wire.js";
 
 export const TEXT_MAX_CHARS = 1000;
 export const TEXT_MAX_DIM = 4096;

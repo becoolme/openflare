@@ -1,6 +1,6 @@
 import { initWasm, Resvg } from "../third_party/resvg/index.js";
 import resvgWasm from "../third_party/resvg/index_bg.wasm";
-import { EngineError } from "./images-engine.js";
+import { EngineError } from "./images-wire.js";
 import { FONT_MAX_BYTES, TEXT_MAX_DIM, looksLikeFont } from "./text-spec.js";
 let resvgReady;
 function ensureResvg() {
