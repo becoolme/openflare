@@ -921,8 +921,8 @@
           "name": "facade/egress/images-binding.js",
           "dist": "facade/dist/facade/egress/images-binding.js",
           "source": "facade/egress/images-binding.ts",
-          "sourceSha256": "bfea5eaf66b8eb759a8c50fc1bbb59a7d28a2a3c4fe8b1eb5958ac82de59462b",
-          "sha256": "d25d599b1ecd5777c259c70356b82c65649fc85fd879b4c34fadd75dcbc3f599"
+          "sourceSha256": "b221e1740a854abd01b248233f365030a6407cbfa287ad4675c4795035b8867b",
+          "sha256": "21691eed445f057e024a27c8e41112bf45dc33ff45c7adb93b731a789f2ea03c"
         },
         {
           "name": "facade/egress/ip.js",
