@@ -934,9 +934,9 @@ fn dump_alarm_rows(do_dir: &Path, when: &str) {
     let mut rows: Vec<String> = Vec::new();
     if let Ok(mut stmt) = conn.prepare("SELECT actor_id, scheduled_time FROM _cf_ALARM") {
         if let Ok(iter) = stmt.query_map([], |r| {
-            let id: Vec<u8> = r.get(0)?;
+            let id: String = r.get(0)?;
             let t: i64 = r.get(1)?;
-            Ok(format!("{}@{t}", hex::encode(id)))
+            Ok(format!("{id}@{t}"))
         }) {
             for row in iter.flatten() {
                 rows.push(row);
