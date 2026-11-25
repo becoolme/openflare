@@ -162,7 +162,7 @@ fn render_spec(
     mod_w1: &str,
     class_w1: bool,
 ) -> Rendered {
-    render_spec_with(fx, p_w1, p_w2, p_wu, gen, mod_w1, class_w1, None)
+    render_spec_with(fx, p_w1, p_w2, p_wu, gen, mod_w1, class_w1, None, false)
 }
 
 /// `do_class`: declare that class as a SQL-less Durable Object on w1
@@ -178,6 +178,7 @@ fn render_spec_with(
     mod_w1: &str,
     class_w1: bool,
     do_class: Option<&str>,
+    enable_sql: bool,
 ) -> Rendered {
     let work_dir = fx.dir.path().join("work").join("t1").join(format!("gen-{gen}"));
     mkdir700(&work_dir);
@@ -203,7 +204,7 @@ fn render_spec_with(
         w1_do.push(json!({
             "className": class,
             "uniqueKey": "e".repeat(64),
-            "enableSql": false
+            "enableSql": enable_sql
         }));
         // workerd's DiskDirectory must exist: `<doStorageDir>/<workerId>`.
         std::fs::create_dir_all(fx.dir.path().join("do").join(W1)).unwrap();
@@ -540,7 +541,7 @@ async fn s2z_durable_object_tenant_never_hibernates() {
     let do_dir = fx.dir.path().join("do-root").join("t1");
     mkdir700(&do_dir);
     let (a, b, c) = (free_port(), free_port(), free_port());
-    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO, false, Some("EventLog"));
+    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO, false, Some("EventLog"), false);
     r.spec.do_storage = Some(DoStorageSpec {
         tenant_dir: do_dir,
         worker_classes: BTreeMap::new(),
@@ -566,10 +567,6 @@ async fn s2z_durable_object_tenant_never_hibernates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VRT_WORKERD_BIN"]
 async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
-    if std::env::var_os("VRT_REAL_HIBERNATION_WAKE").is_none() {
-        eprintln!("skip: set VRT_REAL_HIBERNATION_WAKE=1 to run post-hibernation alarm wake");
-        return;
-    }
     init_logs();
     if workerd_bin_or_skip().is_none() {
         return;
@@ -579,7 +576,7 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
     let do_dir = fx.dir.path().join("do-root").join("t1");
     mkdir700(&do_dir);
     let (a, b, c) = (free_port(), free_port(), free_port());
-    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO_ALARM, false, Some("EventLog"));
+    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO_ALARM, false, Some("EventLog"), true);
     r.spec.do_storage = Some(DoStorageSpec {
         tenant_dir: do_dir,
         worker_classes: BTreeMap::new(),
