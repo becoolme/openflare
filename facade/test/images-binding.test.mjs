@@ -322,6 +322,156 @@ test("proxy: missing VRT_IMAGES surfaces err=9523 on the binding channel", async
   assert.equal(resp.headers.get("cf-images-binding"), "err=9523");
 });
 
+test("relay: malformed multipart with a marker forwards raw", async () => {
+  // Marker bytes present but the boundary is bogus — formData()
+  // throws and the facade's own validation owns the rejection.
+  const { svc, calls } = makeSvc(
+    () =>
+      new Response("ERROR 9423\n", {
+        status: 400,
+        headers: { "cf-images-binding": "err=9423" },
+      }),
+  );
+  const body = new TextEncoder().encode(
+    'name="draw_text" but no real boundary structure',
+  );
+  const resp = await relayImagesBinding(
+    new Request(`${HOST}/transform`, {
+      method: "POST",
+      headers: { "content-type": "multipart/form-data; boundary=zzz" },
+      body,
+    }),
+    svc,
+    PARSED_POLICY,
+  );
+  assert.equal(resp.headers.get("cf-images-binding"), "err=9423");
+  const got = await drainBody(calls[0].init);
+  assert.deepEqual(got.bytes, body);
+});
+
+test("relay: non-http font urls deny at the policy layer", async () => {
+  const { svc, calls } = makeSvc();
+  const resp = await relayImagesBinding(
+    post("/transform", {
+      text_input: JSON.stringify({
+        text: "HI",
+        font: { url: "data:font/ttf;base64,AAAA" },
+      }),
+      transforms: "[]",
+    }),
+    svc,
+    PARSED_POLICY,
+  );
+  assert.equal(resp.headers.get("cf-images-binding"), "err=9420");
+  assert.equal(calls.length, 0);
+});
+
+test("relay: allow-entry font hosts inject like public ones", async () => {
+  const { svc, calls } = makeSvc();
+  const restore = stubFetch(async (url) => {
+    assert.equal(String(url), "https://api.vibeploy.internal:8443/f.ttf");
+    return new Response(FONT_BYTES);
+  });
+  try {
+    await relayImagesBinding(
+      post("/transform", {
+        text_input: JSON.stringify({
+          text: "HI",
+          font: { url: "https://api.vibeploy.internal:8443/f.ttf" },
+        }),
+        transforms: "[]",
+      }),
+      svc,
+      PARSED_POLICY,
+    );
+  } finally {
+    restore();
+  }
+  const body = await drainBody(calls[0].init);
+  const file = body.entries.find(([n]) => n === "text_font")?.[1];
+  assert.ok(file instanceof File);
+});
+
+test("relay: multiple draw_text specs pair fonts in order", async () => {
+  const { svc, calls } = makeSvc();
+  const fonts = {
+    "https://fonts.example/a.ttf": new Uint8Array([1, 2, 3]),
+    "https://fonts.example/b.ttf": new Uint8Array([4, 5, 6]),
+  };
+  const restore = stubFetch(async (url) => new Response(fonts[String(url)]));
+  // Same-named fields need a real FormData (object keys can't dup).
+  const form = new FormData();
+  form.append("image", pngStub());
+  form.append(
+    "draw_text",
+    JSON.stringify({ text: "A", font: { url: "https://fonts.example/a.ttf" } }),
+  );
+  form.append("draw_image", pngStub());
+  form.append(
+    "draw_text",
+    JSON.stringify({ text: "B", font: { url: "https://fonts.example/b.ttf" } }),
+  );
+  form.append("transforms", "[]");
+  try {
+    await relayImagesBinding(
+      new Request(`${HOST}/transform`, { method: "POST", body: form }),
+      svc,
+      PARSED_POLICY,
+    );
+  } finally {
+    restore();
+  }
+  const body = await drainBody(calls[0].init);
+  const names = body.entries.map(([n]) => n);
+  assert.deepEqual(names, [
+    "image",
+    "draw_text",
+    "draw_font",
+    "draw_image",
+    "draw_text",
+    "draw_font",
+    "transforms",
+  ]);
+  const fontsOut = body.entries
+    .filter(([n]) => n === "draw_font")
+    .map(([, f]) => f);
+  assert.deepEqual(
+    new Uint8Array(await fontsOut[0].arrayBuffer()),
+    fonts["https://fonts.example/a.ttf"],
+  );
+  assert.deepEqual(
+    new Uint8Array(await fontsOut[1].arrayBuffer()),
+    fonts["https://fonts.example/b.ttf"],
+  );
+});
+
+test("relay: a dead facade surfaces err=9523, not a bare rejection", async () => {
+  const svc = {
+    async fetch() {
+      throw new Error("service unreachable");
+    },
+  };
+  const resp = await relayImagesBinding(
+    post("/info", { image: pngStub() }),
+    svc,
+    PARSED_POLICY,
+  );
+  assert.equal(resp.status, 500);
+  assert.equal(resp.headers.get("cf-images-binding"), "err=9523");
+});
+
+test("relay: /info streams its body instead of buffering", async () => {
+  const { svc, calls } = makeSvc();
+  await relayImagesBinding(
+    post("/info", { image: pngStub() }),
+    svc,
+    PARSED_POLICY,
+  );
+  assert.ok(calls[0].init.body instanceof ReadableStream);
+  const got = await drainBody(calls[0].init);
+  assert.ok(got.bytes.length > 33);
+});
+
 test("proxy: relay e2e — injected font rasterizes through the facade", async () => {
   const { ImagesFacade } = await import(facadeModule("facade-images.js"));
   const eng = await import(facadeModule("images-engine.js"));

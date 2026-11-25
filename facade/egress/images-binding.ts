@@ -86,6 +86,21 @@ function relayResponse(resp: Response): Response {
   });
 }
 
+// A dead facade is the binding channel's transport error — the shim
+// maps err=9523 to a typed ImagesError like upstream, instead of an
+// opaque fetch rejection at the tenant.
+async function tryFetch(
+  svc: ImagesFacade,
+  target: string,
+  init: RequestInit,
+): Promise<Response> {
+  try {
+    return relayResponse(await svc.fetch(target, init));
+  } catch {
+    return bindingError(9523, 500);
+  }
+}
+
 export async function relayImagesBinding(
   request: Request,
   svc: ImagesFacade,
@@ -100,11 +115,20 @@ export async function relayImagesBinding(
   }
   let body: Uint8Array | undefined;
   if (request.method !== "GET" && request.method !== "HEAD") {
-    body = new Uint8Array(await request.arrayBuffer());
-    init.body = body;
+    if (url.pathname === "/transform") {
+      // /transform needs the whole body anyway — the marker scan
+      // below decides between raw passthrough and a font-injecting
+      // rebuild, and the facade parses the same bytes it always did.
+      body = new Uint8Array(await request.arrayBuffer());
+      init.body = body;
+    } else {
+      // Other paths (/info, ...) can never carry text specs — stream
+      // the body through instead of buffering a copy.
+      init.body = request.body ?? undefined;
+    }
   }
 
-  if (body !== undefined && url.pathname === "/transform") {
+  if (body !== undefined) {
     // latin1 keeps the scan byte-accurate; the markers name the
     // multipart fields StreamableFormData emits for text sources.
     const flat = new TextDecoder("latin1").decode(body);
@@ -120,7 +144,7 @@ export async function relayImagesBinding(
       } catch {
         // Unparseable multipart — forward raw so the facade's own
         // validation produces the canonical rejection.
-        return relayResponse(await svc.fetch(target, init));
+        return tryFetch(svc, target, init);
       }
       const out = new FormData();
       for (const [name, value] of form) {
@@ -142,8 +166,8 @@ export async function relayImagesBinding(
           );
         }
       }
-      return relayResponse(await svc.fetch(target, { method: "POST", body: out }));
+      return tryFetch(svc, target, { method: "POST", body: out });
     }
   }
-  return relayResponse(await svc.fetch(target, init));
+  return tryFetch(svc, target, init);
 }
