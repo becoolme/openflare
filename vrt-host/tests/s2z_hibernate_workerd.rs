@@ -585,7 +585,11 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
     let rt = TenantRuntime::new("t1");
     // The cell alarm index says this class has no due alarm: sleep allowed.
     rt.set_alarm_gate(true, Duration::from_secs(60));
-    let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), s2z_params());
+    // Give workerd enough time to shut down cleanly so the alarm scheduler
+    // metadata is durable before the generation is reaped.
+    let mut params = s2z_params();
+    params.kill_grace = Duration::from_secs(5);
+    let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
     let pid = rt.active_pid();
 
