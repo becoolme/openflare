@@ -201,6 +201,7 @@ fn is_gauge(name: &str) -> bool {
         name,
         "vrt_worker_inflight_requests"
             | "vrt_tenant_memory_rss_bytes"
+            | "vrt_host_tenant_hibernated_seconds"
             | "vrt_host_do_objects"
             | "vrt_host_do_storage_bytes"
             | "vrt_metrics_unsupported"
@@ -257,6 +258,14 @@ pub struct TenantReport {
     pub tenant_id: String,
     pub cpu_seconds: f64,
     pub memory_rss_bytes: u64,
+    /// Point-in-time gauge from `vrt_host_tenant_hibernated_seconds`:
+    /// `> 0` means the tenant is asleep (scale-to-zero). Emitted for
+    /// every registered tenant at scrape time, so `0` is a real
+    /// "awake" answer — not "not reported". Older planes tolerate the
+    /// additive key only once the control schema accepts it, so the
+    /// plane upgrade must land before cells with s2z report it.
+    #[serde(default)]
+    pub hibernated_seconds: f64,
     #[serde(default)]
     pub do_storage: Vec<DoStorage>,
 }
@@ -589,6 +598,11 @@ pub fn build_pod_report(
                     tenants.entry(t.clone()).or_default().memory_rss_bytes += delta;
                 }
             }
+            "vrt_host_tenant_hibernated_seconds" => {
+                if let Some(t) = s.labels.get("tenant_id") {
+                    tenants.entry(t.clone()).or_default().hibernated_seconds = delta;
+                }
+            }
             "vrt_host_do_objects" | "vrt_host_do_storage_bytes" => {
                 let (Some(t), Some(w)) = (s.labels.get("tenant"), s.labels.get("worker")) else {
                     continue;
@@ -657,6 +671,7 @@ pub fn build_pod_report(
                 tenant_id,
                 cpu_seconds: acc.cpu_seconds.max(0.0),
                 memory_rss_bytes: acc.memory_rss_bytes.round().max(0.0) as u64,
+                hibernated_seconds: acc.hibernated_seconds.max(0.0),
                 do_storage,
             }
         })
@@ -732,6 +747,7 @@ impl HistogramAcc {
 struct TenantAcc {
     cpu_seconds: f64,
     memory_rss_bytes: f64,
+    hibernated_seconds: f64,
     do_storage: BTreeMap<String, DoStorage>,
 }
 
@@ -1529,6 +1545,7 @@ vrt_worker_request_duration_seconds_count{{worker_id="team:w"}} 3
 vrt_worker_inflight_requests{{worker_id="team:w"}} 2
 vrt_tenant_cpu_seconds_total{{tenant_id="team"}} {counter}
 vrt_tenant_memory_rss_bytes{{tenant_id="team"}} 1024
+vrt_host_tenant_hibernated_seconds{{tenant_id="team"}} 45.5
 vrt_host_do_objects{{tenant="team",worker="team:w"}} 4
 vrt_host_do_storage_bytes{{tenant="team",worker="team:w"}} 8192
 vrt_host_launches_total{{outcome="ready",reason="none"}} 2
@@ -1566,6 +1583,10 @@ vrt_host_wake_seconds_count 1
         assert_eq!(second.tenants[0].cpu_seconds, 6.0);
         assert_eq!(second.launches.ready, 0); // unchanged counter
         assert_eq!(second.workers[0].inflight, 2); // gauge, not a delta
+                                                   // Gauge passthrough: identical samples → identical value, never
+                                                   // a second window's worth accumulated on top.
+        assert_eq!(first.tenants[0].hibernated_seconds, 45.5);
+        assert_eq!(second.tenants[0].hibernated_seconds, 45.5);
     }
 
     #[test]
