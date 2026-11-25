@@ -32,6 +32,12 @@ import {
   applyTransforms,
   IMAGES_TRANSFORM_MAX_PIXELS,
 } from "./images-transform.js";
+import {
+  attachMetadata,
+  extractMetadata,
+  METADATA_MODES,
+  type MetadataMode,
+} from "./images-metadata.js";
 
 const DECODE_FORMATS = new Set(["jpeg", "png", "webp", "avif", "gif", "bmp"]);
 const OUTPUT_FORMATS: Record<string, string> = {
@@ -53,7 +59,10 @@ function wireError(e: unknown): Response {
 /** Decode a multipart file field into an RGBA frame, or throw a typed
  * EngineError. Returns the sniffed container format alongside — the
  * caller needs it for anim/multi-frame policy. */
-async function decodeField(file: File, what: string): Promise<{ frame: ImageDataLike; format: string }> {
+async function decodeField(
+  file: File,
+  what: string,
+): Promise<{ frame: ImageDataLike; format: string; bytes: Uint8Array }> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (bytes.length === 0 || bytes.length > IMAGES_BODY_MAX_BYTES) {
     throw new EngineError(9409, `images: ${what} empty or over the 64MiB cap`);
@@ -68,7 +77,7 @@ async function decodeField(file: File, what: string): Promise<{ frame: ImageData
   if (!DECODE_FORMATS.has(sniffed.format)) {
     throw new EngineError(9401, `images: ${what} format ${sniffed.format} has no vendored decoder`);
   }
-  return { frame: await decodeImage(bytes, sniffed.format), format: sniffed.format };
+  return { frame: await decodeImage(bytes, sniffed.format), format: sniffed.format, bytes };
 }
 
 /** Alpha-flatten onto `color` for opaque output formats. */
@@ -156,7 +165,8 @@ export class ImagesFacade extends WorkerEntrypoint {
             return imagesError(9423, "images: malformed `transforms` JSON", 400);
           }
 
-          const { frame: canvas, format: canvasFormat } = await decodeField(image, "canvas image");
+          const { frame: canvas, format: canvasFormat, bytes: canvasBytes } =
+            await decodeField(image, "canvas image");
           const frames = [canvas];
           for (const field of form.getAll("draw_image")) {
             if (!(field instanceof File)) {
@@ -198,13 +208,27 @@ export class ImagesFacade extends WorkerEntrypoint {
             return imagesError(9423, "images: invalid `background` color", 400);
           }
 
+          // `metadata` rides the egress cf.image plan; the upstream shim
+          // never sends it, so an absent field defaults to `copyright` —
+          // the same default CF applies to IMAGES binding transforms.
+          const rawMetadata = form.get("metadata");
+          const metadata: MetadataMode = rawMetadata === null ? "copyright" : String(rawMetadata) as MetadataMode;
+          if (!METADATA_MODES.has(metadata)) {
+            return imagesError(9423, "images: invalid `metadata`", 400);
+          }
+
           const done = await applyTransforms(frames, ops);
           const needsFlatten = bg !== null || format === "jpeg";
           const finalImage = needsFlatten
             ? flatten(done, bg ?? [255, 255, 255, 255])
             : done;
           const { bytes, contentType } = await encodeImage(finalImage, format, quality);
-          return new Response(bytes, {
+          const srcMeta = extractMetadata(canvasBytes, canvasFormat);
+          const outBytes = attachMetadata(
+            bytes, format, srcMeta, metadata,
+            finalImage.width, finalImage.height,
+          );
+          return new Response(outBytes, {
             status: 200,
             headers: { "content-type": contentType },
           });

@@ -2,6 +2,7 @@ import { WorkerEntrypoint } from "cloudflare:workers";
 import { imagesError, sniffImage, sniffSvg, IMAGES_BODY_MAX_BYTES, IMAGES_MAX_PIXELS } from "./images-wire.js";
 import { EngineError, decodeImage, encodeImage, parseColor, composite } from "./images-engine.js";
 import { applyTransforms, IMAGES_TRANSFORM_MAX_PIXELS } from "./images-transform.js";
+import { attachMetadata, extractMetadata, METADATA_MODES } from "./images-metadata.js";
 const DECODE_FORMATS = new Set([
     "jpeg",
     "png",
@@ -41,7 +42,8 @@ async function decodeField(file, what) {
     }
     return {
         frame: await decodeImage(bytes, sniffed.format),
-        format: sniffed.format
+        format: sniffed.format,
+        bytes
     };
 }
 function flatten(img, color) {
@@ -126,7 +128,7 @@ export class ImagesFacade extends WorkerEntrypoint {
                         } catch  {
                             return imagesError(9423, "images: malformed `transforms` JSON", 400);
                         }
-                        const { frame: canvas, format: canvasFormat } = await decodeField(image, "canvas image");
+                        const { frame: canvas, format: canvasFormat, bytes: canvasBytes } = await decodeField(image, "canvas image");
                         const frames = [
                             canvas
                         ];
@@ -160,6 +162,11 @@ export class ImagesFacade extends WorkerEntrypoint {
                         if (rawBg !== null && !bg) {
                             return imagesError(9423, "images: invalid `background` color", 400);
                         }
+                        const rawMetadata = form.get("metadata");
+                        const metadata = rawMetadata === null ? "copyright" : String(rawMetadata);
+                        if (!METADATA_MODES.has(metadata)) {
+                            return imagesError(9423, "images: invalid `metadata`", 400);
+                        }
                         const done = await applyTransforms(frames, ops);
                         const needsFlatten = bg !== null || format === "jpeg";
                         const finalImage = needsFlatten ? flatten(done, bg ?? [
@@ -169,7 +176,9 @@ export class ImagesFacade extends WorkerEntrypoint {
                             255
                         ]) : done;
                         const { bytes, contentType } = await encodeImage(finalImage, format, quality);
-                        return new Response(bytes, {
+                        const srcMeta = extractMetadata(canvasBytes, canvasFormat);
+                        const outBytes = attachMetadata(bytes, format, srcMeta, metadata, finalImage.width, finalImage.height);
+                        return new Response(outBytes, {
                             status: 200,
                             headers: {
                                 "content-type": contentType

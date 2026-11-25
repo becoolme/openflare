@@ -180,7 +180,7 @@ export function cfImagePlan(request) {
         outputQuality = num("quality", 1, 100);
     }
     const anim = o.anim === true;
-    const metadata = o.metadata === undefined || o.metadata === "none" ? null : o.metadata === "keep" || o.metadata === "copyright" ? o.metadata : (()=>{
+    const metadata = o.metadata === undefined ? null : o.metadata === "none" || o.metadata === "keep" || o.metadata === "copyright" ? o.metadata : (()=>{
         throw new TypeError("cf.image: invalid metadata");
     })();
     return {
@@ -204,6 +204,7 @@ export function cfImageBody(src, plan) {
     fd.append("output_format", plan.outputFormat ?? "image/jpeg");
     if (plan.outputQuality !== undefined) fd.append("output_quality", String(plan.outputQuality));
     if (plan.anim) fd.append("anim", "true");
+    if (plan.metadata !== null) fd.append("metadata", plan.metadata);
     return fd;
 }
 export { SRC_MAX };
