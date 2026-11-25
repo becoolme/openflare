@@ -62,8 +62,20 @@ and Alertmanager on loopback:
 
 vmalert mounts the canonical `deploy/alerts/openflare-runtime.yaml`;
 Alertmanager ships a silent default receiver so the lifecycle is visible
-without paging anyone. Point the receiver at a real integration in an
-operator overlay.
+without paging anyone.
+
+For real notifications, keep the config outside the repository, fill
+`monitoring/alertmanager.webhook.example.yml`, and point compose at it:
+
+```sh
+ALERTMANAGER_CONFIG=/etc/openflare/alertmanager.yml \
+  docker compose --profile monitoring up -d
+```
+
+For an external vmalert datasource/notifier (for example an existing
+VictoriaMetrics + Alertmanager pair), set `VMALERT_DATASOURCE_URL`,
+`VMALERT_REMOTE_WRITE_URL` and `VMALERT_NOTIFIER_URL`; the defaults stay on the
+local compose services.
 
 `deploy/standalone/alerts-e2e.sh` is the gate: `promtool` validates the
 rules, then vmalert must report every group/rule and Alertmanager must
