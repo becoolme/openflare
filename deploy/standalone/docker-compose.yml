@@ -232,6 +232,50 @@ services:
       vrt-host:
         condition: service_started
 
+  # B12: rule evaluation + notification for the monitoring profile.
+  # vmalert reads the SAME canonical rule file the runtime repo ships
+  # (`deploy/alerts/openflare-runtime.yaml`); Alertmanager's default
+  # receiver is silent on purpose — an operator overlay supplies the
+  # real route. Both listen on loopback by default.
+  alertmanager:
+    profiles: ["monitoring"]
+    image: ${ALERTMANAGER_IMAGE:-prom/alertmanager:v0.28.1}
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --web.listen-address=0.0.0.0:9093
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "${ALERTMANAGER_BIND:-127.0.0.1}:${ALERTMANAGER_PORT:-9093}:9093"
+    depends_on:
+      victoria-metrics:
+        condition: service_started
+
+  vmalert:
+    profiles: ["monitoring"]
+    image: ${VMALERT_IMAGE:-victoriametrics/vmalert:v1.108.0}
+    restart: unless-stopped
+    command:
+      - -rule=/etc/vmalert/openflare-runtime.yaml
+      - -datasource.url=http://victoria-metrics:8428
+      - -remoteRead.url=http://victoria-metrics:8428
+      - -remoteWrite.url=http://victoria-metrics:8428
+      - -notifier.url=http://alertmanager:9093
+      - -evaluationInterval=30s
+      - -httpListenAddr=0.0.0.0:8880
+    volumes:
+      - ../alerts/openflare-runtime.yaml:/etc/vmalert/openflare-runtime.yaml:ro
+    ports:
+      - "${VMALERT_BIND:-127.0.0.1}:${VMALERT_PORT:-8880}:8880"
+    depends_on:
+      victoria-metrics:
+        condition: service_started
+      alertmanager:
+        condition: service_started
+
 volumes:
   # Plain named volume: Docker copies the image's /data ownership
   # (vrt:vrt 0700) on first create — no manual chown needed.
@@ -240,5 +284,6 @@ volumes:
   # manifest/segment data survives independently of db file churn.
   vrt-sql-objects:
   vm-data:
+  alertmanager-data:
   # LE account key + issued certs (acme.json, mode 600 managed by Traefik).
   traefik-acme:

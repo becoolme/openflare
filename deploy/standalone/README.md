@@ -51,6 +51,24 @@ live on one device, so this quick-start stack passes
   service `command:` once (or recreate the volume) — otherwise
   `vrt-sql` exits with `VRT_SQL_DURABILITY_SAME_DEVICE`.
 
+## Monitoring and alerting (`--profile monitoring`)
+
+`docker compose --profile monitoring up` adds VictoriaMetrics, vmalert
+and Alertmanager on loopback:
+
+- VictoriaMetrics: `http://127.0.0.1:8428`
+- vmalert (rules + firing state): `http://127.0.0.1:8880`
+- Alertmanager: `http://127.0.0.1:9093`
+
+vmalert mounts the canonical `deploy/alerts/openflare-runtime.yaml`;
+Alertmanager ships a silent default receiver so the lifecycle is visible
+without paging anyone. Point the receiver at a real integration in an
+operator overlay.
+
+`deploy/standalone/alerts-e2e.sh` is the gate: `promtool` validates the
+rules, then vmalert must report every group/rule and Alertmanager must
+answer its health/status API. CI runs it in the `runtime-alerts` job.
+
 ## Acceptance entry point: `e2e.sh`
 
 `deploy/standalone/e2e.sh` is the real-machine acceptance gate —

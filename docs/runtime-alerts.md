@@ -29,6 +29,13 @@ Rules live in `deploy/alerts/openflare-runtime.yaml`; the drill for D1 is
   data was truncated. Increase `hibernationReplayBytes` or keep those tenants
   resident.
 
+## Scale-to-zero / alarm wake latency
+
+- **AlarmWakeSlow**: p95 of `vrt_host_wake_seconds{source="alarm"}` is above
+  30 s. Check pod CPU/startup time and `vrt_host_wake_total{source="alarm",
+  outcome!="ok"}`. `[scaleToZero].alarmWakeGraceMs` only keeps an already
+  Ready tenant awake; raising it does not speed up workerd boot.
+
 ## General
 
 - Gates are advisory only until they expire; an expired/missing gate keeps DO
