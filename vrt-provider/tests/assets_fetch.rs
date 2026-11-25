@@ -69,6 +69,15 @@ fn remove_stored(root: &std::path::Path, name: &str) {
 }
 
 fn env(files: &[(&str, &[u8])], not_found: &str, store_tenant: &str) -> Env {
+    env_with_base(files, not_found, store_tenant, None)
+}
+
+fn env_with_base(
+    files: &[(&str, &[u8])],
+    not_found: &str,
+    store_tenant: &str,
+    base_path: Option<&str>,
+) -> Env {
     let (digest, mbytes) = manifest_bytes(files, not_found);
     let root = std::env::temp_dir().join(format!("vrt-assets-test-{}", uuid_v4()));
     let store = AssetStore::open(&root).unwrap();
@@ -99,6 +108,7 @@ fn env(files: &[(&str, &[u8])], not_found: &str, store_tenant: &str) -> Env {
                     },
                     assets_first: None,
                     run_worker_first: None,
+                    base_path: base_path.map(str::to_string),
                 })],
             )],
         )],
@@ -869,6 +879,7 @@ async fn route_index_over_limit_returns_too_large_flag() {
                     },
                     assets_first: None,
                     run_worker_first: None,
+                    base_path: None,
                 })],
             )],
         )],
@@ -1162,4 +1173,119 @@ async fn headers_apply_to_not_modified() {
         .to_str()
         .unwrap();
     assert!(names.contains("x-custom-foo-header"), "{names}");
+}
+
+// ---------------------------------------------------------------------------
+// assets.base_path — manifest mounted under a public URL prefix
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn base_path_gates_fetch_and_can_fetch() {
+    // Manifest entries live at the unstripped root (`/x.txt`); the
+    // public surface is only underneath the mount point.
+    let e = env_with_base(
+        &[("/x.txt", b"inside"), ("/index.html", b"root-index")],
+        "none",
+        TENANT,
+        Some("/blog/"),
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/x.txt", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/x.txt", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(code_of(&res), "ASSET_NOT_FOUND");
+    // The base stem and mount root both land on the manifest root.
+    for url in ["https://x/blog", "https://x/blog/"] {
+        let res = fetch(&e.app, &e.digest, "GET", url, &[]).await;
+        assert!(
+            res.status() == StatusCode::OK
+                || res.status() == StatusCode::TEMPORARY_REDIRECT,
+            "{url}: {}",
+            res.status()
+        );
+    }
+    // can_fetch mirrors the gate: outside the mount → false.
+    assert!(can_fetch_body(&e.app, &e.digest, "https://x/blog/x.txt", false).await);
+    assert!(!can_fetch_body(&e.app, &e.digest, "https://x/x.txt", false).await);
+    // `/blog-other` shares the stem but not the segment boundary.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog-other/x.txt", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn base_path_root_intent_and_redirect_republishes() {
+    // auto-trailing-slash canonicalizes the mount root via a 307 that
+    // carries the public base — `/blog` → `/blog/`, never `/`.
+    let e = env_with_base(
+        &[
+            ("/index.html", b"root-index"),
+            ("/dir/page.html", b"page"),
+            ("/dir/index.html", b"dir-index"),
+            ("/_redirects", b"/blog/old /blog/new 301\n"),
+            ("/new", b"redirect-target"),
+        ],
+        "none",
+        TENANT,
+        Some("/blog/"),
+    );
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        res.headers().get("location").unwrap(),
+        "/blog/"
+    );
+    // html-handling intent redirects are asset-relative — republished
+    // under the public base.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/dir/page.html", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        res.headers().get("location").unwrap(),
+        "/blog/dir/page"
+    );
+    // A directory canonicalizes the same way — asset-relative `/dir/`
+    // republished under the public base.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/dir", &[]).await;
+    assert_eq!(res.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        res.headers().get("location").unwrap(),
+        "/blog/dir/"
+    );
+    // `_redirects` match the full PUBLIC path — `/old` never fires,
+    // `/blog/old` does and its target is already public (no re-prefix).
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/old", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/old", &[]).await;
+    assert_eq!(res.status(), StatusCode::MOVED_PERMANENTLY);
+    assert_eq!(
+        res.headers().get("location").unwrap(),
+        "/blog/new"
+    );
+}
+
+#[tokio::test]
+async fn base_path_proxy_destinations_recheck_the_base() {
+    // `200` rewrites keep the client URL and serve the destination —
+    // but the destination shares the _redirects PUBLIC namespace, so
+    // it is re-stripped against the base like upstream re-checks
+    // proxied rewrites.
+    let e = env_with_base(
+        &[
+            ("/real.txt", b"real"),
+            ("/_redirects", b"/blog/alias /blog/real.txt 200\n/blog/bad /real.txt 200\n"),
+        ],
+        "none",
+        TENANT,
+        Some("/blog/"),
+    );
+    // `/blog/real.txt` strips to `/real.txt` — in-base, in-manifest.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/alias", &[]).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"real");
+    // `/real.txt` as a PUBLIC target is outside the mount → 404,
+    // even though the same string would resolve asset-side.
+    let res = fetch(&e.app, &e.digest, "GET", "https://x/blog/bad", &[]).await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
 }

@@ -3580,6 +3580,11 @@ fn router_cfg_json(
         "userWorker": user_worker,
         "assetWorker": asset_worker,
         "manifestDigest": assets.manifest_digest,
+        // `assets.base_path` rides the per-binding cfg rather than the
+        // route-index response: the router's index cache keys on the
+        // manifest digest, and two bindings sharing a digest may mount
+        // it under different prefixes.
+        "basePath": assets.base_path.as_deref().unwrap_or("/"),
     })))
     .map_err(|_| ConfigError::Identifier("routerConfig"))
 }

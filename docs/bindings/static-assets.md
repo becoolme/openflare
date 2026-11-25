@@ -41,7 +41,21 @@ binding = "ASSETS"                    # optional — defaults to ASSETS
 notFoundHandling = "single-page-application"
 htmlHandling = "auto-trailing-slash"  # optional — same four modes
 # assetsFirst = true                  # opt into Cloudflare assets-first routing
+# basePath = "/blog/"                 # mount the manifest under a URL prefix
 ```
+
+`base_path` (Wrangler 4.148+) mounts the whole manifest under a public
+URL prefix: `base_path = "/blog"` (normalized to `/blog/`) serves
+`public/x.txt` at `/blog/x.txt`. Only manifest lookups strip the
+prefix — `_headers`, `_redirects`, `_routes.json` and
+`run_worker_first` still match the full public path, so a rule
+`/blog/old → /blog/new` is written with the prefix in it. Requests
+outside the prefix never reach the assets service (404 /
+worker-routed); `/blog` and `/blog/` land on the mount root and
+canonicalize like `/` would when `/index.html` exists. Accepted forms
+are relative or absolute pathnames (`.`/`..`/empty segments resolve);
+URLs, backslashes, control characters, `?`/`#`, `%` escapes and empty
+input are rejected.
 
 ## Where it runs
 
@@ -167,10 +181,11 @@ that does not match the bytes is never committed.
 ## Unsupported keys and error shape
 
 `assets` accepts only `directory`, `binding`, `html_handling`,
-`not_found_handling`, `run_worker_first` — anything else →
+`not_found_handling`, `run_worker_first`, `base_path` — anything else →
 `VRT_CONFIG_UNSUPPORTED_FIELD` (`assets.<key>`). A missing `directory` →
 `VRT_CONFIG_INVALID`; invalid `run_worker_first` rules →
-`VRT_CONFIG_INVALID` (`assets.run_worker_first`).
+`VRT_CONFIG_INVALID` (`assets.run_worker_first`); a `base_path` that is
+not a plain pathname → `VRT_CONFIG_INVALID` (`assets.base_path`).
 
 ## Examples and tests
 

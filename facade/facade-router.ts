@@ -155,6 +155,7 @@ export class AssetsRouter extends WorkerEntrypoint<RouterEnv> {
       navigate,
       hasStaticRouting,
       cfg.manifestDigest,
+      cfg.basePath,
     );
     if (fetchable.error) return ROUTE_UNREACHABLE(fetchable.error);
     return fetchable.value ? toAssets() : toUserWorker();
@@ -169,6 +170,7 @@ export class AssetsRouter extends WorkerEntrypoint<RouterEnv> {
     navigate: boolean,
     hasStaticRouting: boolean,
     digest: string,
+    basePath: string,
   ): Promise<{ value: boolean; error?: RouteErrorReason }> {
     const env = this.env;
     let slot = cacheGet(digest);
@@ -246,6 +248,7 @@ export class AssetsRouter extends WorkerEntrypoint<RouterEnv> {
         navigate,
         hasStaticRouting,
         rawPath,
+        basePath,
       ),
     };
   }

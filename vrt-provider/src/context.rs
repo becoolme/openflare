@@ -55,6 +55,11 @@ pub enum BindingResource {
     AssetsManifest {
         /// sha256 manifest digest.
         digest: String,
+        /// `assets.base_path` canonical form (`/` or `/seg/…/`); the
+        /// provider strips it before manifest resolution while
+        /// `_headers`/`_redirects`/`_routes.json`/`run_worker_first`
+        /// keep matching the full public path.
+        base_path: String,
     },
     /// `{"type":"d1"}` — server-assigned database + writer epoch (T34).
     D1Database {
@@ -122,7 +127,7 @@ impl BindingResource {
             Self::KvNamespace { id } => id,
             Self::R2Bucket { name } => name,
             Self::PgDatabase { id, .. } => id,
-            Self::AssetsManifest { digest } => digest,
+            Self::AssetsManifest { digest, .. } => digest,
             Self::D1Database { id, .. } => id,
             Self::Queue { id } => id,
             Self::K2Stream { id } => id,

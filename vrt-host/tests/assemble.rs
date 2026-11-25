@@ -662,6 +662,7 @@ fn assets_first_tenant_assembles_with_real_manifest() {
         },
         assets_first: Some(true),
         run_worker_first: None,
+        base_path: None,
     }));
     let spec = assembler
         .assemble(&tenant("t-r", vec![w]), 1, 1)

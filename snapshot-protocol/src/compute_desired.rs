@@ -1073,6 +1073,13 @@ pub struct AssetsBinding {
     /// route assets-first. Only meaningful with `assets_first`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_worker_first: Option<RunWorkerFirst>,
+    /// `assets.base_path` — the public URL prefix the manifest is
+    /// mounted under (Wrangler 4.148+, 2026-11-11 changelog). Canonical
+    /// stored form per workers-shared `normalizeBasePath`: either `/`
+    /// or an absolute pathname with leading AND trailing slashes
+    /// (`/blog/`). Absent is the root mount (pre-feature snapshots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
 }
 
 /// T31c: `run_worker_first` — boolean switch or glob-rule list,
@@ -1090,6 +1097,31 @@ pub enum RunWorkerFirst {
 pub const MAX_RUN_WORKER_FIRST_RULES: usize = 100;
 /// Wrangler bound: each rule at most 100 bytes.
 pub const MAX_RUN_WORKER_FIRST_RULE_LEN: usize = 100;
+
+/// `base_path` canonical-form check — the desired protocol stores the
+/// workers-shared `normalizeBasePath` OUTPUT (vrt-local performs the
+/// normalization; anything malformed here is a corrupt snapshot):
+/// exactly `/`, or `/seg/…/seg/` with no empty/dot/dotdot segments,
+/// no `\`, no `?`/`#`, no `%`, no control bytes, ≤1024 bytes. Unicode
+/// pathname bytes pass (upstream allows them).
+pub fn valid_base_path(value: &str) -> bool {
+    if value == "/" {
+        return true;
+    }
+    if value.len() > 1024
+        || !value.starts_with('/')
+        || !value.ends_with('/')
+        || value.contains(['\\', '?', '#', '%'])
+        || value.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return false;
+    }
+    // `/a/b/` splits to ["", "a", "b", ""] — the inner segments must
+    // be non-empty (no `//`) and never dot/dotdot.
+    value[1..value.len() - 1]
+        .split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
 
 /// Validate one `run_worker_first` rule set (Wrangler semantics):
 /// every rule starts `/` or `!/`; ≤100 rules; ≤100 bytes each; no
@@ -1962,6 +1994,11 @@ impl WorkerDesired {
                     if let Some(RunWorkerFirst::Rules(rules)) = &assets.run_worker_first {
                         if !valid_run_worker_first_rules(rules) {
                             return Err(DesiredError::Identifier("bindings.runWorkerFirst"));
+                        }
+                    }
+                    if let Some(base) = &assets.base_path {
+                        if !valid_base_path(base) {
+                            return Err(DesiredError::Identifier("bindings.basePath"));
                         }
                     }
                 }
@@ -4148,6 +4185,56 @@ mod tests {
         assert!(!valid_run_worker_first_rules(&["x".repeat(101)]));
         let many: Vec<String> = (0..101).map(|i| format!("/{i}")).collect();
         assert!(!valid_run_worker_first_rules(&many));
+    }
+
+    #[test]
+    fn base_path_canonical_form_validation() {
+        // Canonical: exactly `/`, or `/seg/…/seg/` with non-empty,
+        // non-dot segments. The desired protocol stores normalized
+        // OUTPUT — anything else is a corrupt snapshot.
+        for ok in ["/", "/blog/", "/a/b/", "/cdn-cgi/", "/é/"] {
+            assert!(valid_base_path(ok), "{ok}");
+        }
+        for bad in [
+            "", "/blog", "blog/", "//", "/a//b/", "/./a/", "/a/../", "/a?b/", "/a#b/", "/a%20b/",
+            "\\a\\", "/a\\b/", "/a\tb/",
+        ] {
+            assert!(!valid_base_path(bad), "{bad}");
+        }
+        assert!(!valid_base_path(&format!("/{}/", "x".repeat(1023))));
+        // Non-canonical but harmless-looking forms are still corrupt —
+        // normalization happens upstream of this contract.
+        for noncanonical in ["relative/", "/trailing//", "/A/.."] {
+            assert!(!valid_base_path(noncanonical), "{noncanonical}");
+        }
+        // The validator feeds the desired check: a non-canonical wire
+        // `basePath` fails the whole snapshot.
+        let p = payload_with_binding(serde_json::json!({
+            "type": "assets", "name": "ASSETS",
+            "manifestDigest": "b".repeat(64),
+            "permissions": {"read": true, "write": false},
+            "basePath": "blog/"
+        }));
+        assert_eq!(
+            desired(&p).unwrap().validate(),
+            Err(DesiredError::Identifier("bindings.basePath"))
+        );
+        // Canonical + absent both pass; `basePath` round-trips camel.
+        for val in [serde_json::json!("/blog/"), serde_json::Value::Null] {
+            let ok = payload_with_binding(serde_json::json!({
+                "type": "assets", "name": "ASSETS",
+                "manifestDigest": "b".repeat(64),
+                "permissions": {"read": true, "write": false},
+                "basePath": val
+            }));
+            assert!(desired(&ok).unwrap().validate().is_ok(), "{val}");
+        }
+        let b: BindingDesired = serde_json::from_value(serde_json::json!({
+            "type": "assets", "name": "A", "manifestDigest": "b".repeat(64),
+            "permissions": {"read": true, "write": false}, "basePath": "/x/"
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&b).unwrap()["basePath"], json!("/x/"));
     }
 
     #[test]

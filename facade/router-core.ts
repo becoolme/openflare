@@ -281,6 +281,33 @@ export function normalizePath(raw: string): string | null {
   return out;
 }
 
+// Canonical-form check for `assets.base_path` — mirror of
+// snapshot-protocol `valid_base_path`: `/` or `/seg/…/` (leading AND
+// trailing slash), no empty `.`/`..` inner segments.
+export function validBasePath(value: string): boolean {
+  if (value === "/") return true;
+  if (!value.startsWith("/") || !value.endsWith("/")) return false;
+  return value
+    .slice(1, -1)
+    .split("/")
+    .every((seg) => seg !== "" && seg !== "." && seg !== "..");
+}
+
+// Mirror of vrt-provider `strip_base` (workers-shared
+// `asset-worker/src/utils/base-path.ts`). `base` is always canonical.
+// Out-of-base paths return null; the base root maps to `/`.
+export function stripBase(publicDecoded: string, base: string): string | null {
+  if (base === "/") return publicDecoded;
+  const stem = base.slice(0, base.length - 1);
+  if (publicDecoded === stem) return "/";
+  if (publicDecoded.startsWith(base)) {
+    // slice keeps the leading `/`: `/blog/` -> `/`.
+    const stripped = publicDecoded.slice(base.length - 1);
+    return stripped === "" ? "/" : stripped;
+  }
+  return null;
+}
+
 // Mirror of vrt-provider `html_intent`: the per-mode candidate order
 // plus `safeRedirect` validation, so the router's existence decision
 // matches what the provider actually serves. Asset identity is the
@@ -549,7 +576,13 @@ export function intentFetchable(
   navigate: boolean,
   hasStaticRouting: boolean,
   rawPath: string = path,
+  basePath: string = "/",
 ): boolean {
+  // `assets.base_path`: the manifest only ever sees the asset-relative
+  // path — an out-of-base request is never fetchable and falls through
+  // to the user worker (provider `canFetch` answers false the same way).
+  const assetPath = stripBase(path, basePath);
+  if (assetPath === null) return false;
   // An explicit `run_worker_first` policy (rules or `true`) is the
   // deployment's routing authority and takes precedence over
   // `_routes.json`, mirroring Cloudflare Workers config precedence.
@@ -557,7 +590,7 @@ export function intentFetchable(
     return !routesWorkerFirst(index.routes, rawPath);
   }
   const has = (p: string) => index.paths.has(p);
-  if (has(path)) return true;
+  if (has(assetPath)) return true;
   // `_redirects` runs before asset lookup, so a redirect-only path is
   // still handled by the assets service. It matches the RAW request
   // path (provider parity), while everything below uses the decoded,
@@ -569,12 +602,12 @@ export function intentFetchable(
   // provider would 404 (e.g. `/file-bin/` when `/file-bin` shadows the
   // `/file-bin.html` rewrite) must fall through to the user worker
   // instead of being claimed by assets.
-  if (htmlIntent(has, index.htmlHandling, path, false) !== null) return true;
+  if (htmlIntent(has, index.htmlHandling, assetPath, false) !== null) return true;
   if (nfh === "single-page-application") return has("/index.html");
   if (nfh === "404-page") {
     // assets.worker.js:1011–1037 — the nearest ANCESTOR 404.html
     // serves: /a/b/c → /a/b/404.html, /a/404.html, /404.html.
-    let dir = path;
+    let dir = assetPath;
     while (dir.length > 0) {
       const idx = dir.lastIndexOf("/");
       dir = idx <= 0 ? "" : dir.slice(0, idx);
@@ -590,6 +623,7 @@ interface RouterCfg {
   userWorker?: string[];
   assetWorker?: string[];
   manifestDigest?: string;
+  basePath?: string;
 }
 
 export interface CompiledCfg {
@@ -597,6 +631,7 @@ export interface CompiledCfg {
   userWorker: RegExp[];
   assetWorker: RegExp[];
   manifestDigest: string;
+  basePath: string;
 }
 
 // Compiled cfgs memoized by raw string — the JSON.parse and the
@@ -646,11 +681,18 @@ export function compileCfg(raw: string): CompiledCfg | undefined {
     ) {
       return undefined;
     }
+    // `assets.base_path` — absent means the canonical root mount;
+    // anything present but non-canonical is cfg corruption.
+    const basePath = cfg.basePath === undefined ? "/" : cfg.basePath;
+    if (typeof basePath !== "string" || !validBasePath(basePath)) {
+      return undefined;
+    }
     return {
       invokeAhead: cfg.invokeUserWorkerAhead === true,
       userWorker: userWorker.map(compileRule).filter((r): r is RegExp => !!r),
       assetWorker: assetWorker.map(compileRule).filter((r): r is RegExp => !!r),
       manifestDigest: digest,
+      basePath,
     };
   })();
   cfgCache.set(raw, compiled);

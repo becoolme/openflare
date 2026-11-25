@@ -1567,6 +1567,12 @@ async fn assets_dispatch(svc: Arc<TenantService>, request: Request) -> Response<
             false,
         );
     };
+    // `assets.base_path` rides the authorized resource — a corrupt or
+    // absent field can only produce the canonical root mount.
+    let base_path = match ctx.resource() {
+        crate::context::BindingResource::AssetsManifest { base_path, .. } => base_path.as_str(),
+        _ => "/",
+    };
     match request.uri().path() {
         "/internal/assets/v1/route-index" => crate::assets::route_index(
             store,
@@ -1578,12 +1584,14 @@ async fn assets_dispatch(svc: Arc<TenantService>, request: Request) -> Response<
             store,
             ctx.tenant_id(),
             ctx.resource().resource_id(),
+            base_path,
             &request,
         ),
         _ => crate::assets::fetch(
             store,
             ctx.tenant_id(),
             ctx.resource().resource_id(),
+            base_path,
             &request,
         ),
     }
