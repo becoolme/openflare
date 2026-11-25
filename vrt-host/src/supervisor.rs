@@ -657,7 +657,18 @@ impl TenantRuntime {
             self.switch_gate.held() as f64,
         );
         match self.wake.join(source) {
-            WakeJoin::Ticket(t) => t.wait(source.max_wait(self.wake_wait())).await,
+            WakeJoin::Ticket(t) => {
+                t.wait(source.max_wait(self.wake_wait())).await?;
+                if source == crate::hibernate::WakeSourceKind::Alarm {
+                    // The alarm is in workerd's persisted scheduler. Keep the
+                    // tenant awake for a grace window so the restarted
+                    // generation can deliver it before the idle policy puts
+                    // it back to sleep.
+                    self.set_alarm_gate(false, crate::hibernate::ALARM_WAKE_GRACE);
+                    self.touch();
+                }
+                Ok(())
+            }
             WakeJoin::CoolingDown(e) => Err(e),
         }
     }
