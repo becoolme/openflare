@@ -7174,6 +7174,26 @@ impl Actor {
             // In-flight work IS activity (approximation: completion
             // time is not tracked, so every evaluation touches).
             self.runtime.touch();
+            let mut held = Vec::new();
+            for (label, map) in [
+                ("slot", &gen.slots),
+                ("qconsumer", &gen.qconsumer_slots),
+                ("wfops", &gen.wfops_slots),
+                ("cron", &gen.cron_slots),
+            ] {
+                for (id, slot) in map.iter() {
+                    let n = slot.in_flight();
+                    if n > 0 {
+                        held.push(format!("{label}:{id}={n}"));
+                    }
+                }
+            }
+            tracing::info!(
+                tenant = %self.tenant_id,
+                in_flight,
+                held = %held.join(","),
+                "idle: in-flight blocks hibernate"
+            );
         }
         let inputs = IdleInputs {
             now,
