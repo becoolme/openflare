@@ -94,6 +94,7 @@ const config :Workerd.Config = (
     (name = "facade-cron-w-alpha-1", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 2),
       modules = [
         (name = "cron-dispatcher.js", esModule = embed "sys/b30f59801d7bd76dc6245f956cd7b966397ec2dfb65a25a986d57c63a8cd910c"),
       ],

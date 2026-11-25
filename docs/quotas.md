@@ -100,8 +100,19 @@ service-binding calls (binding-backend included); calls into
 internally-provided services are exempt. `0`/absent keeps a dimension
 unbounded. The memory check runs at `enterJs` boundaries, so it bounds
 residency and accumulation — a single turn's transient spike can
-overshoot before the next check. Dynamic dispatch workers (cron,
-qconsumer, heartbeat, waituntil probe) are not yet bounded.
+overshoot before the next check.
+
+Dynamic dispatch workers rendered outside `emit_system_worker` carry
+**emit-site** budgets: `facade-cron-<id>` and `facade-wfops-<id>` get
+the thin tier with `subRequests = 2` (one binding call per trigger/op);
+`facade-qconsumer-<id>` and `facade-router-<id>` inherit their manifest
+entry's budgets; `vrt-heartbeat` gets thin cpu/mem and no `subRequests`
+(it makes zero outbound calls); `vrt-wu-probe` gets 2s/128MB and
+`subRequests = max(2 × tenant workers, 16)` — it fans out one
+service-binding call per tenant worker. The workflow engine, DO
+storage service, secrets store, tail worker and workflow loopback
+remain unlimited: they are tenant-facing compute or internal plumbing,
+not dispatch glue.
 
 ## Cell capability (`quotas`)
 
