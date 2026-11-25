@@ -1894,21 +1894,23 @@ async fn sibling_fail_closed_recovers_transfer_class() {
                     r.expires_at_ms,
                 ));
             }
-            if r.epoch >= 2 {
-                // Victim acquired (or already cycled) — let the
-                // blocked sibling read fail now, then wait for the
-                // release it triggers.
+            // Fire only on the victim's HELD lease — a bare
+            // `epoch >= 2` can also match the cell-A drain release
+            // (empty holder) observed before the victim's first
+            // acquire lands, which would fail the sibling before the
+            // victim ever holds and abort its acquire fail-fast.
+            if r.epoch >= 2 && held && !saw_victim_held {
+                // Victim acquired — let the blocked sibling read fail
+                // now, then wait for the release it triggers.
+                saw_victim_held = true;
                 let (lock, cv) = &*victim_seen;
                 let mut seen = lock.lock().unwrap();
                 if !*seen {
                     *seen = true;
                     cv.notify_all();
                 }
-                drop(seen);
-                saw_victim_held |= held;
-                if !held {
-                    break;
-                }
+            } else if r.epoch >= 2 && saw_victim_held && !held {
+                break;
             }
         }
         assert!(
