@@ -2129,8 +2129,14 @@ impl WsTunnel {
             };
             let asleep = self.runtime.state().is_asleep()
                 || self.runtime.state() == crate::state::TenantState::Hibernating;
-            if reason == "idle_timeout" || reason == "max_duration" || !self.hibernation.enabled
-                || !asleep || self.reconnect.is_none()
+            // Hibernation stops workerd underneath the tunnel, so the relay
+            // usually ends with `closed`/`error` rather than the idle timer.
+            // When the tenant is asleep and can be reconnected, keep the
+            // client session and wait for its next frame instead of closing.
+            if reason == "max_duration"
+                || !self.hibernation.enabled
+                || !asleep
+                || self.reconnect.is_none()
             {
                 break reason;
             }
