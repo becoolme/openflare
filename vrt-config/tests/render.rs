@@ -316,6 +316,7 @@ fn heartbeat_emit_gated_and_isolated() {
         }],
         needs_binding_backend: false,
         cpu_ms: 0,
+        memory_mb: 0,
     }];
     let r = render_tenant_config(&input(&tenant, &bs, &hostile_params));
     assert!(r.is_err(), "heartbeat shadow by system worker must fail");
@@ -1683,7 +1684,7 @@ fn quotas_capability_gate_fails_closed() {
     assert!(ensure_quotas_enforceable(&tenant, false).is_ok());
 }
 
-/// System workers carry platform-declared CPU budgets from the facade
+/// System workers carry platform-declared budgets from the facade
 /// manifest — the same `limits` group tenant quotas render, tiered so
 /// the heavy paths (facade-images decode/encode + text rasterization,
 /// vrt-egress multipart scans) get headroom while thin RPC facades
@@ -1701,17 +1702,17 @@ fn system_workers_render_platform_cpu_budgets() {
     // emitted conditionally (queue consumers / assets mounts) and do
     // not appear here.
     assert_eq!(
-        out.matches("limits = (cpuMs = 10000),").count(),
+        out.matches("limits = (cpuMs = 10000, memoryMb = 768),").count(),
         1,
         "facade-images"
     );
     assert_eq!(
-        out.matches("limits = (cpuMs = 2000),").count(),
+        out.matches("limits = (cpuMs = 2000, memoryMb = 192),").count(),
         1,
         "vrt-egress"
     );
     assert_eq!(
-        out.matches("limits = (cpuMs = 1000),").count(),
+        out.matches("limits = (cpuMs = 1000, memoryMb = 128),").count(),
         11,
         "rendered thin facades + the deny stub"
     );
@@ -1734,23 +1735,44 @@ fn system_workers_render_platform_cpu_budgets() {
         .split("(name = \"facade-images\", worker = (")
         .nth(1)
         .unwrap();
-    let limits_pos = block.find("limits = (cpuMs = 10000)").unwrap();
+    let limits_pos = block
+        .find("limits = (cpuMs = 10000, memoryMb = 768)")
+        .unwrap();
     let modules_pos = block.find("modules = [").unwrap();
     assert!(limits_pos < modules_pos, "limits must precede modules");
 
-    // cpu_ms = 0 stays unlimited — no `limits` group, stock behaviour.
+    // Either dimension at 0 is omitted — both at 0 render no `limits`
+    // group at all (stock behaviour).
     let mut unlimited = params.clone();
     for w in &mut unlimited.system_workers {
         w.cpu_ms = 0;
+        w.memory_mb = 0;
     }
     let out = render_tenant_config(&input(&tenant, &bs, &unlimited))
         .unwrap()
         .text;
-    for tier in ["cpuMs = 1000)", "cpuMs = 2000)", "cpuMs = 10000)"] {
+    for tier in [
+        "cpuMs = 1000", "cpuMs = 2000", "cpuMs = 10000", "memoryMb = 128", "memoryMb = 192",
+        "memoryMb = 768",
+    ] {
         assert!(
             !out.contains(tier),
-            "cpu_ms = 0 must render no system budget: {tier}"
+            "0-budget dimensions must not render: {tier}"
         );
+    }
+    // A 0 dimension beside a declared one renders only the declared dim.
+    // (Scope to the system tiers — tenant workers legitimately render
+    // their own declared memoryMb elsewhere in the same config.)
+    let mut cpu_only = params.clone();
+    for w in &mut cpu_only.system_workers {
+        w.memory_mb = 0;
+    }
+    let out = render_tenant_config(&input(&tenant, &bs, &cpu_only))
+        .unwrap()
+        .text;
+    assert_eq!(out.matches("limits = (cpuMs = 1000),").count(), 11);
+    for tier in ["memoryMb = 128", "memoryMb = 192", "memoryMb = 768"] {
+        assert!(!out.contains(tier), "memoryMb = 0 omits the dim: {tier}");
     }
 
     // Above the protocol cap → refused at emit depth (defense in depth
@@ -1761,8 +1783,15 @@ fn system_workers_render_platform_cpu_budgets() {
         render_tenant_config(&input(&tenant, &bs, &over)),
         Err(ConfigError::Quotas("cpuMs"))
     );
-    // The cap itself is accepted.
+    let mut over = params.clone();
+    over.system_workers[0].memory_mb = 4097;
+    assert_eq!(
+        render_tenant_config(&input(&tenant, &bs, &over)),
+        Err(ConfigError::Quotas("memoryMb"))
+    );
+    // The caps themselves are accepted.
     let mut at_cap = params.clone();
     at_cap.system_workers[0].cpu_ms = 300_000;
+    at_cap.system_workers[0].memory_mb = 4096;
     assert!(render_tenant_config(&input(&tenant, &bs, &at_cap)).is_ok());
 }

@@ -210,6 +210,12 @@ pub struct SystemWorkerRef {
     /// semantic as the capnp field and [`WorkerQuotas::cpu_ms`]: absent
     /// means stock behaviour, never emit a `0` budget.
     pub cpu_ms: u32,
+    /// Platform-declared per-invocation memory budget (MB), emitted into
+    /// the same `limits` group. The fork accounts V8 heap + external
+    /// bytes (ArrayBuffer/WASM backing stores) against it — facade-image
+    /// decode bitmaps and egress multipart buffers are both counted.
+    /// `0` keeps the worker unlimited.
+    pub memory_mb: u32,
 }
 
 /// A resolved secret value. It is emitted **only** into
@@ -495,6 +501,9 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         // effectively-unlimited huge number. `0` is "not declared".
         if system.cpu_ms > snapshot_protocol::compute_desired::MAX_CPU_MS {
             return Err(ConfigError::Quotas("cpuMs"));
+        }
+        if system.memory_mb > snapshot_protocol::compute_desired::MAX_MEMORY_MB {
+            return Err(ConfigError::Quotas("memoryMb"));
         }
     }
     // PT1: a defined system worker may never shadow the watchdog
@@ -2324,14 +2333,22 @@ fn emit_system_worker(
                 .join(", ")
         ));
     }
-    // Platform-declared CPU budget — the same `limits` group tenant
+    // Platform-declared budgets — the same `limits` group tenant
     // workers get from declared quotas, but sourced from the facade
     // manifest instead of a tenant declaration. System workers run
-    // tenant-driven CPU (image decode/encode, text rasterization,
-    // multipart scans) on otherwise unbounded isolates; `0` stays
-    // unlimited and is never emitted.
+    // tenant-driven work (image decode/encode, text rasterization,
+    // multipart scans, buffered egress payloads) on otherwise
+    // unbounded isolates; a `0` dimension stays unlimited and is
+    // never emitted.
+    let mut dims = Vec::new();
     if system.cpu_ms > 0 {
-        out.push_str(&format!("      limits = (cpuMs = {}),\n", system.cpu_ms));
+        dims.push(format!("cpuMs = {}", system.cpu_ms));
+    }
+    if system.memory_mb > 0 {
+        dims.push(format!("memoryMb = {}", system.memory_mb));
+    }
+    if !dims.is_empty() {
+        out.push_str(&format!("      limits = ({}),\n", dims.join(", ")));
     }
     let mut modules: Vec<&SystemModuleRef> = system.modules.iter().collect();
     modules.sort_by(|a, b| utf16_cmp(&a.name, &b.name));

@@ -77,22 +77,27 @@ Rules:
   connection-counter hook yet. A positive non-default value is refused
   (`CONFIG_QUOTA_UNSUPPORTED`) instead of being silently ignored; `0` and the
   platform default (16) are accepted as "not declared".
-- Only `cpuMs`, `memoryMb` and `subRequests` reach workerd. `memoryMb` bounds
-  the V8 heap (not native/SQLite memory) and startup evaluation is not
-  CPU-limited.
+- Only `cpuMs`, `memoryMb` and `subRequests` reach workerd. `memoryMb`
+  bounds the V8 heap plus external bytes (ArrayBuffer/WASM backing
+  stores, including decoded image bitmaps) — not native/SQLite memory —
+  and startup evaluation is not CPU-limited.
 
-### System workers (`cpuMs` only)
+### System workers (`cpuMs`, `memoryMb`)
 
 System workers (facades, `vrt-egress`, `vrt-no-network`) carry
-**platform-declared** CPU budgets from `facade/manifest.json` — the same
+**platform-declared** budgets from `facade/manifest.json` — the same
 `limits` group, sourced by `gen-manifest.mjs` instead of a tenant
-declaration. A service-binding call creates an invocation on the callee, so
-the callee's own `cpuMs` is what bounds CPU burned inside a facade (image
+declaration. A service-binding call creates an invocation on the callee,
+so the callee's own limits bound work burned inside a facade (image
 decode/encode, text rasterization, multipart scans); the tenant's quota
-does not cover it. Budgets are tiered (`facade-images` ≫ `vrt-egress` ≫
-thin RPC facades); `cpuMs = 0`/absent keeps a worker unlimited. Memory,
-subrequests and dynamic dispatch workers (cron, qconsumer, heartbeat) are
-not yet bounded.
+does not cover it. Budgets are tiered: `facade-images` (10s CPU, 768MB —
+64MP bitmaps live in V8 external memory), `vrt-egress` (2s, 192MB —
+buffered multipart plus payload), thin RPC facades and `vrt-no-network`
+(1s, 128MB — tenant-default parity). `0`/absent keeps a dimension
+unbounded. The memory check runs at `enterJs` boundaries, so it bounds
+residency and accumulation — a single turn's transient spike can
+overshoot before the next check. Subrequests and dynamic dispatch
+workers (cron, qconsumer, heartbeat) are not yet bounded.
 
 ## Cell capability (`quotas`)
 

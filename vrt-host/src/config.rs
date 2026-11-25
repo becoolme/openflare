@@ -2714,6 +2714,7 @@ pub fn params_json_from_manifest(
                 }).collect::<Vec<_>>(),
                 "needsBindingBackend": w.needs_binding_backend,
                 "cpuMs": w.cpu_ms,
+                "memoryMb": w.memory_mb,
             })
         }).collect::<Vec<_>>(),
         "systemCompatDate": system_compat_date,
@@ -2888,6 +2889,10 @@ struct SystemWorkerToml {
     /// keeps the worker unlimited (see `vrt_config::SystemWorkerRef`).
     #[serde(default)]
     cpu_ms: u32,
+    /// Platform-declared per-invocation memory budget (MB) — heap +
+    /// external bytes; `0`/absent keeps the worker unlimited.
+    #[serde(default)]
+    memory_mb: u32,
 }
 
 impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
@@ -2898,6 +2903,7 @@ impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
             modules: v.modules.into_iter().map(Into::into).collect(),
             needs_binding_backend: v.needs_binding_backend,
             cpu_ms: v.cpu_ms,
+            memory_mb: v.memory_mb,
         }
     }
 }

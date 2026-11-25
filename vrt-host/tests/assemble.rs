@@ -305,6 +305,7 @@ fn assemble_test_params(sys_digest: String) -> vrt_config::RuntimeParams {
             }],
             needs_binding_backend: false,
             cpu_ms: 0,
+            memory_mb: 0,
         }],
         system_compat_date: "2024-01-01".to_string(),
         system_compat_flags: vec![],
@@ -728,6 +729,7 @@ fn experimental_params(sys_digest: &str) -> vrt_config::RuntimeParams {
             }],
             needs_binding_backend: false,
             cpu_ms: 0,
+            memory_mb: 0,
         }],
         system_compat_date: "2024-01-01".to_string(),
         system_compat_flags: vec!["experimental".to_string()],
@@ -815,6 +817,7 @@ fn params_with_flags(sys_digest: &str, flags: &[&str]) -> vrt_config::RuntimePar
         }],
         needs_binding_backend: false,
         cpu_ms: 0,
+        memory_mb: 0,
     });
     p
 }
@@ -979,6 +982,7 @@ fn binding_backend_dir_derives_per_tenant_socket() {
             // Emits the binding-backend external addr.
             needs_binding_backend: true,
             cpu_ms: 0,
+            memory_mb: 0,
         }],
         system_compat_date: "2024-01-01".to_string(),
         system_compat_flags: vec![],
@@ -1116,18 +1120,19 @@ fn binding_backend_dir_rekeys_fingerprint() {
     assert_ne!(a, b, "binding-backend dir must rekey the fingerprint");
 }
 
-/// `cpu_ms` renders into `limits = (cpuMs = N)` — a manifest change
-/// that touches ONLY a system worker's budget must still rekey the
-/// fingerprint, or the stale generation keeps serving the old budget.
+/// `cpu_ms`/`memory_mb` render into `limits = (...)` — a manifest
+/// change that touches ONLY a system worker's budget must still rekey
+/// the fingerprint, or the stale generation keeps serving the old one.
 #[test]
 fn system_worker_cpu_ms_rekeys_fingerprint() {
     let fx = Fixture::new();
     let source = Arc::new(MemoryBundleSource::default());
     let cache = Arc::new(BundleCache::new(fx.dir.path().join("cache")));
 
-    let mk = |cpu_ms: u32| {
+    let mk = |cpu_ms: u32, memory_mb: u32| {
         let mut p = experimental_params("b".repeat(64).as_str());
         p.system_workers[0].cpu_ms = cpu_ms;
+        p.system_workers[0].memory_mb = memory_mb;
         Assembler::new(
             PathBuf::from("/bin/true"),
             fx.work_root(),
@@ -1142,11 +1147,22 @@ fn system_worker_cpu_ms_rekeys_fingerprint() {
             )),
         )
     };
-    let unlimited = mk(0).params_fingerprint().unwrap();
-    let capped = mk(1_000).params_fingerprint().unwrap();
-    let bigger = mk(10_000).params_fingerprint().unwrap();
+    let unlimited = mk(0, 0).params_fingerprint().unwrap();
+    let capped = mk(1_000, 0).params_fingerprint().unwrap();
+    let bigger = mk(10_000, 0).params_fingerprint().unwrap();
     assert_ne!(unlimited, capped, "cpu_ms must rekey the fingerprint");
     assert_ne!(capped, bigger, "cpu_ms value must rekey the fingerprint");
+    // memory_mb rekeys on its own — and independently of cpu_ms.
+    assert_ne!(
+        unlimited,
+        mk(0, 128).params_fingerprint().unwrap(),
+        "memory_mb must rekey the fingerprint"
+    );
+    assert_ne!(
+        capped,
+        mk(1_000, 128).params_fingerprint().unwrap(),
+        "memory_mb rekeys beside a set cpu_ms"
+    );
 }
 
 /// A tenant declaring `[[worker_loaders]]` renders capnp `workerLoader`

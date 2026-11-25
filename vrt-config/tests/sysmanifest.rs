@@ -269,11 +269,14 @@ fn cpu_ms_values_match_manifest_tiers() {
             .iter()
             .find(|w| w.service_name == name)
             .unwrap_or_else(|| panic!("{name} missing"))
-            .cpu_ms
     };
     // Platform-declared budgets — the tiers gen-manifest.mjs emits.
-    assert_eq!(get("facade-images"), 10_000);
-    assert_eq!(get("vrt-egress"), 2_000);
+    assert_eq!(get("facade-images").cpu_ms, 10_000);
+    assert_eq!(get("vrt-egress").cpu_ms, 2_000);
+    // memoryMb mirrors the same tiering: the decode/composite buffers
+    // concentrate in facade-images; thin transports get tenant parity.
+    assert_eq!(get("facade-images").memory_mb, 768);
+    assert_eq!(get("vrt-egress").memory_mb, 192);
     for thin in [
         "facade-kv",
         "facade-r2",
@@ -289,7 +292,8 @@ fn cpu_ms_values_match_manifest_tiers() {
         "facade-router",
         "vrt-no-network",
     ] {
-        assert_eq!(get(thin), 1_000, "{thin}");
+        assert_eq!(get(thin).cpu_ms, 1_000, "{thin}");
+        assert_eq!(get(thin).memory_mb, 128, "{thin}");
     }
 }
 
@@ -299,8 +303,11 @@ fn cpu_ms_parsing_and_bounds() {
     let workers = minimal();
     let parsed = parse_facade_manifest(&wire(workers)).unwrap();
     assert!(
-        parsed.system_workers.iter().all(|w| w.cpu_ms == 0),
-        "absent cpuMs must stay unset"
+        parsed
+            .system_workers
+            .iter()
+            .all(|w| w.cpu_ms == 0 && w.memory_mb == 0),
+        "absent budgets must stay unset"
     );
 
     // 0 is accepted but stays unset — same semantic as the capnp
@@ -308,55 +315,63 @@ fn cpu_ms_parsing_and_bounds() {
     let mut workers = minimal();
     let mut w = worker(serde_json::json!([module("facade/x.js")]));
     w["cpuMs"] = serde_json::json!(0);
+    w["memoryMb"] = serde_json::json!(0);
     workers
         .as_object_mut()
         .unwrap()
         .insert("facade-kv".into(), w);
     let parsed = parse_facade_manifest(&wire(workers)).unwrap();
-    assert_eq!(
-        parsed
-            .system_workers
-            .iter()
-            .find(|w| w.service_name == "facade-kv")
-            .unwrap()
-            .cpu_ms,
-        0
-    );
+    let kv = parsed
+        .system_workers
+        .iter()
+        .find(|w| w.service_name == "facade-kv")
+        .unwrap();
+    assert_eq!((kv.cpu_ms, kv.memory_mb), (0, 0));
 
-    for (value, expect) in [
-        (serde_json::json!(1), Ok(1)),
-        (serde_json::json!(300_000), Ok(300_000)), // protocol cap edge
-        (serde_json::json!(300_001), Err("workers.cpuMs")),
-        // Wrong types fail at the serde boundary, not the bound check.
-        (serde_json::json!(-1), Err("systemManifest")),
-        (serde_json::json!("500"), Err("systemManifest")),
-        (serde_json::json!(1.5), Err("systemManifest")),
-    ] {
-        let mut workers = minimal();
-        let mut w = worker(serde_json::json!([module("facade/x.js")]));
-        w["cpuMs"] = value;
-        workers
-            .as_object_mut()
-            .unwrap()
-            .insert("facade-kv".into(), w);
-        match expect {
-            Ok(v) => {
-                let parsed = parse_facade_manifest(&wire(workers)).unwrap();
-                assert_eq!(
-                    parsed
+    // Same shape on both dimensions: 1 ok, protocol cap ok, cap+1 is
+    // the field's Identifier error, wrong types fail at serde.
+    for (key, cap, over) in [("cpuMs", 300_000, 300_001), ("memoryMb", 4_096, 4_097)] {
+        let ident = format!("workers.{key}");
+        for (value, expect) in [
+            (serde_json::json!(1), Ok(1)),
+            (serde_json::json!(cap), Ok(cap)), // protocol cap edge
+            (serde_json::json!(over), Err(ident.as_str())),
+            // Wrong types fail at the serde boundary, not the bound check.
+            (serde_json::json!(-1), Err("systemManifest")),
+            (serde_json::json!("500"), Err("systemManifest")),
+            (serde_json::json!(1.5), Err("systemManifest")),
+        ] {
+            let mut workers = minimal();
+            let mut w = worker(serde_json::json!([module("facade/x.js")]));
+            w[key] = value.clone();
+            workers
+                .as_object_mut()
+                .unwrap()
+                .insert("facade-kv".into(), w);
+            match expect {
+                Ok(v) => {
+                    let parsed = parse_facade_manifest(&wire(workers)).unwrap();
+                    let kv = parsed
                         .system_workers
                         .iter()
                         .find(|w| w.service_name == "facade-kv")
-                        .unwrap()
-                        .cpu_ms,
-                    v
-                );
-            }
-            Err(field) => {
-                assert!(matches!(
-                    parse_facade_manifest(&wire(workers)),
-                    Err(ConfigError::Identifier(f)) if f == field
-                ));
+                        .unwrap();
+                    let got = if key == "cpuMs" {
+                        kv.cpu_ms
+                    } else {
+                        kv.memory_mb
+                    };
+                    assert_eq!(got, v, "{key}");
+                }
+                Err(field) => {
+                    assert!(
+                        matches!(
+                            parse_facade_manifest(&wire(workers)),
+                            Err(ConfigError::Identifier(f)) if f == field
+                        ),
+                        "{key}={value}"
+                    );
+                }
             }
         }
     }
