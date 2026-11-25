@@ -592,6 +592,9 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
     // Arm a 30 s alarm, then let the tenant idle out.
     let (status, _) = get(a, "/alarm").await.unwrap();
     assert_eq!(status, 200);
+    // Let workerd commit the scheduler metadata (metadata.sqlite) before the
+    // generation is stopped.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     wait_state(&rt, TenantState::Hibernated, Duration::from_secs(10)).await;
     wait_for(|| !pid_alive(pid), Duration::from_secs(5), "workerd pid exited").await;
     dump_alarm_rows(&do_dir, "after hibernate");
