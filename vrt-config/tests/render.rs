@@ -317,6 +317,7 @@ fn heartbeat_emit_gated_and_isolated() {
         needs_binding_backend: false,
         cpu_ms: 0,
         memory_mb: 0,
+        sub_requests: 0,
     }];
     let r = render_tenant_config(&input(&tenant, &bs, &hostile_params));
     assert!(r.is_err(), "heartbeat shadow by system worker must fail");
@@ -1574,10 +1575,19 @@ fn worker_limits_render_declared_dimensions_only() {
         out.contains("limits = (cpuMs = 200),"),
         "non-default dimension renders alone:\n{out}"
     );
-    assert!(
-        !out.contains("subRequests"),
-        "explicit 0 must never render as a limit:\n{out}"
-    );
+    // Scope to tenant blocks — system workers legitimately render their
+    // own platform-declared `subRequests` budgets elsewhere in the config.
+    for name in ["worker-w-alpha-1", "worker-w-alpha-2"] {
+        let block = out
+            .split(&format!("(name = \"{name}\", worker = ("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} worker block missing"));
+        let block = block.split("    )),").next().unwrap();
+        assert!(
+            !block.contains("subRequests"),
+            "explicit 0 must never render as a limit in {name}:\n{block}"
+        );
+    }
 }
 
 /// `outboundConnections` has no workerd enforcement hook yet: a
@@ -1702,17 +1712,20 @@ fn system_workers_render_platform_cpu_budgets() {
     // emitted conditionally (queue consumers / assets mounts) and do
     // not appear here.
     assert_eq!(
-        out.matches("limits = (cpuMs = 10000, memoryMb = 768),").count(),
+        out.matches("limits = (cpuMs = 10000, memoryMb = 768, subRequests = 64),")
+            .count(),
         1,
         "facade-images"
     );
     assert_eq!(
-        out.matches("limits = (cpuMs = 2000, memoryMb = 192),").count(),
+        out.matches("limits = (cpuMs = 2000, memoryMb = 192, subRequests = 64),")
+            .count(),
         1,
         "vrt-egress"
     );
     assert_eq!(
-        out.matches("limits = (cpuMs = 1000, memoryMb = 128),").count(),
+        out.matches("limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),")
+            .count(),
         11,
         "rendered thin facades + the deny stub"
     );
@@ -1736,7 +1749,7 @@ fn system_workers_render_platform_cpu_budgets() {
         .nth(1)
         .unwrap();
     let limits_pos = block
-        .find("limits = (cpuMs = 10000, memoryMb = 768)")
+        .find("limits = (cpuMs = 10000, memoryMb = 768, subRequests = 64)")
         .unwrap();
     let modules_pos = block.find("modules = [").unwrap();
     assert!(limits_pos < modules_pos, "limits must precede modules");
@@ -1747,13 +1760,20 @@ fn system_workers_render_platform_cpu_budgets() {
     for w in &mut unlimited.system_workers {
         w.cpu_ms = 0;
         w.memory_mb = 0;
+        w.sub_requests = 0;
     }
     let out = render_tenant_config(&input(&tenant, &bs, &unlimited))
         .unwrap()
         .text;
     for tier in [
-        "cpuMs = 1000", "cpuMs = 2000", "cpuMs = 10000", "memoryMb = 128", "memoryMb = 192",
+        "cpuMs = 1000",
+        "cpuMs = 2000",
+        "cpuMs = 10000",
+        "memoryMb = 128",
+        "memoryMb = 192",
         "memoryMb = 768",
+        "subRequests = 8",
+        "subRequests = 64",
     ] {
         assert!(
             !out.contains(tier),
@@ -1770,7 +1790,11 @@ fn system_workers_render_platform_cpu_budgets() {
     let out = render_tenant_config(&input(&tenant, &bs, &cpu_only))
         .unwrap()
         .text;
-    assert_eq!(out.matches("limits = (cpuMs = 1000),").count(), 11);
+    assert_eq!(
+        out.matches("limits = (cpuMs = 1000, subRequests = 8),")
+            .count(),
+        11
+    );
     for tier in ["memoryMb = 128", "memoryMb = 192", "memoryMb = 768"] {
         assert!(!out.contains(tier), "memoryMb = 0 omits the dim: {tier}");
     }
@@ -1789,9 +1813,16 @@ fn system_workers_render_platform_cpu_budgets() {
         render_tenant_config(&input(&tenant, &bs, &over)),
         Err(ConfigError::Quotas("memoryMb"))
     );
+    let mut over = params.clone();
+    over.system_workers[0].sub_requests = 10_001;
+    assert_eq!(
+        render_tenant_config(&input(&tenant, &bs, &over)),
+        Err(ConfigError::Quotas("subRequests"))
+    );
     // The caps themselves are accepted.
     let mut at_cap = params.clone();
     at_cap.system_workers[0].cpu_ms = 300_000;
     at_cap.system_workers[0].memory_mb = 4096;
+    at_cap.system_workers[0].sub_requests = 10_000;
     assert!(render_tenant_config(&input(&tenant, &bs, &at_cap)).is_ok());
 }

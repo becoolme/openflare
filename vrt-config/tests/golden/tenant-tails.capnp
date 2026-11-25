@@ -105,7 +105,7 @@ const config :Workerd.Config = (
     (name = "facade-assets", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-assets.js", esModule = embed "sys/022859b9f78333db380453fa953d92d9293f2524c2b5c8da8679ae5d21fb8f08"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
@@ -123,7 +123,7 @@ const config :Workerd.Config = (
     (name = "facade-d1", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-d1.js", esModule = embed "sys/28bd5fe09b3ee764bd52342aa8d5ac6c16f616b88d63de113b66e01a32a37866"),
         (name = "facade/d1-wire.js", esModule = embed "sys/6c946b92333e55e1acc70e860de50191471cf62e5cc926e6ba6ba45127164320"),
@@ -142,7 +142,7 @@ const config :Workerd.Config = (
     (name = "facade-email", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-email.js", esModule = embed "sys/4335174f6a26021f7bbe4a4f356c6a58382f354489c4b8bbfc3b0fc742db37b9"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
@@ -162,7 +162,7 @@ const config :Workerd.Config = (
     (name = "facade-images", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 10000, memoryMb = 768),
+      limits = (cpuMs = 10000, memoryMb = 768, subRequests = 64),
       modules = [
         (name = "facade/facade-images.js", esModule = embed "sys/253f67ec1afe019dd4c0b05ef270578adb79e0f3ecdb0054a294d64d0e960fe5"),
         (name = "facade/images-decode.js", esModule = embed "sys/9918195eb004ae7d72b86e021f0c79e133b1348e6cd4b1629f3912cc85beaa92"),
@@ -196,7 +196,7 @@ const config :Workerd.Config = (
     (name = "facade-k2", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-k2.js", esModule = embed "sys/750307159dcd7355ec31898877e4ae955a8a5302cb51a8a9a058f0bf0ab4f33c"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
@@ -216,7 +216,7 @@ const config :Workerd.Config = (
     (name = "facade-kv", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-kv.js", esModule = embed "sys/85fe4277383f701876d8f12dda46f91dd4937784d6bd0ba94aee549df33fcc2e"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
@@ -235,7 +235,7 @@ const config :Workerd.Config = (
     (name = "facade-pg", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-pg.js", esModule = embed "sys/8633197cc0dad407103e5633ba1bc9a7b2a12998c540b2ad77e22dd275739b83"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
@@ -253,7 +253,7 @@ const config :Workerd.Config = (
     (name = "facade-queue", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-queue.js", esModule = embed "sys/f1f5e707bb17e4a2fe208294a869735a08f36fc0539a827cfd3bf2e24393ac6d"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
@@ -272,7 +272,7 @@ const config :Workerd.Config = (
     (name = "facade-r2", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-r2.js", esModule = embed "sys/679ee5883d8e5fdcd5b7256184a42d9a8c7b0424494ae0888c27c8c9bb800035"),
         (name = "facade/props.js", esModule = embed "sys/f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"),
@@ -293,7 +293,7 @@ const config :Workerd.Config = (
     (name = "facade-ratelimit", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-ratelimit.js", esModule = embed "sys/53c094769f9a3e67e86a2ca4b72399ee05c86a4bcdb1ab691262f1b71457fd7e"),
         (name = "facade/ratelimit-core.js", esModule = embed "sys/3553c417246ebca24419c689ac0357e133c1ce15512a0205ae678cbe26c1bb6e"),
@@ -307,7 +307,7 @@ const config :Workerd.Config = (
     (name = "facade-vectorize", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/facade-vectorize.js", esModule = embed "sys/f9f5dcfa6508f06789299954c87e689c72193606a88cd591f95171392c373853"),
         (name = "facade/deadline.js", esModule = embed "sys/e2179b8bad1a28e87f2fa5016361062adbb7a29c53183fcd9574bf6b2adc30ee"),
@@ -327,7 +327,7 @@ const config :Workerd.Config = (
     (name = "vrt-egress", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 2000, memoryMb = 192),
+      limits = (cpuMs = 2000, memoryMb = 192, subRequests = 64),
       modules = [
         (name = "facade/egress/egress.js", esModule = embed "sys/65241991ffa2cd2638e1bd980c5c8fa08c1753647a19ef579b74d429be745d9c"),
         (name = "facade/egress/cf-image.js", esModule = embed "sys/67b037e4b374347b2a3d581df88b29e9e522db5af5fb33f117cd6e7f9916ba0e"),
@@ -348,7 +348,7 @@ const config :Workerd.Config = (
     (name = "vrt-no-network", worker = (
       compatibilityDate = "2026-09-08",
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
-      limits = (cpuMs = 1000, memoryMb = 128),
+      limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),
       modules = [
         (name = "facade/egress/deny.js", esModule = embed "sys/a66f0364c5bfeaf8a039a25f2a6b9c4c56939886b592ddbfd332ca01331495af"),
         (name = "facade/egress/shared.js", esModule = embed "sys/54fb1a8e57cfae7227ed25f2d87959fa9a05d2384e6d07663fb71baf8dd36310"),

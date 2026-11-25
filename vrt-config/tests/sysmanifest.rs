@@ -277,6 +277,10 @@ fn cpu_ms_values_match_manifest_tiers() {
     // concentrate in facade-images; thin transports get tenant parity.
     assert_eq!(get("facade-images").memory_mb, 768);
     assert_eq!(get("vrt-egress").memory_mb, 192);
+    // subRequests: the fetch fan-out tier (src + draw overlays + fonts)
+    // versus the thin ≤2 binding-backend-call tier.
+    assert_eq!(get("facade-images").sub_requests, 64);
+    assert_eq!(get("vrt-egress").sub_requests, 64);
     for thin in [
         "facade-kv",
         "facade-r2",
@@ -294,6 +298,7 @@ fn cpu_ms_values_match_manifest_tiers() {
     ] {
         assert_eq!(get(thin).cpu_ms, 1_000, "{thin}");
         assert_eq!(get(thin).memory_mb, 128, "{thin}");
+        assert_eq!(get(thin).sub_requests, 8, "{thin}");
     }
 }
 
@@ -306,7 +311,7 @@ fn cpu_ms_parsing_and_bounds() {
         parsed
             .system_workers
             .iter()
-            .all(|w| w.cpu_ms == 0 && w.memory_mb == 0),
+            .all(|w| w.cpu_ms == 0 && w.memory_mb == 0 && w.sub_requests == 0),
         "absent budgets must stay unset"
     );
 
@@ -316,6 +321,7 @@ fn cpu_ms_parsing_and_bounds() {
     let mut w = worker(serde_json::json!([module("facade/x.js")]));
     w["cpuMs"] = serde_json::json!(0);
     w["memoryMb"] = serde_json::json!(0);
+    w["subRequests"] = serde_json::json!(0);
     workers
         .as_object_mut()
         .unwrap()
@@ -326,11 +332,15 @@ fn cpu_ms_parsing_and_bounds() {
         .iter()
         .find(|w| w.service_name == "facade-kv")
         .unwrap();
-    assert_eq!((kv.cpu_ms, kv.memory_mb), (0, 0));
+    assert_eq!((kv.cpu_ms, kv.memory_mb, kv.sub_requests), (0, 0, 0));
 
-    // Same shape on both dimensions: 1 ok, protocol cap ok, cap+1 is
+    // Same shape on all dimensions: 1 ok, protocol cap ok, cap+1 is
     // the field's Identifier error, wrong types fail at serde.
-    for (key, cap, over) in [("cpuMs", 300_000, 300_001), ("memoryMb", 4_096, 4_097)] {
+    for (key, cap, over) in [
+        ("cpuMs", 300_000, 300_001),
+        ("memoryMb", 4_096, 4_097),
+        ("subRequests", 10_000, 10_001),
+    ] {
         let ident = format!("workers.{key}");
         for (value, expect) in [
             (serde_json::json!(1), Ok(1)),
@@ -358,8 +368,10 @@ fn cpu_ms_parsing_and_bounds() {
                         .unwrap();
                     let got = if key == "cpuMs" {
                         kv.cpu_ms
-                    } else {
+                    } else if key == "memoryMb" {
                         kv.memory_mb
+                    } else {
+                        kv.sub_requests
                     };
                     assert_eq!(got, v, "{key}");
                 }

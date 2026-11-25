@@ -2715,6 +2715,7 @@ pub fn params_json_from_manifest(
                 "needsBindingBackend": w.needs_binding_backend,
                 "cpuMs": w.cpu_ms,
                 "memoryMb": w.memory_mb,
+                "subRequests": w.sub_requests,
             })
         }).collect::<Vec<_>>(),
         "systemCompatDate": system_compat_date,
@@ -2893,6 +2894,10 @@ struct SystemWorkerToml {
     /// external bytes; `0`/absent keeps the worker unlimited.
     #[serde(default)]
     memory_mb: u32,
+    /// Platform-declared per-invocation outbound subrequest count;
+    /// `0`/absent keeps the worker unlimited.
+    #[serde(default)]
+    sub_requests: u32,
 }
 
 impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
@@ -2904,6 +2909,7 @@ impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
             needs_binding_backend: v.needs_binding_backend,
             cpu_ms: v.cpu_ms,
             memory_mb: v.memory_mb,
+            sub_requests: v.sub_requests,
         }
     }
 }

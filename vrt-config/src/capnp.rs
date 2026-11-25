@@ -216,6 +216,12 @@ pub struct SystemWorkerRef {
     /// decode bitmaps and egress multipart buffers are both counted.
     /// `0` keeps the worker unlimited.
     pub memory_mb: u32,
+    /// Platform-declared per-invocation outbound subrequest count. The
+    /// fork counts `fetch()` calls routed through `globalOutbound` and
+    /// service-binding calls (e.g. `binding-backend`); calls into
+    /// internally-provided services are exempt. `0` keeps the worker
+    /// unlimited.
+    pub sub_requests: u32,
 }
 
 /// A resolved secret value. It is emitted **only** into
@@ -504,6 +510,9 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         }
         if system.memory_mb > snapshot_protocol::compute_desired::MAX_MEMORY_MB {
             return Err(ConfigError::Quotas("memoryMb"));
+        }
+        if system.sub_requests > snapshot_protocol::compute_desired::MAX_SUBREQUESTS {
+            return Err(ConfigError::Quotas("subRequests"));
         }
     }
     // PT1: a defined system worker may never shadow the watchdog
@@ -2346,6 +2355,9 @@ fn emit_system_worker(
     }
     if system.memory_mb > 0 {
         dims.push(format!("memoryMb = {}", system.memory_mb));
+    }
+    if system.sub_requests > 0 {
+        dims.push(format!("subRequests = {}", system.sub_requests));
     }
     if !dims.is_empty() {
         out.push_str(&format!("      limits = ({}),\n", dims.join(", ")));
