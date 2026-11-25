@@ -223,6 +223,19 @@ fn params_json_from_manifest_fails_closed() {
     assert_eq!(doc["facades"]["images"]["service"], "facade-images");
     assert_eq!(doc["facades"]["vectorize"]["service"], "facade-vectorize");
     assert_eq!(doc["systemWorkers"].as_array().unwrap().len(), 15);
+    // Platform-declared CPU budgets survive the doc round-trip (the
+    // document is re-parsed via RenderParamsFile inside the call).
+    let sys = doc["systemWorkers"].as_array().unwrap();
+    let cpu = |name: &str| {
+        sys.iter()
+            .find(|w| w["serviceName"] == name)
+            .unwrap_or_else(|| panic!("{name} missing"))["cpuMs"]
+            .as_u64()
+            .unwrap_or(0)
+    };
+    assert_eq!(cpu("facade-images"), 10_000);
+    assert_eq!(cpu("vrt-egress"), 2_000);
+    assert_eq!(cpu("facade-kv"), 1_000);
 }
 
 /// T27/N0: a supervisor config whose failure window cannot hold

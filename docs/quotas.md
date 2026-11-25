@@ -81,6 +81,19 @@ Rules:
   the V8 heap (not native/SQLite memory) and startup evaluation is not
   CPU-limited.
 
+### System workers (`cpuMs` only)
+
+System workers (facades, `vrt-egress`, `vrt-no-network`) carry
+**platform-declared** CPU budgets from `facade/manifest.json` — the same
+`limits` group, sourced by `gen-manifest.mjs` instead of a tenant
+declaration. A service-binding call creates an invocation on the callee, so
+the callee's own `cpuMs` is what bounds CPU burned inside a facade (image
+decode/encode, text rasterization, multipart scans); the tenant's quota
+does not cover it. Budgets are tiered (`facade-images` ≫ `vrt-egress` ≫
+thin RPC facades); `cpuMs = 0`/absent keeps a worker unlimited. Memory,
+subrequests and dynamic dispatch workers (cron, qconsumer, heartbeat) are
+not yet bounded.
+
 ## Cell capability (`quotas`)
 
 The capability bit is reported in every desired-state ACK

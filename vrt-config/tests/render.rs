@@ -315,6 +315,7 @@ fn heartbeat_emit_gated_and_isolated() {
             digest: "a".repeat(64),
         }],
         needs_binding_backend: false,
+        cpu_ms: 0,
     }];
     let r = render_tenant_config(&input(&tenant, &bs, &hostile_params));
     assert!(r.is_err(), "heartbeat shadow by system worker must fail");
@@ -1538,10 +1539,20 @@ fn worker_limits_render_declared_dimensions_only() {
     let out = render_tenant_config(&input(&tenant, &bundles(), &runtime_params()))
         .unwrap()
         .text;
-    assert!(
-        !out.contains("limits = ("),
-        "platform defaults / 0 must not render a limits block:\n{out}"
-    );
+    // Tenant blocks must stay limits-free — system workers carry their
+    // own platform-declared budgets (see below), so scope the check to
+    // the tenant worker definitions instead of the whole config.
+    for name in ["worker-w-alpha-1", "worker-w-alpha-2"] {
+        let block = out
+            .split(&format!("(name = \"{name}\", worker = ("))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} worker block missing"));
+        let block = block.split("    )),").next().unwrap();
+        assert!(
+            !block.contains("limits = ("),
+            "platform defaults / 0 must not render a limits block in {name}:\n{block}"
+        );
+    }
 
     // Mixed declaration: an explicit `subrequests = 0` is "no budget" on
     // the protocol side and must be omitted from a block that still
@@ -1670,4 +1681,88 @@ fn quotas_capability_gate_fails_closed() {
     tenant.workers[1].quotas.cpu_ms = 50;
     tenant.workers[1].quotas.subrequests = 0;
     assert!(ensure_quotas_enforceable(&tenant, false).is_ok());
+}
+
+/// System workers carry platform-declared CPU budgets from the facade
+/// manifest — the same `limits` group tenant quotas render, tiered so
+/// the heavy paths (facade-images decode/encode + text rasterization,
+/// vrt-egress multipart scans) get headroom while thin RPC facades
+/// stay tight.
+#[test]
+fn system_workers_render_platform_cpu_budgets() {
+    let tenant = tenant();
+    let bs = bundles();
+    let params = runtime_params();
+    let out = render_tenant_config(&input(&tenant, &bs, &params))
+        .unwrap()
+        .text;
+    // Tier counts from the real manifest. This fixture renders 13 of
+    // the 15 manifest workers — facade-qconsumer and facade-router are
+    // emitted conditionally (queue consumers / assets mounts) and do
+    // not appear here.
+    assert_eq!(
+        out.matches("limits = (cpuMs = 10000),").count(),
+        1,
+        "facade-images"
+    );
+    assert_eq!(
+        out.matches("limits = (cpuMs = 2000),").count(),
+        1,
+        "vrt-egress"
+    );
+    assert_eq!(
+        out.matches("limits = (cpuMs = 1000),").count(),
+        11,
+        "rendered thin facades + the deny stub"
+    );
+    // Dynamic workers emitted outside `emit_system_worker` — the per-
+    // worker cron dispatcher, qconsumer, heartbeat, waituntil probe —
+    // stay unlimited today: they are dispatch glue, not compute paths,
+    // and each emit site would want its own budget decision.
+    let cron = out
+        .split("(name = \"facade-cron-w-alpha-1\", worker = (")
+        .nth(1)
+        .unwrap();
+    let cron_block = cron.split("    )),").next().unwrap();
+    assert!(
+        !cron_block.contains("limits = ("),
+        "dynamic dispatch facades stay unlimited"
+    );
+    // Placement: inside the worker block, before `modules` — spot-check
+    // the heaviest worker.
+    let block = out
+        .split("(name = \"facade-images\", worker = (")
+        .nth(1)
+        .unwrap();
+    let limits_pos = block.find("limits = (cpuMs = 10000)").unwrap();
+    let modules_pos = block.find("modules = [").unwrap();
+    assert!(limits_pos < modules_pos, "limits must precede modules");
+
+    // cpu_ms = 0 stays unlimited — no `limits` group, stock behaviour.
+    let mut unlimited = params.clone();
+    for w in &mut unlimited.system_workers {
+        w.cpu_ms = 0;
+    }
+    let out = render_tenant_config(&input(&tenant, &bs, &unlimited))
+        .unwrap()
+        .text;
+    for tier in ["cpuMs = 1000)", "cpuMs = 2000)", "cpuMs = 10000)"] {
+        assert!(
+            !out.contains(tier),
+            "cpu_ms = 0 must render no system budget: {tier}"
+        );
+    }
+
+    // Above the protocol cap → refused at emit depth (defense in depth
+    // behind the manifest parse bound, for params that bypassed it).
+    let mut over = params.clone();
+    over.system_workers[0].cpu_ms = 300_001;
+    assert_eq!(
+        render_tenant_config(&input(&tenant, &bs, &over)),
+        Err(ConfigError::Quotas("cpuMs"))
+    );
+    // The cap itself is accepted.
+    let mut at_cap = params.clone();
+    at_cap.system_workers[0].cpu_ms = 300_000;
+    assert!(render_tenant_config(&input(&tenant, &bs, &at_cap)).is_ok());
 }

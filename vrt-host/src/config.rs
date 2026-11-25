@@ -2713,6 +2713,7 @@ pub fn params_json_from_manifest(
                     serde_json::json!({"name": m.name, "digest": m.digest})
                 }).collect::<Vec<_>>(),
                 "needsBindingBackend": w.needs_binding_backend,
+                "cpuMs": w.cpu_ms,
             })
         }).collect::<Vec<_>>(),
         "systemCompatDate": system_compat_date,
@@ -2883,6 +2884,10 @@ struct SystemWorkerToml {
     modules: Vec<SystemModuleToml>,
     #[serde(default)]
     needs_binding_backend: bool,
+    /// Platform-declared per-invocation CPU budget (ms); `0`/absent
+    /// keeps the worker unlimited (see `vrt_config::SystemWorkerRef`).
+    #[serde(default)]
+    cpu_ms: u32,
 }
 
 impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
@@ -2892,6 +2897,7 @@ impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
             main_module: v.main_module,
             modules: v.modules.into_iter().map(Into::into).collect(),
             needs_binding_backend: v.needs_binding_backend,
+            cpu_ms: v.cpu_ms,
         }
     }
 }

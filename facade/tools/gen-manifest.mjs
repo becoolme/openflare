@@ -53,6 +53,20 @@ const DIST_DIR = resolve(FACADE_DIR, "dist");
 const OUT_FILE = resolve(FACADE_DIR, "manifest.json");
 const NODE_MAJOR = process.versions.node.split(".")[0];
 
+// Per-invocation CPU budgets for system workers — rendered as
+// `Worker.limits.cpuMs` by vrt-config (0/absent would mean unlimited).
+// Only JS-turn CPU counts; I/O wait is free. Three tiers:
+//   IMAGES_CPU_MS  — the heavy path: jSquash decode/encode + resvg font
+//                    rasterization on tenant-controlled bytes; a legit
+//                    64MP transform can burn seconds, so the budget must
+//                    bound pathology without false-killing big requests.
+//   EGRESS_CPU_MS  — buffered /transform multiparts (≤64MiB) are scanned
+//                    byte-wise in JS for text markers, plus payload fetches.
+//   DEFAULT_CPU_MS — thin RPC facades; bounds glue pathology only.
+const IMAGES_CPU_MS = 10_000;
+const EGRESS_CPU_MS = 2_000;
+const DEFAULT_CPU_MS = 1_000;
+
 const WORKERS = [
   { serviceName: "facade-kv", entrypoint: "KVNamespace", entry: "facade-kv.ts", needsBindingBackend: true },
   { serviceName: "facade-r2", entrypoint: "R2Transport", entry: "facade-r2.ts", needsBindingBackend: true },
@@ -66,7 +80,7 @@ const WORKERS = [
   { serviceName: "facade-email", entrypoint: "EmailFacade", entry: "facade-email.ts", needsBindingBackend: true },
   // CF Images binding — inner `fetcher` of `cloudflare-internal:images-api`.
   // Pure in-worker transforms (vendored WASM engine); no binding-backend.
-  { serviceName: "facade-images", entrypoint: "ImagesFacade", entry: "facade-images.ts", needsBindingBackend: false },
+  { serviceName: "facade-images", entrypoint: "ImagesFacade", entry: "facade-images.ts", needsBindingBackend: false, cpuMs: IMAGES_CPU_MS },
   // CF Vectorize binding — inner `fetcher` of `cloudflare-internal:vectorize-api`
   // (v2 GA wire); forwards ops to the provider's sqlite-vec backend.
   { serviceName: "facade-vectorize", entrypoint: "VectorizeFacade", entry: "facade-vectorize.ts", needsBindingBackend: true },
@@ -79,7 +93,7 @@ const WORKERS = [
   { serviceName: "facade-router", entrypoint: "AssetsRouter", entry: "facade-router.ts", needsBindingBackend: false },
   // T6: tenant egress gate. No binding-backend — it talks only to the
   // outside world through `outbound-network`, never to platform APIs.
-  { serviceName: "vrt-egress", entrypoint: "EgressProxy", entry: "egress/egress.ts", needsBindingBackend: false },
+  { serviceName: "vrt-egress", entrypoint: "EgressProxy", entry: "egress/egress.ts", needsBindingBackend: false, cpuMs: EGRESS_CPU_MS },
   // Deny-all globalOutbound target for system workers that must never
   // reach a network at all (facades only talk to BINDING_BACKEND).
   { serviceName: "vrt-no-network", entrypoint: "DenyAll", entry: "egress/deny.ts", needsBindingBackend: false },
@@ -308,6 +322,7 @@ function build() {
       entrypoint: worker.entrypoint,
       needsBindingBackend: worker.needsBindingBackend,
       mainModule: moduleName(relative(ROOT, entryFile).split(sep).join("/")),
+      cpuMs: worker.cpuMs ?? DEFAULT_CPU_MS,
       modules,
     };
   }

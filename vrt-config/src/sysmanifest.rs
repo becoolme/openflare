@@ -70,6 +70,11 @@ struct WireWorker {
     needs_binding_backend: bool,
     main_module: String,
     modules: Vec<WireModule>,
+    /// Platform-declared per-invocation CPU budget (ms) → `Worker.limits`.
+    /// Absent/`0` means unlimited; bounded by the protocol cap so a
+    /// manifest typo cannot render an effectively-unlimited huge number.
+    #[serde(default)]
+    cpu_ms: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -190,11 +195,16 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         if !names.contains(&worker.main_module) {
             return Err(ConfigError::Identifier("workers.mainModule"));
         }
+        let cpu_ms = worker.cpu_ms.unwrap_or(0);
+        if cpu_ms > snapshot_protocol::compute_desired::MAX_CPU_MS {
+            return Err(ConfigError::Identifier("workers.cpuMs"));
+        }
         system_workers.push(SystemWorkerRef {
             service_name: service_name.clone(),
             main_module: worker.main_module.clone(),
             modules,
             needs_binding_backend: worker.needs_binding_backend,
+            cpu_ms,
         });
     }
 
