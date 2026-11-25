@@ -806,12 +806,15 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
 
     // PT1: watchdog heartbeat worker — same-process event-loop probe.
     // No bindings, no sockets on ingress, `globalOutbound` deny-all:
-    // it can only answer the private liveness GET.
+    // it can only answer the private liveness GET. Thin-tier cpu/mem
+    // (it is a static responder) and no subRequests — it makes zero
+    // outbound calls by construction.
     if !input.params.heartbeat_socket.is_empty() {
         out.push_str(&format!(
-            "    (name = {}, worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = \"vrt-heartbeat.mjs\", esModule = {}),\n      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
+            "    (name = {}, worker = (\n      compatibilityDate = {},\n{}      modules = [\n        (name = \"vrt-heartbeat.mjs\", esModule = {}),\n      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
             capnp_text(HEARTBEAT_SERVICE),
             capnp_text(&input.params.system_compat_date),
+            limits_line(DYN_CPU_MS, DYN_MEMORY_MB, 0),
             capnp_text(crate::heartbeat::HEARTBEAT_JS),
             capnp_text(&input.params.deny_outbound.service),
             capnp_text(&input.params.deny_outbound.entrypoint),
@@ -837,9 +840,18 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
             wu_names.push(bname);
         }
         out.push_str(&format!(
-            "    (name = {}, worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = {}, esModule = {}),\n      ],\n      bindings = [\n{}      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
+            "    (name = {}, worker = (\n      compatibilityDate = {},\n{}      modules = [\n        (name = {}, esModule = {}),\n      ],\n      bindings = [\n{}      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
             capnp_text(crate::waituntil::PROBE_SERVICE),
             capnp_text(&input.params.system_compat_date),
+            // The probe fans out one service-binding call per tenant
+            // worker — bound at 2× the fan-out (workers are themselves
+            // capped upstream) and never below a useful floor. Twice
+            // the thin CPU tier covers parsing N small JSON responses.
+            limits_line(
+                DYN_CPU_MS * 2,
+                DYN_MEMORY_MB,
+                (input.tenant.workers.len() as u32 * 2).max(16),
+            ),
             capnp_text(crate::waituntil::PROBE_MODULE),
             capnp_text(&crate::waituntil::probe_js(&wu_names)),
             wu_bindings,
@@ -2315,6 +2327,37 @@ fn emit_vectorize_binding(
     Ok(())
 }
 
+/// Render one `limits = (...)` group line for a system worker, or ""
+/// when every dimension is 0 (stock behaviour — workerd's 0 means
+/// unlimited, so an explicit `0` limit would lie about intent). Shared
+/// by `emit_system_worker` (manifest-sourced budgets) and the dynamic
+/// dispatch emitters (emit-site budgets).
+fn limits_line(cpu_ms: u32, memory_mb: u32, sub_requests: u32) -> String {
+    let mut dims = Vec::new();
+    if cpu_ms > 0 {
+        dims.push(format!("cpuMs = {cpu_ms}"));
+    }
+    if memory_mb > 0 {
+        dims.push(format!("memoryMb = {memory_mb}"));
+    }
+    if sub_requests > 0 {
+        dims.push(format!("subRequests = {sub_requests}"));
+    }
+    if dims.is_empty() {
+        String::new()
+    } else {
+        format!("      limits = ({}),\n", dims.join(", "))
+    }
+}
+
+/// Thin-tier budgets for dynamic dispatch workers rendered outside
+/// `emit_system_worker` (vendored modules with no manifest entry).
+/// Same shape as the manifest thin-facade tier; `subRequests` is a
+/// per-site decision because the fan-out differs (the waituntil probe
+/// calls one binding per tenant worker; the dispatchers call once).
+const DYN_CPU_MS: u32 = 1_000;
+const DYN_MEMORY_MB: u32 = 128;
+
 /// Emit one system (facade/egress) worker placeholder.
 fn emit_system_worker(
     out: &mut String,
@@ -2349,19 +2392,11 @@ fn emit_system_worker(
     // multipart scans, buffered egress payloads) on otherwise
     // unbounded isolates; a `0` dimension stays unlimited and is
     // never emitted.
-    let mut dims = Vec::new();
-    if system.cpu_ms > 0 {
-        dims.push(format!("cpuMs = {}", system.cpu_ms));
-    }
-    if system.memory_mb > 0 {
-        dims.push(format!("memoryMb = {}", system.memory_mb));
-    }
-    if system.sub_requests > 0 {
-        dims.push(format!("subRequests = {}", system.sub_requests));
-    }
-    if !dims.is_empty() {
-        out.push_str(&format!("      limits = ({}),\n", dims.join(", ")));
-    }
+    out.push_str(&limits_line(
+        system.cpu_ms,
+        system.memory_mb,
+        system.sub_requests,
+    ));
     let mut modules: Vec<&SystemModuleRef> = system.modules.iter().collect();
     modules.sort_by(|a, b| utf16_cmp(&a.name, &b.name));
     let main = system.main_module.as_str();
@@ -2538,7 +2573,7 @@ fn emit_cron_facade(
         "    (name = {}, worker = (
       compatibilityDate = {},
       compatibilityFlags = [{}],
-      modules = [
+{}      modules = [
         (name = {}, esModule = embed {}),
       ],
       bindings = [
@@ -2554,6 +2589,8 @@ fn emit_cron_facade(
             .map(|f| capnp_text(f))
             .collect::<Vec<_>>()
             .join(", "),
+        // Dispatch glue: one TARGET service-binding call per trigger.
+        limits_line(DYN_CPU_MS, DYN_MEMORY_MB, 2),
         capnp_text("cron-dispatcher.js"),
         capnp_text(&path),
         capnp_text(&worker_service_name(&worker.worker_id)),
@@ -2638,7 +2675,7 @@ fn emit_wfops_facade(
         "    (name = {}, worker = (
       compatibilityDate = {},
       compatibilityFlags = [{}],
-      modules = [
+{}      modules = [
         (name = {}, esModule = embed {}),
       ],
 ",
@@ -2652,6 +2689,8 @@ fn emit_wfops_facade(
         .map(|f| capnp_text(f))
         .collect::<Vec<_>>()
         .join(", "),
+        // Ops bridge: one workflow-binding call per op.
+        limits_line(DYN_CPU_MS, DYN_MEMORY_MB, 2),
         capnp_text("wfops-facade.js"),
         capnp_text(&path),
     ));
@@ -3681,6 +3720,13 @@ fn emit_router_worker(
                 .join(", ")
         ));
     }
+    // Same story as the qconsumer: the `facade-router` manifest entry
+    // supplies the platform-declared budgets.
+    out.push_str(&limits_line(
+        system.cpu_ms,
+        system.memory_mb,
+        system.sub_requests,
+    ));
     let mut modules: Vec<&SystemModuleRef> = system.modules.iter().collect();
     modules.sort_by(|a, b| utf16_cmp(&a.name, &b.name));
     let main = system.main_module.as_str();
@@ -3789,6 +3835,14 @@ fn emit_qconsumer_worker(
             .map(|f| capnp_text(f))
             .collect::<Vec<_>>()
             .join(", ")
+    ));
+    // Budgets come from the `facade-qconsumer` manifest entry — the
+    // per-tenant instance inherits the same platform declaration as the
+    // manifest-defined system workers.
+    out.push_str(&limits_line(
+        system.cpu_ms,
+        system.memory_mb,
+        system.sub_requests,
     ));
     let mut modules: Vec<&SystemModuleRef> = system.modules.iter().collect();
     modules.sort_by(|a, b| utf16_cmp(&a.name, &b.name));

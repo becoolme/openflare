@@ -420,6 +420,17 @@ fn cross_worker_engine_renders_under_defining_worker() {
         out.contains("name = \"facade-wfops-w-alpha-1\", worker = ("),
         "{out}"
     );
+    // Emit-site dispatch budgets: thin cpu/mem, one workflow-binding
+    // call per op ⇒ subRequests = 2.
+    let wfops = out
+        .split("name = \"facade-wfops-w-alpha-1\", worker = (")
+        .nth(1)
+        .unwrap();
+    let wfops_block = wfops.split("    )),").next().unwrap();
+    assert!(
+        wfops_block.contains("limits = (cpuMs = 1000, memoryMb = 128, subRequests = 2)"),
+        "wfops facade carries the thin dispatch tier:\n{wfops_block}"
+    );
     assert!(!out.contains("facade-wfops-w-alpha-2"), "{out}");
     assert!(out.contains("w-alpha-1-wfops.sock"), "{out}");
     assert!(!out.contains("w-alpha-2-wfops.sock"), "{out}");

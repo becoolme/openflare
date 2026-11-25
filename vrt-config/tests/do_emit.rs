@@ -139,6 +139,17 @@ fn switch_marker_requires_waituntil_socket() {
         !out.contains("vrt-sw.sock\", http = (), service = \"worker-"),
         "marker bound to a tenant worker: {out}"
     );
+    // The probe carries emit-site budgets: thin cpu/mem and a
+    // subRequests bound at 2× the tenant-worker fan-out.
+    let probe = out
+        .split("(name = \"vrt-wu-probe\", worker = (")
+        .nth(1)
+        .unwrap_or_else(|| panic!("probe worker missing:\n{out}"));
+    let probe_block = probe.split("    )),").next().unwrap();
+    assert!(
+        probe_block.contains("limits = (cpuMs = 2000, memoryMb = 128, subRequests = "),
+        "probe carries the fan-out dispatch tier:\n{probe_block}"
+    );
 }
 
 /// The marker's dir tracks the probe socket's dir exactly — a nested

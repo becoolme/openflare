@@ -1347,6 +1347,14 @@ fn render_queue_cfg_full(
             "qconsumer missing service_binding_extra_handlers:
 {text}"
         );
+        // The per-tenant instance inherits the `facade-qconsumer`
+        // manifest entry's platform-declared budgets (thin tier).
+        assert!(
+            qsvc[..qsvc.find("bindings = [").unwrap_or(qsvc.len().min(4000))]
+                .contains("limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8)"),
+            "qconsumer missing manifest-tier limits:
+{text}"
+        );
         text = text.replace(
             &format!("unix:sock/{worker_id}-qconsumer.sock"),
             &format!("127.0.0.1:{qport}"),
