@@ -224,6 +224,13 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  runtime-alerts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Validate and load the canonical runtime alert rules
+        run: deploy/standalone/alerts-e2e.sh
+
   persistence-fuzz:
     name: Persistence fuzz (repeated kill -9)
     runs-on: ubuntu-24.04

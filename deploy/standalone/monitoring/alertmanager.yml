@@ -1,0 +1,14 @@
+# B12: local Alertmanager for the standalone monitoring profile.
+# The default receiver is intentionally silent: this stack is for
+# development/acceptance, where the firing/resolved lifecycle is visible
+# through vmalert and the Alertmanager API. Point this receiver at a real
+# webhook/PagerDuty/Slack integration in an operator-owned overlay.
+route:
+  receiver: silent
+  group_by: [alertname, cell_id]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+
+receivers:
+  - name: silent

@@ -56,3 +56,13 @@ groups:
         annotations:
           summary: Hibernated WebSocket sessions fail to reattach
           runbook: docs/runtime-alerts.md
+
+  - name: openflare-scale-to-zero
+    rules:
+      - alert: OpenflareAlarmWakeSlow
+        expr: histogram_quantile(0.95, sum by (le) (rate(vrt_host_wake_seconds_bucket{source="alarm"}[10m]))) > 30
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: DO alarm wakes take longer than 30s at p95
+          runbook: docs/runtime-alerts.md
