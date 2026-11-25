@@ -82,7 +82,7 @@ Rules:
   stores, including decoded image bitmaps) — not native/SQLite memory —
   and startup evaluation is not CPU-limited.
 
-### System workers (`cpuMs`, `memoryMb`)
+### System workers (`cpuMs`, `memoryMb`, `subRequests`)
 
 System workers (facades, `vrt-egress`, `vrt-no-network`) carry
 **platform-declared** budgets from `facade/manifest.json` — the same
@@ -90,14 +90,18 @@ System workers (facades, `vrt-egress`, `vrt-no-network`) carry
 declaration. A service-binding call creates an invocation on the callee,
 so the callee's own limits bound work burned inside a facade (image
 decode/encode, text rasterization, multipart scans); the tenant's quota
-does not cover it. Budgets are tiered: `facade-images` (10s CPU, 768MB —
-64MP bitmaps live in V8 external memory), `vrt-egress` (2s, 192MB —
+does not cover it. Budgets are tiered: `facade-images` (10s CPU, 768MB,
+64 subrequests — 64MP bitmaps live in V8 external memory; src + draw
+overlays + fonts fan out), `vrt-egress` (2s, 192MB, 64 subrequests —
 buffered multipart plus payload), thin RPC facades and `vrt-no-network`
-(1s, 128MB — tenant-default parity). `0`/absent keeps a dimension
+(1s, 128MB, 8 subrequests — ≤2 binding-backend calls per invocation).
+`subRequests` counts outbound fetches through `globalOutbound` and
+service-binding calls (binding-backend included); calls into
+internally-provided services are exempt. `0`/absent keeps a dimension
 unbounded. The memory check runs at `enterJs` boundaries, so it bounds
 residency and accumulation — a single turn's transient spike can
-overshoot before the next check. Subrequests and dynamic dispatch
-workers (cron, qconsumer, heartbeat) are not yet bounded.
+overshoot before the next check. Dynamic dispatch workers (cron,
+qconsumer, heartbeat, waituntil probe) are not yet bounded.
 
 ## Cell capability (`quotas`)
 

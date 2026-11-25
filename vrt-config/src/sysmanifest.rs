@@ -78,6 +78,9 @@ struct WireWorker {
     /// Same story for the memory budget (MB) — heap + external bytes.
     #[serde(default)]
     memory_mb: Option<u32>,
+    /// Same story for the outbound subrequest count.
+    #[serde(default)]
+    sub_requests: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -206,6 +209,10 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         if memory_mb > snapshot_protocol::compute_desired::MAX_MEMORY_MB {
             return Err(ConfigError::Identifier("workers.memoryMb"));
         }
+        let sub_requests = worker.sub_requests.unwrap_or(0);
+        if sub_requests > snapshot_protocol::compute_desired::MAX_SUBREQUESTS {
+            return Err(ConfigError::Identifier("workers.subRequests"));
+        }
         system_workers.push(SystemWorkerRef {
             service_name: service_name.clone(),
             main_module: worker.main_module.clone(),
@@ -213,6 +220,7 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
             needs_binding_backend: worker.needs_binding_backend,
             cpu_ms,
             memory_mb,
+            sub_requests,
         });
     }
 
