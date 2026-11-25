@@ -422,17 +422,105 @@ export function blurImage(img, sigma) {
     }
     return frame(src, w, h);
 }
-export function sharpenImage(img, amount) {
-    const blurred = blurImage(img, 1);
+function boxBlur3(img) {
+    const { width: w, height: h, data: src } = img;
+    const out = new Uint8ClampedArray(src.length);
+    for(let y = 0; y < h; y++){
+        for(let x = 0; x < w; x++){
+            let r = 0, g = 0, b = 0, n = 0;
+            for(let dy = -1; dy <= 1; dy++){
+                const yy = y + dy;
+                if (yy < 0 || yy >= h) continue;
+                for(let dx = -1; dx <= 1; dx++){
+                    const xx = x + dx;
+                    if (xx < 0 || xx >= w) continue;
+                    const i = (yy * w + xx) * 4;
+                    r += src[i];
+                    g += src[i + 1];
+                    b += src[i + 2];
+                    n++;
+                }
+            }
+            const o = (y * w + x) * 4;
+            out[o] = r / n;
+            out[o + 1] = g / n;
+            out[o + 2] = b / n;
+            out[o + 3] = src[o + 3];
+        }
+    }
+    return frame(out, w, h);
+}
+export function gaussianBlur(img, sigma) {
+    const { width: w, height: h, data: src } = img;
+    const radius = Math.max(1, Math.ceil(3 * sigma));
+    const kernel = new Float64Array(2 * radius + 1);
+    let ksum = 0;
+    for(let i = -radius; i <= radius; i++){
+        const v = Math.exp(-(i * i) / (2 * sigma * sigma));
+        kernel[i + radius] = v;
+        ksum += v;
+    }
+    for(let i = 0; i < kernel.length; i++)kernel[i] /= ksum;
+    const tmp = new Float64Array(src.length);
+    for(let y = 0; y < h; y++){
+        for(let x = 0; x < w; x++){
+            let r = 0, g = 0, b = 0, wsum = 0;
+            for(let k = -radius; k <= radius; k++){
+                const xx = x + k;
+                if (xx < 0 || xx >= w) continue;
+                const kv = kernel[k + radius];
+                const i = (y * w + xx) * 4;
+                r += src[i] * kv;
+                g += src[i + 1] * kv;
+                b += src[i + 2] * kv;
+                wsum += kv;
+            }
+            const o = (y * w + x) * 4;
+            tmp[o] = r / wsum;
+            tmp[o + 1] = g / wsum;
+            tmp[o + 2] = b / wsum;
+            tmp[o + 3] = src[o + 3];
+        }
+    }
+    const out = new Uint8ClampedArray(src.length);
+    for(let y = 0; y < h; y++){
+        for(let x = 0; x < w; x++){
+            let r = 0, g = 0, b = 0, wsum = 0;
+            for(let k = -radius; k <= radius; k++){
+                const yy = y + k;
+                if (yy < 0 || yy >= h) continue;
+                const kv = kernel[k + radius];
+                const i = (yy * w + x) * 4;
+                r += tmp[i] * kv;
+                g += tmp[i + 1] * kv;
+                b += tmp[i + 2] * kv;
+                wsum += kv;
+            }
+            const o = (y * w + x) * 4;
+            out[o] = r / wsum;
+            out[o + 1] = g / wsum;
+            out[o + 2] = b / wsum;
+            out[o + 3] = src[o + 3];
+        }
+    }
+    return frame(out, w, h);
+}
+function unsharpMask(img, blurred, amount, threshold) {
     const out = new Uint8ClampedArray(img.data.length);
-    const a = Math.max(0, Math.min(10, amount));
     for(let i = 0; i < out.length; i += 4){
         for(let c = 0; c < 3; c++){
-            out[i + c] = img.data[i + c] + a * (img.data[i + c] - blurred.data[i + c]);
+            const d = img.data[i + c] - blurred.data[i + c];
+            out[i + c] = Math.abs(d) >= threshold ? img.data[i + c] + amount * d : img.data[i + c];
         }
         out[i + 3] = img.data[i + 3];
     }
     return frame(out, img.width, img.height);
+}
+export function sharpenImage(img, amount) {
+    return unsharpMask(img, boxBlur3(img), Math.max(0, Math.min(10, amount)), 0);
+}
+export function gaussianSharpenImage(img, amount, sigma, threshold) {
+    return unsharpMask(img, gaussianBlur(img, sigma), Math.max(0, Math.min(10, amount)), Math.max(0, Math.min(255, Math.round(threshold))));
 }
 export function adjustImage(img, { brightness, contrast, gamma, saturation }) {
     const lut = new Uint8ClampedArray(256);

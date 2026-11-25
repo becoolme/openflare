@@ -101,6 +101,20 @@ test("cfImagePlan: unknown option + bad values throw TypeError", () => {
     { draw: {} },
     { "origin-auth": "x" },
     { quality: 0 },
+    { quality: "ultra" },
+    { dpr: 3 }, // upstream caps dpr at 2
+    { flip: "diagonal" },
+    { compression: "best" },
+    { fit: { upscale: "interpolate" } }, // mode required
+    { sharpen: { mode: "gaussian", amount: 1 } }, // sigma required
+    { sharpen: { mode: "box", amount: 1, sigma: 1 } },
+    { sharpen: { amount: 11 } },
+    { sharpen: "sharp" },
+    { trim: { mode: "color", top: 5 } }, // mode mixing rejected
+    { trim: { mode: "color", tolerance: 300 } },
+    { trim: { mode: "area", width: 4, right: 5 } }, // rect + side keys
+    { trim: { mode: "area", left: "200q" } },
+    { trim: { mode: "bogus" } },
   ]) {
     assert.throws(
       () => cfImagePlan(pngReq(image)),
@@ -108,6 +122,65 @@ test("cfImagePlan: unknown option + bad values throw TypeError", () => {
       JSON.stringify(image),
     );
   }
+});
+
+test("cfImagePlan: structured sharpen/trim/fit/flip reach the wire", () => {
+  const plan = cfImagePlan(
+    pngReq({
+      sharpen: { mode: "gaussian", amount: 1, sigma: 1.5, threshold: 3 },
+      trim: { mode: "color", tolerance: 10, keep: 4 },
+      fit: { mode: "contain", upscale: "interpolate" },
+      flip: "hv",
+      quality: "high",
+    }),
+  );
+  const op = JSON.parse(plan.transforms)[0];
+  assert.deepEqual(op.sharpen, { mode: "gaussian", amount: 1, sigma: 1.5, threshold: 3 });
+  assert.deepEqual(op.trim, { mode: "color", tolerance: 10, keep: 4 });
+  assert.deepEqual(op.fit, { mode: "contain", upscale: "interpolate" });
+  assert.equal(op.flip, "hv");
+  assert.equal(plan.outputQuality, 90); // perceptual tier anchor
+});
+
+test("cfImagePlan: trim lengths and border/padding scale with dpr", () => {
+  const plan = cfImagePlan(
+    pngReq({
+      dpr: 2,
+      trim: { mode: "area", top: 10, right: "20p", bottom: 0.1, left: 4 },
+      border: { width: 5, color: "#ff0000" },
+    }),
+  );
+  const op = JSON.parse(plan.transforms)[0];
+  // px counts ×dpr; "Np" percents and 0<v<1 fractions pass through for
+  // the facade to resolve against the real axis.
+  assert.deepEqual(op.trim, { mode: "area", top: 20, right: "20p", bottom: 0.1, left: 8 });
+  assert.deepEqual(op.border, { width: 10, color: "#ff0000" });
+
+  // padding rides border with the background color (or transparent).
+  const pad = cfImagePlan(pngReq({ padding: 6 }));
+  const pop = JSON.parse(pad.transforms)[0];
+  assert.deepEqual(pop.border, {
+    width: 6,
+    color: "rgba(0,0,0,0)",
+  });
+  const padBg = cfImagePlan(pngReq({ padding: 6, background: "rgb(1,2,3)" }));
+  assert.equal(JSON.parse(padBg.transforms)[0].border.color, "rgb(1,2,3)");
+});
+
+test("cfImagePlan: compression=fast forces jpeg over format", () => {
+  const plan = cfImagePlan(pngReq({ format: "webp", compression: "fast" }));
+  assert.equal(plan.outputFormat, "image/jpeg");
+  const plain = cfImagePlan(pngReq({ compression: "fast" }));
+  assert.equal(plain.outputFormat, "image/jpeg");
+});
+
+test("cfImagePlan: trim string + color-mode keep scale with dpr", () => {
+  const plan = cfImagePlan(pngReq({ trim: "10,20,10,20", dpr: 2 }));
+  assert.deepEqual(JSON.parse(plan.transforms)[0].trim, {
+    top: 20, right: 40, bottom: 20, left: 40,
+  });
+  const keep = cfImagePlan(pngReq({ trim: { mode: "color", keep: 3 }, dpr: 2 }));
+  assert.equal(JSON.parse(keep.transforms)[0].trim.keep, 6);
 });
 
 test("cf.image end-to-end: upstream PNG → webp through real facade", async () => {
@@ -167,6 +240,39 @@ test("cf.image format=json → transformed metadata", async () => {
     assert.equal(meta.width, 2);
     assert.equal(meta.height, 2);
     assert.match(meta.format, /^image\//);
+  });
+});
+
+test("cf.image end-to-end: structured options through real facade", async () => {
+  // 16x16 red-bordered source with a blue center and a step edge —
+  // trim + gaussian sharpen + flip all execute for real.
+  const px = (x, y) =>
+    x < 4 || x >= 12 || y < 4 || y >= 12 ? [255, 0, 0, 255] : [0, 0, x < 10 ? 60 : 200, 255];
+  const data = new Uint8ClampedArray(16 * 16 * 4);
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 16; x++) {
+      const i = (y * 16 + x) * 4;
+      const [r, g, b, a] = px(x, y);
+      data[i] = r; data[i + 1] = g; data[i + 2] = b; data[i + 3] = a;
+    }
+  }
+  const { bytes: png } = await eng.encodeImage({ data, width: 16, height: 16 }, "png", 100);
+  const proxy = makeProxy(egressEnv(realImagesFetcher));
+  await withStubbedUpstream(png, async () => {
+    const resp = await proxy.fetch(
+      pngReq({
+        trim: { mode: "color" },
+        sharpen: { mode: "gaussian", amount: 2, sigma: 1 },
+        flip: "h",
+        format: "png",
+      }),
+    );
+    assert.equal(resp.status, 200);
+    const out = await eng.decodeImage(new Uint8Array(await resp.arrayBuffer()), "png");
+    assert.equal(out.width, 8); // border trimmed to the 8x8 center
+    assert.equal(out.height, 8);
+    // After h-flip the bright half sits left (the step is in blue).
+    assert.ok(out.data[2] > 150, `flipped blue channel ${out.data[2]}`);
   });
 });
 
