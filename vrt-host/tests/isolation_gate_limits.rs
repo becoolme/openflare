@@ -70,14 +70,33 @@ export default {
     // `cpuMs`/`memoryMb` at their defaults, so the render carries the
     // subrequest budget and NO CPU budget — the fairness gap asserted
     // below is the default-quota shape.
-    assert!(
-        text.contains("limits = (subRequests = 100)"),
-        "declared subRequests quota must render: {text}"
-    );
-    assert!(
-        !text.contains("cpuMs = ") && !text.contains("memoryMb = "),
-        "default dimensions must not render (stock behaviour): {text}"
-    );
+    //
+    // Scope the assertions to the TENANT worker blocks: system workers
+    // now carry platform-declared cpuMs budgets (facade/manifest.json),
+    // which is correct and unrelated to the default-quota gap this test
+    // documents — system workers never run the tenant burn/spin probes.
+    let tenant_block = |id: &str| {
+        let start = text
+            .find(&format!("(name = \"worker-{id}\", worker = ("))
+            .unwrap_or_else(|| panic!("worker-{id} service not rendered: {text}"));
+        let rest = &text[start..];
+        let end = rest[1..]
+            .find("\n    (name = \"")
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        &rest[..end]
+    };
+    for id in ["wa", "wb"] {
+        let block = tenant_block(id);
+        assert!(
+            block.contains("limits = (subRequests = 100)"),
+            "declared subRequests quota must render on worker-{id}: {block}"
+        );
+        assert!(
+            !block.contains("cpuMs = ") && !block.contains("memoryMb = "),
+            "default tenant dimensions must not render (stock behaviour): {block}"
+        );
+    }
     assert!(
         !text.contains("isolatedVm") && !text.contains("actorMode"),
         "workers not process-shared — this gate only applies to shared mode"
