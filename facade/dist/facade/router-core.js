@@ -150,6 +150,21 @@ export function normalizePath(raw) {
     while(out.includes("//"))out = out.replaceAll("//", "/");
     return out;
 }
+export function validBasePath(value) {
+    if (value === "/") return true;
+    if (!value.startsWith("/") || !value.endsWith("/")) return false;
+    return value.slice(1, -1).split("/").every((seg)=>seg !== "" && seg !== "." && seg !== "..");
+}
+export function stripBase(publicDecoded, base) {
+    if (base === "/") return publicDecoded;
+    const stem = base.slice(0, base.length - 1);
+    if (publicDecoded === stem) return "/";
+    if (publicDecoded.startsWith(base)) {
+        const stripped = publicDecoded.slice(base.length - 1);
+        return stripped === "" ? "/" : stripped;
+    }
+    return null;
+}
 function findAsset(has, path) {
     return has(path) ? path : null;
 }
@@ -420,18 +435,20 @@ export function routesWorkerFirst(routes, path) {
     if (routeMatches(routes.exclude, path)) return false;
     return routeMatches(routes.include, path);
 }
-export function intentFetchable(index, path, navigate, hasStaticRouting, rawPath = path) {
+export function intentFetchable(index, path, navigate, hasStaticRouting, rawPath = path, basePath = "/") {
+    const assetPath = stripBase(path, basePath);
+    if (assetPath === null) return false;
     if (!hasStaticRouting && index.routes !== null) {
         return !routesWorkerFirst(index.routes, rawPath);
     }
     const has = (p)=>index.paths.has(p);
-    if (has(path)) return true;
+    if (has(assetPath)) return true;
     if (redirectMatches(index.redirects, rawPath)) return true;
     const nfh = hasStaticRouting || navigate ? index.notFoundHandling : "none";
-    if (htmlIntent(has, index.htmlHandling, path, false) !== null) return true;
+    if (htmlIntent(has, index.htmlHandling, assetPath, false) !== null) return true;
     if (nfh === "single-page-application") return has("/index.html");
     if (nfh === "404-page") {
-        let dir = path;
+        let dir = assetPath;
         while(dir.length > 0){
             const idx = dir.lastIndexOf("/");
             dir = idx <= 0 ? "" : dir.slice(0, idx);
@@ -472,11 +489,16 @@ export function compileCfg(raw) {
         if (userWorker.some((r)=>typeof r !== "string" || r.length > 512) || assetWorker.some((r)=>typeof r !== "string" || r.length > 512)) {
             return undefined;
         }
+        const basePath = cfg.basePath === undefined ? "/" : cfg.basePath;
+        if (typeof basePath !== "string" || !validBasePath(basePath)) {
+            return undefined;
+        }
         return {
             invokeAhead: cfg.invokeUserWorkerAhead === true,
             userWorker: userWorker.map(compileRule).filter((r)=>!!r),
             assetWorker: assetWorker.map(compileRule).filter((r)=>!!r),
-            manifestDigest: digest
+            manifestDigest: digest,
+            basePath
         };
     })();
     cfgCache.set(raw, compiled);

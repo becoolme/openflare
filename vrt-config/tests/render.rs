@@ -1204,6 +1204,33 @@ fn run_worker_first_bool_and_rules_serialize() {
     assert!(out.text.contains("userWorker\\\":[\\\"/api/*\\\"]"));
 }
 
+/// `assets.base_path` rides `VRT_ROUTER_CFG` per binding — the index
+/// cache keys on the manifest digest, so a shared digest must never
+/// leak one binding's mount into another's.
+#[test]
+fn base_path_reaches_router_cfg() {
+    let bs = vec![bundle_main()];
+    let mut tenant = tenant_assets_first(serde_json::json!(null));
+    tenant.workers[0].bindings = serde_json::from_value(serde_json::json!([
+        {"type": "assets", "name": "ASSETS",
+         "manifestDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+         "permissions": {"read": true, "write": false},
+         "assetsFirst": true, "basePath": "/blog/"}
+    ]))
+    .unwrap();
+    let out = render_tenant_config(&input(&tenant, &bs, &runtime_params())).unwrap();
+    assert!(
+        out.text.contains("basePath\\\":\\\"/blog/\\\""),
+        "{}",
+        out.text
+    );
+
+    // Absent basePath emits the canonical root mount.
+    let tenant = tenant_assets_first(serde_json::json!(null));
+    let out = render_tenant_config(&input(&tenant, &bs, &runtime_params())).unwrap();
+    assert!(out.text.contains("basePath\\\":\\\"/\\\""), "{}", out.text);
+}
+
 #[test]
 fn duplicate_assets_first_bindings_fail_closed() {
     let tenant: TenantDesired = serde_json::from_value(serde_json::json!({

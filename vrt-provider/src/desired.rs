@@ -156,6 +156,7 @@ fn binding_resource(binding: &BindingDesired) -> BindingResource {
         },
         BindingDesired::Assets(b) => BindingResource::AssetsManifest {
             digest: b.manifest_digest.clone(),
+            base_path: b.base_path.clone().unwrap_or_else(|| "/".to_string()),
         },
         BindingDesired::D1(b) => BindingResource::D1Database {
             id: b.database_id.clone(),

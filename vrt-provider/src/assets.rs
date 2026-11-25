@@ -229,6 +229,41 @@ fn is_config_path(path: &str) -> bool {
     path == "/_headers" || path == "/_redirects" || path == "/_routes.json"
 }
 
+/// `assets.base_path` helpers — ports of workers-shared
+/// `asset-worker/src/utils/base-path.ts`. `base` is always canonical:
+/// `/` or an absolute pathname with leading AND trailing slashes.
+///
+/// `/subpath` is within base `/subpath/` (and so is anything below it)
+/// while `/subpath-other` is not; the root base `/` matches every path.
+fn strip_base<'a>(public_decoded: &'a str, base: &str) -> Option<&'a str> {
+    if base == "/" {
+        return Some(public_decoded);
+    }
+    let stem = &base[..base.len() - 1];
+    if public_decoded == stem {
+        return Some("/");
+    }
+    if public_decoded.starts_with(base) {
+        // slice(base.len - 1) keeps the leading `/`: `/blog/` → `/`.
+        let stripped = &public_decoded[base.len() - 1..];
+        return Some(if stripped.is_empty() { "/" } else { stripped });
+    }
+    None
+}
+
+/// Re-append the base to an asset-relative location, producing the
+/// public path (used for asset-worker-generated redirect targets).
+/// The empty string is the base root without its trailing slash.
+fn add_base(asset_path: &str, base: &str) -> String {
+    if base == "/" {
+        return asset_path.to_string();
+    }
+    if asset_path == "/" {
+        return base.to_string();
+    }
+    format!("{}{}", &base[..base.len() - 1], asset_path)
+}
+
 /// Encode a decoded path segment by segment (Cloudflare `encodePath`).
 pub fn encode_path(path: &str) -> String {
     path.split('/')
@@ -322,6 +357,28 @@ impl Intent {
 
 fn find_asset(manifest: &AssetManifest, path: &str) -> Option<AssetFile> {
     manifest.files.iter().find(|f| f.path == path).cloned()
+}
+
+/// Port of workers-shared `getBaseRootIntent`: a request landing
+/// exactly on the base root canonicalizes when `/index.html` exists —
+/// `/blog` → `/blog/` under auto/force-trailing-slash, `/blog/` →
+/// `/blog` under drop-trailing-slash. Returns the ASSET-relative
+/// redirect target (`"/"`, or `""` = the un-slashed base root).
+fn base_root_intent(manifest: &AssetManifest, public_decoded: &str, base: &str) -> Option<String> {
+    if base == "/" {
+        return None;
+    }
+    let stem = &base[..base.len() - 1];
+    let target = match manifest.html_handling {
+        HtmlHandling::AutoTrailingSlash | HtmlHandling::ForceTrailingSlash
+            if public_decoded == stem =>
+        {
+            "/"
+        }
+        HtmlHandling::DropTrailingSlash if public_decoded == base => "",
+        _ => return None,
+    };
+    find_asset(manifest, "/index.html").map(|_| target.to_string())
 }
 
 fn not_found_intent(manifest: &AssetManifest, nfh: NotFoundHandling) -> Intent {
@@ -1142,6 +1199,7 @@ pub fn fetch(
     store: &AssetStore,
     tenant: &str,
     manifest_digest: &str,
+    base_path: &str,
     request: &Request<Body>,
 ) -> Response<Body> {
     let header_str = |name: &str| {
@@ -1183,6 +1241,15 @@ pub fn fetch(
         .unwrap_or(raw_path);
     let Ok(path) = normalize_asset_path(raw_path) else {
         return typed("BINDING_PROTOCOL_ERROR", StatusCode::BAD_REQUEST);
+    };
+    // `base_path` gate (upstream strips before redirect matching): the
+    // manifest only answers underneath its mount point. `_headers` /
+    // `_redirects` / `run_worker_first` / `_routes.json` continue to
+    // see the full public path — only manifest resolution uses the
+    // stripped `asset_path`.
+    let Some(asset_path) = strip_base(&path, base_path) else {
+        crate::metrics::assets_outcome(&crate::metrics::worker_label(request), "not_found");
+        return typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND);
     };
 
     let manifest = match store.manifest(tenant, manifest_digest) {
@@ -1266,12 +1333,17 @@ pub fn fetch(
         // not the manifest's not-found fallback.
         Some(RedirectAction::Proxy(target)) => {
             proxied = true;
-            // The destination is an internal path, not a client request:
-            // decode it (manifest paths are decoded), apply the same
-            // configuration-file exclusion as for the request path, and
-            // serve an exact file as-is (no `.html` canonical redirect).
-            match normalize_asset_path(&target) {
-                Ok(target) if !is_config_path(&target) => {
+            // The destination is an internal PUBLIC path (it shares the
+            // _redirects namespace): decode it, re-check it against the
+            // base like upstream re-checks proxied rewrites, apply the
+            // same configuration-file exclusion as for the request
+            // path, and serve an exact file as-is (no `.html`
+            // canonical redirect).
+            match normalize_asset_path(&target)
+                .ok()
+                .and_then(|t| strip_base(&t, base_path).map(str::to_string))
+            {
+                Some(target) if !is_config_path(&target) => {
                     match manifest.files.iter().find(|f| f.path == target) {
                         Some(file) => Resolved::Serve(file.clone()),
                         None => resolve_with_nfh(&manifest, &target, NotFoundHandling::None),
@@ -1280,7 +1352,13 @@ pub fn fetch(
                 _ => Resolved::NotFound,
             }
         }
-        None => resolve(&manifest, &path),
+        // The base root canonicalizes before intent resolution —
+        // upstream serves `/blog` via a `/blog/` redirect, not by
+        // answering the un-slashed URL directly.
+        None => match base_root_intent(&manifest, &path, base_path) {
+            Some(target) => Resolved::Redirect(target),
+            None => resolve(&manifest, asset_path),
+        },
     };
     // Cloudflare re-encodes the canonical path and redirects when it
     // differs from the request pathname (`/a b.txt` → `/a%20b.txt`),
@@ -1328,7 +1406,9 @@ pub fn fetch(
     // an internal error surface, not an asset response — bypasses it.
     let header_applicable = !matches!(resolved, Resolved::NotFound);
     let mut response = match resolved {
-        Resolved::Redirect(to) => redirect_location(&encode_path(&to)),
+        // Intent redirects are asset-relative — re-prefix with the
+        // public base (`/foo/` under `/blog/` → `/blog/foo/`).
+        Resolved::Redirect(to) => redirect_location(&encode_path(&add_base(&to, base_path))),
         Resolved::NotFound => typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND),
         Resolved::Serve(_) | Resolved::SpaFallback(_) | Resolved::NotFoundPage(_)
             if needs_encode_redirect =>
@@ -1591,6 +1671,7 @@ pub fn can_fetch(
     store: &AssetStore,
     tenant: &str,
     manifest_digest: &str,
+    base_path: &str,
     request: &Request<Body>,
 ) -> Response<Body> {
     let worker_id = crate::metrics::worker_label(request);
@@ -1627,42 +1708,22 @@ pub fn can_fetch(
             .unwrap_or(raw_path);
         match normalize_asset_path(raw_path) {
             Err(()) => false,
-            Ok(path) => match store.manifest(tenant, manifest_digest) {
-                Ok(Some(manifest)) => {
-                    if is_config_path(&path) {
-                        false
-                    } else {
-                        // `_routes.json` decides invocation directly when
-                        // no explicit `run_worker_first` policy is active
-                        // (has_static_routing). It matches the raw path, the
-                        // same input the router matches; an invalid policy
-                        // fails closed instead of guessing a side.
-                        let routes = match store.route_rules(tenant, &manifest) {
-                            Ok(routes) => routes,
-                            Err(_) => {
-                                crate::metrics::assets_outcome(&worker_id, "route_error");
-                                return typed(
-                                    "ASSET_STORAGE_UNAVAILABLE",
-                                    StatusCode::SERVICE_UNAVAILABLE,
-                                );
-                            }
-                        };
-                        let routed = if has_static_routing {
-                            None
+            // Out-of-base paths are never asset-fetchable — upstream
+            // `canFetch` answers false before any manifest lookup.
+            Ok(path) => match strip_base(&path, base_path) {
+                None => false,
+                Some(asset_path) => match store.manifest(tenant, manifest_digest) {
+                    Ok(Some(manifest)) => {
+                        if is_config_path(asset_path) {
+                            false
                         } else {
-                            routes
-                                .as_deref()
-                                .map(|routes| !routes.worker_first(raw_path))
-                        };
-                        if let Some(assets) = routed {
-                            assets
-                        } else {
-                            // Redirect rules match the raw request path, the
-                            // same input `fetch` gives them.
-                            let redirect_hit = match store.redirect_rules(tenant, &manifest) {
-                                Ok(rules) => rules.as_deref().is_some_and(|rules| {
-                                    assets_redirects::match_redirect(rules, raw_path, None).is_some()
-                                }),
+                            // `_routes.json` decides invocation directly when
+                            // no explicit `run_worker_first` policy is active
+                            // (has_static_routing). It matches the raw path, the
+                            // same input the router matches; an invalid policy
+                            // fails closed instead of guessing a side.
+                            let routes = match store.route_rules(tenant, &manifest) {
+                                Ok(routes) => routes,
                                 Err(_) => {
                                     crate::metrics::assets_outcome(&worker_id, "route_error");
                                     return typed(
@@ -1671,26 +1732,54 @@ pub fn can_fetch(
                                     );
                                 }
                             };
-                            if redirect_hit {
-                                true
+                            let routed = if has_static_routing {
+                                None
                             } else {
-                                let nfh = probe_nfh(&manifest, has_static_routing, navigate);
-                                !matches!(
-                                    resolve_with_nfh(&manifest, &path, nfh),
-                                    Resolved::NotFound
-                                )
+                                routes
+                                    .as_deref()
+                                    .map(|routes| !routes.worker_first(raw_path))
+                            };
+                            if let Some(assets) = routed {
+                                assets
+                            } else {
+                                // Redirect rules match the raw request path, the
+                                // same input `fetch` gives them.
+                                let redirect_hit = match store.redirect_rules(tenant, &manifest) {
+                                    Ok(rules) => rules.as_deref().is_some_and(|rules| {
+                                        assets_redirects::match_redirect(rules, raw_path, None).is_some()
+                                    }),
+                                    Err(_) => {
+                                        crate::metrics::assets_outcome(&worker_id, "route_error");
+                                        return typed(
+                                            "ASSET_STORAGE_UNAVAILABLE",
+                                            StatusCode::SERVICE_UNAVAILABLE,
+                                        );
+                                    }
+                                };
+                                if redirect_hit {
+                                    true
+                                } else {
+                                    let nfh = probe_nfh(&manifest, has_static_routing, navigate);
+                                    !matches!(
+                                        resolve_with_nfh(&manifest, asset_path, nfh),
+                                        Resolved::NotFound
+                                    )
+                                }
                             }
-                        }
                     }
-                }
-                Ok(None) => {
-                    crate::metrics::assets_outcome(&worker_id, "route_error");
-                    return typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND);
-                }
-                Err(_) => {
-                    crate::metrics::assets_outcome(&worker_id, "route_error");
-                    return typed("ASSET_STORAGE_UNAVAILABLE", StatusCode::SERVICE_UNAVAILABLE);
-                }
+                    }
+                    Ok(None) => {
+                        crate::metrics::assets_outcome(&worker_id, "route_error");
+                        return typed("ASSET_NOT_FOUND", StatusCode::NOT_FOUND);
+                    }
+                    Err(_) => {
+                        crate::metrics::assets_outcome(&worker_id, "route_error");
+                        return typed(
+                            "ASSET_STORAGE_UNAVAILABLE",
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        );
+                    }
+                },
             },
         }
     };

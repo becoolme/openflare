@@ -548,6 +548,11 @@ pub(crate) struct AssetsToml {
     /// Cloudflare semantics; `!`-prefixed rules route assets-first.
     #[serde(default)]
     pub(crate) run_worker_first: Option<RunWorkerFirstToml>,
+    /// `assets.base_path` (Wrangler 4.148+) — public URL prefix the
+    /// manifest is mounted under. Normalized to canonical `/` or
+    /// `"/seg/…/"` by `normalize_base_path` at pack time.
+    #[serde(default)]
+    pub(crate) base_path: Option<String>,
 }
 
 /// T31c: `runWorkerFirst` value on `[assets]` — Wrangler wire shape.
@@ -1580,6 +1585,7 @@ pub fn assemble(
                 permissions: read_only.clone(),
                 assets_first: None,
                 run_worker_first: None,
+                base_path: None,
             }));
         }
         for binding in &b.worker_loaders {
@@ -1873,6 +1879,17 @@ pub fn assemble(
             // upload path the client simply did not ship it (a local
             // gather fails earlier at `scan_assets_dir`). Fail closed.
             let pending = gathered_assets.ok_or(LocalError::Worker("assets missing"))?;
+            let base_path = decl
+                .base_path
+                .as_deref()
+                .map(|raw| {
+                    crate::project_cfg::normalize_base_path(
+                        &serde_json::Value::from(raw),
+                        "assets.basePath",
+                    )
+                })
+                .transpose()
+                .map_err(|e| LocalError::WorkerOwned(e.to_string()))?;
             bindings.push(BindingDesired::Assets(AssetsBinding {
                 name: decl.binding.clone(),
                 manifest_digest: pending.manifest_digest.clone(),
@@ -1882,6 +1899,7 @@ pub fn assemble(
                     RunWorkerFirstToml::Bool(b) => RunWorkerFirst::Bool(*b),
                     RunWorkerFirstToml::Rules(rules) => RunWorkerFirst::Rules(rules.clone()),
                 }),
+                base_path,
             }));
             Some(pending)
         }
@@ -2734,6 +2752,7 @@ mod assets_handling_tests {
             not_found_handling: None,
             assets_first: false,
             run_worker_first: None,
+            base_path: None,
         }
     }
 
