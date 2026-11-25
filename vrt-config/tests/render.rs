@@ -292,6 +292,17 @@ fn heartbeat_emit_gated_and_isolated() {
         out.contains("(name = \"vrt-heartbeat\", address = \"unix:sock/vrt-heartbeat.sock\""),
         "private socket missing:\n{out}"
     );
+    // Thin-tier cpu/mem budgets, and no `subRequests` — the probe makes
+    // zero outbound calls by construction.
+    let hb = out
+        .split("(name = \"vrt-heartbeat\", worker = (")
+        .nth(1)
+        .unwrap();
+    let hb_block = hb.split("    )),").next().unwrap();
+    assert!(
+        hb_block.contains("limits = (cpuMs = 1000, memoryMb = 128),"),
+        "heartbeat carries the thin dispatch tier:\n{hb_block}"
+    );
     // Isolation: the heartbeat service appears in exactly TWO places —
     // its service definition and its socket's `service =` ref. It must
     // never be referenced from a tenant worker binding or a route.
@@ -1729,18 +1740,18 @@ fn system_workers_render_platform_cpu_budgets() {
         11,
         "rendered thin facades + the deny stub"
     );
-    // Dynamic workers emitted outside `emit_system_worker` — the per-
-    // worker cron dispatcher, qconsumer, heartbeat, waituntil probe —
-    // stay unlimited today: they are dispatch glue, not compute paths,
-    // and each emit site would want its own budget decision.
+    // Dynamic workers emitted outside `emit_system_worker` carry
+    // emit-site budgets: the per-worker cron dispatcher and wfops
+    // facade get the thin tier with a 2-subrequest fan-out bound;
+    // qconsumer/router inherit their manifest entry's budgets.
     let cron = out
         .split("(name = \"facade-cron-w-alpha-1\", worker = (")
         .nth(1)
         .unwrap();
     let cron_block = cron.split("    )),").next().unwrap();
     assert!(
-        !cron_block.contains("limits = ("),
-        "dynamic dispatch facades stay unlimited"
+        cron_block.contains("limits = (cpuMs = 1000, memoryMb = 128, subRequests = 2)"),
+        "cron dispatcher gets the thin dispatch tier:\n{cron_block}"
     );
     // Placement: inside the worker block, before `modules` — spot-check
     // the heaviest worker.
@@ -1765,19 +1776,22 @@ fn system_workers_render_platform_cpu_budgets() {
     let out = render_tenant_config(&input(&tenant, &bs, &unlimited))
         .unwrap()
         .text;
-    for tier in [
-        "cpuMs = 1000",
-        "cpuMs = 2000",
+    // System-tier dims keyed by the exact rendered group — the dynamic
+    // dispatch workers legitimately keep their emit-site budgets here
+    // (the cron dispatcher still renders `cpuMs = 1000`), so matching
+    // bare dimension names would be a false positive.
+    for group in [
         "cpuMs = 10000",
-        "memoryMb = 128",
-        "memoryMb = 192",
+        "cpuMs = 2000",
         "memoryMb = 768",
+        "memoryMb = 192",
         "subRequests = 8",
         "subRequests = 64",
+        "limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8)",
     ] {
         assert!(
-            !out.contains(tier),
-            "0-budget dimensions must not render: {tier}"
+            !out.contains(group),
+            "0-budget dimensions must not render: {group}"
         );
     }
     // A 0 dimension beside a declared one renders only the declared dim.
@@ -1795,7 +1809,13 @@ fn system_workers_render_platform_cpu_budgets() {
             .count(),
         11
     );
-    for tier in ["memoryMb = 128", "memoryMb = 192", "memoryMb = 768"] {
+    // `memoryMb = 128` legitimately survives on the cron dispatcher's
+    // emit-site budget — the heavy/system tiers are the unique ones.
+    for tier in [
+        "memoryMb = 192",
+        "memoryMb = 768",
+        "memoryMb = 128, subRequests = 8",
+    ] {
         assert!(!out.contains(tier), "memoryMb = 0 omits the dim: {tier}");
     }
 
