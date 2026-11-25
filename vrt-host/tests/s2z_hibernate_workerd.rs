@@ -162,7 +162,7 @@ fn render_spec(
     mod_w1: &str,
     class_w1: bool,
 ) -> Rendered {
-    render_spec_with(fx, p_w1, p_w2, p_wu, gen, mod_w1, class_w1, None)
+    render_spec_with(fx, p_w1, p_w2, p_wu, gen, mod_w1, class_w1, None, false)
 }
 
 /// `do_class`: declare that class as a SQL-less Durable Object on w1
@@ -178,6 +178,7 @@ fn render_spec_with(
     mod_w1: &str,
     class_w1: bool,
     do_class: Option<&str>,
+    enable_sql: bool,
 ) -> Rendered {
     let work_dir = fx.dir.path().join("work").join("t1").join(format!("gen-{gen}"));
     mkdir700(&work_dir);
@@ -203,7 +204,7 @@ fn render_spec_with(
         w1_do.push(json!({
             "className": class,
             "uniqueKey": "e".repeat(64),
-            "enableSql": false
+            "enableSql": enable_sql
         }));
         // workerd's DiskDirectory must exist: `<doStorageDir>/<workerId>`.
         std::fs::create_dir_all(fx.dir.path().join("do").join(W1)).unwrap();
@@ -540,7 +541,7 @@ async fn s2z_durable_object_tenant_never_hibernates() {
     let do_dir = fx.dir.path().join("do-root").join("t1");
     mkdir700(&do_dir);
     let (a, b, c) = (free_port(), free_port(), free_port());
-    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO, false, Some("EventLog"));
+    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO, false, Some("EventLog"), false);
     r.spec.do_storage = Some(DoStorageSpec {
         tenant_dir: do_dir,
         worker_classes: BTreeMap::new(),
@@ -566,37 +567,41 @@ async fn s2z_durable_object_tenant_never_hibernates() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires VRT_WORKERD_BIN"]
 async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
-    if std::env::var_os("VRT_REAL_HIBERNATION_WAKE").is_none() {
-        eprintln!("skip: set VRT_REAL_HIBERNATION_WAKE=1 to run post-hibernation alarm wake");
-        return;
-    }
     init_logs();
     if workerd_bin_or_skip().is_none() {
         return;
     }
     let _g = WORKERD_TEST_LOCK.lock().await;
     let fx = Fixture::new();
-    let do_dir = fx.dir.path().join("do-root").join("t1");
+    let do_dir = fx.dir.path().join("do");
     mkdir700(&do_dir);
     let (a, b, c) = (free_port(), free_port(), free_port());
-    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO_ALARM, false, Some("EventLog"));
+    let mut r = render_spec_with(&fx, a, b, c, 1, MOD_DO_ALARM, false, Some("EventLog"), true);
     r.spec.do_storage = Some(DoStorageSpec {
-        tenant_dir: do_dir,
+        tenant_dir: do_dir.clone(),
         worker_classes: BTreeMap::new(),
         transfer_sources: BTreeMap::new(),
     });
     let rt = TenantRuntime::new("t1");
     // The cell alarm index says this class has no due alarm: sleep allowed.
     rt.set_alarm_gate(true, Duration::from_secs(60));
-    let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), s2z_params());
+    // Give workerd enough time to shut down cleanly so the alarm scheduler
+    // metadata is durable before the generation is reaped.
+    let mut params = s2z_params();
+    params.kill_grace = Duration::from_secs(5);
+    let h = spawn_supervisor(rt.clone(), r.spec, SupervisorDeps::default(), params);
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
     let pid = rt.active_pid();
 
     // Arm a 30 s alarm, then let the tenant idle out.
     let (status, _) = get(a, "/alarm").await.unwrap();
     assert_eq!(status, 200);
+    // Let workerd commit the scheduler metadata (metadata.sqlite) before the
+    // generation is stopped.
+    tokio::time::sleep(Duration::from_secs(2)).await;
     wait_state(&rt, TenantState::Hibernated, Duration::from_secs(10)).await;
     wait_for(|| !pid_alive(pid), Duration::from_secs(5), "workerd pid exited").await;
+    dump_alarm_rows(&do_dir, "after hibernate");
 
     // The controller's alarm waker asks the host to start the generation.
     rt.await_wake(0, 64, 1 << 20, vrt_host::hibernate::WakeSourceKind::Alarm)
@@ -604,9 +609,10 @@ async fn s2z_do_alarm_wakes_a_hibernated_tenant() {
         .expect("alarm wake");
     wait_state(&rt, TenantState::Ready, Duration::from_secs(20)).await;
 
+    dump_alarm_rows(&do_dir, "after wake");
     // workerd reloads `_cf_ALARM` and fires the overdue alarm.
     let mut hits = 0;
-    for _ in 0..40 {
+    for _ in 0..160 {
         if let Some((200, body)) = get(a, "/alarm-hits").await {
             hits = body.trim().parse().unwrap_or(0);
             if hits > 0 {
@@ -916,6 +922,30 @@ async fn get_dbg(port: u16, path: &str, dbg: bool) -> Option<(u16, String)> {
 
 /// DO extending the native `DurableObject` base (the production
 /// regression: a Proxy ctx fails workerd's constructor type check).
+fn dump_alarm_rows(do_dir: &Path, when: &str) {
+    let path = do_dir
+        .join(W1)
+        .join("e".repeat(64))
+        .join("metadata.sqlite");
+    let Ok(conn) = rusqlite::Connection::open(&path) else {
+        eprintln!("alarm probe {when}: cannot open {}", path.display());
+        return;
+    };
+    let mut rows: Vec<String> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT actor_id, scheduled_time FROM _cf_ALARM") {
+        if let Ok(iter) = stmt.query_map([], |r| {
+            let id: String = r.get(0)?;
+            let t: i64 = r.get(1)?;
+            Ok(format!("{id}@{t}"))
+        }) {
+            for row in iter.flatten() {
+                rows.push(row);
+            }
+        }
+    }
+    eprintln!("alarm probe {when}: {} rows {:?}", rows.len(), rows);
+}
+
 const MOD_WS: &str = r#"
 export default {
   async fetch(req) {
@@ -936,7 +966,7 @@ export class EventLog extends DurableObject {
   async fetch(req) {
     const u = new URL(req.url);
     if (u.pathname === "/alarm") {
-      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      await this.ctx.storage.setAlarm(Date.now() + 15000);
       return new Response("armed");
     }
     if (u.pathname === "/alarm-hits") {
