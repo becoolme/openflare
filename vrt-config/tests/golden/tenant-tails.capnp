@@ -163,7 +163,7 @@ const config :Workerd.Config = (
         (name = "facade/facade-images.js", esModule = embed "sys/ba8bb3d0db40c543fca7e60ac7e230c8584c2c05c8023d227987a76c9b751aa3"),
         (name = "facade/images-decode.js", esModule = embed "sys/9918195eb004ae7d72b86e021f0c79e133b1348e6cd4b1629f3912cc85beaa92"),
         (name = "facade/images-engine.js", esModule = embed "sys/2d9afc9330930e841172a4e90e428d6b3e9a35358709bc8c1e038e0df9b2a596"),
-        (name = "facade/images-metadata.js", esModule = embed "sys/660a826bc2471eb40958631cb981e65d45c27e6fb9956a119fbed929c21776dc"),
+        (name = "facade/images-metadata.js", esModule = embed "sys/db3489722d8243fc78ab279c6787e2b916ccb2adc0789b7365d35480f626195b"),
         (name = "facade/images-transform.js", esModule = embed "sys/80a374883f7b5306d36babb918a1a152b7db116c4dcd8a04c2051753dba7414e"),
         (name = "facade/images-wire.js", esModule = embed "sys/092f5e374b124771938623bed2c0c6cf908a64f4029118112519dcc11dcce483"),
         (name = "third_party/jsquash/avif/avif_dec.js", esModule = embed "sys/65d0fd2b2e415bf2712c329694dc2bc257fc54f02572c29d5c46212ae6dc6c3c"),

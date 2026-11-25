@@ -216,8 +216,11 @@ function iptcDatasets(irb: Uint8Array): Map<number, string[]> {
       while (q + 5 <= size && irb[data + q] === 0x1c) {
         const record = irb[data + q + 1];
         const ds = irb[data + q + 2];
-        const n = idv.getUint16(q + 3);
+        let n = idv.getUint16(q + 3);
         q += 5;
+        // IIM extended length: bit 15 of the length field means the real
+        // length follows as a 4-octet value (field total = 4, flag included).
+        if (n & 0x8000) { n = idv.getUint32(q - 2) & 0x7fffffff; q += 2; }
         if (record === 2 && q + n <= size) {
           const list = out.get(ds) ?? [];
           list.push(dec.decode(irb.subarray(data + q, data + q + n)));

@@ -397,3 +397,284 @@ test("extractMetadata: avif source reads back a written Exif item", async () => 
   const meta = extractMetadata(withMeta, "avif");
   assert.deepEqual(meta.exif, tiff);
 });
+
+// ---- real-world container shapes ----
+
+/** Big-endian ("MM") TIFF: 3 IFD0 tags (offset + inline values) plus an
+ * IFD1 pointer carrying a thumbnail tag — the camera-produced shape. */
+function tiffMM() {
+  const make = enc.encode("DEVCAM\0");      // 7 bytes → offset
+  const cpr = enc.encode("(C) MM\0");       // 6 bytes → offset
+  const xres = new Uint8Array(8);           // RATIONAL 72/1 → offset
+  new DataView(xres.buffer).setUint32(0, 72); new DataView(xres.buffer).setUint32(4, 1);
+  const ifd0n = 3;
+  const dataOff = 8 + 2 + ifd0n * 12 + 4;
+  const ifd1Off = dataOff + make.length + cpr.length + xres.length;
+  const out = new Uint8Array(ifd1Off + 2 + 12 + 4);
+  const dv = new DataView(out.buffer);
+  out.set([0x4d, 0x4d]);                    // MM
+  dv.setUint16(2, 42); dv.setUint32(4, 8);
+  dv.setUint16(8, ifd0n);
+  let d = dataOff;
+  const entry = (i, tag, type, n, value) => {
+    const e = 10 + i * 12;
+    dv.setUint16(e, tag); dv.setUint16(e + 2, type); dv.setUint32(e + 4, n);
+    if (n <= 4) { out.set(value, e + 8); }
+    else { dv.setUint32(e + 8, d); out.set(value, d); d += value.length; }
+  };
+  entry(0, 0x010f, 2, make.length, make);   // Make
+  entry(1, 0x8298, 2, cpr.length, cpr);     // Copyright
+  entry(2, 0x011a, 5, 8, xres);             // XResolution RATIONAL
+  dv.setUint32(10 + ifd0n * 12, ifd1Off);   // next IFD → IFD1
+  dv.setUint16(ifd1Off, 1);
+  dv.setUint16(ifd1Off + 2, 0x0201); dv.setUint16(ifd1Off + 4, 4);
+  dv.setUint32(ifd1Off + 6, 1); dv.setUint32(ifd1Off + 10, 999);
+  dv.setUint32(ifd1Off + 14, 0);
+  return out;
+}
+
+test("copyright filter: big-endian multi-IFD TIFF keeps only 0x8298", () => {
+  const mm = tiffMM();
+  const src = jpegWithMeta(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), { exif: mm });
+  const meta = extractMetadata(src, "jpeg");
+  assert.deepEqual(meta.exif, mm, "keep passthrough is byte-identical");
+  const filtered = attachMetadata(
+    new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), "jpeg",
+    { exif: mm }, "copyright", 1, 1,
+  );
+  const app1 = jpegSegments(filtered, 0xe1);
+  const seg = app1.find((s) => s[0] === 0x45);
+  assert.ok(seg, "rebuilt EXIF present");
+  const t = seg.subarray(6);
+  const tdv = new DataView(t.buffer, t.byteOffset, t.byteLength);
+  assert.equal(t[0], 0x49, "rebuilt as little-endian II");
+  assert.equal(tdv.getUint16(8, true), 1, "exactly one tag");
+  assert.equal(tdv.getUint16(10, true), 0x8298);
+  const text = new TextDecoder().decode(t);
+  assert.ok(text.includes("(C) MM"), "copyright text survives");
+  assert.ok(!text.includes("DEVCAM"), "Make stripped");
+});
+
+/** 8BIM block: custom Pascal name + optional leading non-IPTC resources. */
+function iptcBlockEx({ name = "", lead = [], datasets = [] }) {
+  const blocks = [];
+  for (const [id, payload] of [...lead, [0x0404, iimBytes(datasets)]]) {
+    const nb = enc.encode(name);
+    const nameTotal = 1 + nb.length + ((1 + nb.length) % 2);
+    const blk = new Uint8Array(4 + 2 + nameTotal + 4 + payload.length + (payload.length & 1));
+    const dv = new DataView(blk.buffer);
+    blk.set(enc.encode("8BIM"), 0);
+    dv.setUint16(4, id);
+    blk[6] = nb.length;
+    blk.set(nb, 7);
+    dv.setUint32(6 + nameTotal, payload.length);
+    blk.set(payload, 6 + nameTotal + 4);
+    blocks.push(blk);
+  }
+  const total = blocks.reduce((s, b) => s + b.length, 0);
+  const out = new Uint8Array(total);
+  let p = 0;
+  for (const b of blocks) { out.set(b, p); p += b.length; }
+  return out;
+}
+
+/** IIM record-2 datasets; entry [ds, value, extendedLen?]. */
+function iimBytes(datasets) {
+  let len = 0;
+  for (const [, v, ext] of datasets) len += (ext ? 7 : 5) + enc.encode(v).length;
+  const out = new Uint8Array(len);
+  const dv = new DataView(out.buffer);
+  let q = 0;
+  for (const [ds, v, ext] of datasets) {
+    const vb = enc.encode(v);
+    out[q] = 0x1c; out[q + 1] = 2; out[q + 2] = ds;
+    if (ext) {
+      dv.setUint32(q + 3, 0x80000000 | vb.length);
+      out.set(vb, q + 7);
+      q += 7 + vb.length;
+    } else {
+      dv.setUint16(q + 3, vb.length);
+      out.set(vb, q + 5);
+      q += 5 + vb.length;
+    }
+  }
+  return out;
+}
+
+test("iptcToXmp: named 8BIM, leading non-IPTC resource, multi-value datasets, extended length", () => {
+  const irb = iptcBlockEx({
+    name: "mynrsrc",
+    lead: [[0x03ed, new Uint8Array([1, 2, 3, 4])]], // resolution info, not IPTC
+    datasets: [
+      [0x74, "RIGHTS-1"],
+      [0x19, "k1"], [0x19, "k2"],               // keywords repeat → rdf:Bag x2
+      [0x78, "A".repeat(64), true],             // extended-length dataset
+    ],
+  });
+  const xmp = new TextDecoder().decode(iptcToXmp(irb));
+  assert.ok(xmp.includes("RIGHTS-1"), "copyright mapped");
+  const bag = /dc:subject>.*?rdf:Bag(.*?)<\/rdf:Bag/s.exec(xmp);
+  assert.ok(bag && bag[1].includes(">k1<") && bag[1].includes(">k2<"),
+    "both keywords in rdf:Bag");
+  assert.ok(xmp.includes("A".repeat(64)), "extended-length dataset decoded");
+});
+
+test("extractJpeg: COM and other APPn segments before metadata still parse", () => {
+  const tiff = tiffWithCopyright();
+  const segs = [
+    jpegSeg(0xe0, new Uint8Array([0x4a, 0x46, 0x49, 0x46, 0])),  // JFIF APP0
+    jpegSeg(0xfe, enc.encode("a comment")),                       // COM
+    jpegSeg(0xe1, (() => { const p = new Uint8Array(6 + tiff.length); p.set(EXIF_PFX); p.set(tiff, 6); return p; })()),
+  ];
+  const out = new Uint8Array(2 + segs.reduce((s, x) => s + x.length, 0) + 2);
+  out.set([0xff, 0xd8]); let p = 2;
+  for (const s of segs) { out.set(s, p); p += s.length; }
+  out.set([0xff, 0xd9], p);
+  const meta = extractMetadata(out, "jpeg");
+  assert.deepEqual(meta.exif, tiff);
+});
+
+test("extractMetadata: truncated segment yields partial meta, no throw", () => {
+  const tiff = tiffWithCopyright();
+  const full = jpegWithMeta(new Uint8Array([0xff, 0xd8, 0xff, 0xd9]),
+    { exif: tiff, xmp: xmpPacket() });
+  const cut = full.subarray(0, full.length - 5); // chop inside the XMP seg
+  const meta = extractMetadata(cut, "jpeg");
+  assert.deepEqual(meta.exif, tiff, "earlier EXIF still found");
+  assert.equal(meta.xmp, undefined);
+});
+
+test("extractPng: compressed iTXt (flag=1) is skipped", () => {
+  const kw = enc.encode("XML:com.adobe.xmp");
+  const itxt = new Uint8Array(kw.length + 1 + 2 + 1 + 1 + 8);
+  itxt.set(kw);
+  itxt[kw.length + 1] = 1; // compressed — inflater unavailable, must skip
+  const chunk = (t, d) => {
+    const c = new Uint8Array(12 + d.length);
+    const dv = new DataView(c.buffer);
+    dv.setUint32(0, d.length); c.set(enc.encode(t), 4); c.set(d, 8);
+    return c;
+  };
+  const sig = new Uint8Array(8);
+  const dv8 = new DataView(sig.buffer);
+  dv8.setUint32(0, 0x89504e47); dv8.setUint32(4, 0x0d0a1a0a);
+  const png = new Uint8Array(8 + 25 + 12 + itxt.length + 12);
+  let p = 0;
+  png.set(sig, 0); p += 8;
+  png.set(chunk("IHDR", new Uint8Array(13)), p); p += 25;
+  png.set(chunk("iTXt", itxt), p); p += 12 + itxt.length;
+  png.set(chunk("IEND", new Uint8Array(0)), p);
+  const meta = extractMetadata(png, "png");
+  assert.equal(meta.xmp, undefined);
+});
+
+test("extractMetadata: webp VP8X EXIF+XMP chunks", () => {
+  const tiff = tiffWithCopyright();
+  const xmp = xmpPacket();
+  const riff = (fourcc, d) => {
+    const c = new Uint8Array(8 + d.length + (d.length & 1));
+    const dv = new DataView(c.buffer);
+    c.set(enc.encode(fourcc)); dv.setUint32(4, d.length, true); c.set(d, 8);
+    return c;
+  };
+  const vp8x = new Uint8Array(10);
+  vp8x[0] = 0x0c; // exif|xmp flags
+  const body = [riff("VP8X", vp8x), riff("EXIF", tiff), riff("XMP ", xmp)];
+  const len = body.reduce((s, c) => s + c.length, 0);
+  const out = new Uint8Array(12 + len);
+  out.set(enc.encode("RIFF"));
+  new DataView(out.buffer).setUint32(4, 4 + len, true);
+  out.set(enc.encode("WEBP"), 8);
+  let p = 12;
+  for (const c of body) { out.set(c, p); p += c.length; }
+  const meta = extractMetadata(out, "webp");
+  assert.deepEqual(meta.exif, tiff);
+  assert.deepEqual(meta.xmp, xmp);
+});
+
+test("transform: real PNG source with eXIf+iTXt → jpeg keep output", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const base = await eng.encodeImage(solidFrame(8, 8), "png", 90);
+  const tiff = tiffWithCopyright();
+  const xmp = xmpPacket();
+  // Build the source PNG by attaching metadata to a real encoded PNG —
+  // exercises the same writer against our own reader.
+  const src = attachMetadata(base.bytes, "png", { exif: tiff, xmp }, "keep", 8, 8);
+  const out = await transform(src, { metadata: "keep" });
+  const app1 = jpegSegments(out, 0xe1);
+  const exifSeg = app1.find((s) => s[0] === 0x45);
+  const xmpSeg = app1.find((s) => s[0] === 0x68);
+  assert.deepEqual(exifSeg?.subarray(6), tiff, "PNG eXIf → JPEG APP1");
+  assert.ok(xmpSeg, "PNG iTXt xmp → JPEG APP1");
+  // JFIF APP0 must remain first; our segments land after it.
+  assert.equal(out[2], 0xff); assert.equal(out[3], 0xe0, "APP0 first");
+  assert.equal(out[4 + new DataView(out.buffer, out.byteOffset).getUint16(4) + 1], 0xe1);
+});
+
+test("transform: real WebP source with EXIF+XMP → jpeg keep output", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const base = await eng.encodeImage(solidFrame(8, 8), "webp", 90);
+  const tiff = tiffWithCopyright();
+  const xmp = xmpPacket();
+  const src = attachMetadata(base.bytes, "webp", { exif: tiff, xmp }, "keep", 8, 8);
+  const out = await transform(src, { metadata: "keep" });
+  const app1 = jpegSegments(out, 0xe1);
+  const exifSeg = app1.find((s) => s[0] === 0x45);
+  const xmpSeg = app1.find((s) => s[0] === 0x68);
+  assert.deepEqual(exifSeg?.subarray(6), tiff, "webp EXIF → jpeg APP1");
+  assert.ok(xmpSeg, "webp XMP → jpeg APP1");
+});
+
+test("transform: APP13 with only non-IPTC Photoshop resources → no XMP mapping on png out", async () => {
+  const eng = await import(facadeModule("images-engine.js"));
+  const base = await eng.encodeImage(solidFrame(8, 8), "jpeg", 90);
+  const irb = iptcBlockEx({
+    name: "res",
+    lead: [], datasets: [], // will be ignored
+  });
+  // Build manually: single 0x03ed resource, no 0x0404.
+  const dv0 = new Uint8Array(4 + 2 + 2 + 4 + 4);
+  dv0.set(enc.encode("8BIM"), 0);
+  new DataView(dv0.buffer).setUint16(4, 0x03ed);
+  new DataView(dv0.buffer).setUint32(8, 4);
+  dv0.set([9, 9, 9, 9], 12);
+  const src = jpegWithMeta(base.bytes, { iptc: dv0 });
+  const out = await transform(src, {
+    metadata: "keep",
+    output_format: "image/png",
+  });
+  assert.equal(pngChunks(out, "iTXt").length, 0,
+    "non-0404 Photoshop block produces no XMP");
+});
+
+test("transform: gif source + metadata=keep still transforms, no metadata attached", async () => {
+  const realGif = Uint8Array.from(
+    atob("R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=="),
+    (c) => c.charCodeAt(0),
+  );
+  const out = await transform(realGif, {
+    metadata: "keep",
+    output_format: "image/png",
+  });
+  assert.equal(pngChunks(out, "eXIf").length, 0);
+  assert.equal(pngChunks(out, "iTXt").length, 0);
+});
+
+test("copyright filter: inline (<=4 byte) copyright value survives", () => {
+  const tiff = new Uint8Array(8 + 2 + 12 + 4);
+  const dv = new DataView(tiff.buffer);
+  tiff.set([0x49, 0x49]); dv.setUint16(2, 42, true); dv.setUint32(4, 8, true);
+  dv.setUint16(8, 1);
+  dv.setUint16(10, 0x8298, true); dv.setUint16(12, 2, true);
+  dv.setUint32(14, 3, true);                  // 3 bytes → inline
+  tiff.set(enc.encode("C)\0"), 18);
+  const out = attachMetadata(
+    new Uint8Array([0xff, 0xd8, 0xff, 0xd9]), "jpeg",
+    { exif: tiff }, "copyright", 1, 1,
+  );
+  const seg = jpegSegments(out, 0xe1).find((s) => s[0] === 0x45);
+  assert.ok(seg, "inline copyright kept");
+  const t = seg.subarray(6);
+  const tdv = new DataView(t.buffer, t.byteOffset, t.byteLength);
+  assert.equal(tdv.getUint32(14, true), 3, "inline count preserved");
+});
