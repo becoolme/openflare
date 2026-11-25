@@ -162,9 +162,9 @@ const config :Workerd.Config = (
       modules = [
         (name = "facade/facade-images.js", esModule = embed "sys/ba8bb3d0db40c543fca7e60ac7e230c8584c2c05c8023d227987a76c9b751aa3"),
         (name = "facade/images-decode.js", esModule = embed "sys/9918195eb004ae7d72b86e021f0c79e133b1348e6cd4b1629f3912cc85beaa92"),
-        (name = "facade/images-engine.js", esModule = embed "sys/2d9afc9330930e841172a4e90e428d6b3e9a35358709bc8c1e038e0df9b2a596"),
+        (name = "facade/images-engine.js", esModule = embed "sys/a382a3c01fe07679b012749b7482c45a898df2b0f68f0bb3da34dfc5dd9360a7"),
         (name = "facade/images-metadata.js", esModule = embed "sys/db3489722d8243fc78ab279c6787e2b916ccb2adc0789b7365d35480f626195b"),
-        (name = "facade/images-transform.js", esModule = embed "sys/80a374883f7b5306d36babb918a1a152b7db116c4dcd8a04c2051753dba7414e"),
+        (name = "facade/images-transform.js", esModule = embed "sys/94025b16fca0820712d5d376670a9b3bfa8056f6565868f09c5ec988ab2fe752"),
         (name = "facade/images-wire.js", esModule = embed "sys/092f5e374b124771938623bed2c0c6cf908a64f4029118112519dcc11dcce483"),
         (name = "third_party/jsquash/avif/avif_dec.js", esModule = embed "sys/65d0fd2b2e415bf2712c329694dc2bc257fc54f02572c29d5c46212ae6dc6c3c"),
         (name = "third_party/jsquash/avif/avif_dec.wasm", wasm = embed "sys/5c35dde23dfd862088a49a6b8a9fe81f9f9a1a46aaa27de7efd7baa7611c4b47"),
@@ -314,7 +314,7 @@ const config :Workerd.Config = (
       compatibilityFlags = ["experimental", "service_binding_extra_handlers"],
       modules = [
         (name = "facade/egress/egress.js", esModule = embed "sys/65ab2aa3980e197c3258f378238c395a9a83f205f4d8183b371f94e46295ff61"),
-        (name = "facade/egress/cf-image.js", esModule = embed "sys/42426c2d2c18a19a8cf5c8aab3e182118a05689d88f6bed8f4e386856439596d"),
+        (name = "facade/egress/cf-image.js", esModule = embed "sys/46c055faf9b574c9c50f293360ec07d5278da969e4f1fb62e02ee94a9bb0f86a"),
         (name = "facade/egress/ip.js", esModule = embed "sys/6575c6e66245aebea369d5e97ae7ffc6783652044ed2adc2be462c9df3e7b97b"),
         (name = "facade/egress/policy.js", esModule = embed "sys/e6dc4ee5d55668354c4a180e570142fb0a0df195e6228baa038c4d7a96d72fef"),
         (name = "facade/egress/shared.js", esModule = embed "sys/353d7aa02d71f0745c83d132dd884378b3ff2fc2ec2215ebdd8e08d5e4ab89dc"),

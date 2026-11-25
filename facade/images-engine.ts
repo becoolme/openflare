@@ -443,18 +443,123 @@ export function blurImage(img: ImageDataLike, sigma: number): ImageDataLike {
   return frame(src, w, h);
 }
 
-export function sharpenImage(img: ImageDataLike, amount: number): ImageDataLike {
-  // Unsharp mask: out = orig + amount × (orig - blur).
-  const blurred = blurImage(img, 1);
+/** Uniform 3x3 mean — the literal box blur upstream documents for
+ * `sharpen` box mode ("averaging each pixel with its eight surrounding
+ * pixels"). Edge taps are skipped and the divisor renormalized. */
+function boxBlur3(img: ImageDataLike): ImageDataLike {
+  const { width: w, height: h, data: src } = img;
+  const out = new Uint8ClampedArray(src.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const yy = y + dy;
+        if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = x + dx;
+          if (xx < 0 || xx >= w) continue;
+          const i = (yy * w + xx) * 4;
+          r += src[i]; g += src[i + 1]; b += src[i + 2];
+          n++;
+        }
+      }
+      const o = (y * w + x) * 4;
+      out[o] = r / n; out[o + 1] = g / n; out[o + 2] = b / n;
+      out[o + 3] = src[o + 3];
+    }
+  }
+  return frame(out, w, h);
+}
+
+/** True Gaussian blur — separable kernel, radius = ceil(3*sigma).
+ * Out-of-bounds taps are skipped and the surviving weight
+ * renormalized, so edges neither darken nor bleed. */
+export function gaussianBlur(img: ImageDataLike, sigma: number): ImageDataLike {
+  const { width: w, height: h, data: src } = img;
+  const radius = Math.max(1, Math.ceil(3 * sigma));
+  const kernel = new Float64Array(2 * radius + 1);
+  let ksum = 0;
+  for (let i = -radius; i <= radius; i++) {
+    const v = Math.exp(-(i * i) / (2 * sigma * sigma));
+    kernel[i + radius] = v;
+    ksum += v;
+  }
+  for (let i = 0; i < kernel.length; i++) kernel[i] /= ksum;
+  const tmp = new Float64Array(src.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0, wsum = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const xx = x + k;
+        if (xx < 0 || xx >= w) continue;
+        const kv = kernel[k + radius];
+        const i = (y * w + xx) * 4;
+        r += src[i] * kv; g += src[i + 1] * kv; b += src[i + 2] * kv;
+        wsum += kv;
+      }
+      const o = (y * w + x) * 4;
+      tmp[o] = r / wsum; tmp[o + 1] = g / wsum; tmp[o + 2] = b / wsum;
+      tmp[o + 3] = src[o + 3];
+    }
+  }
+  const out = new Uint8ClampedArray(src.length);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let r = 0, g = 0, b = 0, wsum = 0;
+      for (let k = -radius; k <= radius; k++) {
+        const yy = y + k;
+        if (yy < 0 || yy >= h) continue;
+        const kv = kernel[k + radius];
+        const i = (yy * w + x) * 4;
+        r += tmp[i] * kv; g += tmp[i + 1] * kv; b += tmp[i + 2] * kv;
+        wsum += kv;
+      }
+      const o = (y * w + x) * 4;
+      out[o] = r / wsum; out[o + 1] = g / wsum; out[o + 2] = b / wsum;
+      out[o + 3] = src[o + 3];
+    }
+  }
+  return frame(out, w, h);
+}
+
+/** Unsharp-mask core: out = orig + amount·(orig - blur) per RGB
+ * channel, gated on |orig - blur| >= threshold (upstream `threshold`
+ * semantics — low-contrast detail is left alone). */
+function unsharpMask(
+  img: ImageDataLike,
+  blurred: ImageDataLike,
+  amount: number,
+  threshold: number,
+): ImageDataLike {
   const out = new Uint8ClampedArray(img.data.length);
-  const a = Math.max(0, Math.min(10, amount));
   for (let i = 0; i < out.length; i += 4) {
     for (let c = 0; c < 3; c++) {
-      out[i + c] = img.data[i + c] + a * (img.data[i + c] - blurred.data[i + c]);
+      const d = img.data[i + c] - blurred.data[i + c];
+      out[i + c] = Math.abs(d) >= threshold ? img.data[i + c] + amount * d : img.data[i + c];
     }
     out[i + 3] = img.data[i + 3];
   }
   return frame(out, img.width, img.height);
+}
+
+export function sharpenImage(img: ImageDataLike, amount: number): ImageDataLike {
+  return unsharpMask(img, boxBlur3(img), Math.max(0, Math.min(10, amount)), 0);
+}
+
+/** `sharpen={mode:"gaussian",...}` — unsharp mask over a true Gaussian
+ * blur (sigma 0<..<=5) with the upstream per-channel threshold gate. */
+export function gaussianSharpenImage(
+  img: ImageDataLike,
+  amount: number,
+  sigma: number,
+  threshold: number,
+): ImageDataLike {
+  return unsharpMask(
+    img,
+    gaussianBlur(img, sigma),
+    Math.max(0, Math.min(10, amount)),
+    Math.max(0, Math.min(255, Math.round(threshold))),
+  );
 }
 
 export function adjustImage(

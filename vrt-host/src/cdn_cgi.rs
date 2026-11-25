@@ -19,9 +19,9 @@ use crate::endpoint::{UpstreamIo, WorkerEndpoint};
 use crate::ingress::IngressError;
 use crate::route::RouteTarget;
 use crate::supervisor::TenantRuntime;
+use axum::body::Body;
 use axum::body::Bytes;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
-use axum::body::Body;
 use http_body_util::{BodyExt, Full};
 use std::sync::Arc;
 
@@ -96,8 +96,63 @@ struct Parsed {
     output_format: Option<String>,
     output_quality: Option<u32>,
     anim: bool,
-    metadata: bool,
+    /// `metadata=exif` routes to `/info` (platform extension — the
+    /// upstream URL vocabulary has no source-info verb of its own).
+    info: bool,
+    /// `metadata=none|copyright|keep` — sent on the transform wire.
+    wire_metadata: Option<String>,
     onerror_redirect: bool,
+}
+
+/// `quality` value: fixed 1-100 or a perceptual tier. Upstream
+/// publishes no integer mapping; the anchors match what other
+/// CF-compat implementations picked.
+fn quality_level(s: &str) -> Result<u32, u32> {
+    match s {
+        "high" => Ok(90),
+        "medium-high" => Ok(80),
+        "medium-low" => Ok(60),
+        "low" => Ok(40),
+        _ => Ok(parse_num(s, 1.0, 100.0)? as u32),
+    }
+}
+
+/// `%XX` escapes decode once per option value — upstream URLs carry
+/// percent-encoded `#`/`(` characters in e.g. color args. Malformed
+/// sequences pass through so the option's own validation types them.
+fn pct_decode(s: &str) -> String {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    if !s.contains('%') {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let dec = if bytes[i] == b'%' && i + 2 < bytes.len() {
+            match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                (Some(h), Some(l)) => Some(h * 16 + l),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(d) = dec {
+            out.push(d);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn parse_num(s: &str, min: f64, max: f64) -> Result<f64, u32> {
@@ -108,10 +163,131 @@ fn parse_num(s: &str, min: f64, max: f64) -> Result<f64, u32> {
     Ok(v)
 }
 
+/// Top-level option split: commas inside `(...)` groups do not split —
+/// the structured form nests `k=v` pairs (and `(a,b)` lists) under one
+/// parameter, e.g. `sharpen=(mode=gaussian,amount=1,sigma=1.5)`.
+fn split_opts(raw: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in raw.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&raw[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&raw[start..]);
+    out
+}
+
+/// `(k=v,...)` group → its inner comma-list, else `None`.
+fn group_inner(v: &str) -> Option<&str> {
+    let v = v.trim();
+    v.strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .map(str::trim)
+}
+
+fn group_pairs(inner: &str) -> Result<Vec<(&str, &str)>, u32> {
+    split_opts(inner)
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|pair| pair.split_once('=').ok_or(9423u32))
+        .collect()
+}
+
+/// Chromium client hints for `quality.slow-connection` (upstream
+/// applies it when rtt>150ms, save-data=on, ect is 2g-class, or
+/// downlink<5Mbps).
+fn slow_connection(headers: &HeaderMap) -> bool {
+    let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
+    if h("rtt")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some_and(|r| r > 150.0)
+    {
+        return true;
+    }
+    if h("save-data").is_some_and(|v| v.eq_ignore_ascii_case("on")) {
+        return true;
+    }
+    if h("ect").is_some_and(|v| matches!(v, "slow-2g" | "2g" | "3g")) {
+        return true;
+    }
+    if h("downlink")
+        .and_then(|v| v.parse::<f64>().ok())
+        .is_some_and(|d| d < 5.0)
+    {
+        return true;
+    }
+    false
+}
+
+/// `width=auto`: Viewport-Width/Sec-CH-Viewport-Width picks the
+/// smallest breakpoint >= the viewport (largest when beyond all);
+/// otherwise a UA heuristic picks mobile/desktop fallbacks — the same
+/// two upstream fallback sources, with upstream's defaults.
+fn auto_width(headers: &HeaderMap, breakpoints: &[f64], mobile: f64, desktop: f64) -> f64 {
+    let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok());
+    let vw = h("viewport-width")
+        .or_else(|| h("sec-ch-viewport-width"))
+        .and_then(|v| v.parse::<f64>().ok());
+    if let Some(vw) = vw {
+        if vw > 0.0 {
+            let mut bps: Vec<f64> = breakpoints.to_vec();
+            bps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            return bps
+                .iter()
+                .copied()
+                .find(|&b| b >= vw)
+                .unwrap_or_else(|| *bps.last().unwrap_or(&desktop));
+        }
+    }
+    let ua = h("user-agent").unwrap_or_default();
+    if ua.contains("Mobile")
+        || ua.contains("Android")
+        || ua.contains("iPhone")
+        || ua.contains("iPad")
+    {
+        mobile
+    } else {
+        desktop
+    }
+}
+
+/// A trim/border length on the URL: `"Np"` percent strings pass
+/// through for the facade to resolve against the axis length;
+/// anything else is a nonnegative finite number.
+fn trim_len(s: &str) -> Result<serde_json::Value, u32> {
+    if let Some(p) = s.strip_suffix('p') {
+        parse_num(p, 0.0, 100.0)?;
+        return Ok(s.into());
+    }
+    Ok(parse_num(s, 0.0, 16384.0)?.into())
+}
+
+/// Multiply whole-pixel values (>=1) of the named keys by dpr —
+/// fractions (0..1) and `"Np"` percent strings pass through for the
+/// facade to resolve against the real axis length.
+fn scale_px(v: &mut serde_json::Value, dpr: f64) {
+    for key in ["top", "right", "bottom", "left", "width", "height", "keep"] {
+        if let Some(n) = v.get(key).and_then(|x| x.as_f64()) {
+            if n >= 1.0 {
+                v[key] = (n * dpr).round().into();
+            }
+        }
+    }
+}
+
 /// Translate `k=v,k=v` URL options into the facade `transforms` op JSON.
-/// CF's URL vocabulary is a near-1:1 projection of the binding op keys;
-/// keys with no vendored-engine support pass through so the facade
-/// fails closed with the typed code (`segment`, `zoom`, `anim`→9401).
+/// Structured groups `(k=v,...)` mirror the cf.image object form;
+/// the older compact forms keep working. Keys with no vendored-engine
+/// support pass through so the facade fails closed with the typed
+/// code (`segment`, `zoom`, `anim`→9401).
 fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
     let mut op = serde_json::Map::new();
     let mut p = Parsed {
@@ -119,40 +295,137 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
         output_format: None,
         output_quality: None,
         anim: false,
-        metadata: false,
+        info: false,
+        wire_metadata: None,
         onerror_redirect: false,
     };
     let mut dpr = 1.0f64;
     let mut width: Option<f64> = None;
     let mut height: Option<f64> = None;
-    for pair in raw.split(',') {
+    let mut trim_val: Option<serde_json::Value> = None;
+    let mut border_map = serde_json::Map::new();
+    let mut padding_seen = false;
+    let mut compression_fast = false;
+    for pair in split_opts(raw) {
         let (key, value) = pair.split_once('=').ok_or(9423u32)?;
-        let v = value.trim();
+        let decoded = pct_decode(value);
+        let v = decoded.trim();
         match key {
-            "width" => width = Some(parse_num(v, 1.0, 16384.0)?),
-            "height" => height = Some(parse_num(v, 1.0, 16384.0)?),
-            "dpr" => dpr = parse_num(v, 0.1, 4.0)?,
-            "fit" => match v {
-                "scale-down" | "contain" | "cover" | "crop" | "pad" | "squeeze" => {
-                    op.insert("fit".into(), v.into());
+            "width" | "w" => {
+                if v == "auto" {
+                    width = Some(auto_width(
+                        headers,
+                        &[320.0, 768.0, 960.0, 1200.0],
+                        768.0,
+                        1200.0,
+                    ));
+                } else if let Some(inner) = group_inner(v) {
+                    let mut mobile = 768.0;
+                    let mut desktop = 1200.0;
+                    let mut bps = vec![320.0, 768.0, 960.0, 1200.0];
+                    for (sk, sv) in group_pairs(inner)? {
+                        match sk {
+                            "mode" | "m" => {
+                                if sv != "auto" {
+                                    return Err(9423);
+                                }
+                            }
+                            "mobile" | "mb" => mobile = parse_num(sv, 1.0, 16384.0)?,
+                            "desktop" | "dt" => desktop = parse_num(sv, 1.0, 16384.0)?,
+                            "breakpoints" | "bp" | "b" => {
+                                let Some(list) = group_inner(sv) else {
+                                    return Err(9423);
+                                };
+                                let parsed: Result<Vec<f64>, u32> = split_opts(list)
+                                    .into_iter()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .map(|s| parse_num(s.trim(), 1.0, 16384.0))
+                                    .collect();
+                                let parsed = parsed?;
+                                if parsed.is_empty() {
+                                    return Err(9423);
+                                }
+                                bps = parsed;
+                            }
+                            _ => return Err(9423),
+                        }
+                    }
+                    width = Some(auto_width(headers, &bps, mobile, desktop));
+                } else {
+                    width = Some(parse_num(v, 1.0, 16384.0)?);
+                }
+            }
+            "height" | "h" => height = Some(parse_num(v, 1.0, 16384.0)?),
+            "dpr" => dpr = parse_num(v, 0.1, 2.0)?,
+            "fit" => {
+                if let Some(inner) = group_inner(v) {
+                    let mut m = serde_json::Map::new();
+                    for (sk, sv) in group_pairs(inner)? {
+                        match sk {
+                            "mode" => {
+                                m.insert("mode".into(), sv.into());
+                            }
+                            "upscale" => {
+                                m.insert("upscale".into(), sv.into());
+                            }
+                            _ => return Err(9423),
+                        }
+                    }
+                    if m.get("mode").is_none() {
+                        return Err(9423);
+                    }
+                    op.insert("fit".into(), m.into());
+                } else {
+                    match v {
+                        "scale-down" | "contain" | "cover" | "crop" | "aspect-crop"
+                        | "scale-up" | "pad" | "squeeze" => {
+                            op.insert("fit".into(), v.into());
+                        }
+                        _ => return Err(9423),
+                    }
+                }
+            }
+            "flip" => match v {
+                "h" | "v" | "hv" => {
+                    op.insert("flip".into(), v.into());
                 }
                 _ => return Err(9423),
             },
-            "gravity" => {
-                // Named anchors pass through; `XxY` fractions map onto
-                // the binding's coordinate-gravity object.
-                match v {
-                    "auto" | "entropy" | "face" | "center" | "top" | "bottom" | "left"
-                    | "right" => {
-                        op.insert("gravity".into(), v.into());
+            "gravity" | "g" => {
+                // Named anchors pass through (`face` reaches the facade,
+                // which fails closed — no detection is vendored); `XxY`
+                // fractions and the `(x=,y=)` group map onto the
+                // binding's coordinate-gravity object.
+                if let Some(inner) = group_inner(v) {
+                    let (mut x, mut y) = (None, None);
+                    for (sk, sv) in group_pairs(inner)? {
+                        match sk {
+                            "x" => x = Some(parse_num(sv, 0.0, 1.0)?),
+                            "y" => y = Some(parse_num(sv, 0.0, 1.0)?),
+                            _ => return Err(9423),
+                        }
                     }
-                    _ => {
-                        let (x, y) = v.split_once('x').ok_or(9423u32)?;
-                        let (x, y) = (parse_num(x, 0.0, 1.0)?, parse_num(y, 0.0, 1.0)?);
-                        op.insert(
-                            "gravity".into(),
-                            serde_json::json!({"x": x, "y": y, "mode": "remainder"}),
-                        );
+                    let (Some(x), Some(y)) = (x, y) else {
+                        return Err(9423);
+                    };
+                    op.insert(
+                        "gravity".into(),
+                        serde_json::json!({"x": x, "y": y, "mode": "remainder"}),
+                    );
+                } else {
+                    match v {
+                        "auto" | "entropy" | "face" | "center" | "top" | "bottom" | "left"
+                        | "right" => {
+                            op.insert("gravity".into(), v.into());
+                        }
+                        _ => {
+                            let (x, y) = v.split_once('x').ok_or(9423u32)?;
+                            let (x, y) = (parse_num(x, 0.0, 1.0)?, parse_num(y, 0.0, 1.0)?);
+                            op.insert(
+                                "gravity".into(),
+                                serde_json::json!({"x": x, "y": y, "mode": "remainder"}),
+                            );
+                        }
                     }
                 }
             }
@@ -164,7 +437,47 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
                 op.insert("blur".into(), parse_num(v, 1.0, 250.0)?.into());
             }
             "sharpen" => {
-                op.insert("sharpen".into(), parse_num(v, 0.0, 10.0)?.into());
+                if let Some(inner) = group_inner(v) {
+                    let mut m = serde_json::Map::new();
+                    let mut mode = "box";
+                    for (sk, sv) in group_pairs(inner)? {
+                        match sk {
+                            "mode" => match sv {
+                                "box" | "gaussian" => mode = sv,
+                                _ => return Err(9423),
+                            },
+                            "amount" => {
+                                m.insert("amount".into(), parse_num(sv, 0.0, 10.0)?.into());
+                            }
+                            "sigma" => {
+                                let s = parse_num(sv, f64::EPSILON, 5.0)?;
+                                m.insert("sigma".into(), s.into());
+                            }
+                            "threshold" => {
+                                let t = parse_num(sv, 0.0, 255.0)?;
+                                if t.fract() != 0.0 {
+                                    return Err(9423);
+                                }
+                                m.insert("threshold".into(), (t as u32).into());
+                            }
+                            _ => return Err(9423),
+                        }
+                    }
+                    if m.get("amount").is_none() {
+                        return Err(9423);
+                    }
+                    if mode == "gaussian" {
+                        if m.get("sigma").is_none() {
+                            return Err(9423);
+                        }
+                    } else if m.get("sigma").is_some() || m.get("threshold").is_some() {
+                        return Err(9423);
+                    }
+                    m.insert("mode".into(), mode.into());
+                    op.insert("sharpen".into(), m.into());
+                } else {
+                    op.insert("sharpen".into(), parse_num(v, 0.0, 10.0)?.into());
+                }
             }
             "brightness" => {
                 op.insert("brightness".into(), parse_num(v, 0.0, 3.0)?.into());
@@ -184,39 +497,163 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
                 }
                 op.insert("background".into(), v.into());
             }
-            "trim" => {
-                // `top x right x bottom x left` pixel inset, or `border`
-                // for content-detected trimming.
-                if v == "border" {
-                    op.insert("trim".into(), "border".into());
+            "trim"
+            | "trim.mode"
+            | "trim.top"
+            | "trim.right"
+            | "trim.bottom"
+            | "trim.left"
+            | "trim.width"
+            | "trim.height"
+            | "trim.border.color"
+            | "trim.border.tolerance"
+            | "trim.border.keep" => {
+                // All trim spellings accumulate into one object emitted
+                // after the loop so dpr can scale the pixel counts:
+                // `trim=color|border`, `trim=T;R;B;L` / `TxRxBxL` insets,
+                // `trim=(mode=..., ...)` groups, and the legacy dotted
+                // `trim.X=` / `trim.border.X=` keys.
+                let map = trim_val
+                    .get_or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or(9423u32)?;
+                let set_mode = |m: &mut serde_json::Map<String, serde_json::Value>,
+                                mode: &str|
+                 -> Result<(), u32> {
+                    if let Some(prev) = m.get("mode").and_then(|x| x.as_str()) {
+                        if prev != mode {
+                            return Err(9423);
+                        }
+                    }
+                    m.insert("mode".into(), mode.into());
+                    Ok(())
+                };
+                if key == "trim" {
+                    if v == "border" || v == "color" {
+                        set_mode(map, "color")?;
+                    } else if let Some(inner) = group_inner(v) {
+                        let (mut color_keys, mut area_keys) = (false, false);
+                        for (sk, sv) in group_pairs(inner)? {
+                            match sk {
+                                "mode" => match sv {
+                                    "color" | "area" => set_mode(map, sv)?,
+                                    _ => return Err(9423),
+                                },
+                                "color" => {
+                                    if sv.len() > 64 {
+                                        return Err(9423);
+                                    }
+                                    color_keys = true;
+                                    map.insert("color".into(), sv.into());
+                                }
+                                "tolerance" => {
+                                    let t = parse_num(sv, 0.0, 255.0)?;
+                                    if t.fract() != 0.0 {
+                                        return Err(9423);
+                                    }
+                                    color_keys = true;
+                                    map.insert("tolerance".into(), (t as u32).into());
+                                }
+                                "keep" => {
+                                    color_keys = true;
+                                    map.insert("keep".into(), parse_num(sv, 0.0, 16384.0)?.into());
+                                }
+                                "top" | "right" | "bottom" | "left" | "width" | "height" => {
+                                    area_keys = true;
+                                    map.insert(sk.into(), trim_len(sv)?);
+                                }
+                                _ => return Err(9423),
+                            }
+                        }
+                        // color and area settings never mix in one mode.
+                        match map.get("mode").and_then(|m| m.as_str()) {
+                            Some("color") if area_keys => return Err(9423),
+                            Some("area") if color_keys => return Err(9423),
+                            None if color_keys && area_keys => return Err(9423),
+                            _ => {}
+                        }
+                    } else {
+                        let sep = if v.contains(';') {
+                            ';'
+                        } else if v.contains('x') {
+                            'x'
+                        } else {
+                            ','
+                        };
+                        let nums: Vec<&str> = v.split(sep).collect();
+                        if nums.len() != 4 {
+                            return Err(9423);
+                        }
+                        set_mode(map, "area")?;
+                        for (k, s) in ["top", "right", "bottom", "left"].iter().zip(nums) {
+                            map.insert((*k).into(), trim_len(s.trim())?);
+                        }
+                    }
+                } else if let Some(sub) = key.strip_prefix("trim.border.") {
+                    set_mode(map, "color")?;
+                    match sub {
+                        "color" => {
+                            if v.len() > 64 {
+                                return Err(9423);
+                            }
+                            map.insert("color".into(), v.into());
+                        }
+                        "tolerance" => {
+                            let t = parse_num(v, 0.0, 255.0)?;
+                            if t.fract() != 0.0 {
+                                return Err(9423);
+                            }
+                            map.insert("tolerance".into(), (t as u32).into());
+                        }
+                        "keep" => {
+                            map.insert("keep".into(), parse_num(v, 0.0, 16384.0)?.into());
+                        }
+                        _ => return Err(9423),
+                    }
+                } else if key == "trim.mode" {
+                    match v {
+                        "color" | "area" => set_mode(map, v)?,
+                        _ => return Err(9423),
+                    }
                 } else {
-                    let nums: Vec<&str> = v.split('x').collect();
-                    if nums.len() != 4 {
-                        return Err(9423);
-                    }
-                    let mut m = serde_json::Map::new();
-                    for (k, s) in ["top", "right", "bottom", "left"].iter().zip(nums) {
-                        m.insert((*k).into(), parse_num(s, 0.0, 16384.0)?.into());
-                    }
-                    op.insert("trim".into(), m.into());
+                    // trim.top/right/bottom/left/width/height
+                    set_mode(map, "area")?;
+                    let sub = key.strip_prefix("trim.").ok_or(9423u32)?;
+                    map.insert(sub.into(), trim_len(v)?);
                 }
             }
             "border" => {
-                // `<width>x<color>` (uniform) — per-side borders are a
-                // binding-only shape, not part of the URL vocabulary.
-                let (w, c) = v.split_once('x').ok_or(9423u32)?;
-                let w = parse_num(w, 0.0, 4096.0)?;
-                if c.len() > 32 {
-                    return Err(9423);
+                // `<width>x<color>` (uniform) or the
+                // `(color=,width=|top,right,bottom,left)` group — width
+                // keys accept px ints and `"Np"` percents.
+                if let Some(inner) = group_inner(v) {
+                    for (sk, sv) in group_pairs(inner)? {
+                        match sk {
+                            "color" => {
+                                if sv.len() > 64 {
+                                    return Err(9423);
+                                }
+                                border_map.insert("color".into(), sv.into());
+                            }
+                            "width" | "top" | "right" | "bottom" | "left" => {
+                                border_map.insert(sk.into(), trim_len(sv)?);
+                            }
+                            _ => return Err(9423),
+                        }
+                    }
+                } else {
+                    let (w, c) = v.split_once('x').ok_or(9423u32)?;
+                    let w = parse_num(w, 0.0, 4096.0)?;
+                    if c.len() > 32 {
+                        return Err(9423);
+                    }
+                    border_map.insert("width".into(), w.into());
+                    border_map.insert("color".into(), format!("#{c}").into());
                 }
-                op.insert(
-                    "border".into(),
-                    serde_json::json!({"width": w, "color": format!("#{c}")}),
-                );
             }
             "padding" => {
                 // Uniform or `topxrightxbottomxleft`; painted with the
-                // `background` color (or transparent).
+                // `background` color (or transparent) at emit time.
                 let nums: Vec<&str> = v.split('x').collect();
                 let (t, r, b, l) = match nums.len() {
                     1 => {
@@ -231,12 +668,19 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
                     ),
                     _ => return Err(9423),
                 };
-                op.insert(
-                    "border".into(),
-                    serde_json::json!({"top": t, "right": r, "bottom": b, "left": l}),
-                );
+                border_map.insert("top".into(), t.into());
+                border_map.insert("right".into(), r.into());
+                border_map.insert("bottom".into(), b.into());
+                border_map.insert("left".into(), l.into());
+                padding_seen = true;
             }
-            "format" => match v {
+            "compression" => {
+                if v != "fast" {
+                    return Err(9423);
+                }
+                compression_fast = true;
+            }
+            "format" | "f" => match v {
                 "auto" => {
                     // Content negotiation on the inbound Accept header —
                     // CF prefers avif, then webp, else the source format
@@ -267,8 +711,27 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
                 }
                 _ => return Err(9423),
             },
-            "quality" => {
-                p.output_quality = Some(parse_num(v, 1.0, 100.0)? as u32);
+            "quality" | "q" => {
+                if let Some(inner) = group_inner(v) {
+                    let mut slow: Option<u32> = None;
+                    for (sk, sv) in group_pairs(inner)? {
+                        match sk {
+                            "level" | "v" => p.output_quality = Some(quality_level(sv)?),
+                            "slow-connection" | "sc" => slow = Some(quality_level(sv)?),
+                            _ => return Err(9423),
+                        }
+                    }
+                    if let Some(s) = slow.filter(|_| slow_connection(headers)) {
+                        p.output_quality = Some(s);
+                    }
+                } else {
+                    p.output_quality = Some(quality_level(v)?);
+                }
+            }
+            "slow-connection-quality" | "scq" => {
+                if slow_connection(headers) {
+                    p.output_quality = Some(quality_level(v)?);
+                }
             }
             "anim" => {
                 p.anim = match v {
@@ -277,13 +740,13 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
                     _ => return Err(9423),
                 };
             }
-            "metadata" => {
-                p.metadata = match v {
-                    "true" | "exif" | "copyright" => true,
-                    "none" | "false" => false,
-                    _ => return Err(9423),
-                };
-            }
+            "metadata" => match v {
+                // The preservation enum rides the transform wire;
+                // `exif` keeps our `/info` introspection extension.
+                "none" | "copyright" | "keep" => p.wire_metadata = Some(v.into()),
+                "exif" => p.info = true,
+                _ => return Err(9423),
+            },
             "onerror" => {
                 p.onerror_redirect = v == "redirect";
                 if !p.onerror_redirect {
@@ -306,6 +769,26 @@ fn parse_options(raw: &str, headers: &HeaderMap) -> Result<Parsed, u32> {
     }
     if let Some(h) = height {
         op.insert("height".into(), ((h * dpr).round().max(1.0) as u64).into());
+    }
+    if let Some(mut tv) = trim_val {
+        scale_px(&mut tv, dpr);
+        op.insert("trim".into(), tv);
+    }
+    if !border_map.is_empty() {
+        let mut bv = serde_json::Value::Object(border_map);
+        scale_px(&mut bv, dpr);
+        if padding_seen && bv.get("color").is_none() {
+            bv["color"] = op
+                .get("background")
+                .cloned()
+                .unwrap_or_else(|| "rgba(0,0,0,0)".into());
+        }
+        op.insert("border".into(), bv);
+    }
+    if compression_fast {
+        // `compression=fast` picks the quickest format upstream —
+        // JPEG — overriding an explicit `format`.
+        p.output_format = Some("image/jpeg".into());
     }
     p.transforms = serde_json::json!([serde_json::Value::Object(op)]).to_string();
     Ok(p)
@@ -336,7 +819,8 @@ fn images_endpoint(worker_ep: &WorkerEndpoint) -> Option<WorkerEndpoint> {
     // Refutable only under `dev-stub` (the Tcp variant) — production
     // builds see a single-variant enum.
     #[allow(irrefutable_let_patterns)]
-    let WorkerEndpoint::Unix(path) = worker_ep else {
+    let WorkerEndpoint::Unix(path) = worker_ep
+    else {
         return None;
     };
     let name = path.file_name()?.to_str()?.strip_suffix(".sock")?;
@@ -364,89 +848,91 @@ async fn run_transform(
 
     // Errors surface as u16 codes: 4xx/5xx upstream statuses pass
     // through, transport/build failures collapse to 9411.
-    let upstream: Result<Response<Body>, u16> =
-        tokio::time::timeout(UPSTREAM_TIMEOUT, async {
-            // 1. Fetch the source through the tenant's own worker socket —
-            //    this is the same-origin semantic (worker, assets, or the
-            //    platform asset route all resolve naturally).
-            let get = Request::builder()
-                .method("GET")
-                .uri(src_path)
-                .header(header::HOST, host)
-                .header(header::ACCEPT, "*/*")
-                .body(
-                    Full::new(Bytes::new())
-                        .map_err(axum::Error::new)
-                        .boxed_unsync(),
-                )
-                .map_err(|_| 9411u16)?;
-            let io = worker_ep.connect().await.map_err(|_| 9411u16)?;
-            let src_resp = http1(io, get).await.map_err(|_| 9411u16)?;
-            if !src_resp.status().is_success() {
-                return Err(src_resp.status().as_u16());
-            }
-            let src = src_resp
-                .into_body()
-                .collect()
-                .await
-                .map_err(|_| 9411u16)?
-                .to_bytes();
-            if src.len() > MAX_SRC_BYTES {
-                return Err(9424u16);
-            }
+    let upstream: Result<Response<Body>, u16> = tokio::time::timeout(UPSTREAM_TIMEOUT, async {
+        // 1. Fetch the source through the tenant's own worker socket —
+        //    this is the same-origin semantic (worker, assets, or the
+        //    platform asset route all resolve naturally).
+        let get = Request::builder()
+            .method("GET")
+            .uri(src_path)
+            .header(header::HOST, host)
+            .header(header::ACCEPT, "*/*")
+            .body(
+                Full::new(Bytes::new())
+                    .map_err(axum::Error::new)
+                    .boxed_unsync(),
+            )
+            .map_err(|_| 9411u16)?;
+        let io = worker_ep.connect().await.map_err(|_| 9411u16)?;
+        let src_resp = http1(io, get).await.map_err(|_| 9411u16)?;
+        if !src_resp.status().is_success() {
+            return Err(src_resp.status().as_u16());
+        }
+        let src = src_resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|_| 9411u16)?
+            .to_bytes();
+        if src.len() > MAX_SRC_BYTES {
+            return Err(9424u16);
+        }
 
-            // 2. Multipart POST to the facade-images socket.
-            let boundary = "vrtcdnimage0a1b2c3d4e5f60718293a4b5c6d7e8f9";
-            let mut body = Vec::with_capacity(src.len() + 1024);
-            let mut field = |name: &str, filename: Option<&str>, value: &[u8]| {
+        // 2. Multipart POST to the facade-images socket.
+        let boundary = "vrtcdnimage0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let mut body = Vec::with_capacity(src.len() + 1024);
+        let mut field = |name: &str, filename: Option<&str>, value: &[u8]| {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"")
+                    .as_bytes(),
+            );
+            if let Some(f) = filename {
                 body.extend_from_slice(
-                    format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"")
+                    format!("; filename=\"{f}\"\r\nContent-Type: application/octet-stream")
                         .as_bytes(),
                 );
-                if let Some(f) = filename {
-                    body.extend_from_slice(
-                        format!("; filename=\"{f}\"\r\nContent-Type: application/octet-stream")
-                            .as_bytes(),
-                    );
-                }
-                body.extend_from_slice(b"\r\n\r\n");
-                body.extend_from_slice(value);
-                body.extend_from_slice(b"\r\n");
-            };
-            field("image", Some("source"), &src);
-            field("transforms", None, parsed.transforms.as_bytes());
-            if let Some(f) = &parsed.output_format {
-                field("output_format", None, f.as_bytes());
             }
-            if let Some(q) = parsed.output_quality {
-                field("output_quality", None, q.to_string().as_bytes());
-            }
-            if parsed.anim {
-                field("anim", None, b"true");
-            }
-            body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+            body.extend_from_slice(b"\r\n\r\n");
+            body.extend_from_slice(value);
+            body.extend_from_slice(b"\r\n");
+        };
+        field("image", Some("source"), &src);
+        field("transforms", None, parsed.transforms.as_bytes());
+        if let Some(f) = &parsed.output_format {
+            field("output_format", None, f.as_bytes());
+        }
+        if let Some(q) = parsed.output_quality {
+            field("output_quality", None, q.to_string().as_bytes());
+        }
+        if parsed.anim {
+            field("anim", None, b"true");
+        }
+        if let Some(md) = &parsed.wire_metadata {
+            field("metadata", None, md.as_bytes());
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
-            let ep = images_endpoint(&worker_ep).ok_or(9411u16)?;
-            let post = Request::builder()
-                .method("POST")
-                .uri(if parsed.metadata { "/info" } else { "/transform" })
-                .header(header::HOST, "vrt-images.internal")
-                .header(
-                    header::CONTENT_TYPE,
-                    format!("multipart/form-data; boundary={boundary}"),
-                )
-                .header(header::ACCEPT, accept)
-                .body(
-                    Full::new(Bytes::from(body))
-                        .map_err(axum::Error::new)
-                        .boxed_unsync(),
-                )
-                .map_err(|_| 9411u16)?;
-            let io = ep.connect().await.map_err(|_| 9411u16)?;
-            http1(io, post).await.map_err(|_| 9411u16)
-        })
-        .await
-        .unwrap_or(Err(9411));
+        let ep = images_endpoint(&worker_ep).ok_or(9411u16)?;
+        let post = Request::builder()
+            .method("POST")
+            .uri(if parsed.info { "/info" } else { "/transform" })
+            .header(header::HOST, "vrt-images.internal")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header(header::ACCEPT, accept)
+            .body(
+                Full::new(Bytes::from(body))
+                    .map_err(axum::Error::new)
+                    .boxed_unsync(),
+            )
+            .map_err(|_| 9411u16)?;
+        let io = ep.connect().await.map_err(|_| 9411u16)?;
+        http1(io, post).await.map_err(|_| 9411u16)
+    })
+    .await
+    .unwrap_or(Err(9411));
 
     let redirect = || {
         Response::builder()
@@ -479,8 +965,7 @@ async fn run_transform(
             }
             Ok(error_body(
                 if status == 9424 { 9424 } else { 9411 },
-                StatusCode::from_u16(status.clamp(400, 599))
-                    .unwrap_or(StatusCode::BAD_GATEWAY),
+                StatusCode::from_u16(status.clamp(400, 599)).unwrap_or(StatusCode::BAD_GATEWAY),
             ))
         }
     }
@@ -524,7 +1009,14 @@ mod tests {
 
     #[test]
     fn bad_and_unknown_options_fail_closed() {
-        for raw in ["width=0", "width=", "bogus=1", "fit=stretch", "quality=101", "rotate=abc"] {
+        for raw in [
+            "width=0",
+            "width=",
+            "bogus=1",
+            "fit=stretch",
+            "quality=101",
+            "rotate=abc",
+        ] {
             assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
         }
     }
@@ -537,5 +1029,270 @@ mod tests {
         assert_eq!(p.output_format.as_deref(), Some("image/avif"));
         let p = parse_options("format=auto", &HeaderMap::new()).unwrap();
         assert_eq!(p.output_format.as_deref(), Some("image/jpeg"));
+    }
+
+    fn op_of(p: &Parsed) -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(&p.transforms).unwrap()[0].clone()
+    }
+
+    #[test]
+    fn sharpen_group_and_scalar() {
+        let g = op_of(&opts(
+            "sharpen=(mode=gaussian,amount=1,sigma=1.5,threshold=0)",
+        ));
+        assert_eq!(
+            g["sharpen"],
+            serde_json::json!({"mode": "gaussian", "amount": 1.0, "sigma": 1.5, "threshold": 0})
+        );
+        let b = op_of(&opts("sharpen=(mode=box,amount=5)"));
+        assert_eq!(
+            b["sharpen"],
+            serde_json::json!({"mode": "box", "amount": 5.0})
+        );
+        assert_eq!(op_of(&opts("sharpen=5"))["sharpen"], 5.0);
+        for raw in [
+            "sharpen=(mode=gaussian,amount=1)", // sigma required
+            "sharpen=(amount=1,sigma=1)",       // sigma without gaussian
+            "sharpen=(mode=mild,amount=1)",
+            "sharpen=(sigma=1)", // amount required
+            "sharpen=(mode=box,amount=1,threshold=3)",
+        ] {
+            assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn trim_all_spellings() {
+        // Structured color mode + the renamed string.
+        let c = op_of(&opts(
+            "trim=(mode=color,color=%23ffffff,tolerance=10,keep=5)",
+        ));
+        assert_eq!(
+            c["trim"],
+            serde_json::json!({"mode": "color", "color": "#ffffff", "tolerance": 10, "keep": 5.0})
+        );
+        for s in ["color", "border"] {
+            assert_eq!(op_of(&opts(&format!("trim={s}")))["trim"]["mode"], "color");
+        }
+        // Side insets: group, %-lengths, fractions, and both legacy
+        // separators.
+        let a = op_of(&opts(
+            "trim=(mode=area,top=10p,right=20p,bottom=10p,left=20p)",
+        ));
+        assert_eq!(a["trim"]["top"], "10p");
+        assert_eq!(a["trim"]["right"], "20p");
+        let f = op_of(&opts("trim=(mode=area,top=0.1,left=0.2)"));
+        assert_eq!(f["trim"]["top"], 0.1);
+        assert_eq!(f["trim"]["left"], 0.2);
+        for sep in [";", "x"] {
+            let s = op_of(&opts(&format!("trim=10{sep}20{sep}10{sep}20")));
+            assert_eq!(s["trim"]["top"], 10.0, "{sep}");
+            assert_eq!(s["trim"]["left"], 20.0, "{sep}");
+        }
+        // Bare side key infers area; rect form keeps its keys.
+        assert_eq!(op_of(&opts("trim=(left=800)"))["trim"]["left"], 800.0);
+        let r = op_of(&opts(
+            "trim=(mode=area,left=10,top=10,width=500,height=300)",
+        ));
+        assert_eq!(r["trim"]["width"], 500.0);
+        // Legacy dotted keys fold into the same object.
+        let d = op_of(&opts("trim.top=5,trim.left=10"));
+        assert_eq!(d["trim"]["top"], 5.0);
+        assert_eq!(d["trim"]["left"], 10.0);
+        let db = op_of(&opts(
+            "trim=color,trim.border.tolerance=30,trim.border.keep=2",
+        ));
+        assert_eq!(
+            db["trim"],
+            serde_json::json!({"mode": "color", "tolerance": 30, "keep": 2.0})
+        );
+        for raw in [
+            "trim=(mode=color,top=5)",
+            "trim=(mode=bogus)",
+            "trim=1;2;3",
+            "trim=(left=abc)",
+            "trim=(mode=area,color=%23fff)",
+        ] {
+            assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn fit_new_modes_and_group() {
+        for m in ["aspect-crop", "scale-up"] {
+            assert_eq!(op_of(&opts(&format!("fit={m}")))["fit"], m);
+        }
+        let g = op_of(&opts("fit=(mode=contain,upscale=generate)"));
+        assert_eq!(
+            g["fit"],
+            serde_json::json!({"mode": "contain", "upscale": "generate"})
+        );
+        assert!(parse_options("fit=(upscale=generate)", &HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn gravity_group_and_alias() {
+        let g = op_of(&opts("gravity=(x=0.5,y=0.3)"));
+        assert_eq!(g["gravity"]["x"], 0.5);
+        assert_eq!(g["gravity"]["y"], 0.3);
+        assert_eq!(op_of(&opts("g=auto"))["gravity"], "auto");
+        assert!(parse_options("gravity=(x=0.5)", &HeaderMap::new()).is_err());
+        assert!(parse_options("gravity=(x=1.5,y=0.3)", &HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn border_group_percent_and_padding() {
+        let b = op_of(&opts("border=(color=%23ffffff,width=10)"));
+        assert_eq!(
+            b["border"],
+            serde_json::json!({"color": "#ffffff", "width": 10.0})
+        );
+        let p = op_of(&opts("border=(width=10p)"));
+        assert_eq!(p["border"]["width"], "10p");
+        // rgba() commas stay inside the group.
+        let rgba = op_of(&opts(
+            "border=(color=rgba(0,0,0,0),top=5,left=10),width=200",
+        ));
+        assert_eq!(rgba["border"]["color"], "rgba(0,0,0,0)");
+        assert_eq!(rgba["border"]["top"], 5.0);
+        assert_eq!(rgba["width"], 200);
+        // Legacy WxCOLOR still works.
+        let legacy = op_of(&opts("border=5xFF0000"));
+        assert_eq!(
+            legacy["border"],
+            serde_json::json!({"width": 5.0, "color": "#FF0000"})
+        );
+        // padding defaults its color to transparent.
+        let pad = op_of(&opts("padding=10"));
+        assert_eq!(
+            pad["border"],
+            serde_json::json!({"top": 10.0, "right": 10.0, "bottom": 10.0, "left": 10.0, "color": "rgba(0,0,0,0)"})
+        );
+        let pad_bg = op_of(&opts("padding=10,background=%23ff0000"));
+        assert_eq!(pad_bg["border"]["color"], "#ff0000");
+    }
+
+    #[test]
+    fn quality_tiers_groups_and_slow_connection() {
+        assert_eq!(opts("quality=low").output_quality, Some(40));
+        assert_eq!(opts("quality=medium-high").output_quality, Some(80));
+        assert_eq!(opts("q=50").output_quality, Some(50));
+        // slow-connection applies only with slow client hints.
+        let mut slow_h = HeaderMap::new();
+        slow_h.insert("ect", "2g".parse().unwrap());
+        let p = parse_options("quality=(level=80,slow-connection=40)", &slow_h).unwrap();
+        assert_eq!(p.output_quality, Some(40));
+        let fast =
+            parse_options("quality=(level=80,slow-connection=40)", &HeaderMap::new()).unwrap();
+        assert_eq!(fast.output_quality, Some(80));
+        let short = parse_options("q=(v=80,sc=40)", &slow_h).unwrap();
+        assert_eq!(short.output_quality, Some(40));
+        // Top-level scq key + the other hint channels.
+        let mut rtt = HeaderMap::new();
+        rtt.insert("rtt", "400".parse().unwrap());
+        assert_eq!(
+            parse_options("slow-connection-quality=30", &rtt)
+                .unwrap()
+                .output_quality,
+            Some(30)
+        );
+        let mut sd = HeaderMap::new();
+        sd.insert("save-data", "on".parse().unwrap());
+        assert_eq!(
+            parse_options("scq=low", &sd).unwrap().output_quality,
+            Some(40)
+        );
+        let mut dl = HeaderMap::new();
+        dl.insert("downlink", "1".parse().unwrap());
+        assert_eq!(
+            parse_options("scq=30", &dl).unwrap().output_quality,
+            Some(30)
+        );
+        // scq ignored on fast connections.
+        assert_eq!(
+            parse_options("scq=30", &HeaderMap::new())
+                .unwrap()
+                .output_quality,
+            None
+        );
+    }
+
+    #[test]
+    fn width_auto_client_hints_and_ua() {
+        // Viewport-Width picks the smallest breakpoint >= it.
+        let mut h = HeaderMap::new();
+        h.insert("viewport-width", "700".parse().unwrap());
+        let p = parse_options("width=auto", &h).unwrap();
+        assert_eq!(op_of(&p)["width"], 768);
+        // Beyond all breakpoints → the largest.
+        h.insert("viewport-width", "4000".parse().unwrap());
+        let p = parse_options("width=(mode=auto,breakpoints=(400,800))", &h).unwrap();
+        assert_eq!(op_of(&p)["width"], 800);
+        // UA fallback: mobile → 768, desktop → 1200 (overridable).
+        let mut mob = HeaderMap::new();
+        mob.insert(
+            header::USER_AGENT,
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)".parse().unwrap(),
+        );
+        assert_eq!(
+            op_of(&parse_options("width=auto", &mob).unwrap())["width"],
+            768
+        );
+        assert_eq!(
+            op_of(&parse_options("width=(m=auto,mb=600,dt=1400)", &mob).unwrap())["width"],
+            600
+        );
+        assert_eq!(op_of(&opts("width=auto"))["width"], 1200);
+        assert!(parse_options("width=(mode=fixed)", &HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn metadata_wire_and_compression_and_flip() {
+        for m in ["none", "copyright", "keep"] {
+            let p = opts(&format!("metadata={m}"));
+            assert_eq!(p.wire_metadata.as_deref(), Some(m));
+            assert!(!p.info);
+        }
+        let p = opts("metadata=exif");
+        assert!(p.info);
+        assert!(p.wire_metadata.is_none());
+        for raw in ["metadata=true", "metadata=false"] {
+            assert!(parse_options(raw, &HeaderMap::new()).is_err(), "{raw}");
+        }
+        assert_eq!(
+            opts("compression=fast").output_format.as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            opts("format=webp,compression=fast")
+                .output_format
+                .as_deref(),
+            Some("image/jpeg")
+        );
+        for f in ["h", "v", "hv"] {
+            assert_eq!(op_of(&opts(&format!("flip={f}")))["flip"], f);
+        }
+        assert!(parse_options("flip=d", &HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn dpr_scales_pixel_lengths() {
+        let p = opts("dpr=2,trim=10;10;10;10,border=(width=5),padding=6");
+        let op = op_of(&p);
+        assert_eq!(op["trim"]["top"], 20.0);
+        assert_eq!(op["border"]["width"], 10.0);
+        // padding sides merge with the border width; the padding color
+        // fills in transparent when none is set.
+        assert_eq!(op["border"]["top"], 12.0);
+        assert_eq!(op["border"]["color"], "rgba(0,0,0,0)");
+        // Percents and fractions do not scale — the facade resolves
+        // them against the axis.
+        let p = opts("dpr=2,trim=(mode=area,top=10p,left=0.1)");
+        let op = op_of(&p);
+        assert_eq!(op["trim"]["top"], "10p");
+        assert_eq!(op["trim"]["left"], 0.1);
+        // dpr is capped at 2 upstream.
+        assert!(parse_options("dpr=3", &HeaderMap::new()).is_err());
+        assert!(parse_options("dpr=2", &HeaderMap::new()).is_ok());
     }
 }
