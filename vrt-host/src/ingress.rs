@@ -1983,6 +1983,18 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
     }
 }
 
+/// Completes as soon as the tenant starts hibernating, so a WebSocket
+/// relay can detach while the client half is still usable.
+async fn wait_sleeping(runtime: &crate::supervisor::TenantRuntime) {
+    loop {
+        let state = runtime.state();
+        if state.is_asleep() || state == crate::state::TenantState::Hibernating {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn wait_idle(started: Instant, last_ms: Arc<AtomicU64>, idle_ms: u64) {
     loop {
         let last = last_ms.load(Ordering::Relaxed);
@@ -2100,7 +2112,6 @@ impl WsTunnel {
                 return;
             }
         };
-        tracing::info!(worker = %w, "ws tunnel upgrades ready");
         let started = Instant::now();
         let last_ms = Arc::new(AtomicU64::new(0));
         let from_client = Arc::new(AtomicU64::new(0));
@@ -2127,18 +2138,14 @@ impl WsTunnel {
                 },
                 _ = wait_idle(started, last_ms.clone(), idle_ms) => "idle_timeout",
                 _ = tokio::time::sleep_until(max_at) => "max_duration",
+                // Stop relaying BEFORE workerd closes the upstream: once
+                // `copy_bidirectional` observes that EOF it also shuts down
+                // the client's write half, which would strand a socket we
+                // want to keep across hibernation.
+                _ = wait_sleeping(&self.runtime) => "hibernating",
             };
-            let sleeping = self.runtime.state();
-            let asleep = sleeping.is_asleep()
-                || sleeping == crate::state::TenantState::Hibernating;
-            tracing::info!(
-                worker = %w,
-                reason,
-                ?sleeping,
-                enabled = self.hibernation.enabled,
-                reconnect = self.reconnect.is_some(),
-                "ws tunnel relay ended"
-            );
+            let asleep = self.runtime.state().is_asleep()
+                || self.runtime.state() == crate::state::TenantState::Hibernating;
             // Hibernation stops workerd underneath the tunnel, so the relay
             // usually ends with `closed`/`error` rather than the idle timer.
             // When the tenant is asleep and can be reconnected, keep the
