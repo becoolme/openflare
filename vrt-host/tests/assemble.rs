@@ -600,7 +600,7 @@ fn assets_first_tenant_assembles_with_real_manifest() {
         deny_outbound: manifest.deny_outbound.clone(),
         facades: manifest.facades.clone(),
         system_workers: manifest.system_workers.clone(),
-        disk_services: manifest.disk_services.clone(),
+        disk_services: vrt_config::resolve_disk_paths(&facade_dir, &manifest.disk_services).unwrap(),
         system_compat_date: "2024-01-01".to_string(),
         system_compat_flags: vec![],
         vars: Default::default(),

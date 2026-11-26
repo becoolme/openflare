@@ -2922,17 +2922,16 @@ pub fn params_json_from_manifest(
         // emitted config wants the absolute on-host directory, so the
         // join under the manifest's own dir is canonicalised here and
         // must exist (fail closed like a missing module file).
-        "diskServices": manifest.disk_services.iter().map(|d| {
-            let joined = manifest_path
+        "diskServices": vrt_config::resolve_disk_paths(
+            manifest_path
                 .parent()
-                .unwrap_or_else(|| std::path::Path::new("/"))
-                .join(&d.path);
-            std::fs::canonicalize(&joined)
-                .ok()
-                .filter(|p| p.is_dir())
-                .map(|p| serde_json::json!({"serviceName": d.service_name, "path": p.to_string_lossy()}))
-                .ok_or(ConfigError::Parse("diskServices.path"))
-        }).collect::<Result<Vec<_>, _>>()?,
+                .unwrap_or_else(|| std::path::Path::new("/")),
+            &manifest.disk_services,
+        )
+        .ok_or(ConfigError::Parse("diskServices.path"))?
+        .iter()
+        .map(|d| serde_json::json!({"serviceName": d.service_name, "path": d.path}))
+        .collect::<Vec<_>>(),
         "systemCompatDate": system_compat_date,
         "systemCompatFlags": system_compat_flags,
     });

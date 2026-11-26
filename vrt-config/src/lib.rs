@@ -57,4 +57,6 @@ pub use manifest::{
 pub use netpolicy::{
     render_network_policy, Cidr, EgressBackend, NetPort, Protocol, RuntimeNetPolicy, SelectorPeer,
 };
-pub use sysmanifest::{parse_facade_manifest, FacadeManifest, FACADE_MANIFEST_SCHEMA_VERSION};
+pub use sysmanifest::{
+    parse_facade_manifest, resolve_disk_paths, FacadeManifest, FACADE_MANIFEST_SCHEMA_VERSION,
+};

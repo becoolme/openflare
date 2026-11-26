@@ -496,3 +496,27 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         disk_services,
     })
 }
+
+/// Resolve the manifest's facade-relative `diskServices` paths to the
+/// absolute on-host directories `render_tenant_config` emits verbatim.
+/// Canonicalised under `facade_dir` and each must be an existing
+/// directory — `None` fails closed like a missing module file.
+pub fn resolve_disk_paths(
+    facade_dir: &std::path::Path,
+    services: &[SystemDiskService],
+) -> Option<Vec<SystemDiskService>> {
+    services
+        .iter()
+        .map(|d| {
+            let path = std::fs::canonicalize(facade_dir.join(&d.path))
+                .ok()
+                .filter(|p| p.is_dir())?
+                .to_string_lossy()
+                .into_owned();
+            Some(SystemDiskService {
+                service_name: d.service_name.clone(),
+                path,
+            })
+        })
+        .collect()
+}

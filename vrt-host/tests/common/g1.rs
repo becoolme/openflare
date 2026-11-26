@@ -312,7 +312,7 @@ pub fn render(
         deny_outbound: manifest.deny_outbound.clone(),
         facades: manifest.facades.clone(),
         system_workers: manifest.system_workers.clone(),
-        disk_services: manifest.disk_services.clone(),
+        disk_services: vrt_config::resolve_disk_paths(&facade_root(), &manifest.disk_services).unwrap(),
         system_compat_date: "2026-09-08".into(),
         system_compat_flags: vec![
             "experimental".into(),
