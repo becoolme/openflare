@@ -204,6 +204,25 @@ jobs:
           VRT_WORKERD_BIN: ${{ github.workspace }}/.ci/workerd/workerd
           OF_BUNDLER: ${{ github.workspace }}/of-bundler/target/debug/of-bundler
         run: node spike/config-sandbox/verify.mjs --workerd "$VRT_WORKERD_BIN"
+      # Drift detector, not a gate: run the conformance cases against
+      # workerd's bundled modules (kv/d1/r2/ratelimits). `only bundled
+      # passes` rows are behaviour our facades are missing; a red step
+      # here means the *expectation* or a facade drifted, so it must not
+      # block unrelated PRs until the divergences are triaged.
+      - name: Conformance against workerd's bundled modules
+        continue-on-error: true
+        run: |
+          node conformance/reference.mjs             --workerd "$GITHUB_WORKSPACE/.ci/workerd/workerd"             --capnp "$GITHUB_WORKSPACE/.ci/workerd/workerd.capnp"
+      - name: Upload bundled-reference report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundled-reference-report
+          path: |
+            conformance/results/bundled.json
+            conformance/results/bundled.md
+          if-no-files-found: ignore
+          retention-days: 14
       # Tests keep their /tmp/vrt-* roots on panic (announced via
       # stderr) — collect them plus rendered configs and workerd logs.
       - name: Collect test logs on failure
