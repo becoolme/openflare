@@ -619,6 +619,9 @@ pub struct IngressState {
     /// off; if a preview route still exists (a bug), every request 403s
     /// rather than serving anonymously.
     preview_auth: std::sync::OnceLock<preview_token::PreviewTokenKey>,
+    /// Workers Cache (`[cache]`): per-pod ingress response cache. Always
+    /// constructed; only consulted for routes whose snapshot enables it.
+    wc: Arc<crate::wc::Store>,
 }
 
 impl IngressState {
@@ -657,6 +660,7 @@ impl IngressState {
             logs: std::sync::OnceLock::new(),
             dev_catch_all: Arc::new(AtomicBool::new(false)),
             preview_auth: std::sync::OnceLock::new(),
+            wc: Arc::new(crate::wc::Store::new()),
         })
     }
 
@@ -729,6 +733,7 @@ impl IngressState {
             },
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
+            wc: self.wc.clone(),
         })
     }
 
@@ -768,6 +773,7 @@ impl IngressState {
             },
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
+            wc: self.wc.clone(),
         })
     }
 
@@ -805,6 +811,7 @@ impl IngressState {
             },
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
+            wc: self.wc.clone(),
         })
     }
 
@@ -842,6 +849,7 @@ impl IngressState {
             },
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
+            wc: self.wc.clone(),
         })
     }
 
@@ -880,6 +888,7 @@ impl IngressState {
             },
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
+            wc: self.wc.clone(),
         })
     }
 
@@ -924,6 +933,7 @@ impl IngressState {
             },
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
+            wc: self.wc.clone(),
         })
     }
 
@@ -1278,8 +1288,39 @@ async fn proxy_inner(
     // host) have no worker label and are not worker metrics.
     let mut metric = crate::metrics::RequestMetric::begin(&target.worker_id);
     let logs = state.logs.get().cloned();
-    match handle_routed(state, peer, req, host.as_str(), &target, &mut metric).await {
+    // Workers Cache: preview hosts stay uncached (their auth/stamp contract
+    // is applied after the proxy and must never be bypassed). HEAD is not
+    // converted yet, so only GET participates.
+    let cache = match (&target.preview, target.cache) {
+        (None, Some(cfg)) if cfg.enabled => crate::wc::key_plan(
+            &target.tenant_id,
+            &target.worker_id,
+            &target.version_id,
+            cfg.cross_version_cache,
+            req.uri(),
+            req.method(),
+        )
+        .filter(|plan| !plan.head)
+        .map(|plan| (plan, req.headers().clone(), req.uri().path().to_string())),
+        _ => None,
+    };
+    if let Some((plan, headers, _)) = &cache {
+        if let crate::wc::Lookup::Hit(entry) =
+            state.wc.get(&plan.key, headers, std::time::SystemTime::now())
+        {
+            return Ok(crate::wc::response(
+                &entry,
+                false,
+                crate::wc::Status::Hit,
+                std::time::SystemTime::now(),
+            ));
+        }
+    }
+    match handle_routed(state.clone(), peer, req, host.as_str(), &target, &mut metric).await {
         Ok(mut r) => {
+            if let Some((plan, req_headers, path)) = &cache {
+                r = cache_store(&state.wc, plan, req_headers, path, r).await?;
+            }
             // PREVIEW: a preview response is ALWAYS labelled, so a client
             // (or the app itself) can never mistake preview output for
             // production. Worker-supplied `x-vrt-*` headers were scrubbed
@@ -1334,6 +1375,75 @@ async fn proxy_inner(
             Err(e)
         }
     }
+}
+
+/// Workers Cache store path: evaluate the response, buffer a bounded body
+/// and store it. `Cf-Cache-Status` is always authored by the host.
+async fn cache_store(
+    store: &crate::wc::Store,
+    plan: &crate::wc::KeyPlan,
+    req_headers: &axum::http::HeaderMap,
+    path: &str,
+    resp: Response,
+) -> Result<Response, IngressError> {
+    use axum::http::header;
+    let (mut parts, body) = resp.into_parts();
+    let policy = crate::wc::evaluate(req_headers, parts.status, &parts.headers, path);
+    let bypass = |mut parts: axum::http::response::Parts, body: Body| {
+        parts
+            .headers
+            .insert("cf-cache-status", axum::http::HeaderValue::from_static("BYPASS"));
+        parts.headers.remove("cache-tag");
+        Ok(Response::from_parts(parts, body))
+    };
+    if policy.bypass {
+        return bypass(parts, body);
+    }
+    let Some(len) = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+    else {
+        // Chunked/unknown length: do not buffer (phase 1).
+        return bypass(parts, body);
+    };
+    if len > crate::wc::MAX_ENTRY_BYTES {
+        return bypass(parts, body);
+    }
+    let bytes = match body.collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => return Err(IngressError::Internal),
+    };
+    let Some(stored_headers) = crate::wc::storable_headers(&parts.headers) else {
+        return bypass(parts, body_or_bytes(bytes));
+    };
+    let now = std::time::SystemTime::now();
+    let stored = store.put(
+        &plan.key,
+        crate::wc::Entry {
+            status: parts.status,
+            version: parts.version,
+            headers: stored_headers,
+            body: bytes.clone(),
+            stored_at: now,
+            fresh_for: policy.ttl.unwrap_or_default(),
+            no_cache: policy.no_cache,
+            vary: crate::wc::vary_values(&policy.vary, req_headers),
+            tags: policy.tags.clone(),
+            size: 0,
+        },
+    );
+    parts.headers.insert(
+        "cf-cache-status",
+        axum::http::HeaderValue::from_static(if stored { "MISS" } else { "BYPASS" }),
+    );
+    parts.headers.remove("cache-tag");
+    Ok(Response::from_parts(parts, body_or_bytes(bytes)))
+}
+
+fn body_or_bytes(bytes: bytes::Bytes) -> Body {
+    Body::from(bytes)
 }
 
 /// Scale-to-zero: map a wake failure onto its typed 503.
