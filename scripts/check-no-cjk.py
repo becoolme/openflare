@@ -2,7 +2,10 @@
 """Fail if any tracked file contains CJK characters.
 
 Vendored upstream code under third_party/ is exempt, but our own provenance
-notes there (UPSTREAM.md) are checked.
+notes there (UPSTREAM.md) are checked. facade/dist/kitesurf/ is the same kind
+of vendored upstream payload (the engine's built dist, incl. its public-suffix
+data file which legitimately lists CJK idn names); facade/dist/facade/ stays
+checked because it is built from our own facade/*.ts sources.
 
 Policy: code, comments, test data and config are English/ASCII. Test input that
 needs non-ASCII must be written as escapes (Rust "\\u{4e2d}", JS/JSON "\\u4e2d").
@@ -15,7 +18,7 @@ import subprocess
 import sys
 
 PATTERN = re.compile("[\u3000-\u9fff\uff00-\uffef]")
-SKIP_PREFIXES = ("third_party/",)
+SKIP_PREFIXES = ("third_party/", "facade/dist/kitesurf/")
 
 
 def repo_root():
