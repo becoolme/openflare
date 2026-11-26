@@ -1316,6 +1316,7 @@ async fn proxy_inner(
     let mut flight = None;
     if let Some((plan, headers, _)) = &cache {
         if let crate::wc::Lookup::Hit(entry) = state.wc.get(&plan.key, headers, now) {
+            wc_metric("hit");
             return Ok(crate::wc::response(
                 &entry,
                 plan.head,
@@ -1333,6 +1334,7 @@ async fn proxy_inner(
                 if let crate::wc::Lookup::Hit(entry) =
                     state.wc.get(&plan.key, headers, std::time::SystemTime::now())
                 {
+                    wc_metric("hit");
                     return Ok(crate::wc::response(
                         &entry,
                         plan.head,
@@ -1414,6 +1416,14 @@ async fn proxy_inner(
     }
 }
 
+fn wc_metric(status: &'static str) {
+    crate::metrics::registry().inc(
+        "vrt_host_cache_lookups_total",
+        &[("status", status)],
+        1.0,
+    );
+}
+
 /// Workers Cache store path: evaluate the response, buffer a bounded body
 /// and store it. `Cf-Cache-Status` is always authored by the host.
 async fn cache_store(
@@ -1428,6 +1438,7 @@ async fn cache_store(
     let (mut parts, body) = resp.into_parts();
     let policy = crate::wc::evaluate(req_headers, parts.status, &parts.headers, path);
     let bypass = |mut parts: axum::http::response::Parts, body: Body| {
+        wc_metric("bypass");
         parts
             .headers
             .insert("cf-cache-status", axum::http::HeaderValue::from_static("BYPASS"));
@@ -1473,6 +1484,7 @@ async fn cache_store(
             size: 0,
         },
     );
+    wc_metric(if stored { "miss" } else { "bypass" });
     parts.headers.insert(
         "cf-cache-status",
         axum::http::HeaderValue::from_static(if stored { "MISS" } else { "BYPASS" }),

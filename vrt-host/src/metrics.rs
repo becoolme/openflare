@@ -35,6 +35,10 @@ pub fn registry() -> Arc<Registry> {
 fn declare_all(r: &Registry) {
     // ---- worker logs (no worker-id labels: bounded cardinality) ----
     r.declare_counter(
+        "vrt_host_cache_lookups_total",
+        "Workers Cache lookups by outcome (hit, miss, bypass).",
+    );
+    r.declare_counter(
         "vrt_host_logs_ingested_total",
         "Log records accepted into the host log ring buffers.",
     );
