@@ -57,7 +57,31 @@ SQLite state, or WebSocket sessions, and wake them from:
    The replay/detach state machine is unit-tested and
    `vrt-host/tests/s2z_hibernate_workerd.rs` covers a real-workerd
    sleep → client-frame reattach round trip.
-4. **Automatic policy**: idle window, max sleep, wake budget, metrics.
+4. **Automatic policy — implemented, opt-in** via `[scaleToZero.auto]`
+   (`vrt-host/src/config.rs`, mechanisms in `vrt-host/src/hibernate.rs`):
+   - **Adaptive idle window**: `AutoState` doubles the window after a
+     sleep shorter than `prematureWakeMs` (the wake cost outran the
+     residency saving) and halves it after a sleep at least
+     `soundSleepMs` (deeply idle — could have slept sooner), bounded by
+     `idleMs` (floor — the policy never sleeps a tenant sooner than
+     declared) and `ceilingMs`.
+   - **Wake budget**: `wakeBudget` successful wakes inside
+     `wakeBudgetWindowMs` exhaust the tenant's hibernation budget — the
+     policy then DEFERS sleep until enough counted wakes age out. The
+     budget denies sleep, never traffic: a thrashing tenant simply
+     stays resident.
+   - **Max sleep**: `maxSleepMs` bounds how long a tenant may stay
+     hibernated; at expiry the actor joins a `MaxSleep` wake flight
+     through the normal coordinator path so spec/alarm-index state
+     refreshes.
+   - **Metrics**: `vrt_host_tenant_idle_window_seconds` (adapted
+     window), `vrt_host_tenant_wake_budget` (remaining tokens, Inf =
+     unlimited), `vrt_host_s2z_budget_deferred_total` (budget-denied
+     evaluations); max-sleep wakes surface as
+     `vrt_host_wake_total{source="max-sleep"}`.
+
+   All knobs are bounds-checked at startup (fail closed); absent
+   `[scaleToZero.auto]` keeps the fixed `idleMs` policy byte-identical.
 
 ## Invariants
 

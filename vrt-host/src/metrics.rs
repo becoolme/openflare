@@ -423,6 +423,21 @@ fn declare_all(r: &Registry) {
         "vrt_host_tenant_last_wake_seconds",
         "Duration of the tenant's most recent completed wake (0 if none).",
     );
+    // Stage 4 (`[scaleToZero.auto]`): the adaptive window and wake
+    // budget per tenant; the deferred counter exposes how often the
+    // budget denied a hibernation evaluation.
+    r.declare_gauge(
+        "vrt_host_tenant_idle_window_seconds",
+        "Auto policy: the tenant's currently adapted idle window (0 = auto off).",
+    );
+    r.declare_gauge(
+        "vrt_host_tenant_wake_budget",
+        "Auto policy: counted wakes remaining before the tenant is kept resident (Inf = unlimited).",
+    );
+    r.declare_counter(
+        "vrt_host_s2z_budget_deferred_total",
+        "Idle evaluations the auto-policy wake budget denied (tenant stays resident).",
+    );
     r.declare_counter(
         "vrt_host_prewarm_warmup_total",
         "Prewarm module-warmup probe verdicts by outcome (ok|failed).",
@@ -872,6 +887,25 @@ pub fn collect_state(reg: &Arc<TenantRegistry>) {
             "vrt_host_tenant_last_wake_seconds",
             &[("tenant_id", &id)],
             st.last_wake_ms.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1000.0,
+        );
+        r.set(
+            "vrt_host_tenant_idle_window_seconds",
+            &[("tenant_id", &id)],
+            st.s2z_idle_window_ms
+                .load(std::sync::atomic::Ordering::Relaxed) as f64
+                / 1000.0,
+        );
+        let budget = st
+            .s2z_budget_remaining
+            .load(std::sync::atomic::Ordering::Relaxed);
+        r.set(
+            "vrt_host_tenant_wake_budget",
+            &[("tenant_id", &id)],
+            if budget == u64::MAX {
+                f64::INFINITY
+            } else {
+                budget as f64
+            },
         );
     }
 }

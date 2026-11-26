@@ -351,9 +351,7 @@ pub fn render(
                     .iter()
                     .find(|m| m["name"].as_str().unwrap() == module_name)
                     .unwrap();
-                let src = facade_root()
-                    .join("..")
-                    .join(m["dist"].as_str().unwrap());
+                let src = facade_root().join("..").join(m["dist"].as_str().unwrap());
                 let bytes = std::fs::read(&src).unwrap();
                 assert_eq!(format!("{:x}", Sha256::digest(&bytes)), embed.digest);
                 std::fs::write(&dst, bytes).unwrap();
