@@ -38,6 +38,14 @@ use tokio::sync::{watch, Notify};
 pub struct ScaleToZero {
     /// "Want to sleep" strategy (default [`FixedWindowPolicy`]).
     pub policy: Arc<dyn IdlePolicy>,
+    /// `Some` when `policy` is an [`AutoPolicy`]: the actor keeps one
+    /// [`AutoState`] per tenant with these params and feeds it
+    /// [`AutoFacts`] at every evaluation.
+    pub auto: Option<AutoParams>,
+    /// Longest a tenant may stay hibernated before the host wakes it
+    /// itself ([`WakeSourceKind::MaxSleep`]) — bounds spec/alarm-index
+    /// staleness. `None` = sleep indefinitely.
+    pub max_sleep: Option<Duration>,
     /// "May sleep" chain (default [`BlockerChain::p0`]).
     pub blockers: Arc<BlockerChain>,
     /// Host-wide wake cap + fair queue (shared by every tenant actor).
@@ -116,6 +124,9 @@ pub struct IdleInputs {
     pub last_activity: Instant,
     /// When the current generation became `Ready` (wake or boot).
     pub ready_since: Instant,
+    /// Per-tenant auto-policy facts; `Some` only under
+    /// `[scaleToZero.auto]`. Other policies ignore it.
+    pub auto: Option<AutoFacts>,
 }
 
 /// Verdict of an [`IdlePolicy`].
@@ -152,6 +163,185 @@ impl IdlePolicy for FixedWindowPolicy {
             return IdleVerdict::Keep;
         }
         let idle_at = i.last_activity + self.idle_window;
+        let resident_at = i.ready_since + self.min_residency;
+        let at = idle_at.max(resident_at);
+        if i.now >= at {
+            IdleVerdict::Hibernate
+        } else {
+            IdleVerdict::DeferUntil(at)
+        }
+    }
+}
+
+// ======================= automatic policy (stage 4) =======================
+
+/// Tunables of the automatic idle policy (`[scaleToZero.auto]`).
+/// `AutoPolicy` (the shared [`IdlePolicy`]) decides from
+/// [`AutoFacts`]; `AutoState` (per tenant, actor-owned) produces those
+/// facts from observed sleep/wake history.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoParams {
+    /// Adaptation floor: the configured idle window. The policy never
+    /// sleeps a tenant sooner than the operator declared.
+    pub floor: Duration,
+    /// Adaptation ceiling.
+    pub ceiling: Duration,
+    /// A committed sleep shorter than this was not worth the cold
+    /// start: the window doubles (bounded by `ceiling`).
+    pub premature_wake: Duration,
+    /// A committed sleep at least this long means the tenant was
+    /// deeply idle and could have slept sooner: the window halves
+    /// (bounded by `floor`). Must exceed `premature_wake` so
+    /// adaptation cannot oscillate between grow and shrink.
+    pub sound_sleep: Duration,
+    /// Successful wakes allowed inside `wake_budget_window` before
+    /// the tenant is kept resident (0 = unlimited). A thrashing
+    /// tenant stays awake — the budget denies SLEEP, never traffic.
+    pub wake_budget: u32,
+    /// Sliding window the wake budget is counted over.
+    pub wake_budget_window: Duration,
+}
+
+/// Facts the actor feeds [`AutoPolicy`] through [`IdleInputs::auto`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoFacts {
+    /// The tenant's currently adapted idle window.
+    pub window: Duration,
+    /// `Some(t)` when the wake budget is exhausted: the tenant stays
+    /// resident until `t` (the instant enough counted wakes age out
+    /// of `wake_budget_window`).
+    pub budget_refill_at: Option<Instant>,
+}
+
+/// Per-tenant bookkeeping behind [`AutoPolicy`]. Lives on the actor —
+/// it describes the tenant's traffic shape and therefore survives
+/// generations, sleeps and wakes (it is reset only with the tenant).
+pub struct AutoState {
+    params: AutoParams,
+    window: Duration,
+    /// When the current/last committed sleep began (set at
+    /// `commit_hibernate`, consumed by `record_wake`).
+    slept_at: Option<Instant>,
+    /// Successful-wake timestamps inside `wake_budget_window`
+    /// (oldest first).
+    wakes: VecDeque<Instant>,
+}
+
+/// Window adaptation step: premature sleeps double it, sound sleeps
+/// halve it. Fixed factors keep the policy predictable — the operator
+/// tunes the thresholds, not the gain.
+const AUTO_GROW: u32 = 2;
+const AUTO_SHRINK: u32 = 2;
+
+impl AutoState {
+    /// New state at the adaptation floor.
+    pub fn new(params: AutoParams) -> Self {
+        Self {
+            params,
+            window: params.floor,
+            slept_at: None,
+            wakes: VecDeque::new(),
+        }
+    }
+
+    /// Mark the start of a committed hibernation.
+    pub fn record_sleep_commit(&mut self, now: Instant) {
+        self.slept_at = Some(now);
+    }
+
+    /// Adapt the window from the just-ended sleep and count the wake
+    /// against the budget. A wake with no committed sleep (the tenant
+    /// was drained/applied instead of hibernated) only counts toward
+    /// the budget.
+    pub fn record_wake(&mut self, now: Instant) {
+        if let Some(slept_at) = self.slept_at.take() {
+            let slept = now.saturating_duration_since(slept_at);
+            if slept < self.params.premature_wake {
+                self.window = (self.window * AUTO_GROW).min(self.params.ceiling);
+            } else if slept >= self.params.sound_sleep {
+                self.window = (self.window / AUTO_SHRINK).max(self.params.floor);
+            }
+        }
+        self.wakes.push_back(now);
+        self.prune(now);
+    }
+
+    /// A hibernation attempt that aborted never became a sleep.
+    pub fn clear_sleep(&mut self) {
+        self.slept_at = None;
+    }
+
+    fn prune(&mut self, now: Instant) {
+        // Underflow (now < window from the monotonic epoch) means no
+        // instant can be before the horizon — nothing to drop.
+        let Some(horizon) = now.checked_sub(self.params.wake_budget_window) else {
+            return;
+        };
+        while self.wakes.front().is_some_and(|t| *t < horizon) {
+            self.wakes.pop_front();
+        }
+    }
+
+    /// Counted wakes remaining before the budget gates (u32::MAX when
+    /// the budget is unlimited).
+    pub fn budget_remaining(&mut self, now: Instant) -> u32 {
+        self.prune(now);
+        if self.params.wake_budget == 0 {
+            return u32::MAX;
+        }
+        self.params
+            .wake_budget
+            .saturating_sub(self.wakes.len().min(u32::MAX as usize) as u32)
+    }
+
+    /// Snapshot for [`AutoPolicy::evaluate`].
+    pub fn facts(&mut self, now: Instant) -> AutoFacts {
+        self.prune(now);
+        let budget = self.params.wake_budget as usize;
+        let budget_refill_at = (budget > 0 && self.wakes.len() >= budget).then(|| {
+            // To fall below `budget`, `len - budget + 1` counted wakes
+            // must age out: the refill instant is when the
+            // `len - budget`-th oldest wake exits the window.
+            self.wakes[self.wakes.len() - budget] + self.params.wake_budget_window
+        });
+        AutoFacts {
+            window: self.window,
+            budget_refill_at,
+        }
+    }
+
+    /// Current adapted window (diagnostics / metrics).
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+}
+
+/// Stage-4 policy: the fixed-window rule over a per-tenant adapted
+/// window, gated by the wake budget. Shared per host like
+/// [`FixedWindowPolicy`]; the per-tenant state arrives via
+/// [`IdleInputs::auto`].
+#[derive(Clone, Copy, Debug)]
+pub struct AutoPolicy {
+    /// Adaptation/budget tunables.
+    pub params: AutoParams,
+    /// Anti-flap residency floor (same meaning as
+    /// [`FixedWindowPolicy::min_residency`]).
+    pub min_residency: Duration,
+}
+
+impl IdlePolicy for AutoPolicy {
+    fn evaluate(&self, i: &IdleInputs) -> IdleVerdict {
+        // No facts means the actor does not track auto state — keep the
+        // tenant rather than sleep without the inputs the verdict needs.
+        let Some(auto) = i.auto else {
+            return IdleVerdict::Keep;
+        };
+        if let Some(refill) = auto.budget_refill_at {
+            // Budget exhausted: stay resident until it refills. Not
+            // `Keep` — the budget does refill.
+            return IdleVerdict::DeferUntil(refill);
+        }
+        let idle_at = i.last_activity + auto.window;
         let resident_at = i.ready_since + self.min_residency;
         let at = idle_at.max(resident_at);
         if i.now >= at {
@@ -438,6 +628,12 @@ pub enum WakeSourceKind {
     /// BEFORE a workflow was added (lazy Apply) or any wfops that lands
     /// on a sleeping tenant.
     Workflow,
+    /// The host's own max-sleep deadline (`[scaleToZero.auto]
+    /// maxSleepMs`): the tenant has been asleep long enough that its
+    /// spec/alarm-index view may be stale — wake it so the next eval
+    /// sees a fresh resident tenant. No external waiter watches the
+    /// flight.
+    MaxSleep,
 }
 
 impl WakeSourceKind {
@@ -450,6 +646,7 @@ impl WakeSourceKind {
             Self::Alarm => "alarm",
             Self::WebSocket => "websocket",
             Self::Workflow => "workflow",
+            Self::MaxSleep => "max-sleep",
         }
     }
 
@@ -457,9 +654,13 @@ impl WakeSourceKind {
     /// single wake may use (>= 1).
     pub fn max_attempts(self) -> u32 {
         match self {
-            Self::Http | Self::Cron | Self::Queue | Self::Workflow | Self::Alarm | Self::WebSocket => {
-                2
-            }
+            Self::Http
+            | Self::Cron
+            | Self::Queue
+            | Self::Workflow
+            | Self::Alarm
+            | Self::WebSocket
+            | Self::MaxSleep => 2,
         }
     }
 
@@ -471,7 +672,7 @@ impl WakeSourceKind {
     /// timeout, see that constant).
     pub fn max_wait(self, default: Duration) -> Duration {
         match self {
-            Self::Http | Self::Cron | Self::Alarm | Self::WebSocket => default,
+            Self::Http | Self::Cron | Self::Alarm | Self::WebSocket | Self::MaxSleep => default,
             Self::Queue => default.min(QUEUE_WAKE_MAX_WAIT),
             Self::Workflow => default.min(WORKFLOW_WAKE_MAX_WAIT),
         }
@@ -882,6 +1083,7 @@ mod tests {
             now,
             last_activity: last,
             ready_since: ready,
+            auto: None,
         };
         // Idle long enough and resident long enough.
         assert_eq!(
@@ -912,6 +1114,165 @@ mod tests {
             min_residency: Duration::ZERO,
         };
         assert_eq!(off.evaluate(&mk(at(t0, 9999), t0, t0)), IdleVerdict::Keep);
+    }
+
+    fn auto_params() -> AutoParams {
+        AutoParams {
+            floor: Duration::from_secs(600),
+            ceiling: Duration::from_secs(3_600),
+            premature_wake: Duration::from_secs(120),
+            sound_sleep: Duration::from_secs(3_600),
+            wake_budget: 0,
+            wake_budget_window: Duration::from_secs(3_600),
+        }
+    }
+
+    #[test]
+    fn auto_state_adapts_window_on_wake() {
+        let t0 = Instant::now();
+        let mut s = AutoState::new(auto_params());
+        assert_eq!(s.window(), Duration::from_secs(600));
+        // A premature wake (slept < 2min) doubles the window.
+        s.record_sleep_commit(t0);
+        s.record_wake(at(t0, 60));
+        assert_eq!(s.window(), Duration::from_secs(1_200));
+        // Neutral sleep: between premature and sound — unchanged.
+        s.record_sleep_commit(at(t0, 100));
+        s.record_wake(at(t0, 1_300));
+        assert_eq!(s.window(), Duration::from_secs(1_200));
+        // A sound sleep halves it toward the floor.
+        s.record_sleep_commit(at(t0, 1_400));
+        s.record_wake(at(t0, 1_400 + 3_700));
+        assert_eq!(s.window(), Duration::from_secs(600));
+        // Ceiling cap: repeated premature wakes stop at ceiling.
+        for i in 0..5 {
+            let base = at(t0, 10_000 + i * 300);
+            s.record_sleep_commit(base);
+            s.record_wake(base + Duration::from_secs(10));
+        }
+        assert_eq!(s.window(), Duration::from_secs(3_600));
+        // Floor cap: sound sleeps cannot push below the configured
+        // idle window.
+        for i in 0..5 {
+            let base = at(t0, 20_000 + i * 4_000);
+            s.record_sleep_commit(base);
+            s.record_wake(base + Duration::from_secs(3_900));
+        }
+        assert_eq!(s.window(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn auto_state_clear_sleep_ignores_uncommitted_wake() {
+        let t0 = Instant::now();
+        let mut s = AutoState::new(auto_params());
+        s.record_sleep_commit(t0);
+        s.clear_sleep();
+        // Wake without a committed sleep: no adaptation (slept_at was
+        // consumed), but the wake still counts toward the budget.
+        s.record_wake(at(t0, 60));
+        assert_eq!(s.window(), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn auto_state_wake_budget_gates_facts() {
+        let t0 = Instant::now();
+        let mut p = auto_params();
+        p.wake_budget = 2;
+        let mut s = AutoState::new(p);
+        assert_eq!(s.facts(t0).budget_refill_at, None);
+        assert_eq!(s.budget_remaining(t0), 2);
+        s.record_wake(at(t0, 10));
+        s.record_wake(at(t0, 20));
+        // Exhausted: refill when the OLDEST counted wake ages out.
+        let f = s.facts(at(t0, 30));
+        assert_eq!(f.budget_refill_at, Some(at(t0, 10 + 3_600)));
+        assert_eq!(s.budget_remaining(at(t0, 30)), 0);
+        // Over-budget (3 wakes): refill when len-budget+1 = 2 wakes
+        // age out — i.e. the wake at index len-budget = 1 (t=20).
+        s.record_wake(at(t0, 25));
+        let f = s.facts(at(t0, 30));
+        assert_eq!(f.budget_refill_at, Some(at(t0, 20 + 3_600)));
+        // After the first wake ages out, still exhausted (2 remain).
+        let f = s.facts(at(t0, 3_611));
+        assert_eq!(f.budget_refill_at, Some(at(t0, 20 + 3_600)));
+        // After two age out: budget refilled.
+        let f = s.facts(at(t0, 3_621));
+        assert_eq!(f.budget_refill_at, None);
+        assert_eq!(s.budget_remaining(at(t0, 3_621)), 1);
+    }
+
+    #[test]
+    fn auto_policy_evaluates_facts() {
+        let p = AutoPolicy {
+            params: auto_params(),
+            min_residency: Duration::from_secs(120),
+        };
+        let t0 = Instant::now();
+        let facts = |window, refill| {
+            Some(AutoFacts {
+                window,
+                budget_refill_at: refill,
+            })
+        };
+        let mk = |now, last, ready, auto| IdleInputs {
+            now,
+            last_activity: last,
+            ready_since: ready,
+            auto,
+        };
+        // No facts = keep (policy cannot decide without state).
+        assert_eq!(
+            p.evaluate(&mk(at(t0, 9999), t0, t0, None)),
+            IdleVerdict::Keep
+        );
+        // Idle past the adapted window hibernates.
+        assert_eq!(
+            p.evaluate(&mk(
+                at(t0, 700),
+                t0,
+                t0,
+                facts(Duration::from_secs(600), None)
+            )),
+            IdleVerdict::Hibernate
+        );
+        // A longer adapted window defers further out.
+        assert_eq!(
+            p.evaluate(&mk(
+                at(t0, 700),
+                t0,
+                t0,
+                facts(Duration::from_secs(1_200), None)
+            )),
+            IdleVerdict::DeferUntil(at(t0, 1_200))
+        );
+        // Exhausted budget defers to the refill instant — not Keep.
+        assert_eq!(
+            p.evaluate(&mk(
+                at(t0, 700),
+                t0,
+                t0,
+                facts(Duration::from_secs(600), Some(at(t0, 5_000)))
+            )),
+            IdleVerdict::DeferUntil(at(t0, 5_000))
+        );
+        // Residency floor still applies under the adapted window.
+        assert_eq!(
+            p.evaluate(&mk(
+                at(t0, 50),
+                t0,
+                t0,
+                facts(Duration::from_secs(10), None)
+            )),
+            IdleVerdict::DeferUntil(at(t0, 120))
+        );
+    }
+
+    #[test]
+    fn max_sleep_wake_source_is_bounded() {
+        assert_eq!(WakeSourceKind::MaxSleep.label(), "max-sleep");
+        assert_eq!(WakeSourceKind::MaxSleep.max_attempts(), 2);
+        let d = Duration::from_secs(30);
+        assert_eq!(WakeSourceKind::MaxSleep.max_wait(d), d);
     }
 
     fn ctx(in_flight: usize, s: StructuralFacts, wu: WaitUntilFact) -> BlockContext {

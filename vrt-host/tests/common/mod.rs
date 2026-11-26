@@ -175,7 +175,7 @@ impl Fixture {
             wfop_tokens: BTreeMap::new(),
             limits: ResourceLimits::default(),
             heartbeat_endpoint: None,
-        waituntil_endpoint: None,
+            waituntil_endpoint: None,
             extra_args: Vec::new(),
             generation: 0,
             isolation: None,

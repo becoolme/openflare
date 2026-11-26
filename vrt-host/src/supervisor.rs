@@ -429,6 +429,12 @@ pub struct TenantStats {
     pub last_wake_ms: AtomicU64,
     /// Scale-to-zero: unix ms the tenant went to sleep (0 = awake).
     pub hibernated_at_ms: AtomicU64,
+    /// Stage-4 auto policy: the tenant's currently adapted idle window
+    /// (0 = auto policy off).
+    pub s2z_idle_window_ms: AtomicU64,
+    /// Stage-4 auto policy: counted wakes remaining before the budget
+    /// keeps the tenant resident (u64::MAX = unlimited).
+    pub s2z_budget_remaining: AtomicU64,
 }
 
 impl std::fmt::Debug for TenantRuntime {
@@ -1959,7 +1965,19 @@ pub fn spawn_supervisor(
         hib: None,
         wake_run: None,
         hib_probe_seq: 0,
+        auto_state: params
+            .scale_to_zero
+            .as_ref()
+            .and_then(|s| s.auto)
+            .map(crate::hibernate::AutoState::new),
+        sleep_until: None,
     };
+    // Unlimited until an auto policy says otherwise.
+    actor
+        .runtime
+        .stats
+        .s2z_budget_remaining
+        .store(u64::MAX, Ordering::Relaxed);
     if let Some(cfg) = &params.scale_to_zero {
         actor
             .runtime
@@ -2188,6 +2206,13 @@ struct Actor {
     wake_run: Option<WakeRun>,
     /// Monotone id of waitUntil pre-commit probes.
     hib_probe_seq: u64,
+    /// Stage-4 auto-policy state (adaptive window + wake budget).
+    /// Lazily built from `s2z.auto` at the first idle evaluation so a
+    /// config landing after boot still takes effect.
+    auto_state: Option<crate::hibernate::AutoState>,
+    /// Max-sleep deadline for the current hibernation (`s2z.max_sleep`
+    /// armed at commit); the tick fires a `MaxSleep` self-wake at it.
+    sleep_until: Option<Instant>,
 }
 
 /// Where the waitUntil pre-commit probe stands.
@@ -3646,6 +3671,16 @@ impl Actor {
             self.on_wake_deadline();
         }
         self.evaluate_idle(now);
+        // Stage 4: a hibernated tenant past its max-sleep bound wakes
+        // itself — the wake goes through the normal flight/coordinator
+        // path (source `max-sleep`), just with nobody waiting on it.
+        if self.state == TenantState::Hibernated && self.sleep_until.is_some_and(|t| now >= t) {
+            self.sleep_until = None;
+            self.runtime
+                .wake
+                .join(crate::hibernate::WakeSourceKind::MaxSleep);
+            self.service_wake();
+        }
         if self.state == TenantState::Ready && now >= self.next_monitor {
             self.next_monitor = now + self.monitor_interval;
             self.sample_active(now);
@@ -7183,6 +7218,12 @@ impl Actor {
             self.hib_next_eval = now + s2z.blocked_recheck;
             return;
         }
+        // A Ready tenant holding an unconsumed sleep marker reached
+        // Ready without a wake flight (relaunch/apply path) — the
+        // marker is stale, not a sleep to adapt from.
+        if let Some(s) = self.auto_state.as_mut() {
+            s.clear_sleep();
+        }
         let Some(gen) = self.active.as_ref() else {
             return;
         };
@@ -7192,10 +7233,38 @@ impl Actor {
             // time is not tracked, so every evaluation touches).
             self.runtime.touch();
         }
+        // Stage-4 auto policy: lazily adopt the params the config
+        // carries (an `s2z` swap after boot still takes effect), feed
+        // the per-tenant facts, and count budget-denied evaluations.
+        if self.auto_state.is_none() {
+            self.auto_state = s2z.auto.map(crate::hibernate::AutoState::new);
+        }
+        let auto_facts = self.auto_state.as_mut().map(|s| s.facts(now));
+        if let Some(f) = auto_facts {
+            self.runtime.stats.s2z_idle_window_ms.store(
+                f.window.as_millis().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            self.runtime.stats.s2z_budget_remaining.store(
+                self.auto_state
+                    .as_mut()
+                    .map(|s| s.budget_remaining(now))
+                    .unwrap_or(0) as u64,
+                Ordering::Relaxed,
+            );
+            if f.budget_refill_at.is_some() {
+                crate::metrics::registry().inc(
+                    "vrt_host_s2z_budget_deferred_total",
+                    &[("tenant_id", &self.tenant_id)],
+                    1.0,
+                );
+            }
+        }
         let inputs = IdleInputs {
             now,
             last_activity: self.runtime.last_activity(),
             ready_since: self.ready_since,
+            auto: auto_facts,
         };
         match s2z.policy.evaluate(&inputs) {
             IdleVerdict::Keep => {
@@ -7424,6 +7493,13 @@ impl Actor {
             &[("outcome", "committed")],
             1.0,
         );
+        // Stage 4: the committed sleep feeds the adaptive window and
+        // arms the optional max-sleep deadline (a `MaxSleep` self-wake
+        // refreshes a tenant that slept too long).
+        if let Some(s) = self.auto_state.as_mut() {
+            s.record_sleep_commit(now);
+        }
+        self.sleep_until = self.s2z.as_ref().and_then(|s| s.max_sleep).map(|d| now + d);
         tracing::info!(tenant = %self.tenant_id, gen = gen.id, "tenant hibernated");
         self.enter_draining(gen, now, false);
         // A wake that raced the commit is picked up here.
@@ -7551,6 +7627,11 @@ impl Actor {
             Ordering::Relaxed,
         );
         stats.hibernated_at_ms.store(0, Ordering::Relaxed);
+        self.sleep_until = None;
+        // Stage 4: the wake adapts the idle window and spends budget.
+        if let Some(s) = self.auto_state.as_mut() {
+            s.record_wake(Instant::now());
+        }
         let r = crate::metrics::registry();
         r.inc(
             "vrt_host_wake_total",
@@ -9541,6 +9622,12 @@ mod tests {
             hib: None,
             wake_run: None,
             hib_probe_seq: 0,
+            auto_state: params
+                .scale_to_zero
+                .as_ref()
+                .and_then(|s| s.auto)
+                .map(crate::hibernate::AutoState::new),
+            sleep_until: None,
         }
     }
 

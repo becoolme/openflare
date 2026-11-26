@@ -464,9 +464,7 @@ pub fn render_and_write(
                     .iter()
                     .find(|m| m["name"].as_str().unwrap() == module_name)
                     .unwrap_or_else(|| panic!("{service_name}/{module_name} not in manifest"));
-                let src = facade_root()
-                    .join("..")
-                    .join(m["dist"].as_str().unwrap());
+                let src = facade_root().join("..").join(m["dist"].as_str().unwrap());
                 let bytes =
                     std::fs::read(&src).unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
                 let got = format!("{:x}", Sha256::digest(&bytes));

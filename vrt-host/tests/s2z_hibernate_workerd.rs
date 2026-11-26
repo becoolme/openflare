@@ -408,6 +408,8 @@ fn s2z(idle_ms: u64, min_res_ms: u64) -> ScaleToZero {
             idle_window: Duration::from_millis(idle_ms),
             min_residency: Duration::from_millis(min_res_ms),
         }),
+        auto: None,
+        max_sleep: None,
         blockers: Arc::new(BlockerChain::p0()),
         coordinator: WakeCoordinator::new(4, 256),
         drain_timeout: Duration::from_secs(5),

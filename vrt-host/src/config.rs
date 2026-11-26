@@ -291,6 +291,60 @@ pub struct ScaleToZeroConfig {
     /// persisted overdue alarm before the idle policy sleeps it again.
     #[serde(default = "default_s2z_alarm_grace_ms")]
     pub alarm_wake_grace_ms: u64,
+    /// `[scaleToZero.auto]` — stage-4 automatic policy (absent = the
+    /// fixed `idleMs` window). Present ⇒ per-tenant adaptive idle
+    /// window + wake budget + optional max-sleep bound.
+    #[serde(default)]
+    pub auto: Option<S2zAutoConfig>,
+}
+
+/// `[scaleToZero.auto]` — the stage-4 automatic idle policy
+/// (`docs/do-hibernation.md`): the idle window adapts to observed
+/// sleep/wake history instead of staying at the fixed `idleMs`, a
+/// per-tenant wake budget keeps thrashing tenants resident, and an
+/// optional `maxSleepMs` bounds how long a tenant may stay asleep.
+/// The section's presence selects the policy; every knob has a
+/// default and the whole set is bounds-checked at startup (fail
+/// closed — a mistyped bound must not silently tune hibernation).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct S2zAutoConfig {
+    /// A committed sleep shorter than this was not worth the wake
+    /// cost: the idle window doubles (bounded by `ceilingMs`).
+    #[serde(default = "default_s2z_auto_premature_ms")]
+    pub premature_wake_ms: u64,
+    /// A committed sleep at least this long means the tenant could
+    /// have slept sooner: the window halves (bounded by `idleMs`).
+    /// Must exceed `prematureWakeMs` (else grow/shrink oscillates).
+    #[serde(default = "default_s2z_auto_sound_ms")]
+    pub sound_sleep_ms: u64,
+    /// Adaptation ceiling — the window never grows past this.
+    #[serde(default = "default_s2z_auto_ceiling_ms")]
+    pub ceiling_ms: u64,
+    /// Longest a tenant may stay hibernated before the host wakes it
+    /// itself (bounds spec/alarm-index staleness). 0 = no bound.
+    #[serde(default)]
+    pub max_sleep_ms: u64,
+    /// Successful wakes allowed inside `wakeBudgetWindowMs` before
+    /// the tenant is kept resident (0 = unlimited).
+    #[serde(default)]
+    pub wake_budget: u32,
+    /// Sliding window the wake budget is counted over.
+    #[serde(default = "default_s2z_auto_budget_window_ms")]
+    pub wake_budget_window_ms: u64,
+}
+
+fn default_s2z_auto_premature_ms() -> u64 {
+    120_000
+}
+fn default_s2z_auto_sound_ms() -> u64 {
+    3_600_000
+}
+fn default_s2z_auto_ceiling_ms() -> u64 {
+    86_400_000
+}
+fn default_s2z_auto_budget_window_ms() -> u64 {
+    3_600_000
 }
 
 fn default_s2z_idle_ms() -> u64 {
@@ -326,6 +380,7 @@ impl Default for ScaleToZeroConfig {
             drain_timeout_ms: default_s2z_drain_ms(),
             wake_deadline_ms: default_s2z_wake_ms(),
             alarm_wake_grace_ms: default_s2z_alarm_grace_ms(),
+            auto: None,
         }
     }
 }
@@ -370,21 +425,54 @@ impl ScaleToZeroConfig {
                 "scaleToZero.alarmWakeGraceMs must be 1s..10min",
             ));
         }
+        if let Some(a) = &self.auto {
+            a.validate(self.idle_ms)?;
+        }
         Ok(())
     }
 
     /// Build the shared runtime object (ONE coordinator for the whole
     /// host); `None` when the switch is off.
     pub fn build(&self) -> Option<crate::hibernate::ScaleToZero> {
-        use crate::hibernate::{BlockerChain, FixedWindowPolicy, ScaleToZero, WakeCoordinator};
+        use crate::hibernate::{
+            AutoParams, AutoPolicy, BlockerChain, FixedWindowPolicy, ScaleToZero, WakeCoordinator,
+        };
         if !self.enabled {
             return None;
         }
+        let min_residency = Duration::from_millis(self.min_residency_ms);
+        let (policy, auto, max_sleep) = match &self.auto {
+            Some(a) => {
+                let params = AutoParams {
+                    floor: Duration::from_millis(self.idle_ms),
+                    ceiling: Duration::from_millis(a.ceiling_ms),
+                    premature_wake: Duration::from_millis(a.premature_wake_ms),
+                    sound_sleep: Duration::from_millis(a.sound_sleep_ms),
+                    wake_budget: a.wake_budget,
+                    wake_budget_window: Duration::from_millis(a.wake_budget_window_ms),
+                };
+                (
+                    std::sync::Arc::new(AutoPolicy {
+                        params,
+                        min_residency,
+                    }) as std::sync::Arc<dyn crate::hibernate::IdlePolicy>,
+                    Some(params),
+                    (a.max_sleep_ms > 0).then(|| Duration::from_millis(a.max_sleep_ms)),
+                )
+            }
+            None => (
+                std::sync::Arc::new(FixedWindowPolicy {
+                    idle_window: Duration::from_millis(self.idle_ms),
+                    min_residency,
+                }) as std::sync::Arc<dyn crate::hibernate::IdlePolicy>,
+                None,
+                None,
+            ),
+        };
         Some(ScaleToZero {
-            policy: std::sync::Arc::new(FixedWindowPolicy {
-                idle_window: Duration::from_millis(self.idle_ms),
-                min_residency: Duration::from_millis(self.min_residency_ms),
-            }),
+            policy,
+            auto,
+            max_sleep,
             blockers: std::sync::Arc::new(BlockerChain::p0()),
             coordinator: WakeCoordinator::new(self.max_concurrent_wakes, self.max_wake_queue),
             drain_timeout: Duration::from_millis(self.drain_timeout_ms),
@@ -393,6 +481,47 @@ impl ScaleToZeroConfig {
             quiesce_poll: Duration::from_millis(250),
             alarm_wake_grace: Duration::from_millis(self.alarm_wake_grace_ms),
         })
+    }
+}
+
+impl S2zAutoConfig {
+    /// Fail closed: auto-policy bounds that cannot produce a sane
+    /// window refuse to start.
+    fn validate(&self, idle_ms: u64) -> Result<(), ConfigError> {
+        if self.premature_wake_ms < 1_000 || self.premature_wake_ms > 3_600_000 {
+            return Err(ConfigError::Invalid(
+                "scaleToZero.auto.prematureWakeMs must be 1s..1h",
+            ));
+        }
+        if self.sound_sleep_ms <= self.premature_wake_ms || self.sound_sleep_ms > 7 * 24 * 3_600_000
+        {
+            return Err(ConfigError::Invalid(
+                "scaleToZero.auto.soundSleepMs must be > prematureWakeMs and <= 7d",
+            ));
+        }
+        if self.ceiling_ms < idle_ms || self.ceiling_ms > 7 * 24 * 3_600_000 {
+            return Err(ConfigError::Invalid(
+                "scaleToZero.auto.ceilingMs must be >= idleMs and <= 7d",
+            ));
+        }
+        if self.max_sleep_ms != 0
+            && (self.max_sleep_ms < 60_000 || self.max_sleep_ms > 7 * 24 * 3_600_000)
+        {
+            return Err(ConfigError::Invalid(
+                "scaleToZero.auto.maxSleepMs must be 0 or 1min..7d",
+            ));
+        }
+        if self.wake_budget > 10_000 {
+            return Err(ConfigError::Invalid(
+                "scaleToZero.auto.wakeBudget must be <= 10000",
+            ));
+        }
+        if self.wake_budget_window_ms < 60_000 || self.wake_budget_window_ms > 7 * 24 * 3_600_000 {
+            return Err(ConfigError::Invalid(
+                "scaleToZero.auto.wakeBudgetWindowMs must be 1min..7d",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -3102,6 +3231,103 @@ mod tests {
             toml::from_str("enabled = true\nidleMs = 5000\nmaxConcurrentWakes = 2").unwrap();
         assert!(c.enabled && c.idle_ms == 5000 && c.max_concurrent_wakes == 2);
         assert!(toml::from_str::<ScaleToZeroConfig>("bogus = 1").is_err());
+        // Nested auto section parses; an unknown key inside it fails
+        // (deny_unknown_fields — a mistyped knob must not silently
+        // tune the policy).
+        let a: ScaleToZeroConfig =
+            toml::from_str("enabled = true\n[auto]\nmaxSleepMs = 86400000\nwakeBudget = 12")
+                .unwrap();
+        let auto = a.auto.expect("auto section parsed");
+        assert_eq!(auto.max_sleep_ms, 86_400_000);
+        assert_eq!(auto.wake_budget, 12);
+        assert!(toml::from_str::<ScaleToZeroConfig>("enabled = true\n[auto]\nbogus = 1").is_err());
+    }
+
+    /// Stage 4: `[scaleToZero.auto]` builds the auto policy + bounds,
+    /// and its knobs are bounds-checked fail-closed.
+    #[test]
+    fn scale_to_zero_auto_validates_and_builds() {
+        let on = ScaleToZeroConfig {
+            enabled: true,
+            auto: Some(S2zAutoConfig {
+                premature_wake_ms: 60_000,
+                sound_sleep_ms: 600_000,
+                ceiling_ms: 7_200_000,
+                max_sleep_ms: 86_400_000,
+                wake_budget: 4,
+                wake_budget_window_ms: 3_600_000,
+            }),
+            ..Default::default()
+        };
+        on.validate().unwrap();
+        let s = on.build().expect("enabled builds");
+        let params = s.auto.expect("auto config produces auto params");
+        assert_eq!(params.floor, Duration::from_millis(on.idle_ms));
+        assert_eq!(params.ceiling, Duration::from_secs(7_200));
+        assert_eq!(params.premature_wake, Duration::from_secs(60));
+        assert_eq!(params.sound_sleep, Duration::from_secs(600));
+        assert_eq!(params.wake_budget, 4);
+        assert_eq!(params.wake_budget_window, Duration::from_secs(3_600));
+        assert_eq!(s.max_sleep, Some(Duration::from_secs(86_400)));
+        // Auto absent = fixed policy, no state, no max-sleep.
+        let fixed = ScaleToZeroConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .build()
+        .unwrap();
+        assert!(fixed.auto.is_none() && fixed.max_sleep.is_none());
+        // maxSleepMs = 0 means no bound.
+        let unbounded = ScaleToZeroConfig {
+            enabled: true,
+            auto: Some(S2zAutoConfig {
+                max_sleep_ms: 0,
+                ..auto_default()
+            }),
+            ..Default::default()
+        };
+        unbounded.validate().unwrap();
+        assert_eq!(unbounded.build().unwrap().max_sleep, None);
+
+        let mk_auto = |patch: &dyn Fn(&mut S2zAutoConfig)| {
+            let mut a = auto_default();
+            patch(&mut a);
+            ScaleToZeroConfig {
+                enabled: true,
+                auto: Some(a),
+                ..Default::default()
+            }
+        };
+        for c in [
+            mk_auto(&|a| a.premature_wake_ms = 999),
+            mk_auto(&|a| a.sound_sleep_ms = a.premature_wake_ms),
+            mk_auto(&|a| a.ceiling_ms = 1),
+            mk_auto(&|a| a.max_sleep_ms = 59_000),
+            mk_auto(&|a| a.wake_budget = 10_001),
+            mk_auto(&|a| a.wake_budget_window_ms = 59_000),
+        ] {
+            assert!(c.validate().is_err(), "{c:?} must be rejected");
+        }
+        // Auto bounds are only checked when the feature is on.
+        mk_auto(&|a| a.premature_wake_ms = 1)
+            .auto
+            .is_some()
+            .then(|| ())
+            .unwrap();
+        ScaleToZeroConfig {
+            enabled: false,
+            auto: Some(S2zAutoConfig {
+                premature_wake_ms: 1,
+                ..auto_default()
+            }),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+    }
+
+    fn auto_default() -> S2zAutoConfig {
+        toml::from_str::<S2zAutoConfig>("").unwrap()
     }
 
     #[test]
