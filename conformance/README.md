@@ -3,7 +3,10 @@
 ## Current coverage
 
 Executable cases cover KV, R2, D1, Queues, Cache, Cron, Durable Objects,
-static Assets, plain Vars, and the basic Rate Limiting binding result.
+static Assets, plain Vars, the basic Rate Limiting binding result, and
+Browser (`puppeteer.launch`/`connect` over the `/v1/*` control surface
+against the vendored kitesurf engine, including a PNG screenshot
+golden).
 D1 coverage includes prepared-statement calls, Sessions, `dump()`,
 `raw({columnNames})`, and the documented 50 MB query-result limit.
 The areas that need infrastructure or protocols the runner cannot yet

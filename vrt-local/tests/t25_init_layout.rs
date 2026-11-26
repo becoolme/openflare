@@ -266,6 +266,11 @@ fn init_seeds_facade_modules_and_persists_manifest() {
         }
     }
     assert!(count > 10, "seeded all system modules: {count}");
+    // diskServices payload trees are copied next to the manifest —
+    // the host resolves the facade-relative path under this dir.
+    assert!(root.join("facade/kitesurf-public").is_dir());
+    assert!(root.join("facade/kitesurf-public/_headers").is_file());
+    assert!(root.join("facade/kitesurf-public/fonts").is_dir());
     // L9: signed empty envelope published at revision 1.
     let env: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("desired/envelope.json")).unwrap())

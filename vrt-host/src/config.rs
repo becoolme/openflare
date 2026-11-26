@@ -2717,9 +2717,26 @@ struct RenderParamsFile {
     deny_outbound: ServiceEndpointToml,
     facades: FacadeRefsToml,
     system_workers: Vec<SystemWorkerToml>,
+    /// `disk` services from the facade manifest — absolute on-host
+    /// payload directories (facade-relative paths are resolved by
+    /// `params_json_from_manifest` before this document is written).
+    #[serde(default)]
+    disk_services: Vec<SystemDiskServiceToml>,
     system_compat_date: String,
     #[serde(default)]
     system_compat_flags: Vec<String>,
+}
+
+/// Serde mirror of `vrt_config::SystemDiskService`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SystemDiskServiceToml {
+    service_name: String,
+    /// Absolute directory path — emitted verbatim into
+    /// `disk = (path = …)`. The manifest derivation resolves the
+    /// facade-relative path and canonicalises it; a static params file
+    /// carries the absolute path directly.
+    path: String,
 }
 
 impl RenderParamsFile {
@@ -2756,6 +2773,34 @@ impl RenderParamsFile {
             deny_outbound: self.deny_outbound.into(),
             facades: self.facades.into(),
             system_workers: self.system_workers.into_iter().map(Into::into).collect(),
+            disk_services: self
+                .disk_services
+                .into_iter()
+                .map(|d| {
+                    // The emitted `disk = (path = …)` is verbatim —
+                    // reject anything the strict path whitelist refuses
+                    // so a params typo cannot smuggle weird segments.
+                    if d.path.len() > 1024
+                        || !d.path.starts_with('/')
+                        // Absolute path — the leading `/` itself is the
+                        // first (empty) segment; skip it.
+                        || d.path
+                            .split('/')
+                            .skip(1)
+                            .any(|s| s.is_empty() || s == "." || s == "..")
+                        || !d
+                            .path
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+                    {
+                        return Err(ConfigError::Parse("diskServices.path"));
+                    }
+                    Ok(vrt_config::SystemDiskService {
+                        service_name: d.service_name,
+                        path: d.path,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
             system_compat_date: self.system_compat_date,
             system_compat_flags: self.system_compat_flags,
             vars,
@@ -2833,20 +2878,60 @@ pub fn params_json_from_manifest(
             "images": endpoint(&manifest.facades.images),
             // Vectorize binding facade (REQUIRED_FACADES).
             "vectorize": endpoint(&manifest.facades.vectorize),
+            // Browser binding facade (REQUIRED_FACADES).
+            "browser": endpoint(&manifest.facades.browser),
         },
         "systemWorkers": manifest.system_workers.iter().map(|w| {
             serde_json::json!({
                 "serviceName": w.service_name,
                 "mainModule": w.main_module,
                 "modules": w.modules.iter().map(|m| {
-                    serde_json::json!({"name": m.name, "digest": m.digest})
+                    // `type` must ride the params doc — without it the
+                    // SystemModuleToml mirror infers esModule/wasm by
+                    // suffix and every text/data/json module (kitesurf
+                    // css/dat/glue payloads) renders as JS and fails
+                    // workerd load.
+                    serde_json::json!({"name": m.name, "digest": m.digest, "type": m.module_type})
                 }).collect::<Vec<_>>(),
                 "needsBindingBackend": w.needs_binding_backend,
                 "cpuMs": w.cpu_ms,
                 "memoryMb": w.memory_mb,
                 "subRequests": w.sub_requests,
+                // Schema v3 fields — serialized verbatim so the derived
+                // params doc carries the same shape a static params
+                // file would (the TOML mirror re-parses them).
+                "compatibilityFlags": w.compatibility_flags,
+                "compatibilityDate": w.compatibility_date,
+                "bindings": w.bindings.iter().map(|b| match b {
+                    vrt_config::SystemBinding::WorkerLoader { name, max_workers } =>
+                        serde_json::json!({"type": "workerLoader", "name": name, "maxWorkers": max_workers}),
+                    vrt_config::SystemBinding::Service { name, service, entrypoint } =>
+                        serde_json::json!({"type": "service", "name": name, "service": service, "entrypoint": entrypoint}),
+                    vrt_config::SystemBinding::Text { name, value } =>
+                        serde_json::json!({"type": "text", "name": name, "value": value}),
+                    vrt_config::SystemBinding::Json { name, value } =>
+                        serde_json::json!({"type": "json", "name": name, "value": value}),
+                }).collect::<Vec<_>>(),
+                "outbound": match w.outbound {
+                    vrt_config::SystemOutbound::Deny => "deny",
+                    vrt_config::SystemOutbound::PublicOnly => "publicOnly",
+                },
             })
         }).collect::<Vec<_>>(),
+        // `diskServices` — the manifest path is facade-relative; the
+        // emitted config wants the absolute on-host directory, so the
+        // join under the manifest's own dir is canonicalised here and
+        // must exist (fail closed like a missing module file).
+        "diskServices": vrt_config::resolve_disk_paths(
+            manifest_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("/")),
+            &manifest.disk_services,
+        )
+        .ok_or(ConfigError::Parse("diskServices.path"))?
+        .iter()
+        .map(|d| serde_json::json!({"serviceName": d.service_name, "path": d.path}))
+        .collect::<Vec<_>>(),
         "systemCompatDate": system_compat_date,
         "systemCompatFlags": system_compat_flags,
     });
@@ -2986,6 +3071,7 @@ struct FacadeRefsToml {
     email: ServiceEndpointToml,
     images: ServiceEndpointToml,
     vectorize: ServiceEndpointToml,
+    browser: ServiceEndpointToml,
 }
 
 impl From<FacadeRefsToml> for vrt_config::FacadeRefs {
@@ -3002,6 +3088,7 @@ impl From<FacadeRefsToml> for vrt_config::FacadeRefs {
             email: v.email.into(),
             images: v.images.into(),
             vectorize: v.vectorize.into(),
+            browser: v.browser.into(),
         }
     }
 }
@@ -3027,6 +3114,36 @@ struct SystemWorkerToml {
     /// `0`/absent keeps the worker unlimited.
     #[serde(default)]
     sub_requests: u32,
+    /// Per-worker compat flags (stable-only — see the facade manifest
+    /// schema; the TOML mirror applies the same check at parse).
+    #[serde(default)]
+    compatibility_flags: Vec<String>,
+    /// Per-worker `compatibilityDate` override (vendored engines).
+    #[serde(default)]
+    compatibility_date: Option<String>,
+    /// Manifest-declared bindings beyond `BINDING_BACKEND`.
+    #[serde(default)]
+    bindings: Vec<SystemBindingToml>,
+    /// `"deny"` (default) or `"publicOnly"` — same contract as the
+    /// facade manifest `outbound` field.
+    #[serde(default)]
+    outbound: Option<String>,
+}
+
+/// Serde mirror of `vrt_config::SystemBinding` — internally tagged on
+/// `type` like the manifest wire shape.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum SystemBindingToml {
+    WorkerLoader { name: String, max_workers: u32 },
+    Service {
+        name: String,
+        service: String,
+        #[serde(default)]
+        entrypoint: Option<String>,
+    },
+    Text { name: String, value: String },
+    Json { name: String, value: String },
 }
 
 impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
@@ -3036,6 +3153,36 @@ impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
             main_module: v.main_module,
             modules: v.modules.into_iter().map(Into::into).collect(),
             needs_binding_backend: v.needs_binding_backend,
+            compatibility_flags: v.compatibility_flags,
+            compatibility_date: v.compatibility_date,
+            bindings: v
+                .bindings
+                .into_iter()
+                .map(|b| match b {
+                    SystemBindingToml::WorkerLoader { name, max_workers } => {
+                        vrt_config::SystemBinding::WorkerLoader { name, max_workers }
+                    }
+                    SystemBindingToml::Service {
+                        name,
+                        service,
+                        entrypoint,
+                    } => vrt_config::SystemBinding::Service {
+                        name,
+                        service,
+                        entrypoint: entrypoint.unwrap_or_default(),
+                    },
+                    SystemBindingToml::Text { name, value } => {
+                        vrt_config::SystemBinding::Text { name, value }
+                    }
+                    SystemBindingToml::Json { name, value } => {
+                        vrt_config::SystemBinding::Json { name, value }
+                    }
+                })
+                .collect(),
+            outbound: match v.outbound.as_deref() {
+                Some("publicOnly") => vrt_config::SystemOutbound::PublicOnly,
+                _ => vrt_config::SystemOutbound::Deny,
+            },
             cpu_ms: v.cpu_ms,
             memory_mb: v.memory_mb,
             sub_requests: v.sub_requests,
@@ -3049,13 +3196,27 @@ impl From<SystemWorkerToml> for vrt_config::SystemWorkerRef {
 struct SystemModuleToml {
     name: String,
     digest: String,
+    /// capnp module kind (`esModule`/`text`/`data`/`json`/`wasm`);
+    /// absent infers from the `.wasm` suffix like the manifest parser.
+    #[serde(default)]
+    r#type: Option<String>,
 }
 
 impl From<SystemModuleToml> for vrt_config::SystemModuleRef {
     fn from(v: SystemModuleToml) -> Self {
         Self {
-            name: v.name,
+            name: v.name.clone(),
             digest: v.digest,
+            module_type: match v.r#type.as_deref() {
+                Some("wasm") => vrt_config::manifest::ModuleType::Wasm,
+                Some("text") => vrt_config::manifest::ModuleType::Text,
+                Some("data") => vrt_config::manifest::ModuleType::Data,
+                Some("json") => vrt_config::manifest::ModuleType::Json,
+                Some("esModule") => vrt_config::manifest::ModuleType::EsModule,
+                Some("commonJs") => vrt_config::manifest::ModuleType::CommonJs,
+                _ if v.name.ends_with(".wasm") => vrt_config::manifest::ModuleType::Wasm,
+                _ => vrt_config::manifest::ModuleType::EsModule,
+            },
         }
     }
 }

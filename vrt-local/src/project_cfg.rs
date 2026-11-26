@@ -145,6 +145,7 @@ const NON_INHERITABLE_ENV_KEYS: &[&str] = &[
     "secrets_store_secrets",
     "version_metadata",
     "worker_loaders",
+    "browser",
 ];
 /// Mirrors @wdl-dev/cli TOP_LEVEL_ONLY_ENV_KEYS.
 const TOP_LEVEL_ONLY_ENV_KEYS: &[&str] = &["name", "keep_vars", "send_metrics"];
@@ -2166,6 +2167,37 @@ pub fn normalize_wrangler_config(cfg: &Value, file: &str) -> Result<Value, Proje
                 b.insert("name".into(), Value::from(binding));
                 bindings.push(Value::Object(b));
             }
+            "browser" => {
+                // CF `[browser] {binding}` — Browser Rendering
+                // (`env.<binding>` is the Fetcher @cloudflare/puppeteer
+                // drives: `/v1/devtools/browser` acquire/attach +
+                // `/v1/sessions|history|limits`). Rendered as a service
+                // binding to facade-browser → the vendored kitesurf
+                // engine. `remote` is a CF local-dev knob accepted and
+                // ignored (images precedent).
+                let t = value
+                    .as_object()
+                    .ok_or_else(|| invalid("browser", "must be a table"))?;
+                for k in t.keys() {
+                    match k.as_str() {
+                        "binding" | "remote" => {}
+                        _ => return Err(unsupported(&format!("browser.{k}"), None)),
+                    }
+                }
+                let binding = req_str(
+                    t.get("binding").unwrap_or(&Value::Null),
+                    "browser.binding",
+                )?;
+                if let Some(v) = t.get("remote") {
+                    if !v.is_boolean() {
+                        return Err(invalid("browser.remote", "must be a boolean"));
+                    }
+                }
+                let mut b = Map::new();
+                b.insert("type".into(), Value::from("browser"));
+                b.insert("name".into(), Value::from(binding));
+                bindings.push(Value::Object(b));
+            }
             "version_metadata" => {
                 // CF `[version_metadata] {binding}` — `env.<binding>`
                 // is `{id, tag, timestamp}` of the worker's active
@@ -3739,6 +3771,7 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         let mut worker_loaders = Vec::new();
         let mut unsafe_evals = Vec::new();
         let mut images = Vec::new();
+        let mut browser = Vec::new();
         let mut flagship = Map::new();
         let mut k2 = Map::new();
         let mut send_email = Map::new();
@@ -3899,6 +3932,11 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
                     // workerLoaders): no resource reference.
                     images.push(Value::from(name));
                 }
+                "browser" => {
+                    // `[browser] {binding}` — name list only: sessions
+                    // are tenant-scoped via props, no resource reference.
+                    browser.push(Value::from(name));
+                }
                 "vectorize" => {
                     // `{type:"vectorize", index_name, dimensions,
                     // metric}` → `[bindings].vectorize.<name>`; the
@@ -3987,6 +4025,9 @@ fn wrangler_config_to_worker_toml(config: &Value) -> Result<WorkerToml, ProjectC
         }
         if !vectorize.is_empty() {
             bind.insert("vectorize".into(), Value::Object(vectorize));
+        }
+        if !browser.is_empty() {
+            bind.insert("browser".into(), Value::Array(browser));
         }
         if !bind.is_empty() {
             wire.insert("bindings".into(), Value::Object(bind));
@@ -5483,6 +5524,40 @@ console.log("after the payload");
             meta.bindings.unwrap().version_metadata.as_deref(),
             Some("V_META")
         );
+    }
+
+    #[test]
+    fn browser_binding_into_pack_shape() {
+        // CF `[browser] {binding}` → `{type:"browser"}` record + the
+        // pack-shape `browser` name list — sessions are tenant-scoped
+        // via props, so the binding carries no resource reference.
+        let dir = wrangler_loader_body("[browser]\nbinding=\"BROWSER\"\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        let b = meta.bindings.unwrap();
+        assert_eq!(b.browser, ["BROWSER"]);
+
+        // `remote` is a CF local-dev knob — accepted (ignored) as a
+        // boolean only.
+        let dir = wrangler_loader_body("[browser]\nbinding=\"B\"\nremote=true\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.bindings.unwrap().browser, ["B"]);
+
+        // Fail closed: missing binding, non-string binding, non-boolean
+        // remote, unknown keys, non-table shape.
+        for toml in [
+            "[browser]\n",
+            "[browser]\nbinding=1\n",
+            "[browser]\nbinding=\"B\"\nremote=\"yes\"\n",
+            "[browser]\nbinding=\"B\"\nextra=1\n",
+            "browser={binding=1}\n",
+        ] {
+            let dir = wrangler_loader_body(toml);
+            assert!(load_worker_meta(dir.path()).is_err(), "{toml}");
+        }
+        // Inline-table form is accepted (same TOML table shape).
+        let dir = wrangler_loader_body("browser={binding=\"B2\"}\n");
+        let (meta, _) = load_worker_meta(dir.path()).unwrap();
+        assert_eq!(meta.bindings.unwrap().browser, ["B2"]);
     }
 
     #[test]

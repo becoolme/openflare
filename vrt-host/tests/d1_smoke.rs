@@ -361,6 +361,7 @@ fn render_cfg(dir: &Path, port: u16, sql_port: u16, db_id: &str) -> (PathBuf, Ve
         deny_outbound: manifest.deny_outbound.clone(),
         facades: manifest.facades.clone(),
         system_workers: manifest.system_workers.clone(),
+        disk_services: vrt_config::resolve_disk_paths(&facade_root(), &manifest.disk_services).unwrap(),
         system_compat_date: "2026-09-08".into(),
         system_compat_flags: vec![],
         vars: Default::default(),
@@ -467,7 +468,7 @@ fn render_cfg(dir: &Path, port: u16, sql_port: u16, db_id: &str) -> (PathBuf, Ve
     std::fs::write(&cfg, text).unwrap();
     (
         cfg,
-        vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant),
+        vrt_config::runtime_experimental_extra_args(&params.system_compat_flags, &tenant, &params.system_workers),
     )
 }
 
@@ -1261,6 +1262,7 @@ fn render_queue_cfg_full(
         deny_outbound: manifest.deny_outbound.clone(),
         facades: manifest.facades.clone(),
         system_workers: manifest.system_workers.clone(),
+        disk_services: vrt_config::resolve_disk_paths(&facade_root(), &manifest.disk_services).unwrap(),
         system_compat_date: "2026-09-08".into(),
         system_compat_flags: vec![],
         vars: Default::default(),
@@ -1384,7 +1386,7 @@ fn render_queue_cfg_full(
     std::fs::write(&cfg, text).unwrap();
     (
         cfg,
-        vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant),
+        vrt_config::runtime_experimental_extra_args(&params.system_compat_flags, &tenant, &params.system_workers),
     )
 }
 
@@ -1999,6 +2001,7 @@ fn render_do_cfg(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf, Strin
         deny_outbound: manifest.deny_outbound.clone(),
         facades: manifest.facades.clone(),
         system_workers: manifest.system_workers.clone(),
+        disk_services: vrt_config::resolve_disk_paths(&facade_root(), &manifest.disk_services).unwrap(),
         system_compat_date: "2026-09-08".into(),
         system_compat_flags: vec![],
         vars: Default::default(),
@@ -2080,7 +2083,7 @@ fn render_do_cfg(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf, Strin
     std::fs::write(&cfg, text).unwrap();
     // argv from the PRODUCTION derivation (T31g/H4): durableObjectClasses
     // present ⇒ --experimental must be on the command line.
-    let mut argv = vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant);
+    let mut argv = vrt_config::runtime_experimental_extra_args(&params.system_compat_flags, &tenant, &params.system_workers);
     assert!(argv.iter().any(|a| a == "--experimental"), "{argv:?}");
     // P3c-1-r2: `--external-addr` comes from the SAME production
     // derivation the supervisor uses — `assemble` copies

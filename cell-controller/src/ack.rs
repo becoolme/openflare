@@ -251,6 +251,14 @@ pub struct AckCapabilities {
     /// bindings onto cells that claim it. Omitted while false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub vectorize: bool,
+    /// `{"type":"browser"}` bindings render a service binding to
+    /// `facade-browser` (`BrowserBinding` entrypoint) — a cell predating
+    /// either fails the snapshot parse (`deny_unknown_fields` on the
+    /// binding variant) or the manifest parse (REQUIRED_FACADES), so the
+    /// control plane only admits browser bindings onto cells that claim
+    /// it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub browser: bool,
 }
 
 /// Server-side bound for `reason` (zod `.max(256)`) — an oversized

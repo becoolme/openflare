@@ -218,8 +218,13 @@ fn all_emitted_binding_kinds_exist_in_schema() {
         }
     }
     for k in &kinds {
+        // Named union members appear either as `kind @N` (ordinal
+        // members) or `kind :group`/`kind :union` (grouped members like
+        // `workerLoader`, which carry no ordinal of their own).
         assert!(
-            schema.contains(&format!("{k} @")),
+            schema.contains(&format!("{k} @"))
+                || schema.contains(&format!("{k} :group"))
+                || schema.contains(&format!("{k} :union")),
             "binding union member `{k}` missing from workerd.capnp"
         );
     }

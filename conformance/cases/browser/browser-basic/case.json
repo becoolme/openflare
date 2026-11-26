@@ -1,0 +1,273 @@
+{
+  "schemaVersion": 1,
+  "id": "browser-basic",
+  "binding": "browser",
+  "title": "Browser binding — puppeteer launch/connect over /v1/*, session registry incl. edge cases (404/409/410/429), concurrent sessions, screenshot golden, engine fail-closed",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/browser-rendering/reference/wrangler/#browser-bindings",
+    "https://developers.cloudflare.com/browser-rendering/rest-api/",
+    "@cloudflare/puppeteer 2.0.1 lib/puppeteer-cloudflare/cloudflare/PuppeteerWorkers.js (acquire: POST /v1/devtools/browser; connect: ws GET /v1/devtools/browser/<sessionId>)",
+    "facade/test/browser.test.mjs (registry shape, engine fail-closed, session lifecycle)",
+    "docs/bindings/browser.md"
+  ],
+  "steps": [
+    {
+      "name": "engine select rejects arbitrary unknown names",
+      "request": {
+        "path": "/engine-bogus"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 400
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "acquire reserves a 128-bit hex session id",
+      "request": {
+        "method": "POST",
+        "path": "/acquire"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 200,
+          "sessionIdLen": 32,
+          "sessionIdHex": true
+        }
+      }
+    },
+    {
+      "name": "engine select rejects unknown engine",
+      "request": {
+        "path": "/engine-rejected"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 400
+        }
+      }
+    },
+    {
+      "name": "acquire rejects a non-integer keep_alive",
+      "request": {
+        "path": "/keep-alive-junk"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 400
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "ws connect rejects an unknown engine",
+      "request": {
+        "path": "/ws-engine-rejected"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 400
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "limits surface reports the configured caps",
+      "request": {
+        "path": "/limits"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "maxConcurrentSessions": 4
+        }
+      }
+    },
+    {
+      "name": "launch + setContent + screenshot golden",
+      "request": {
+        "path": "/launch-screenshot"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "sha256": "2b1367f70a0285ab6cda38a23d23676a75fe63db04202226ff8285b457d4ec9d"
+        }
+      }
+    },
+    {
+      "name": "acquire + attach renders the same golden",
+      "request": {
+        "path": "/acquire-attach"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "sha256": "2b1367f70a0285ab6cda38a23d23676a75fe63db04202226ff8285b457d4ec9d"
+        }
+      }
+    },
+    {
+      "name": "attach to an unknown sessionId is 404",
+      "request": {
+        "path": "/bad-session-attach"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 404
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "attach without a websocket upgrade is 400",
+      "request": {
+        "path": "/attach-no-upgrade"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 400
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "attach to an expired pending session is 410",
+      "request": {
+        "path": "/pending-expired"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 410
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "browser.close() lands a closed/client_closed record in history",
+      "request": {
+        "path": "/history"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "found": true,
+          "status": "closed",
+          "reason": "client_closed"
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "engine discovery passthrough",
+      "request": {
+        "path": "/json-version"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "Browser": "Kitesurf/0.0.1"
+        }
+      }
+    },
+    {
+      "name": "re-attaching a closed session is 410",
+      "request": {
+        "path": "/closed-reattach"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 410
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "attaching an already-attached session is 409",
+      "request": {
+        "path": "/double-attach"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 409
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "two concurrent sessions render the same golden",
+      "request": {
+        "path": "/dual-sessions"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "a": "2b1367f70a0285ab6cda38a23d23676a75fe63db04202226ff8285b457d4ec9d",
+          "b": "2b1367f70a0285ab6cda38a23d23676a75fe63db04202226ff8285b457d4ec9d",
+          "twoActive": true,
+          "distinctIds": true
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    },
+    {
+      "name": "acquire past the concurrency cap is 429",
+      "request": {
+        "path": "/concurrency-limit"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "overflow429": true,
+          "acquiredWithinCap": true
+        }
+      },
+      "retry": {
+        "timeoutMs": 60000,
+        "intervalMs": 1000
+      }
+    }
+  ]
+}

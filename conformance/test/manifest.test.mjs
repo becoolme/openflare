@@ -104,6 +104,7 @@ test("bindings coverage: implemented binding areas are represented", () => {
     "assets",
     "vars",
     "ratelimit",
+    "browser",
   ])
     assert.ok(bindings.has(b), `missing binding coverage: ${b}`);
 });

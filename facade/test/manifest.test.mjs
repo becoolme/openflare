@@ -29,10 +29,11 @@ const FACADES = {
 const STANDALONE = {
   "vrt-egress": "EgressProxy",
   "vrt-no-network": "DenyAll",
+  "facade-browser": "BrowserBinding",
 };
 
 test("schema carries build provenance", () => {
-  assert.equal(MANIFEST.schemaVersion, 2);
+  assert.equal(MANIFEST.schemaVersion, 3);
   assert.match(MANIFEST.generatedBy, /gen-manifest\.mjs$/);
   // Pinned Node major: stripTypeScriptTypes output is only guaranteed
   // deterministic within one major; --check detects drift if regenerated
@@ -70,10 +71,17 @@ test("module digests address dist bytes, sources tracked separately", () => {
       const sourcePath = resolve(ROOT, module.source);
       // name is the logical specifier-facing path; dist holds its bytes.
       assert.equal(module.dist, `facade/dist/${module.name}`);
-      assert.equal(
-        module.name,
-        module.source.replace(/\.ts$/, ".js"),
-      );
+      // Vendored (prebuilt) modules carry no .ts source — `source` points
+      // at the vendored bytes themselves, so source == dist by
+      // construction. Generated modules keep name = source(.ts→.js).
+      if (module.source !== module.dist) {
+        assert.equal(
+          module.name,
+          module.source.replace(/\.ts$/, ".js"),
+        );
+      } else {
+        assert.equal(module.source, `facade/dist/${module.name}`);
+      }
       assert.equal(sha256(distPath), module.sha256, `${module.name} dist digest`);
       assert.equal(sha256(sourcePath), module.sourceSha256, `${module.name} source digest`);
       if (module.sha256 !== module.sourceSha256) sawDistDistinctFromSource = true;
@@ -88,9 +96,14 @@ test("module digests address dist bytes, sources tracked separately", () => {
 test("all published modules load as plain JavaScript under node", async () => {
   // Dynamic-import of every dist module is the load-level proof that the
   // emitted bytes carry no TypeScript residue (the same check workerd's
-  // esModule load would perform).
+  // esModule load would perform). Vendored workers (every module's
+  // source == dist — prebuilt upstream artifacts) are skipped: their
+  // graphs legitimately import `text`/`data`/`wasm` modules that node
+  // cannot load, and upstream's own pipeline already closed them.
   const failures = [];
   for (const worker of Object.values(MANIFEST.workers)) {
+    const prebuilt = worker.modules.every((m) => m.source === m.dist);
+    if (prebuilt) continue;
     for (const module of worker.modules) {
       const url = pathToFileURL(resolve(ROOT, module.dist)).href;
       try {

@@ -93,11 +93,16 @@ System workers (facades, `vrt-egress`, `vrt-no-network`) carry
 declaration. A service-binding call creates an invocation on the callee,
 so the callee's own limits bound work burned inside a facade (image
 decode/encode, text rasterization, multipart scans); the tenant's quota
-does not cover it. Budgets are tiered: `facade-images` (10s CPU, 768MB,
-64 subrequests — 64MP bitmaps live in V8 external memory; src + draw
-overlays + fonts fan out), `vrt-egress` (2s, 192MB, 64 subrequests —
-buffered multipart plus payload), thin RPC facades and `vrt-no-network`
-(1s, 128MB, 8 subrequests — ≤2 binding-backend calls per invocation).
+does not cover it. Budgets are tiered: `facade-kitesurf` (300s CPU,
+1024MB, 10000 subrequests — the vendored browser engine: every CDP
+session spans `env.LOADER` page isolates whose per-page wasm, font
+fetches and frame renders all burn the engine worker's budget),
+`facade-images` (10s CPU, 768MB, 64 subrequests — 64MP bitmaps live in
+V8 external memory; src + draw overlays + fonts fan out), `vrt-egress`
+(2s, 192MB, 64 subrequests — buffered multipart plus payload),
+`facade-kitesurf-front` and the other thin RPC facades plus
+`vrt-no-network` (1s, 128MB, 8 subrequests — ≤2 binding-backend calls
+per invocation).
 `subRequests` counts outbound fetches through `globalOutbound` and
 service-binding calls (binding-backend included); calls into
 internally-provided services are exempt. `0`/absent keeps a dimension

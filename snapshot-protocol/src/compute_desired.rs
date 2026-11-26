@@ -506,6 +506,23 @@ pub enum BindingDesired {
     /// version, and keeping it there preserves content-addressed
     /// version dedup.
     VersionMetadata(VersionMetadataBinding),
+    /// `{"type":"browser"}` — CF Browser Rendering (`env.<name>` is the
+    /// `Fetcher` `@cloudflare/puppeteer` drives: `/v1/devtools/browser`
+    /// acquire/attach, `/v1/sessions|history|limits`). Rendered as a
+    /// plain `service` binding to `facade-browser` (entrypoint
+    /// `BrowserBinding`), which bridges the protocol onto the vendored
+    /// kitesurf engine — no provider resource.
+    Browser(BrowserBinding),
+}
+
+/// `{"type":"browser"}` — see [`BindingDesired::Browser`]. `name` is the
+/// only field: sessions are tenant-scoped via `instanceId` in props and
+/// the engine is platform-pinned, so there is no resource reference.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserBinding {
+    /// Binding name (`env.<name>`), JS identifier.
+    pub name: String,
 }
 
 /// `{"type":"flagship"}` — see [`BindingDesired::Flagship`].
@@ -2127,6 +2144,9 @@ impl WorkerDesired {
                 // Images carries no resource reference — `name` is the
                 // only field (the engine lives in the facade worker).
                 BindingDesired::Images(_) => {}
+                // Browser carries no resource reference — `name` is the
+                // only field (sessions are tenant-scoped via props).
+                BindingDesired::Browser(_) => {}
                 BindingDesired::AnalyticsEngine(ae) => {
                     // `dataset` is emitted as a workerd service name
                     // AND used as a spool/parquet path segment —
@@ -2352,6 +2372,7 @@ impl BindingDesired {
             Self::Flagship(b) => &b.name,
             Self::SecretsStore(b) => &b.name,
             Self::VersionMetadata(b) => &b.name,
+            Self::Browser(b) => &b.name,
         }
     }
 
@@ -2378,7 +2399,7 @@ impl BindingDesired {
             | Self::WorkerLoader(_)
             | Self::Images(_)
             | Self::AnalyticsEngine(_)
-            | Self::UnsafeEval(_) | Self::Flagship(_) | Self::SecretsStore(_) | Self::VersionMetadata(_) => None,
+            | Self::UnsafeEval(_) | Self::Flagship(_) | Self::SecretsStore(_) | Self::VersionMetadata(_) | Self::Browser(_) => None,
         }
     }
 }

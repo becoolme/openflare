@@ -999,7 +999,11 @@ impl Assembler {
         // shared with vrt-local's deploy preflight
         // (`vrt_config::launch_args`) so both paths agree.
         let mut extra_args = self.extra_args.clone();
-        for a in vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, tenant) {
+        for a in vrt_config::runtime_experimental_extra_args(
+            &params.system_compat_flags,
+            tenant,
+            &params.system_workers,
+        ) {
             if !extra_args.iter().any(|e| e == &a) {
                 extra_args.push(a);
             }

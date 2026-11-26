@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Generate facade/dist/ + facade/manifest.json (schemaVersion 2).
+// Generate facade/dist/ + facade/manifest.json (schemaVersion 3).
 //
 // Pipeline (deterministic):
 //   1. walk the static relative-import graph of each system worker's TypeScript
@@ -18,6 +18,14 @@
 //      `sha256` over the DIST bytes (what workerd embeds), `sourceSha256`
 //      over the TypeScript source (provenance only).
 //
+// PREBUILT workers (`prebuilt: {dir, main}`) skip steps 1-3: their modules are
+// vendored upstream build artifacts already in place under `dist/` (the
+// kitesurf engine — `import(` appears inside vendored string literals, so the
+// import scanner cannot audit them, and upstream's own pipeline already
+// closed the graph). Their module list is a sorted directory enumeration
+// hashed verbatim; trust and drift control come from the vendor pin
+// (third_party/kitesurf/UPSTREAM.md) + manifest sha256s.
+//
 // Rules enforced (fail closed):
 //   - every import specifier is relative AND resolves to a file inside the
 //     repo (workerd embeds modules by name; nothing may escape the graph)
@@ -27,9 +35,11 @@
 //   - no dynamic import()
 //   - `import type`/`export type` statements are erased, not resolved
 //   - the declared entrypoint must be exported by the entry module
+//     (generated workers only — prebuilt modules are opaque)
 //
 // Usage: node gen-manifest.mjs [--check]
-//   default : clean-rebuild dist/ and rewrite manifest.json
+//   default : clean-rebuild dist/ and rewrite manifest.json (vendored
+//             subtrees in VENDORED_DIST_DIRS are preserved, not cleaned)
 //   --check : rebuild everything in memory and byte-compare against the
 //             committed dist/ + manifest.json; exit 1 on any drift
 //             (missing/extra/changed file), exit 0 when identical.
@@ -91,6 +101,34 @@ const EGRESS_MEMORY_MB = 192;
 const DEFAULT_MEMORY_MB = 128;
 const HEAVY_SUBREQUESTS = 64;
 const DEFAULT_SUBREQUESTS = 8;
+// Kitesurf (vendored browser engine — third_party/kitesurf/UPSTREAM.md):
+//   CPU — upstream asks 300000ms (packages/engine/wrangler.jsonc); page
+//         parse/layout/paint/boa-eval all burn in-engine.
+//   MEM — observed ~430MB workerd RSS for a screenshot session (process
+//         total; the isolate slice is smaller). 1024MB bounds a page
+//         pathology that would otherwise be unbounded.
+//   SUB — upstream wants 1000000; clamped to the platform cap 10000
+//         (subresource fan-out of a real page is the legit workload).
+const KITESURF_CPU_MS = 300_000;
+const KITESURF_MEMORY_MB = 1024;
+const KITESURF_SUBREQUESTS = 10_000;
+
+// Vendored subtrees under facade/dist/ — build INPUTS that live at their
+// published location so the host's `<dist>/<name>` seeding covers them.
+// Clean-rebuild preserves them; --check verifies them byte-for-byte.
+const VENDORED_DIST_DIRS = new Set(["kitesurf"]);
+
+// Module types for prebuilt workers — the same filename-suffix map
+// upstream's scripts/workerd-config.mjs applies to the kitesurf :dist.
+// `.js` files not matching a suffix are esModule; anything else fails.
+const PREBUILT_MODULE_TYPES = [
+  [".wasm", "wasm"],
+  [".glue.js", "text"],
+  [".css", "text"],
+  [".dat", "text"],
+  [".woff2", "data"],
+  [".bin", "data"],
+];
 
 const WORKERS = [
   { serviceName: "facade-kv", entrypoint: "KVNamespace", entry: "facade-kv.ts", needsBindingBackend: true },
@@ -122,6 +160,101 @@ const WORKERS = [
   // Deny-all globalOutbound target for system workers that must never
   // reach a network at all (facades only talk to BINDING_BACKEND).
   { serviceName: "vrt-no-network", entrypoint: "DenyAll", entry: "egress/deny.ts", needsBindingBackend: false },
+  // ── kitesurf: vendored browser engine (third_party/kitesurf/UPSTREAM.md).
+  // The engine worker is a PREBUILT upstream `:dist` — page HTML/CSS/JS,
+  // layout and paint all run inside it; per-page JS runs in LOADER-spawned
+  // anonymous isolates. `entrypoint: ""` = default export (it has no named
+  // WorkerEntrypoint). `global_fetch_strictly_public` + `publicOnly` are a
+  // pair: the engine fetches page subresources, and only over the public
+  // internet (its own PNA guard also defaults closed).
+  {
+    serviceName: "facade-kitesurf",
+    entrypoint: "",
+    prebuilt: { dir: "facade/dist/kitesurf/engine", main: "index.js" },
+    needsBindingBackend: false,
+    compatibilityDate: "2026-09-11",
+    compatibilityFlags: ["global_fetch_strictly_public"],
+    outbound: "publicOnly",
+    cpuMs: KITESURF_CPU_MS,
+    memoryMb: KITESURF_MEMORY_MB,
+    subRequests: KITESURF_SUBREQUESTS,
+    bindings: [
+      { type: "workerLoader", name: "LOADER", maxWorkers: 32 },
+      { type: "service", name: "FONT_ASSETS", service: "facade-kitesurf-front", entrypoint: "Assets" },
+      // Upstream `vars` (wrangler.jsonc) — "" toggles are read as unset.
+      // `KITESURF_NATIVE_EVAL` stays empty: page eval runs on boa (the
+      // native-eval path needs workerd's `experimental` flag per-worker,
+      // which is a platform decision the manifest cannot take).
+      { type: "text", name: "KITESURF_ENV", value: "production" },
+      { type: "text", name: "KITESURF_VERSION", value: "0affe70c" },
+      { type: "text", name: "KITESURF_RESOURCE_DRAIN_QUIET_TURNS", value: "" },
+      { type: "text", name: "KITESURF_NATIVE_EVAL", value: "" },
+      { type: "text", name: "KITESURF_DISABLE_PARTIAL_RASTER", value: "" },
+      { type: "text", name: "KITESURF_PAGE_CPU_MS_CAP", value: "" },
+      { type: "text", name: "KITESURF_PAGE_WALL_MS_CAP", value: "" },
+      { type: "text", name: "KITESURF_LAG_WATCHDOG", value: "" },
+      { type: "text", name: "KITESURF_FONT_PROFILE", value: "" },
+      { type: "text", name: "KITESURF_INSPECTOR_BASE_URL", value: "" },
+      { type: "text", name: "KITESURF_INSPECTOR_FALLBACK_URL", value: "" },
+      { type: "text", name: "KITESURF_ALLOW_PRIVATE_NETWORK", value: "" },
+      { type: "text", name: "WEB_BOT_AUTH_SIGNATURE_AGENT", value: "" },
+      { type: "text", name: "WEB_BOT_AUTH_JWK", value: "" },
+    ],
+  },
+  // The engine's FONT_ASSETS backend + public/ router — vendored
+  // `docker/front.js` verbatim. `PUBLIC` targets the `disk` service;
+  // `HEADERS` is compiled from kitesurf-public/_headers at build time.
+  {
+    serviceName: "facade-kitesurf-front",
+    entrypoint: "Assets",
+    prebuilt: { dir: "facade/dist/kitesurf", main: "front.js" },
+    needsBindingBackend: false,
+    compatibilityDate: "2026-09-11",
+    outbound: "deny",
+    bindings: [
+      { type: "service", name: "ENGINE", service: "facade-kitesurf" },
+      { type: "service", name: "PUBLIC", service: "facade-kitesurf-public" },
+    ],
+    // Compiled `_headers` rules → the HEADERS `json` binding. Single
+    // source of truth: the vendored _headers file inside the payload.
+    headersJsonFrom: "facade/kitesurf-public/_headers",
+  },
+  // `browser` binding endpoint — CF Browser Rendering `/v1/*` protocol
+  // (acquire/attach/sessions/history/limits) over the kitesurf engine.
+  // ENGINE goes through facade-kitesurf-front's default export, which
+  // routes upgrade + /json requests to the engine and static paths to
+  // the disk service. `outbound: deny` — every call is a service binding.
+  // Session registry lives in the isolate (ws sockets can't cross
+  // requests), so its budget stays thin-tier; tenant scoping comes from
+  // ctx.props at bind time, not the manifest.
+  {
+    serviceName: "facade-browser",
+    entrypoint: "BrowserBinding",
+    entry: "facade-browser.ts",
+    needsBindingBackend: false,
+    outbound: "deny",
+    bindings: [
+      { type: "service", name: "ENGINE", service: "facade-kitesurf-front" },
+      {
+        type: "json",
+        name: "BROWSER_LIMITS",
+        value: JSON.stringify({
+          maxConcurrentSessions: 4,
+          maxSessionMs: 900_000,
+          maxKeepAliveMs: 600_000,
+          pendingTtlMs: 60_000,
+          historyCap: 100,
+        }),
+      },
+    ],
+  },
+];
+
+// `disk` services (workerd DiskDirectory) — vendored static payload trees
+// served to system workers. `path` is FACADE-relative: the host joins it
+// under the manifest's own dir and canonicalises at render-params time.
+const DISK_SERVICES = [
+  { serviceName: "facade-kitesurf-public", path: "kitesurf-public" },
 ];
 
 const EXTERNAL_PREFIXES = ["cloudflare:", "cloudflare-internal:", "node:"];
@@ -300,63 +433,156 @@ function publish(source, file) {
   return source;
 }
 
+// Ported verbatim (algorithm only) from upstream kitesurf
+// scripts/workerd-config.mjs `headerRules`: compiles Cloudflare's
+// `_headers` format into the rule list docker/front.js's `applyHeaderRules`
+// consumes. Supports path patterns with `*` splats, `Name: value` and
+// `! Name` lines; anything else fails the build.
+function headerRules(source, file) {
+  const rules = [];
+  const lines = source.split(/\r?\n/);
+  for (const [index, raw] of lines.entries()) {
+    const die = (why) => fail(`${file}:${index + 1}`, `${why}: ${raw}`);
+    const line = raw.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    if (!/^\s/.test(raw)) {
+      if (!/^\/[\w\-./*]*$/.test(line)) die("only path patterns with `*` are translated");
+      const pattern = `^${line.replaceAll(".", "\\.").replaceAll("*", ".*")}$`;
+      rules.push({ pattern, set: [], unset: [] });
+      continue;
+    }
+    const rule = rules.at(-1) ?? die("a header before any path");
+    const unset = /^!\s*([\w-]+)$/.exec(line);
+    const set = /^([\w-]+):\s*(.*)$/.exec(line);
+    if (unset) rule.unset.push(unset[1].toLowerCase());
+    else if (set) rule.set.push([set[1].toLowerCase(), set[2]]);
+    else die("not a header");
+  }
+  return rules;
+}
+
+// Modules of a PREBUILT worker: the flat file list of `dir`, hashed
+// verbatim. `dir` is DIST-relative (vendored payloads are already at
+// their published location — see VENDORED_DIST_DIRS).
+function prebuiltModules(worker, emitted) {
+  const dir = resolve(DIST_DIR, worker.prebuilt.dir.replace(/^facade\/dist\//, ""));
+  if (!existsSync(dir)) fail(worker.prebuilt.dir, "prebuilt module dir missing — run the vendor step first");
+  const modules = [];
+  const files = readdirSync(dir, { withFileTypes: true });
+  for (const entry of files) {
+    // Subdirectories belong to another worker's prebuilt dir (engine/
+    // sits next to front.js); files the --check drift pass flags.
+    if (!entry.isFile()) continue;
+    const abs = resolve(dir, entry.name);
+    const name = `${worker.prebuilt.dir.replace(/^facade\/dist\//, "")}/${entry.name}`;
+    const bytes = readFileSync(abs);
+    emitted.set(abs, bytes);
+    const type = PREBUILT_MODULE_TYPES.find(([suffix]) => entry.name.endsWith(suffix))?.[1];
+    if (!type && !entry.name.endsWith(".js")) {
+      fail(abs, `no module type for prebuilt file ${entry.name} — extend PREBUILT_MODULE_TYPES deliberately`);
+    }
+    const rel = relative(ROOT, abs).split(sep).join("/");
+    modules.push({
+      name,
+      dist: rel,
+      source: rel, // vendored artifact — provenance is third_party/*/UPSTREAM.md
+      sourceSha256: sha256Hex(bytes),
+      sha256: sha256Hex(bytes),
+      ...(type ? { type } : {}),
+    });
+  }
+  const mainName = `${worker.prebuilt.dir.replace(/^facade\/dist\//, "")}/${worker.prebuilt.main}`;
+  if (!modules.some((m) => m.name === mainName)) {
+    fail(worker.prebuilt.dir, `prebuilt main ${worker.prebuilt.main} not among the modules`);
+  }
+  return { modules, mainName };
+}
+
 function build() {
   const externals = new Map();
   const workers = {};
   const emitted = new Map(); // absolute dist path -> bytes
   for (const worker of WORKERS) {
-    const entryFile = resolve(FACADE_DIR, worker.entry);
-    if (!existsSync(entryFile)) fail(entryFile, "entry module missing");
-    const { files, externals: workerExternals } = walk(entryFile, ROOT, SOURCE_TRIES);
-    for (const spec of workerExternals) {
-      externals.set(spec, "workerd-provided external");
-    }
-    assertEntrypoint(readFileSync(entryFile, "utf8"), entryFile, worker.entrypoint);
-
-    const modules = [];
-    for (const file of files) {
-      const rel = relative(ROOT, file).split(sep).join("/");
-      const name = moduleName(rel);
-      const distAbs = resolve(DIST_DIR, name);
-      const entry = {
-        name,
-        dist: relative(ROOT, distAbs).split(sep).join("/"),
-        source: rel,
-      };
-      if (file.endsWith(".wasm")) {
-        // Raw bytes — no transpile; `wasm = embed` in the rendered capnp.
-        const bytes = readFileSync(file);
-        emitted.set(distAbs, bytes);
-        entry.sourceSha256 = sha256Hex(bytes);
-        entry.sha256 = sha256Hex(bytes);
-        entry.type = "wasm";
-      } else {
-        const source = readFileSync(file, "utf8");
-        const published = publish(source, file);
-        emitted.set(distAbs, published);
-        entry.sourceSha256 = sha256Hex(source);
-        entry.sha256 = sha256Hex(published);
+    let modules;
+    let mainName;
+    if (worker.prebuilt) {
+      // Vendored artifacts: enumerate + hash verbatim, no transpile and
+      // no import-graph audit (see the PREBUILT note in the header).
+      ({ modules, mainName } = prebuiltModules(worker, emitted));
+    } else {
+      const entryFile = resolve(FACADE_DIR, worker.entry);
+      if (!existsSync(entryFile)) fail(entryFile, "entry module missing");
+      const { files, externals: workerExternals } = walk(entryFile, ROOT, SOURCE_TRIES);
+      for (const spec of workerExternals) {
+        externals.set(spec, "workerd-provided external");
       }
-      modules.push(entry);
+      assertEntrypoint(readFileSync(entryFile, "utf8"), entryFile, worker.entrypoint);
+      mainName = moduleName(relative(ROOT, entryFile).split(sep).join("/"));
+      modules = [];
+      for (const file of files) {
+        const rel = relative(ROOT, file).split(sep).join("/");
+        const name = moduleName(rel);
+        const distAbs = resolve(DIST_DIR, name);
+        const entry = {
+          name,
+          dist: relative(ROOT, distAbs).split(sep).join("/"),
+          source: rel,
+        };
+        if (file.endsWith(".wasm")) {
+          // Raw bytes — no transpile; `wasm = embed` in the rendered capnp.
+          const bytes = readFileSync(file);
+          emitted.set(distAbs, bytes);
+          entry.sourceSha256 = sha256Hex(bytes);
+          entry.sha256 = sha256Hex(bytes);
+          entry.type = "wasm";
+        } else {
+          const source = readFileSync(file, "utf8");
+          const published = publish(source, file);
+          emitted.set(distAbs, published);
+          entry.sourceSha256 = sha256Hex(source);
+          entry.sha256 = sha256Hex(published);
+        }
+        modules.push(entry);
+      }
     }
     modules.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     if (new Set(modules.map((m) => m.name)).size !== modules.length) {
-      fail(entryFile, "duplicate logical module name");
+      fail(worker.serviceName, "duplicate logical module name");
+    }
+    // `headersJsonFrom`: compile a vendored `_headers` file into the
+    // worker's HEADERS `json` binding (single source of truth = the file).
+    const bindings = [...(worker.bindings ?? [])];
+    if (worker.headersJsonFrom) {
+      const headersPath = resolve(ROOT, worker.headersJsonFrom);
+      if (!existsSync(headersPath)) fail(worker.headersJsonFrom, "_headers source missing");
+      bindings.push({
+        type: "json",
+        name: "HEADERS",
+        value: JSON.stringify(headerRules(readFileSync(headersPath, "utf8"), worker.headersJsonFrom)),
+      });
     }
     workers[worker.serviceName] = {
       entrypoint: worker.entrypoint,
       needsBindingBackend: worker.needsBindingBackend,
-      mainModule: moduleName(relative(ROOT, entryFile).split(sep).join("/")),
+      mainModule: mainName,
       cpuMs: worker.cpuMs ?? DEFAULT_CPU_MS,
       memoryMb: worker.memoryMb ?? DEFAULT_MEMORY_MB,
       subRequests: worker.subRequests ?? DEFAULT_SUBREQUESTS,
+      // Schema v3 optional fields — emitted only when a WORKERS entry
+      // declares them (wasm-engine workers: kitesurf).
+      ...(worker.compatibilityDate ? { compatibilityDate: worker.compatibilityDate } : {}),
+      ...(worker.compatibilityFlags ? { compatibilityFlags: worker.compatibilityFlags } : {}),
+      ...(bindings.length ? { bindings } : {}),
+      ...(worker.outbound ? { outbound: worker.outbound } : {}),
       modules,
     };
   }
 
   // Re-scan the emitted graph: published specifiers must close over exactly
   // the emitted set with no new externals and no `.ts`/`.d.ts` references.
+  // (Prebuilt workers are opaque vendored artifacts — skipped.)
   for (const worker of WORKERS) {
+    if (worker.prebuilt) continue;
     const entryName = workers[worker.serviceName].mainModule;
     const seen = new Set();
     const queue = [resolve(DIST_DIR, entryName)];
@@ -397,13 +623,14 @@ function build() {
   const manifest =
     JSON.stringify(
       {
-        schemaVersion: 2,
+        schemaVersion: 3,
         generatedBy: "facade/tools/gen-manifest.mjs",
         nodeVersion: NODE_MAJOR,
         externals: Object.fromEntries(
           [...externals.keys()].sort().map((k) => [k, externals.get(k)]),
         ),
         workers,
+        diskServices: DISK_SERVICES,
       },
       null,
       2,
@@ -452,7 +679,14 @@ if (process.argv.includes("--check")) {
   }
   console.log("gen-manifest --check: manifest.json and dist/ are up to date");
 } else {
-  rmSync(DIST_DIR, { recursive: true, force: true });
+  // Clean-rebuild, preserving vendored payload subtrees (prebuilt module
+  // inputs — deleting them would lose the vendored artifacts).
+  if (existsSync(DIST_DIR)) {
+    for (const entry of readdirSync(DIST_DIR, { withFileTypes: true })) {
+      if (VENDORED_DIST_DIRS.has(entry.name)) continue;
+      rmSync(resolve(DIST_DIR, entry.name), { recursive: true, force: true });
+    }
+  }
   for (const [file, bytes] of [...emitted.entries()].sort()) {
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, bytes);

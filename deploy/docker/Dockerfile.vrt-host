@@ -91,9 +91,14 @@ RUN test ! -e /opt/vrt/workerd || test -x /opt/vrt/workerd
 # runtime user (uid 10001) can neither edit nor replace them.
 COPY --chown=0:0 facade/manifest.json /opt/vrt/facade/manifest.json
 COPY --chown=0:0 facade/dist /opt/vrt/facade/dist
+# facade/kitesurf-public — the `disk` service payload the manifest's
+# `diskServices` references (facade-relative path; root-owned read-only
+# like dist/, workerd's DiskDirectory only reads it).
+COPY --chown=0:0 facade/kitesurf-public /opt/vrt/facade/kitesurf-public
 RUN set -eux; \
     test -s /opt/vrt/facade/manifest.json; \
     test -d /opt/vrt/facade/dist; \
+    test -d /opt/vrt/facade/kitesurf-public; \
     chown -R 0:0 /opt/vrt/facade; \
     chmod -R u=rwX,go=rX,a-w /opt/vrt/facade
 USER vrt

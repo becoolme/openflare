@@ -1,0 +1,17 @@
+// Conformance case: Browser binding — @cloudflare/puppeteer launch(),
+// acquire→attach session flow, setContent + screenshot golden, and the
+// /v1/* control surface (sessions/limits/history, engine select).
+{
+  "name": "conf-browser-basic",
+  "main": "worker.js",
+  // >=2025-09-15 so nodejs_compat implies enableNodeJsFsModule —
+  // puppeteer.vendor.mjs top-level-imports node:fs (the vendored
+  // upstream Node-shim path; the workers code path never calls it).
+  "compatibility_date": "2025-10-01",
+  // @cloudflare/puppeteer's bundled Node shim top-level-imports node:fs
+  // and node:path; the workers code path never calls them but the module
+  // graph must resolve. nodejs_compat supplies the stubs.
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": ["conf-browser-basic.vrt.local/*"],
+  "browser": { "binding": "BROWSER" },
+}

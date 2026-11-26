@@ -195,6 +195,7 @@ fn desired_ack_fixture() {
             secrets_store: true,
             version_metadata: true,
             vectorize: true,
+            browser: true,
         }),
     };
     check(

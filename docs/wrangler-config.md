@@ -230,6 +230,7 @@ before they reach stderr, so config values are not echoed back.
 | `send_email` | supported — Email Sending binding; per-entry keys `name` (required), `destination_address`, `allowed_destination_addresses`, `allowed_sender_addresses` (`destination_address` and `allowed_destination_addresses` are mutually exclusive — both set fails closed; every address format-validated; unknown keys `VRT_CONFIG_UNSUPPORTED_FIELD`). `env.<name>.send(message)` validates the CF Workers Email Sending contract provider-side (from required, ≥1 of to/cc/bcc, subject required, ≤50 recipients, ≤32 attachments, ≤25MiB total) and resolves `{messageId}` on success or throws an `Error` carrying the CF `E_*` code in `.code`. Restrictions are signed into desired state and enforced on every send. Delivery is NOT self-hosted — the provider `[email]` config selects an adapter: `cf`, `resend`, `smtp`, or `log` | `project_cfg.rs:1179` |
 | `secrets_store_secrets` | supported — Secrets Store binding; per-entry keys `binding` (required), `store_id` (optional, CF default `"default"`), `secret_name` (required); unknown keys fail closed. `env.<binding>` is a read-only `SecretsStoreSecret` stub — `get()` resolves to the value served by the bundled `/workerd/secrets-store.js` worker via an `env:<secret_name>` `fromEnvironment` binding. The value resolves from the tenant secret map under the derived `secrets-store:{store_id}:{secret_name}` ref and never enters config text or digest. See [Secrets Store](bindings/secrets-store.md) | `project_cfg.rs:1279` |
 | `version_metadata` | supported — Version Metadata binding; table key `binding` (required) only — `id`/`tag`/`timestamp` are version facts, not config. `env.<binding>` is `{id, tag, timestamp}` (`WorkerVersionMetadata`) for the worker's active version: `id` = the content-addressed `versionId`, `tag` = the deploy's `--tag` (`""` untagged), `timestamp` = ISO 8601 record creation (deduped re-deploys keep the first upload's). Rendered as a `json` binding — no shim, no adapter. See [Version metadata](bindings/version-metadata.md) | `project_cfg.rs` `version_metadata` |
+| `browser` | partial — Browser Rendering binding; table keys `binding` (required) and `remote` (accepted and ignored — the engine always runs local). `env.<binding>` is the `Fetcher` `@cloudflare/puppeteer` drives (CF `/v1/*` protocol: `launch`/`connect`, `/v1/sessions`, `/v1/history`, `/v1/limits`). Renders a plain service binding → `facade-browser` (`BrowserBinding` entrypoint) → the vendored kitesurf engine worker; `?browser=kitesurf` is the only engine, others fail closed. Not Chromium — see [Browser](bindings/browser.md) | `project_cfg.rs` `browser` arm |
 | `durable_objects` | supported — see [Durable Objects](bindings/durable-objects.md); `bindings[]` with `name`, `class_name`, `script_name` | `project_cfg.rs:1003` |
 | `migrations` | supported — `tag`, `new_classes`, `new_sqlite_classes`, `renamed_classes` (`{from,to}`), `deleted_classes`; **`transferred_classes` rejected** | `project_cfg.rs:1062` |
 | `triggers` | supported — `crons` only; see [Cron Triggers](bindings/cron-triggers.md) | `project_cfg.rs:1179` |
@@ -298,7 +299,7 @@ Any other top-level key → `VRT_CONFIG_UNSUPPORTED_FIELD`
 
 That includes, non-exhaustively: `ai`, `ai_search`,
 `ai_search_namespaces`,
-`mtls_certificates`, `pipelines`, `dispatch_namespaces`, `browser`,
+`mtls_certificates`, `pipelines`, `dispatch_namespaces`,
 `containers`, `wasm_modules`, `text_blobs`, `data_blobs`,
 `migrations_pattern`,
 `logpush`, `site`, `preview_id` (top level),
@@ -453,3 +454,18 @@ whitelist is `CARRIED` in `wrangler_config_to_worker_toml`
   the new fields (their `deny_unknown_fields` would reject the whole
   snapshot; admission is gated on the `versionMetadata` capability
   bit).
+- 2026-11-26: `browser` is supported — `[browser] {binding, remote}`
+  (remote accepted-and-ignored) declares a Browser Rendering binding
+  rendered as a plain service binding to the `facade-browser` system
+  worker (`BrowserBinding` entrypoint). `env.<binding>` is the Fetcher
+  `@cloudflare/puppeteer` drives: `POST /v1/devtools/browser` acquire,
+  `GET /v1/devtools/browser/<id>` WebSocket attach (CDP verbatim),
+  `/v1/sessions`, `/v1/history`, `/v1/limits`, `/json/*` passthrough.
+  facade-browser owns the per-tenant session registry (keyed on the
+  signed `instanceId` props; 4 concurrent / 15 min / 10 min
+  keep-alive defaults) and bridges to the vendored kitesurf engine
+  worker (`facade-kitesurf-front` → `facade-kitesurf`,
+  `third_party/kitesurf`). `?browser=kitesurf` is the only engine —
+  `?browser=chromium` and others fail closed with 400. Verified
+  end-to-end by `conformance/cases/browser/browser-basic`
+  (launch/connect + screenshot PNG golden on real workerd).

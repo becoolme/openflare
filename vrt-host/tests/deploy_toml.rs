@@ -96,7 +96,10 @@ fn deploy_host_tomls_load_and_emit() {
             // examples/: `__VRT_ROOT__` layouts (platform pod dirs and the
             // standalone work/objects/desired set).
             "pods/pod-0/work", "pods/pod-0/cache", "provider/listeners",
-            "secrets", "facade", "work", "objects", "desired",
+            // `facade/kitesurf-public` — the manifest's diskServices
+            // target; resolve_disk_paths fails closed on a missing dir.
+            "secrets", "facade", "facade/kitesurf-public", "work",
+            "objects", "desired",
         ] {
             std::fs::create_dir_all(root.0.join(d)).unwrap();
         }

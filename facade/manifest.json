@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "generatedBy": "facade/tools/gen-manifest.mjs",
   "nodeVersion": "24",
   "externals": {
@@ -1033,6 +1033,289 @@
           "sha256": "54fb1a8e57cfae7227ed25f2d87959fa9a05d2384e6d07663fb71baf8dd36310"
         }
       ]
+    },
+    "facade-kitesurf": {
+      "entrypoint": "",
+      "needsBindingBackend": false,
+      "mainModule": "kitesurf/engine/index.js",
+      "cpuMs": 300000,
+      "memoryMb": 1024,
+      "subRequests": 10000,
+      "compatibilityDate": "2026-09-11",
+      "compatibilityFlags": [
+        "global_fetch_strictly_public"
+      ],
+      "bindings": [
+        {
+          "type": "workerLoader",
+          "name": "LOADER",
+          "maxWorkers": 32
+        },
+        {
+          "type": "service",
+          "name": "FONT_ASSETS",
+          "service": "facade-kitesurf-front",
+          "entrypoint": "Assets"
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_ENV",
+          "value": "production"
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_VERSION",
+          "value": "0affe70c"
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_RESOURCE_DRAIN_QUIET_TURNS",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_NATIVE_EVAL",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_DISABLE_PARTIAL_RASTER",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_PAGE_CPU_MS_CAP",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_PAGE_WALL_MS_CAP",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_LAG_WATCHDOG",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_FONT_PROFILE",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_INSPECTOR_BASE_URL",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_INSPECTOR_FALLBACK_URL",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "KITESURF_ALLOW_PRIVATE_NETWORK",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "WEB_BOT_AUTH_SIGNATURE_AGENT",
+          "value": ""
+        },
+        {
+          "type": "text",
+          "name": "WEB_BOT_AUTH_JWK",
+          "value": ""
+        }
+      ],
+      "outbound": "publicOnly",
+      "modules": [
+        {
+          "name": "kitesurf/engine/4eff2cf6f3190839efd045b6552dc1fbd25775ef-renderer_core.glue.js",
+          "dist": "facade/dist/kitesurf/engine/4eff2cf6f3190839efd045b6552dc1fbd25775ef-renderer_core.glue.js",
+          "source": "facade/dist/kitesurf/engine/4eff2cf6f3190839efd045b6552dc1fbd25775ef-renderer_core.glue.js",
+          "sourceSha256": "46054c96e30c65bf2f2f7d5dc1a758f3b99c3ad65abe059e7e368c93c7a34d9c",
+          "sha256": "46054c96e30c65bf2f2f7d5dc1a758f3b99c3ad65abe059e7e368c93c7a34d9c",
+          "type": "text"
+        },
+        {
+          "name": "kitesurf/engine/540fdfdebf9198ade3b634364ecfe4432461c35b-stylesheet.css",
+          "dist": "facade/dist/kitesurf/engine/540fdfdebf9198ade3b634364ecfe4432461c35b-stylesheet.css",
+          "source": "facade/dist/kitesurf/engine/540fdfdebf9198ade3b634364ecfe4432461c35b-stylesheet.css",
+          "sourceSha256": "593c5f368764453f2de3217299cafaa4ac2df64758125773c1cf04e728d205b1",
+          "sha256": "593c5f368764453f2de3217299cafaa4ac2df64758125773c1cf04e728d205b1",
+          "type": "text"
+        },
+        {
+          "name": "kitesurf/engine/79b558057760acae23ae6a79da4568ff42d08dae-kitesurf_core.glue.js",
+          "dist": "facade/dist/kitesurf/engine/79b558057760acae23ae6a79da4568ff42d08dae-kitesurf_core.glue.js",
+          "source": "facade/dist/kitesurf/engine/79b558057760acae23ae6a79da4568ff42d08dae-kitesurf_core.glue.js",
+          "sourceSha256": "a605aaa1fc2f48672106fc5de8f5caeaaa1936aa0efa399daf8fc79784de31b2",
+          "sha256": "a605aaa1fc2f48672106fc5de8f5caeaaa1936aa0efa399daf8fc79784de31b2",
+          "type": "text"
+        },
+        {
+          "name": "kitesurf/engine/94cd05a17ab71d50a930f3626e2630ba768212a5-public-suffix-list.dat",
+          "dist": "facade/dist/kitesurf/engine/94cd05a17ab71d50a930f3626e2630ba768212a5-public-suffix-list.dat",
+          "source": "facade/dist/kitesurf/engine/94cd05a17ab71d50a930f3626e2630ba768212a5-public-suffix-list.dat",
+          "sourceSha256": "347b147702878a99c37f699ab796a3c8eae3e4ee648db4eae5968d6f1583b037",
+          "sha256": "347b147702878a99c37f699ab796a3c8eae3e4ee648db4eae5968d6f1583b037",
+          "type": "text"
+        },
+        {
+          "name": "kitesurf/engine/9f2c9ae5a20c0f9011e8c9625b1950dd8beb21ee-stylesheet-level2.css",
+          "dist": "facade/dist/kitesurf/engine/9f2c9ae5a20c0f9011e8c9625b1950dd8beb21ee-stylesheet-level2.css",
+          "source": "facade/dist/kitesurf/engine/9f2c9ae5a20c0f9011e8c9625b1950dd8beb21ee-stylesheet-level2.css",
+          "sourceSha256": "7c4f917ba974bd1e24a9fe1283dcefa34777a78dd424ae6a01d35bd9dc86774f",
+          "sha256": "7c4f917ba974bd1e24a9fe1283dcefa34777a78dd424ae6a01d35bd9dc86774f",
+          "type": "text"
+        },
+        {
+          "name": "kitesurf/engine/d27054f6d90d83e18e4233cc5840662b98cfaa73-focus.css",
+          "dist": "facade/dist/kitesurf/engine/d27054f6d90d83e18e4233cc5840662b98cfaa73-focus.css",
+          "source": "facade/dist/kitesurf/engine/d27054f6d90d83e18e4233cc5840662b98cfaa73-focus.css",
+          "sourceSha256": "d968eeb7e117c24517922093726011faee3062e1ff4573800148eaeb7ac4467f",
+          "sha256": "d968eeb7e117c24517922093726011faee3062e1ff4573800148eaeb7ac4467f",
+          "type": "text"
+        },
+        {
+          "name": "kitesurf/engine/da77753baf0e11fcd3fca084597b5cfb83406a1f-kitesurf_core_bg.wasm",
+          "dist": "facade/dist/kitesurf/engine/da77753baf0e11fcd3fca084597b5cfb83406a1f-kitesurf_core_bg.wasm",
+          "source": "facade/dist/kitesurf/engine/da77753baf0e11fcd3fca084597b5cfb83406a1f-kitesurf_core_bg.wasm",
+          "sourceSha256": "702503b4a79ff239523ed1f566cf026e1d609d1d74731b8a1c8119861441e9b6",
+          "sha256": "702503b4a79ff239523ed1f566cf026e1d609d1d74731b8a1c8119861441e9b6",
+          "type": "wasm"
+        },
+        {
+          "name": "kitesurf/engine/f02e02048e9c6fd85e90f02df1470f7fa937b266-renderer_core_bg.wasm",
+          "dist": "facade/dist/kitesurf/engine/f02e02048e9c6fd85e90f02df1470f7fa937b266-renderer_core_bg.wasm",
+          "source": "facade/dist/kitesurf/engine/f02e02048e9c6fd85e90f02df1470f7fa937b266-renderer_core_bg.wasm",
+          "sourceSha256": "35b7abf76633632fef48f40edee72d79be290b66b0ce7b70fb4fb900b9c3a15a",
+          "sha256": "35b7abf76633632fef48f40edee72d79be290b66b0ce7b70fb4fb900b9c3a15a",
+          "type": "wasm"
+        },
+        {
+          "name": "kitesurf/engine/index.js",
+          "dist": "facade/dist/kitesurf/engine/index.js",
+          "source": "facade/dist/kitesurf/engine/index.js",
+          "sourceSha256": "a4c93a237550c8e214f9fce3507f1084eb49886506856a6419ecfc221243afcf",
+          "sha256": "a4c93a237550c8e214f9fce3507f1084eb49886506856a6419ecfc221243afcf"
+        }
+      ]
+    },
+    "facade-kitesurf-front": {
+      "entrypoint": "Assets",
+      "needsBindingBackend": false,
+      "mainModule": "kitesurf/front.js",
+      "cpuMs": 1000,
+      "memoryMb": 128,
+      "subRequests": 8,
+      "compatibilityDate": "2026-09-11",
+      "bindings": [
+        {
+          "type": "service",
+          "name": "ENGINE",
+          "service": "facade-kitesurf"
+        },
+        {
+          "type": "service",
+          "name": "PUBLIC",
+          "service": "facade-kitesurf-public"
+        },
+        {
+          "type": "json",
+          "name": "HEADERS",
+          "value": "[{\"pattern\":\"^/fonts/.*$\",\"set\":[[\"cache-control\",\"public, max-age=31536000, immutable\"]],\"unset\":[]},{\"pattern\":\"^/inspector/.*$\",\"set\":[[\"cache-control\",\"public, max-age=3600\"]],\"unset\":[]}]"
+        }
+      ],
+      "outbound": "deny",
+      "modules": [
+        {
+          "name": "kitesurf/front.js",
+          "dist": "facade/dist/kitesurf/front.js",
+          "source": "facade/dist/kitesurf/front.js",
+          "sourceSha256": "8f06f24160377894f4da440cfcca8f9125872db85cdaf45da0ab4be403a4490b",
+          "sha256": "8f06f24160377894f4da440cfcca8f9125872db85cdaf45da0ab4be403a4490b"
+        }
+      ]
+    },
+    "facade-browser": {
+      "entrypoint": "BrowserBinding",
+      "needsBindingBackend": false,
+      "mainModule": "facade/facade-browser.js",
+      "cpuMs": 1000,
+      "memoryMb": 128,
+      "subRequests": 8,
+      "bindings": [
+        {
+          "type": "service",
+          "name": "ENGINE",
+          "service": "facade-kitesurf-front"
+        },
+        {
+          "type": "json",
+          "name": "BROWSER_LIMITS",
+          "value": "{\"maxConcurrentSessions\":4,\"maxSessionMs\":900000,\"maxKeepAliveMs\":600000,\"pendingTtlMs\":60000,\"historyCap\":100}"
+        }
+      ],
+      "outbound": "deny",
+      "modules": [
+        {
+          "name": "facade/browser-core.js",
+          "dist": "facade/dist/facade/browser-core.js",
+          "source": "facade/browser-core.ts",
+          "sourceSha256": "9510e38d71d593887d87b0d0221715062dde854692d58c6f471f1f5e8b4b39a1",
+          "sha256": "ff1d55dc716a496682f99efeabd63f6b2b6093ee0354d490066fde4f3f4dea20"
+        },
+        {
+          "name": "facade/facade-browser.js",
+          "dist": "facade/dist/facade/facade-browser.js",
+          "source": "facade/facade-browser.ts",
+          "sourceSha256": "71fa119056072b0fb9bfdbfa57d45fec05bd1372e3a7ad2485ef4078a85bef88",
+          "sha256": "d1eda24ba80c399a0cb3073669ce018987e6c75013df0d49ace0413895b0bad4"
+        },
+        {
+          "name": "facade/props.js",
+          "dist": "facade/dist/facade/props.js",
+          "source": "facade/props.ts",
+          "sourceSha256": "1fd29f8ddaea55911d86d9b32070e4aa9030ce4bbdbab8ff8c96298b1e297eb6",
+          "sha256": "f89460a2990c7f42849f017de9e45e996b166a436ddc2916c6bb5f2e9f73e92c"
+        },
+        {
+          "name": "third_party/open-compute/facade/bindings/json-body.js",
+          "dist": "facade/dist/third_party/open-compute/facade/bindings/json-body.js",
+          "source": "third_party/open-compute/facade/bindings/json-body.ts",
+          "sourceSha256": "d825baf1890f95f520fa6b548b7f1487021e62e287e91670cf050b8bfdd862cd",
+          "sha256": "d1386702d201992e704b8218a5b37327d2ae27abd056076c1c942376be0e226c"
+        },
+        {
+          "name": "third_party/open-compute/facade/loader/python-snapshot.js",
+          "dist": "facade/dist/third_party/open-compute/facade/loader/python-snapshot.js",
+          "source": "third_party/open-compute/facade/loader/python-snapshot.ts",
+          "sourceSha256": "a69bc46cd34708e1b57848f60fde07d51b2a331f5c9ed5e5c23067a57bd8d292",
+          "sha256": "97154655cb68c44d37f225a18d0bf995387da9b48f0c27356eb3239553951d55"
+        },
+        {
+          "name": "third_party/open-compute/facade/loader/shared.js",
+          "dist": "facade/dist/third_party/open-compute/facade/loader/shared.js",
+          "source": "third_party/open-compute/facade/loader/shared.ts",
+          "sourceSha256": "0bcc1aef30a74df9d90237e4d2ef8276ab346bb0645207575746d9a0dd9feca5",
+          "sha256": "ad6ec6871acd01776f6fe414510e0126266f15f95480ce1172c3fa34babfef6e"
+        },
+        {
+          "name": "third_party/open-compute/facade/loader/snapshot.js",
+          "dist": "facade/dist/third_party/open-compute/facade/loader/snapshot.js",
+          "source": "third_party/open-compute/facade/loader/snapshot.ts",
+          "sourceSha256": "61cb57e3b0295e97d078553a321a5c3c6c88aeda66cdfb228de62fcb9cdb885b",
+          "sha256": "197e8b61660cae5b8829f707ea091adbc206f9ceec3a2bdb105ecbd65cde0a58"
+        }
+      ]
     }
-  }
+  },
+  "diskServices": [
+    {
+      "serviceName": "facade-kitesurf-public",
+      "path": "kitesurf-public"
+    }
+  ]
 }

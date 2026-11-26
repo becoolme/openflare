@@ -79,7 +79,11 @@ pub struct WorkerProc {
 }
 impl WorkerProc {
     pub fn log(&self) -> String {
-        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+        // Lossy: read_to_string returns Err on any non-UTF-8 byte and
+        // unwrap_or_default would print an empty log over real content.
+        std::fs::read(&self.log_path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
     }
 }
 impl Drop for WorkerProc {
@@ -266,7 +270,6 @@ pub fn render(
     let mut bundles = Vec::new();
     let mut worker_json = Vec::new();
     let mut ingress_ports = BTreeMap::new();
-    let mut has_do = false;
     for (id, name, module, bindings) in workers {
         let bundle = VersionBundle::build(
             DeployManifest::from_pack(&json!({
@@ -278,9 +281,6 @@ pub fn render(
             .unwrap(),
         )
         .unwrap();
-        if bindings.to_string().contains("durableObject") {
-            has_do = true;
-        }
         worker_json.push(json!({
             "workerId": id, "name": name,
             "activeVersion": {
@@ -312,6 +312,7 @@ pub fn render(
         deny_outbound: manifest.deny_outbound.clone(),
         facades: manifest.facades.clone(),
         system_workers: manifest.system_workers.clone(),
+        disk_services: vrt_config::resolve_disk_paths(&facade_root(), &manifest.disk_services).unwrap(),
         system_compat_date: "2026-09-08".into(),
         system_compat_flags: vec![
             "experimental".into(),
@@ -385,12 +386,10 @@ pub fn render(
     }
     let cfg = dir.join("cfg.capnp");
     std::fs::write(&cfg, &text).unwrap();
-    let args = vrt_host::assemble::experimental_extra_args(
+    let args = vrt_config::runtime_experimental_extra_args(
         &params.system_compat_flags,
-        vrt_host::assemble::ExperimentalNeeds {
-            durable_objects_or_workflows: has_do,
-            ..Default::default()
-        },
+        &tenant,
+        &params.system_workers,
     );
     (cfg, ingress_ports, args, text)
 }
