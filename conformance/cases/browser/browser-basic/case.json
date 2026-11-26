@@ -1,0 +1,103 @@
+{
+  "schemaVersion": 1,
+  "id": "browser-basic",
+  "binding": "browser",
+  "title": "Browser binding — puppeteer launch/connect over /v1/*, session registry, screenshot golden, engine fail-closed",
+  "requiresWorkerd": true,
+  "evidence": [
+    "https://developers.cloudflare.com/browser-rendering/reference/wrangler/#browser-bindings",
+    "https://developers.cloudflare.com/browser-rendering/rest-api/",
+    "@cloudflare/puppeteer 2.0.1 lib/puppeteer-cloudflare/cloudflare/PuppeteerWorkers.js (acquire: POST /v1/devtools/browser; connect: ws GET /v1/devtools/browser/<sessionId>)",
+    "facade/test/browser.test.mjs (registry shape, engine fail-closed, session lifecycle)",
+    "docs/bindings/browser.md"
+  ],
+  "steps": [
+    {
+      "name": "acquire reserves a 128-bit hex session id",
+      "request": {
+        "method": "POST",
+        "path": "/acquire"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 200,
+          "sessionIdLen": 32,
+          "sessionIdHex": true
+        }
+      }
+    },
+    {
+      "name": "engine select rejects unknown engine",
+      "request": {
+        "path": "/engine-rejected"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "status": 400
+        }
+      }
+    },
+    {
+      "name": "limits surface reports the configured caps",
+      "request": {
+        "path": "/limits"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "maxConcurrentSessions": 4
+        }
+      }
+    },
+    {
+      "name": "launch + setContent + screenshot golden",
+      "request": {
+        "path": "/launch-screenshot"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "sha256": "2b1367f70a0285ab6cda38a23d23676a75fe63db04202226ff8285b457d4ec9d"
+        }
+      }
+    },
+    {
+      "name": "acquire + attach renders the same golden",
+      "request": {
+        "path": "/acquire-attach"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "sha256": "2b1367f70a0285ab6cda38a23d23676a75fe63db04202226ff8285b457d4ec9d"
+        }
+      }
+    },
+    {
+      "name": "browser.close() lands sessions in history",
+      "request": {
+        "path": "/history"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "closedWithClientClosed": 2
+        }
+      }
+    },
+    {
+      "name": "engine discovery passthrough",
+      "request": {
+        "path": "/json-version"
+      },
+      "expect": {
+        "status": 200,
+        "json": {
+          "Browser": "Kitesurf/0.0.1"
+        }
+      }
+    }
+  ]
+}

@@ -167,6 +167,10 @@ pub struct FacadeRefs {
     /// whose inner `fetcher` service is this facade → provider's
     /// sqlite-vec index backend.
     pub vectorize: ServiceEndpoint,
+    /// `browser` bindings → plain service binding to this facade's
+    /// `BrowserBinding` entrypoint (CF `/v1/*` protocol → vendored
+    /// kitesurf engine; no provider resource).
+    pub browser: ServiceEndpoint,
 }
 
 /// A system module referenced by content digest (the artifact for a
@@ -177,17 +181,11 @@ pub struct SystemModuleRef {
     pub name: String,
     /// sha256 of the module bytes, lowercase hex (64 chars).
     pub digest: String,
-}
-
-/// The capnp `Worker.Module` union member a system module emits: `.wasm`
-/// names embed as `wasm` (workerd hands the importer a `WebAssembly.Module`),
-/// everything else as `esModule`.
-pub fn system_module_capnp_field(name: &str) -> &'static str {
-    if name.ends_with(".wasm") {
-        "wasm"
-    } else {
-        "esModule"
-    }
+    /// capnp `Worker.Module` union member — declared by the manifest
+    /// (`type`), never sniffed from the name. ES sources, Text-rule
+    /// payloads (engine glue/css/dat) and `CompiledWasm` all ride the
+    /// same module list.
+    pub module_type: crate::manifest::ModuleType,
 }
 
 /// A system worker placeholder: a named worker whose modules are
@@ -205,6 +203,25 @@ pub struct SystemWorkerRef {
     /// Whether to bind `BINDING_BACKEND` → `binding-backend` (facades
     /// need it to reach vrt-provider; the egress worker does not).
     pub needs_binding_backend: bool,
+    /// Per-worker compat flags merged over `system_compat_flags` —
+    /// engines that need `nodejs_compat` or `global_fetch_strictly_public`
+    /// cannot take them globally (other facades must not change
+    /// behaviour). Only stable, non-experimental flags are admitted by
+    /// the manifest parser.
+    pub compatibility_flags: Vec<String>,
+    /// Per-worker `compatibilityDate` override — vendored engines pin
+    /// their own date (upstream `compatibility_date`) instead of the
+    /// shared `system_compat_date`.
+    pub compatibility_date: Option<String>,
+    /// Manifest-declared bindings beyond `BINDING_BACKEND` —
+    /// `workerLoader` (anonymous page isolates), `service` (engine
+    /// payload/front workers and `disk` services), `text`/`json` (vars).
+    pub bindings: Vec<SystemBinding>,
+    /// Outbound posture — every non-egress system worker defaults to the
+    /// deny-all designator; `PublicOnly` emits no `globalOutbound` at
+    /// all (workerd's `internet` default) and is only admitted together
+    /// with `global_fetch_strictly_public`.
+    pub outbound: SystemOutbound,
     /// Platform-declared per-invocation CPU budget (ms) emitted as
     /// `limits = (cpuMs = N)`. `0` keeps the worker unlimited — same
     /// semantic as the capnp field and [`WorkerQuotas::cpu_ms`]: absent
@@ -222,6 +239,60 @@ pub struct SystemWorkerRef {
     /// internally-provided services are exempt. `0` keeps the worker
     /// unlimited.
     pub sub_requests: u32,
+}
+
+/// Outbound posture of a system worker — see [`SystemWorkerRef::outbound`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SystemOutbound {
+    /// `globalOutbound` → the deny-all `vrt-no-network` entrypoint
+    /// (default for every non-egress system worker).
+    #[default]
+    Deny,
+    /// No `globalOutbound` line at all — workerd's `internet` default.
+    /// Only admitted with `global_fetch_strictly_public` in the worker's
+    /// compat flags, so the fetch surface is restricted to public
+    /// addresses by the runtime itself.
+    PublicOnly,
+}
+
+/// A binding declared on a system worker by the facade manifest —
+/// closed set; new kinds extend this enum + the wire parser together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SystemBinding {
+    /// `workerLoader` — anonymous dynamic isolates (`env.LOADER.load`).
+    WorkerLoader { name: String, max_workers: u32 },
+    /// Plain service binding to another system worker or `disk`
+    /// service (engine payload servers, protocol facades, vendored
+    /// file trees). No props — system↔system calls are
+    /// platform-internal by construction; the parser requires the
+    /// target to be declared in the same manifest. An empty
+    /// `entrypoint` selects the target worker's default export (and is
+    /// mandatory for `disk` services, which have no entrypoints).
+    Service {
+        name: String,
+        service: String,
+        entrypoint: String,
+    },
+    /// `text` binding — a plain string env var (engine toggles, URLs).
+    Text { name: String, value: String },
+    /// `json` binding — parsed at config load (compiled `_headers`
+    /// rules and similar structured payloads).
+    Json { name: String, value: String },
+}
+
+/// A `disk` service declared by the facade manifest — a read-only
+/// directory the runtime serves over HTTP (vendored engine payloads).
+/// `path` is the absolute on-host directory at render time (the
+/// manifest carries a facade-relative path; the host resolves it when
+/// deriving render params).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SystemDiskService {
+    /// capnp service name other workers bind to (e.g.
+    /// `facade-kitesurf-public`).
+    pub service_name: String,
+    /// Absolute directory path emitted verbatim into
+    /// `disk = (path = …)`; `writable` stays unset (read-only).
+    pub path: String,
 }
 
 /// A resolved secret value. It is emitted **only** into
@@ -281,6 +352,10 @@ pub struct RuntimeParams {
     /// System worker definitions; `egress.service` and every
     /// `facades.*.service` must resolve here.
     pub system_workers: Vec<SystemWorkerRef>,
+    /// `disk` services declared by the facade manifest (vendored
+    /// read-only file trees — e.g. the kitesurf `public/` payload);
+    /// emitted as named `disk` services system workers can bind to.
+    pub disk_services: Vec<SystemDiskService>,
     /// `compatibilityDate` for system workers (platform lockfile value).
     pub system_compat_date: String,
     /// `compatibilityFlags` for system workers.
@@ -542,6 +617,7 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         ("facades.d1", &input.params.facades.d1),
         ("facades.ratelimit", &input.params.facades.ratelimit),
         ("facades.vectorize", &input.params.facades.vectorize),
+        ("facades.browser", &input.params.facades.browser),
     ] {
         // An endpoint must resolve to a defined system worker — and can
         // never be an internal service (`binding-backend`/`outbound-network`
@@ -802,6 +878,21 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
     systems.sort_by(|a, b| utf16_cmp(&a.service_name, &b.service_name));
     for system in &systems {
         emit_system_worker(&mut out, system, input.params, &mut embeds, input)?;
+    }
+
+    // `disk` services declared by the facade manifest — vendored
+    // read-only file trees (e.g. the kitesurf `public/` payload) served
+    // by workerd's DiskDirectory HTTP surface. `writable` stays unset:
+    // the payload is image-owned and immutable.
+    let mut disk_services: Vec<&SystemDiskService> =
+        input.params.disk_services.iter().collect();
+    disk_services.sort_by(|a, b| utf16_cmp(&a.service_name, &b.service_name));
+    for disk in disk_services {
+        out.push_str(&format!(
+            "    (name = {}, disk = (path = {})),\n",
+            capnp_text(&disk.service_name),
+            capnp_text(&disk.path),
+        ));
     }
 
     // PT1: watchdog heartbeat worker — same-process event-loop probe.
@@ -1761,6 +1852,25 @@ fn emit_binding(
         BindingDesired::Ratelimit(r) => {
             emit_ratelimit_binding(out, r, worker, input)?;
         }
+        BindingDesired::Browser(b) => {
+            // `env.<name>` is the Fetcher @cloudflare/puppeteer drives —
+            // a plain service binding to facade-browser's BrowserBinding
+            // entrypoint. No provider resource: `namespaceResourceId` is
+            // the constant "browser" (sessions scope by instanceId).
+            emit_facade_binding(
+                out,
+                &b.name,
+                &input.params.facades.browser,
+                "browser",
+                worker,
+                input,
+                &snapshot_protocol::compute_desired::BindingPermissions {
+                    read: true,
+                    write: true,
+                },
+                &b.name,
+            )?;
+        }
         BindingDesired::DurableObject(d) => {
             // P3c-1: `durableObjectNamespace` (Worker.Binding @10) —
             // same-worker designator omits serviceName (workerd
@@ -1945,7 +2055,7 @@ fn emit_binding(
 /// live worker holds a compiled isolate. Cloudflare documents no
 /// public bound; 32 leaves room for per-user plugin/dispatch use cases
 /// while still bounding a runaway `get()` loop.
-const WORKER_LOADER_MAX_WORKERS: u32 = 32;
+pub(crate) const WORKER_LOADER_MAX_WORKERS: u32 = 32;
 
 /// MIG-15: synthetic internal TCP targets derived from this tenant's
 /// hyperdrive bindings — the ONLY producer of
@@ -2374,15 +2484,28 @@ fn emit_system_worker(
     embeds: &mut Vec<EmbedRef>,
     input: &TenantRenderInput<'_>,
 ) -> Result<(), ConfigError> {
+    // A vendored engine may pin its own `compatibilityDate` (upstream
+    // `compatibility_date`); every other system worker shares
+    // `system_compat_date`.
+    let compat_date = system
+        .compatibility_date
+        .as_deref()
+        .unwrap_or(&params.system_compat_date);
     out.push_str(&format!(
         "    (name = {}, worker = (\n      compatibilityDate = {},\n",
         capnp_text(&system.service_name),
-        capnp_text(&params.system_compat_date),
+        capnp_text(compat_date),
     ));
-    let system_flags = crate::compat_flags::flags_for_compat_date(
-        params.system_compat_flags.iter().map(|f| f.as_str()),
-        &params.system_compat_date,
-    );
+    let mut seen_flags = std::collections::BTreeSet::new();
+    let merged_flags: Vec<&str> = params
+        .system_compat_flags
+        .iter()
+        .map(|f| f.as_str())
+        .chain(system.compatibility_flags.iter().map(|f| f.as_str()))
+        .filter(|flag| seen_flags.insert(*flag))
+        .collect();
+    let system_flags =
+        crate::compat_flags::flags_for_compat_date(merged_flags, compat_date);
     if !system_flags.is_empty() {
         out.push_str(&format!(
             "      compatibilityFlags = [{}],\n",
@@ -2423,7 +2546,7 @@ fn emit_system_worker(
         out.push_str(&format!(
             "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
-            system_module_capnp_field(&module.name),
+            module.module_type.capnp_field(),
             capnp_text(&path),
         ));
     }
@@ -2453,6 +2576,47 @@ fn emit_system_worker(
             capnp_text(&params.facades.images.entrypoint),
         ));
     }
+    for binding in &system.bindings {
+        match binding {
+            SystemBinding::WorkerLoader { name, max_workers } => bindings.push(format!(
+                "(name = {}, workerLoader = (maxWorkers = {}))",
+                capnp_text(name),
+                max_workers,
+            )),
+            SystemBinding::Service {
+                name,
+                service,
+                entrypoint,
+            } => {
+                // Empty entrypoint = the target's default export (and
+                // the only legal form for `disk` service targets).
+                let designator = if entrypoint.is_empty() {
+                    format!("(name = {})", capnp_text(service))
+                } else {
+                    format!(
+                        "(name = {}, entrypoint = {})",
+                        capnp_text(service),
+                        capnp_text(entrypoint)
+                    )
+                };
+                bindings.push(format!(
+                    "(name = {}, service = {})",
+                    capnp_text(name),
+                    designator,
+                ));
+            }
+            SystemBinding::Text { name, value } => bindings.push(format!(
+                "(name = {}, text = {})",
+                capnp_text(name),
+                capnp_text(value),
+            )),
+            SystemBinding::Json { name, value } => bindings.push(format!(
+                "(name = {}, json = {})",
+                capnp_text(name),
+                capnp_text(value),
+            )),
+        }
+    }
     if system.service_name == params.egress.service && !internal_tcp_targets(input).is_empty() {
         // MIG-15: `connect()` to a synthetic internal host is routed
         // through this service binding to the loopback-only network
@@ -2481,6 +2645,13 @@ fn emit_system_worker(
             "      globalOutbound = {},\n    )),\n",
             capnp_text(OUTBOUND_NETWORK_SERVICE),
         ));
+    } else if system.outbound == SystemOutbound::PublicOnly {
+        // Fetch engines (facade-kitesurf): NO globalOutbound line —
+        // workerd's `internet` default applies. The manifest parser
+        // only admits this together with `global_fetch_strictly_public`,
+        // so the unrestricted channel is still constrained to public
+        // addresses by the runtime flag.
+        out.push_str("    )),\n");
     } else {
         out.push_str(&format!(
             "      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
@@ -3541,7 +3712,7 @@ pub(crate) fn valid_entrypoint(value: &str) -> bool {
 }
 
 /// Binding names — same rule as `compute_desired::valid_binding_name`.
-fn valid_binding_name(value: &str) -> bool {
+pub(crate) fn valid_binding_name(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && (value
@@ -3751,7 +3922,7 @@ fn emit_router_worker(
         out.push_str(&format!(
             "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
-            system_module_capnp_field(&module.name),
+            module.module_type.capnp_field(),
             capnp_text(&path),
         ));
     }
@@ -3865,7 +4036,7 @@ fn emit_qconsumer_worker(
         out.push_str(&format!(
             "        (name = {}, {} = embed {}),\n",
             capnp_text(&module.name),
-            system_module_capnp_field(&module.name),
+            module.module_type.capnp_field(),
             capnp_text(&path),
         ));
     }

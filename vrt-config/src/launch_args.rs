@@ -18,6 +18,8 @@
 
 use snapshot_protocol::compute_desired::{BindingDesired, TenantDesired};
 
+use crate::capnp::{SystemBinding, SystemWorkerRef};
+
 /// Tenant launch-shape facts that force `$experimental` workerd
 /// surfaces. Derived from the desired snapshot, never from rendered
 /// text, so callers cannot disagree about the same tenant.
@@ -65,6 +67,21 @@ impl ExperimentalNeeds {
             }),
         }
     }
+
+    /// Scan the manifest's system workers for `$experimental` surfaces —
+    /// `facade-kitesurf`'s LOADER is a `workerLoader` binding, and
+    /// manifest bindings never appear in the tenant desired snapshot the
+    /// [`Self::of_tenant`] scan reads.
+    pub fn of_system_workers(workers: &[SystemWorkerRef]) -> Self {
+        Self {
+            worker_loaders: workers.iter().any(|w| {
+                w.bindings
+                    .iter()
+                    .any(|b| matches!(b, SystemBinding::WorkerLoader { .. }))
+            }),
+            ..Self::default()
+        }
+    }
 }
 
 /// Extra workerd argv required by `needs` plus the host's system
@@ -99,6 +116,27 @@ pub fn tenant_experimental_extra_args(
     tenant: &TenantDesired,
 ) -> Vec<String> {
     experimental_extra_args(system_compat_flags, ExperimentalNeeds::of_tenant(tenant))
+}
+
+/// [`experimental_extra_args`] for a tenant plus the manifest's system
+/// workers — the form every capnp-render path (serve assemble, deploy
+/// preflight) uses. System workers ride every tenant generation, so
+/// their `$experimental` surfaces (`facade-kitesurf`'s LOADER today)
+/// bound every launch; [`tenant_experimental_extra_args`] alone misses
+/// them because manifest bindings live outside the desired snapshot.
+pub fn runtime_experimental_extra_args(
+    system_compat_flags: &[String],
+    tenant: &TenantDesired,
+    system_workers: &[SystemWorkerRef],
+) -> Vec<String> {
+    let mut needs = ExperimentalNeeds::of_tenant(tenant);
+    let sys = ExperimentalNeeds::of_system_workers(system_workers);
+    needs.queue_consumers |= sys.queue_consumers;
+    needs.durable_objects_or_workflows |= sys.durable_objects_or_workflows;
+    needs.crons |= sys.crons;
+    needs.worker_loaders |= sys.worker_loaders;
+    needs.analytics_engine |= sys.analytics_engine;
+    experimental_extra_args(system_compat_flags, needs)
 }
 
 #[cfg(test)]
@@ -206,6 +244,53 @@ mod tests {
         }];
         let args = tenant_experimental_extra_args(&[], &tenant(vec![w]));
         assert_eq!(args, vec!["--experimental".to_string()]);
+    }
+
+    /// Minimal system worker — the facade-kitesurf LOADER shape drives
+    /// the only `$experimental` surface the manifest knows today.
+    fn system_worker(bindings: Vec<crate::capnp::SystemBinding>) -> SystemWorkerRef {
+        SystemWorkerRef {
+            service_name: "facade-x".into(),
+            main_module: "m.js".into(),
+            modules: vec![crate::capnp::SystemModuleRef {
+                name: "m.js".into(),
+                digest: "0".repeat(64),
+                module_type: crate::manifest::ModuleType::EsModule,
+            }],
+            needs_binding_backend: false,
+            compatibility_flags: Vec::new(),
+            compatibility_date: None,
+            bindings,
+            outbound: crate::capnp::SystemOutbound::Deny,
+            cpu_ms: 0,
+            memory_mb: 0,
+            sub_requests: 0,
+        }
+    }
+
+    #[test]
+    fn system_worker_loader_derives_experimental_arg() {
+        // facade-kitesurf's LOADER binding lives in the manifest — the
+        // tenant-level scan never sees it, so without the system scan
+        // every generation would lose `--experimental` and workerd
+        // would refuse to load the facade.
+        let w = system_worker(vec![crate::capnp::SystemBinding::WorkerLoader {
+            name: "LOADER".into(),
+            max_workers: 32,
+        }]);
+        let args = runtime_experimental_extra_args(&[], &tenant(vec![worker()]), &[w]);
+        assert_eq!(args, vec!["--experimental".to_string()]);
+    }
+
+    #[test]
+    fn plain_system_workers_need_no_experimental_arg() {
+        let w = system_worker(vec![crate::capnp::SystemBinding::Text {
+            name: "V".into(),
+            value: "x".into(),
+        }]);
+        assert!(
+            runtime_experimental_extra_args(&[], &tenant(vec![worker()]), &[w]).is_empty()
+        );
     }
 
     #[test]

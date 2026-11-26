@@ -52,7 +52,8 @@ of the `worker_loader` API, including the fork additions below.
 
 The binding renders workerd's own `workerLoader` group
 (`vrt-config/src/capnp.rs`) and the tenant process gets
-`--experimental` (assemble adds it when any worker declares a loader).
+`--experimental` (assemble adds it when any tenant *or system* worker
+declares a loader — `facade-kitesurf`'s PageScript loader needs it too).
 Dynamic workers run **inside the same tenant workerd process** — the
 same isolate boundary model as service bindings, never a separate
 tenant. The upstream runtime compiles, links and caches them; named

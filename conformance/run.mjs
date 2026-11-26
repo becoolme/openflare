@@ -44,6 +44,7 @@ export const KNOWN_BINDINGS = [
   "email",
   "vectorize",
   "node-compat",
+  "browser",
 ];
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,63}$/;

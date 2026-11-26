@@ -165,6 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // workerd ships `cloudflare-internal:vectorize-api` and the
         // sysmanifest requires `facade-vectorize`) -- unconditionally on.
         vectorize: true,
+        // `browser` bindings render with this generation (the
+        // sysmanifest requires `facade-browser` and the kitesurf engine
+        // payload ships in every pinned image) -- unconditionally on.
+        browser: true,
     };
     let mut controller = cell_controller::prod::build_controller(
         &config,

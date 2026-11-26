@@ -103,8 +103,10 @@ fn platform_and_standalone_host_examples_validate_and_emit() {
     }
     // standalone references secrets/secrets.json as well.
     std::fs::copy(&secrets_file, root.join("secrets/secrets.json")).unwrap();
-    // Copy the real facade manifest into the layout the examples expect.
-    std::fs::create_dir_all(root.join("facade")).unwrap();
+    // Copy the real facade manifest into the layout the examples expect
+    // (+ the diskServices payload dir it references — canonicalised at
+    // render-params time, existence is fail-closed).
+    std::fs::create_dir_all(root.join("facade/kitesurf-public")).unwrap();
     std::fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../facade/manifest.json"),
         root.join("facade/manifest.json"),
@@ -123,7 +125,8 @@ fn platform_and_standalone_host_examples_validate_and_emit() {
             .unwrap_or_else(|e| panic!("{name} emit_mode failed: {e}"));
         match mode {
             vrt_host::assemble::EmitMode::Capnp { params } => {
-                assert_eq!(params.system_workers.len(), 15); // +facade-qconsumer (T37b), +facade-ratelimit (MIG-16), +facade-k2, +facade-email, +facade-images, +facade-vectorize
+                assert_eq!(params.system_workers.len(), 18); // +facade-qconsumer (T37b), +facade-ratelimit (MIG-16), +facade-k2, +facade-email, +facade-images, +facade-vectorize, +facade-kitesurf, +facade-kitesurf-front, +facade-browser
+                assert_eq!(params.disk_services.len(), 1);
                 assert!(!params.system_compat_date.is_empty());
             }
             #[cfg(feature = "dev-stub")]
@@ -222,7 +225,8 @@ fn params_json_from_manifest_fails_closed() {
     assert_eq!(doc["facades"]["email"]["service"], "facade-email");
     assert_eq!(doc["facades"]["images"]["service"], "facade-images");
     assert_eq!(doc["facades"]["vectorize"]["service"], "facade-vectorize");
-    assert_eq!(doc["systemWorkers"].as_array().unwrap().len(), 15);
+    assert_eq!(doc["facades"]["browser"]["service"], "facade-browser");
+    assert_eq!(doc["systemWorkers"].as_array().unwrap().len(), 18);
     // Platform-declared budgets survive the doc round-trip (the
     // document is re-parsed via RenderParamsFile inside the call).
     let sys = doc["systemWorkers"].as_array().unwrap();
@@ -239,6 +243,40 @@ fn params_json_from_manifest_fails_closed() {
     assert_eq!(dim("facade-images", "memoryMb"), 768);
     assert_eq!(dim("vrt-egress", "memoryMb"), 192);
     assert_eq!(dim("facade-kv", "memoryMb"), 128);
+    assert_eq!(dim("facade-kitesurf", "cpuMs"), 300_000);
+    // v3 fields survive the doc round-trip as well.
+    let kitesurf = sys
+        .iter()
+        .find(|w| w["serviceName"] == "facade-kitesurf")
+        .expect("facade-kitesurf in doc");
+    assert_eq!(kitesurf["compatibilityDate"], "2026-09-11");
+    assert_eq!(kitesurf["outbound"], "publicOnly");
+    assert!(kitesurf["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["type"] == "workerLoader"));
+    // Module kinds must survive the doc round-trip: without `type`
+    // the TOML mirror infers esModule/wasm by suffix and workerd
+    // parses kitesurf's css/dat payloads as JS (SyntaxError at load).
+    let mods = kitesurf["modules"].as_array().unwrap();
+    let mtype = |suffix: &str| {
+        mods.iter()
+            .find(|m| m["name"].as_str().unwrap().ends_with(suffix))
+            .unwrap_or_else(|| panic!("module *{suffix} missing"))["type"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(mtype("index.js"), "esModule");
+    assert_eq!(mtype("stylesheet.css"), "text");
+    assert_eq!(mtype("public-suffix-list.dat"), "text");
+    assert_eq!(mtype("core_bg.wasm"), "wasm");
+    // diskServices canonicalised to the absolute facade path.
+    let disk = doc["diskServices"].as_array().unwrap();
+    assert_eq!(disk.len(), 1);
+    assert_eq!(disk[0]["serviceName"], "facade-kitesurf-public");
+    assert!(disk[0]["path"].as_str().unwrap().ends_with("facade/kitesurf-public"));
 }
 
 /// T27/N0: a supervisor config whose failure window cannot hold

@@ -28,6 +28,11 @@ function isHandlerValue(value) {
 
 test("manifest main modules export only handlers (workerd service map)", async () => {
   for (const [service, worker] of Object.entries(manifest.workers)) {
+    // Vendored (prebuilt) workers: every module's source == dist — their
+    // import graphs reach `text`/`data`/`wasm` artifacts node cannot
+    // load, and the vendored export shape is upstream's responsibility
+    // (it already runs under workerd).
+    if (worker.modules.every((m) => m.source === m.dist)) continue;
     const mod = await import(distModule(worker.mainModule));
     const named = Object.entries(mod);
     assert.ok(named.length > 0, `${service}: main module exports nothing`);

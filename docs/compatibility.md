@@ -168,7 +168,7 @@ Any unrecognized wrangler key fails the deploy with
 Notable Cloudflare features with no OpenFlare counterpart: Workers AI
 (`ai`), AI Search (`ai_search`,
 `ai_search_namespaces`), Pipelines, dispatch namespaces
-(`dispatch_namespaces`), `mtls_certificates`, `browser`,
+(`dispatch_namespaces`), `mtls_certificates`,
 `containers`, and the legacy
 `wasm_modules`/`text_blobs`/`data_blobs` upload keys (their modern
 replacement — `rules` module typing with `Text`/`Data`/`CompiledWasm`

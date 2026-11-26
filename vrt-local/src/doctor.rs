@@ -475,7 +475,7 @@ fn check_facade(root: &Path) -> Check {
     };
     let dist_root = manifest_path.parent().unwrap_or(root).join("dist");
     let mut checked = 0usize;
-    for worker in manifest.system_workers {
+    for worker in &manifest.system_workers {
         let Some(w) = wire["workers"][&worker.service_name].as_object() else {
             return Check::fail(id, "manifest worker missing from wire form", "re-init");
         };
@@ -514,6 +514,23 @@ fn check_facade(root: &Path) -> Check {
                 );
             }
             checked += 1;
+        }
+    }
+    // `diskServices` payload trees must exist next to the manifest —
+    // the host canonicalises the facade-relative path at render-params
+    // time and a missing dir fails every tenant render.
+    for disk in &manifest.disk_services {
+        if !manifest_path
+            .parent()
+            .unwrap_or(root)
+            .join(&disk.path)
+            .is_dir()
+        {
+            return Check::fail(
+                id,
+                format!("diskServices payload missing: {}", disk.path),
+                "restore the payload dir or re-init",
+            );
         }
     }
     Check::ok(

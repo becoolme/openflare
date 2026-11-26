@@ -316,6 +316,11 @@ pub(crate) struct BindingsToml {
     /// the platform in the Flagship app store).
     #[serde(default)]
     pub(crate) flagship: BTreeMap<String, String>,
+    /// CF `[browser]` — binding names only; sessions are tenant-scoped
+    /// and the engine is platform-pinned (facade-browser), so the
+    /// binding points at no resource (images precedent).
+    #[serde(default)]
+    pub(crate) browser: Vec<String>,
 }
 
 /// `[bindings].vectorize.<name>` normalized shape — mirrors CF
@@ -1473,6 +1478,11 @@ pub fn assemble(
                 snapshot_protocol::compute_desired::ImagesBinding { name: name.clone() },
             ));
         }
+        for name in &b.browser {
+            bindings.push(BindingDesired::Browser(
+                snapshot_protocol::compute_desired::BrowserBinding { name: name.clone() },
+            ));
+        }
         for (binding, spec) in &b.vectorize {
             // indexId derivation — first 26 hex chars of
             // sha256("vrt-vx:{tenant}:{index_name}") — same rule as
@@ -2480,6 +2490,9 @@ pub fn summarize(g: &Gathered, overrides: &DeployOverrides) -> Result<DeploySumm
         }
         for name in &b.images {
             bindings.push(format!("images:{name}"));
+        }
+        for name in &b.browser {
+            bindings.push(format!("browser:{name}"));
         }
         for name in b.pg.keys() {
             bindings.push(format!("pg:{name}"));

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use vrt_host::artifact::{sha256_hex, ArtifactError, BundleCache, BundleSource};
 use vrt_host::system_seed::{seed_system_modules, SeedError};
 
-const SERVICES: [&str; 13] = [
+const SERVICES: [&str; 14] = [
     "facade-kv",
     "facade-r2",
     "facade-assets",
@@ -21,6 +21,7 @@ const SERVICES: [&str; 13] = [
     "facade-email",
     "facade-images",
     "facade-vectorize",
+    "facade-browser",
     "vrt-egress",
     "vrt-no-network",
 ];
@@ -66,7 +67,7 @@ fn fixture(mutate: impl Fn(String) -> String) -> Fixture {
         );
     }
     let doc = serde_json::json!({
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "generatedBy": "test",
         "nodeVersion": "24",
         "externals": {},

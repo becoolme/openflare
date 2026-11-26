@@ -219,6 +219,7 @@ fn render_do(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf) {
         deny_outbound: manifest.deny_outbound.clone(),
         facades: manifest.facades.clone(),
         system_workers: manifest.system_workers.clone(),
+        disk_services: manifest.disk_services.clone(),
         system_compat_date: "2026-09-08".into(),
         system_compat_flags: vec![],
         vars: Default::default(),
@@ -279,7 +280,7 @@ fn render_do(dir: &Path, port: u16) -> (PathBuf, Vec<String>, PathBuf) {
     );
     let cfg = dir.join("cfg.capnp");
     std::fs::write(&cfg, text).unwrap();
-    let mut argv = vrt_config::tenant_experimental_extra_args(&params.system_compat_flags, &tenant);
+    let mut argv = vrt_config::runtime_experimental_extra_args(&params.system_compat_flags, &tenant, &params.system_workers);
     argv.extend(vrt_host::launch::external_addr_args(&out.external_addrs));
     (cfg, argv, do_root)
 }

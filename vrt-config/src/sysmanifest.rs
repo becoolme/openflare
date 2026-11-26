@@ -13,19 +13,26 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::capnp::{
-    is_lower_hex, valid_entrypoint, valid_service_name, FacadeRefs, ServiceEndpoint,
-    SystemModuleRef, SystemWorkerRef,
+    is_lower_hex, valid_binding_name, valid_entrypoint, valid_service_name, FacadeRefs,
+    ServiceEndpoint, SystemBinding, SystemDiskService, SystemModuleRef, SystemOutbound,
+    SystemWorkerRef, WORKER_LOADER_MAX_WORKERS,
 };
+use crate::compat_flags::is_tenant_allowed_compat_flag;
 use crate::error::ConfigError;
-use crate::manifest::valid_module_name;
+use crate::manifest::{valid_compat_date, valid_module_name, ModuleType};
 
-/// `schemaVersion` accepted by this parser. Version 2 addresses published
-/// dist bytes (`sha256` over `facade/dist/**`); version 1 addressed
-/// TypeScript sources workerd could never load.
-pub const FACADE_MANIFEST_SCHEMA_VERSION: u32 = 2;
+/// `schemaVersion` accepted by this parser. Version 3 adds typed module
+/// kinds (`text`/`data`/`json`), per-worker `compatibilityFlags` +
+/// `compatibilityDate`, `bindings` (`workerLoader`/`service`/`text`/
+/// `json`), top-level `diskServices` and `outbound` (`deny`/
+/// `publicOnly`) — the surface a wasm fetch engine (facade-kitesurf)
+/// needs. Version 2 addressed published dist bytes (`sha256` over
+/// `facade/dist/**`); version 1 addressed TypeScript sources workerd
+/// could never load.
+pub const FACADE_MANIFEST_SCHEMA_VERSION: u32 = 3;
 
 /// Service names whose endpoints fill [`FacadeRefs`].
-const REQUIRED_FACADES: [&str; 11] = [
+const REQUIRED_FACADES: [&str; 12] = [
     "facade-kv",
     "facade-r2",
     "facade-assets",
@@ -37,6 +44,7 @@ const REQUIRED_FACADES: [&str; 11] = [
     "facade-email",
     "facade-images",
     "facade-vectorize",
+    "facade-browser",
 ];
 
 /// Service name of the T6 egress worker — required since T6: it is the
@@ -59,7 +67,23 @@ struct WireManifest {
     node_version: String,
     #[serde(default)]
     externals: BTreeMap<String, String>,
+    /// `disk` services — read-only vendored file trees served by
+    /// workerd's DiskDirectory surface (e.g. the kitesurf `public/`
+    /// payload). `path` is relative to the facade directory; the host
+    /// resolves it to an absolute path when deriving render params.
+    #[serde(default)]
+    disk_services: Vec<WireDiskService>,
     workers: BTreeMap<String, WireWorker>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
+struct WireDiskService {
+    /// capnp service name other workers bind to.
+    service_name: String,
+    /// Facade-relative payload directory.
+    path: String,
 }
 
 #[derive(Deserialize)]
@@ -81,6 +105,48 @@ struct WireWorker {
     /// Same story for the outbound subrequest count.
     #[serde(default)]
     sub_requests: Option<u32>,
+    /// Per-worker compat flags merged over `system_compat_flags` —
+    /// stable flags only (`experimental` would force the workerd argv
+    /// per-worker and is rejected).
+    #[serde(default)]
+    compatibility_flags: Option<Vec<String>>,
+    /// Per-worker `compatibilityDate` override — vendored engines pin
+    /// their upstream `compatibility_date` instead of the shared
+    /// `system_compat_date`.
+    #[serde(default)]
+    compatibility_date: Option<String>,
+    /// Manifest-declared bindings beyond `BINDING_BACKEND`.
+    #[serde(default)]
+    bindings: Option<Vec<WireBinding>>,
+    /// Outbound posture: `"deny"` (default — the deny-all designator)
+    /// or `"publicOnly"` (no `globalOutbound`; requires
+    /// `global_fetch_strictly_public` in `compatibilityFlags`).
+    #[serde(default)]
+    outbound: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+enum WireBinding {
+    /// `workerLoader` — anonymous dynamic isolates (`env.LOADER.load`).
+    WorkerLoader {
+        name: String,
+        max_workers: u32,
+    },
+    /// `service` — plain service binding to another declared service
+    /// in this manifest (system workers and `diskServices` alike).
+    /// Absent `entrypoint` selects the target's default export (the
+    /// only legal form for `disk` service targets).
+    Service {
+        name: String,
+        service: String,
+        #[serde(default)]
+        entrypoint: Option<String>,
+    },
+    /// `text` — plain string env var.
+    Text { name: String, value: String },
+    /// `json` — structured value parsed at config load.
+    Json { name: String, value: String },
 }
 
 #[derive(Deserialize)]
@@ -117,6 +183,9 @@ pub struct FacadeManifest {
     pub deny_outbound: ServiceEndpoint,
     /// All system workers declared in the manifest (service-name order).
     pub system_workers: Vec<SystemWorkerRef>,
+    /// `disk` services declared in the manifest (facade-relative paths;
+    /// resolved to absolute when the host derives render params).
+    pub disk_services: Vec<SystemDiskService>,
 }
 
 fn check_text(value: &str, max: usize, field: &'static str) -> Result<(), ConfigError> {
@@ -130,6 +199,21 @@ fn check_text(value: &str, max: usize, field: &'static str) -> Result<(), Config
     }
     Ok(())
 }
+
+/// `text` binding values may be empty (`KITESURF_NATIVE_EVAL`-style
+/// toggles are keyed on `"1"` semantics) but stay bounded and clean of
+/// control bytes — they land verbatim in the rendered config.
+const MAX_TEXT_BINDING_BYTES: usize = 4096;
+fn check_text_len(value: &str) -> bool {
+    value.len() <= MAX_TEXT_BINDING_BYTES
+        && value
+            .bytes()
+            .all(|b| (0x20..=0x7e).contains(&b) || b >= 0x80)
+}
+
+/// `json` binding payloads (compiled `_headers` rules and the like)
+/// stay small — the value is inlined into the rendered config text.
+const MAX_JSON_BINDING_BYTES: usize = 64 * 1024;
 
 /// Parse and validate a `facade/manifest.json` document.
 ///
@@ -154,12 +238,42 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         return Err(ConfigError::Capacity("systemManifest.externals"));
     }
 
+    // `diskServices` — bounded, uniquely named, facade-relative paths
+    // that cannot collide with a declared worker service name (a
+    // `service` binding target must resolve to exactly one service).
+    if wire.disk_services.len() > 8 {
+        return Err(ConfigError::Capacity("diskServices"));
+    }
+    let mut disk_services = Vec::with_capacity(wire.disk_services.len());
+    let mut disk_names = std::collections::BTreeSet::new();
+    for disk in &wire.disk_services {
+        if !valid_service_name(&disk.service_name)
+            || !disk_names.insert(disk.service_name.as_str())
+            || wire.workers.contains_key(&disk.service_name)
+        {
+            return Err(ConfigError::Identifier("diskServices.serviceName"));
+        }
+        // Same relative-path rule as module names: no `..`, `.`,
+        // empty or absolute segments — the host canonicalises the
+        // joined path under the facade dir at render-param time.
+        if !valid_module_name(&disk.path) {
+            return Err(ConfigError::Identifier("diskServices.path"));
+        }
+        disk_services.push(SystemDiskService {
+            service_name: disk.service_name.clone(),
+            path: disk.path.clone(),
+        });
+    }
+
     let mut system_workers = Vec::with_capacity(wire.workers.len());
     for (service_name, worker) in &wire.workers {
         if !valid_service_name(service_name) {
             return Err(ConfigError::Identifier("workers.serviceName"));
         }
-        if !valid_entrypoint(&worker.entrypoint) {
+        // Empty entrypoint = the worker's default export (vendored
+        // engines like kitesurf export no named WorkerEntrypoint).
+        // Required facades must still name one — `endpoint()` enforces.
+        if !worker.entrypoint.is_empty() && !valid_entrypoint(&worker.entrypoint) {
             return Err(ConfigError::Identifier("workers.entrypoint"));
         }
         if !valid_module_name(&worker.main_module) {
@@ -184,18 +298,28 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
             if !valid_module_name(&module.dist) {
                 return Err(ConfigError::Identifier("workers.modules.dist"));
             }
-            // `type: "wasm"` is the only meaningful kind marker and must
-            // match the `.wasm` suffix the renderer keys on — anything else
-            // would silently emit the wrong capnp module union member.
+            // `type` picks the capnp `Worker.Module` union member; a
+            // `.wasm` name still embeds as `wasm` when `type` is absent
+            // (v2 manifests did that by suffix alone). `wasm` claims
+            // stay bound to the `.wasm` name — declaring `wasm` for
+            // `x.js` would hand the importer a `WebAssembly.Module` it
+            // cannot use. `text`/`data`/`json` are allowed on ANY name:
+            // a payload server embeds e.g. a vendored `scene_host.wasm`
+            // as `data` to serve raw bytes.
             let is_wasm_name = module.name.ends_with(".wasm");
-            match module.module_type.as_deref() {
-                None if !is_wasm_name => {}
-                Some("wasm") if is_wasm_name => {}
+            let module_type = match module.module_type.as_deref() {
+                None if !is_wasm_name => ModuleType::EsModule,
+                None => ModuleType::Wasm,
+                Some("wasm") if is_wasm_name => ModuleType::Wasm,
+                Some("text") => ModuleType::Text,
+                Some("data") => ModuleType::Data,
+                Some("json") => ModuleType::Json,
                 _ => return Err(ConfigError::Identifier("workers.modules.type")),
-            }
+            };
             modules.push(SystemModuleRef {
                 name: module.name.clone(),
                 digest: module.sha256.clone(),
+                module_type,
             });
         }
         if !names.contains(&worker.main_module) {
@@ -213,11 +337,122 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         if sub_requests > snapshot_protocol::compute_desired::MAX_SUBREQUESTS {
             return Err(ConfigError::Identifier("workers.subRequests"));
         }
+        // Per-worker flags are limited to the tenant-allowed (stable,
+        // non-experimental) set — the manifest ships in the image, but
+        // admitting `$experimental` here would quietly force the workerd
+        // argv per-worker; that decision stays a platform one.
+        let compatibility_flags = worker.compatibility_flags.clone().unwrap_or_default();
+        if compatibility_flags.len() > 64
+            || compatibility_flags
+                .iter()
+                .any(|f| !is_tenant_allowed_compat_flag(f))
+        {
+            return Err(ConfigError::Identifier("workers.compatibilityFlags"));
+        }
+        let compatibility_date = match &worker.compatibility_date {
+            None => None,
+            Some(date) if valid_compat_date(date) => Some(date.clone()),
+            _ => return Err(ConfigError::Identifier("workers.compatibilityDate")),
+        };
+        let outbound = match worker.outbound.as_deref() {
+            None | Some("deny") => SystemOutbound::Deny,
+            // `publicOnly` emits no `globalOutbound` — the workerd
+            // `internet` default — and is only sound when the runtime
+            // itself restricts fetch to public addresses.
+            Some("publicOnly")
+                if compatibility_flags
+                    .iter()
+                    .any(|f| f == "global_fetch_strictly_public") =>
+            {
+                SystemOutbound::PublicOnly
+            }
+            _ => return Err(ConfigError::Identifier("workers.outbound")),
+        };
+        let bindings = worker
+            .bindings
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|binding| match binding {
+                WireBinding::WorkerLoader { name, max_workers } => {
+                    if !valid_binding_name(&name)
+                        || max_workers == 0
+                        || max_workers > WORKER_LOADER_MAX_WORKERS
+                    {
+                        return Err(ConfigError::Identifier("workers.bindings.workerLoader"));
+                    }
+                    Ok(SystemBinding::WorkerLoader { name, max_workers })
+                }
+                WireBinding::Service {
+                    name,
+                    service,
+                    entrypoint,
+                } => {
+                    // The target must be declared in this manifest — a
+                    // system worker or a `diskServices` entry. A worker
+                    // target takes an optional entrypoint (absent = its
+                    // default export); a disk target has no entrypoints.
+                    let targets_worker = wire.workers.contains_key(&service);
+                    let targets_disk = wire
+                        .disk_services
+                        .iter()
+                        .any(|d| d.service_name == service);
+                    let entrypoint = entrypoint.unwrap_or_default();
+                    if !valid_binding_name(&name)
+                        || !valid_service_name(&service)
+                        || !(targets_worker || targets_disk)
+                        || (targets_disk && !entrypoint.is_empty())
+                        || (!entrypoint.is_empty() && !valid_entrypoint(&entrypoint))
+                    {
+                        return Err(ConfigError::Identifier("workers.bindings.service"));
+                    }
+                    Ok(SystemBinding::Service {
+                        name,
+                        service,
+                        entrypoint,
+                    })
+                }
+                WireBinding::Text { name, value } => {
+                    if !valid_binding_name(&name) || !check_text_len(&value) {
+                        return Err(ConfigError::Identifier("workers.bindings.text"));
+                    }
+                    Ok(SystemBinding::Text { name, value })
+                }
+                WireBinding::Json { name, value } => {
+                    if !valid_binding_name(&name)
+                        || value.len() > MAX_JSON_BINDING_BYTES
+                        || serde_json::from_str::<serde_json::Value>(&value).is_err()
+                    {
+                        return Err(ConfigError::Identifier("workers.bindings.json"));
+                    }
+                    Ok(SystemBinding::Json { name, value })
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if bindings.len() > 32
+            || bindings
+                .iter()
+                .map(|b| match b {
+                    SystemBinding::WorkerLoader { name, .. } => name,
+                    SystemBinding::Service { name, .. } => name,
+                    SystemBinding::Text { name, .. } => name,
+                    SystemBinding::Json { name, .. } => name,
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != bindings.len()
+        {
+            return Err(ConfigError::Identifier("workers.bindings"));
+        }
         system_workers.push(SystemWorkerRef {
             service_name: service_name.clone(),
             main_module: worker.main_module.clone(),
             modules,
             needs_binding_backend: worker.needs_binding_backend,
+            compatibility_flags,
+            compatibility_date,
+            bindings,
+            outbound,
             cpu_ms,
             memory_mb,
             sub_requests,
@@ -229,6 +464,9 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
             .workers
             .get(service)
             .ok_or(ConfigError::ServiceReference(field))?;
+        if worker.entrypoint.is_empty() {
+            return Err(ConfigError::ServiceReference(field));
+        }
         Ok(ServiceEndpoint {
             service: service.to_owned(),
             entrypoint: worker.entrypoint.clone(),
@@ -246,6 +484,7 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         email: endpoint(REQUIRED_FACADES[8], "facades.required")?,
         images: endpoint(REQUIRED_FACADES[9], "facades.required")?,
         vectorize: endpoint(REQUIRED_FACADES[10], "facades.required")?,
+        browser: endpoint(REQUIRED_FACADES[11], "facades.required")?,
     };
     let egress = endpoint(EGRESS_SERVICE, "egress.required")?;
     let deny_outbound = endpoint(DENY_OUTBOUND_SERVICE, "denyOutbound.required")?;
@@ -254,5 +493,6 @@ pub fn parse_facade_manifest(json: &str) -> Result<FacadeManifest, ConfigError> 
         egress,
         deny_outbound,
         system_workers,
+        disk_services,
     })
 }

@@ -1871,6 +1871,94 @@
     "code": "VRT_CONFIG_INVALID",
     "field": "images"
    }
+  },
+  {
+   "name": "browser binding",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[browser]\nbinding = \"BROWSER\"\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.toml",
+    "config": {
+     "bindings": [
+      {
+       "name": "BROWSER",
+       "type": "browser"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "browser remote accepted and ignored",
+   "files": {
+    "wrangler.json": "{ \"name\": \"svc\", \"main\": \"src/index.ts\", \"compatibility_date\": \"2025-01-01\", \"browser\": { \"binding\": \"BR\", \"remote\": true } }\n"
+   },
+   "expect": {
+    "ok": true,
+    "source": "wrangler.json",
+    "config": {
+     "bindings": [
+      {
+       "name": "BR",
+       "type": "browser"
+      }
+     ],
+     "compatibilityDate": "2025-01-01",
+     "main": "src/index.ts",
+     "name": "svc",
+     "schemaVersion": 1
+    }
+   }
+  },
+  {
+   "name": "browser unknown sub-key rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[browser]\nbinding = \"B\"\nlab = true\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_UNSUPPORTED_FIELD",
+    "field": "browser.lab"
+   }
+  },
+  {
+   "name": "browser missing binding rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[browser]\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "browser.binding"
+   }
+  },
+  {
+   "name": "browser remote non-boolean rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\n[browser]\nbinding = \"B\"\nremote = \"yes\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "browser.remote"
+   }
+  },
+  {
+   "name": "browser non-table rejected",
+   "files": {
+    "wrangler.toml": "name = \"svc\"\nmain = \"src/index.ts\"\ncompatibility_date = \"2025-01-01\"\n\nbrowser = \"B\"\n"
+   },
+   "expect": {
+    "ok": false,
+    "code": "VRT_CONFIG_INVALID",
+    "field": "browser"
+   }
   }
  ]
 }

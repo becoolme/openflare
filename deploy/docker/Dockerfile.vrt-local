@@ -151,6 +151,9 @@ RUN set -eux; \
 # A module's bytes live at <dir>/dist/<module.name>.
 COPY facade/manifest.json /usr/share/vrt/facade/manifest.json
 COPY facade/dist /usr/share/vrt/facade/dist
+# `disk` service payload referenced by the manifest's `diskServices`
+# (facade-relative, canonicalised by params_json_from_manifest).
+COPY facade/kitesurf-public /usr/share/vrt/facade/kitesurf-public
 
 USER vrt
 WORKDIR /data

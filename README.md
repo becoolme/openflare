@@ -109,6 +109,7 @@ limits) are documented in [`docs/compatibility.md`](docs/compatibility.md).
 | `facade/` | TypeScript system workers that expose bindings to user code inside workerd |
 | `contract/` | cross-language contract fixtures (TS ⇄ Rust) and drift checks |
 | `third_party/open-compute` | vendored upstream code (Apache-2.0, see its `LICENSE` and `UPSTREAM.md`) |
+| `third_party/kitesurf` | vendored browser engine metadata (Apache-2.0); the payload lives under `facade/dist/kitesurf/` + `facade/kitesurf-public/` |
 | `deploy/` | Dockerfiles and the standalone Docker Compose stack (Kubernetes manifests live in `openflare-control`) |
 | `examples/` | example workers: hello, KV + assets, D1, R2, queues, cron, Durable Objects, workflows, wrangler projects |
 
@@ -314,5 +315,6 @@ bit are described in [`docs/quotas.md`](docs/quotas.md).
 
 ## License
 
-[MIT](LICENSE). Code under `third_party/open-compute` keeps its upstream
-Apache-2.0 license.
+[MIT](LICENSE). Code under `third_party/open-compute`, `third_party/kitesurf`,
+`facade/dist/kitesurf/` and `facade/kitesurf-public/` keeps its upstream
+Apache-2.0 license (see each `UPSTREAM.md`).

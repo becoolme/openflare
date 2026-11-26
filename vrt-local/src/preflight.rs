@@ -73,6 +73,28 @@ pub(crate) fn deploy_preflight(
         .map_err(|_| LocalError::Op("deploy check", "facade manifest unreadable".into()))?;
     let manifest = vrt_config::parse_facade_manifest(&manifest_raw)
         .map_err(|_| LocalError::Op("deploy check", "facade manifest invalid".into()))?;
+    // `diskServices` paths are facade-relative — canonicalise under the
+    // manifest's own dir to the absolute path workerd's DiskDirectory
+    // needs (same rule as the host's params_json_from_manifest).
+    let facade_dir = cfg
+        .facade_manifest
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let disk_services = manifest
+        .disk_services
+        .iter()
+        .map(|d| {
+            std::fs::canonicalize(facade_dir.join(&d.path))
+                .ok()
+                .filter(|p| p.is_dir())
+                .map(|p| vrt_config::SystemDiskService {
+                    service_name: d.service_name.clone(),
+                    path: p.to_string_lossy().into_owned(),
+                })
+                .ok_or(LocalError::Op("deploy check", "diskServices.path".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let secrets = crate::state::read_secrets(root)?
         .into_iter()
         .map(|(t, m)| {
@@ -95,6 +117,7 @@ pub(crate) fn deploy_preflight(
         deny_outbound: manifest.deny_outbound,
         facades: manifest.facades,
         system_workers: manifest.system_workers,
+        disk_services,
         system_compat_date: cfg.system_compat_date.clone(),
         system_compat_flags: cfg.system_compat_flags.clone(),
         vars: std::collections::BTreeMap::from([(
@@ -285,10 +308,16 @@ fn materialize_and_check(
     // `--experimental` argv parity with assemble's derivation: the
     // predicate is shared (`vrt_config::launch_args`), so queue
     // consumers, DO/workflow namespaces, cron facades, workerLoader
-    // bindings and non-"experimental" system experimental flags all
-    // force the arg here exactly as they do at serve time. Deriving it
-    // locally is how cron-basic deployments once failed the check.
-    let extra = vrt_config::tenant_experimental_extra_args(&cfg.system_compat_flags, tenant);
+    // bindings (tenant OR system-worker — facade-kitesurf's LOADER
+    // rides every generation) and non-"experimental" system
+    // experimental flags all force the arg here exactly as they do at
+    // serve time. Deriving it locally is how cron-basic deployments
+    // once failed the check.
+    let extra = vrt_config::runtime_experimental_extra_args(
+        &cfg.system_compat_flags,
+        tenant,
+        &params.system_workers,
+    );
 
     // Needles: every env value the child would see — redacted out of
     // the failure tail just like the launch path.

@@ -1671,6 +1671,49 @@ fn seed_system_modules(
     if seeded.is_empty() {
         return Err(LocalError::Layout("no modules"));
     }
+    // `diskServices` payload trees: the host resolves each facade-relative
+    // `path` under the manifest's own dir, so the seeded root must carry
+    // the same files. Recursive copy — regular files only (a symlinked
+    // payload file is refused like a symlinked module).
+    let out_facade = layout::facade_manifest_path(root)
+        .parent()
+        .ok_or(LocalError::Layout("facade dir"))?
+        .to_path_buf();
+    for disk in &manifest.disk_services {
+        let src_root = facade_dir.join(&disk.path);
+        let dst_root = out_facade.join(&disk.path);
+        let mut stack = vec![src_root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .map_err(|e| LocalError::Op("seed diskServices", format!("{}: {e}", dir.display())))?
+            {
+                let entry = entry.map_err(|e| LocalError::Io(e))?;
+                let meta = std::fs::symlink_metadata(entry.path()).map_err(|e| {
+                    LocalError::Op("seed diskServices", format!("{}: {e}", entry.path().display()))
+                })?;
+                if meta.file_type().is_symlink() {
+                    return Err(LocalError::Layout("diskServices symlink"));
+                }
+                let rel = entry
+                    .path()
+                    .strip_prefix(&src_root)
+                    .map_err(|_| LocalError::Layout("diskServices path"))?
+                    .to_path_buf();
+                let out = dst_root.join(&rel);
+                if meta.is_dir() {
+                    stack.push(entry.path());
+                } else if meta.is_file() {
+                    if let Some(parent) = out.parent() {
+                        vrt_securefs::ensure_secure_dir(parent)
+                            .map_err(|e| LocalError::Op("seed diskServices", e.to_string()))?;
+                    }
+                    std::fs::copy(entry.path(), &out).map_err(|e| {
+                        LocalError::Op("seed diskServices", format!("{}: {e}", out.display()))
+                    })?;
+                }
+            }
+        }
+    }
     let manifest_out = layout::facade_manifest_path(root);
     vrt_securefs::atomic_write(&manifest_out, raw.as_bytes(), 0o644)
         .map_err(|e| LocalError::Op("seed manifest", format!("{}: {e}", manifest_out.display())))?;

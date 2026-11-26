@@ -324,8 +324,13 @@ fn heartbeat_emit_gated_and_isolated() {
         modules: vec![SystemModuleRef {
             name: "x.mjs".into(),
             digest: "a".repeat(64),
+            module_type: vrt_config::ModuleType::EsModule,
         }],
         needs_binding_backend: false,
+        compatibility_flags: vec![],
+        compatibility_date: None,
+        bindings: vec![],
+        outbound: vrt_config::SystemOutbound::Deny,
         cpu_ms: 0,
         memory_mb: 0,
         sub_requests: 0,
@@ -402,8 +407,11 @@ fn render_produces_expected_structure() {
     // + facade-cron-w-alpha-1
     // (CR1: the cron dispatcher is also deny-routed — it reaches the
     // tenant worker only through the TARGET service binding, never
-    // the network) + vrt-no-network itself.
-    assert_eq!(denied, 13, "all non-egress system workers are deny-routed");
+    // the network) + vrt-no-network itself + facade-kitesurf-front
+    // (payload router — bindings only) + facade-browser (service
+    // bindings only). facade-kitesurf itself is the
+    // one `publicOnly` system worker and emits no globalOutbound.
+    assert_eq!(denied, 15, "all non-egress system workers are deny-routed");
     // No worker emits any other globalOutbound spelling.
     assert_eq!(
         out.matches("globalOutbound =").count(),
@@ -1425,9 +1433,10 @@ fn worker_loader_binding_renders_native_loader() {
         out.contains("(name = \"LOADER\", workerLoader = (maxWorkers = 32))"),
         "workerLoader group with platform quota must render:\n{out}"
     );
-    // The only LOADER occurrence is the binding line itself — a loader
-    // wires no service, socket, or facade reference.
-    assert_eq!(out.matches("\"LOADER\"").count(), 1, "{out}");
+    // Exactly two LOADER bindings exist — this tenant worker's plus the
+    // vendored kitesurf engine's (page isolates). Neither wires a
+    // service, socket, or facade reference beyond the binding line.
+    assert_eq!(out.matches("\"LOADER\"").count(), 2, "{out}");
 }
 
 /// `images` renders a `wrapped` binding over the upstream Miniflare
@@ -1464,6 +1473,39 @@ fn images_binding_renders_wrapped_images_api() {
     assert!(
         out.contains(&format!("{wid}-images.sock\"")),
         "images facade socket must render for cdn-cgi:\n{out}"
+    );
+}
+
+/// `browser` renders a plain service binding to facade-browser's
+/// `BrowserBinding` entrypoint — `env.<name>` is the Fetcher
+/// @cloudflare/puppeteer drives (`/v1/*` protocol). Sessions are
+/// tenant-scoped via the canonical props (`instanceId`), so the
+/// `namespaceResourceId` is the constant `"browser"`.
+#[test]
+fn browser_binding_renders_service_to_facade_browser() {
+    let mut tenant = tenant();
+    tenant.workers[0].bindings = serde_json::from_value(serde_json::json!([
+        {"type": "browser", "name": "BROWSER"}
+    ]))
+    .unwrap();
+    let bs = bundles();
+    let out = render_tenant_config(&input(&tenant, &bs, &runtime_params()))
+        .unwrap()
+        .text;
+    assert!(
+        out.contains(
+            "(name = \"BROWSER\", service = (name = \"facade-browser\", entrypoint = \"BrowserBinding\""
+        ),
+        "browser must render a service binding to facade-browser:\n{out}"
+    );
+    // Canonical facade props — tenant scope + the constant resource id.
+    assert!(
+        out.contains("\\\"namespaceResourceId\\\":\\\"browser\\\""),
+        "browser props carry the constant resource id:\n{out}"
+    );
+    assert!(
+        out.contains("\\\"bindingId\\\":\\\""),
+        "browser props carry a bindingId:\n{out}"
     );
 }
 
@@ -1777,8 +1819,16 @@ fn system_workers_render_platform_cpu_budgets() {
     assert_eq!(
         out.matches("limits = (cpuMs = 1000, memoryMb = 128, subRequests = 8),")
             .count(),
-        11,
-        "rendered thin facades + the deny stub"
+        13,
+        "rendered thin facades + the deny stub + the kitesurf front router + facade-browser"
+    );
+    // facade-kitesurf (vendored engine) carries its own tier — the
+    // largest envelope on the platform: page parse/layout/paint/boa.
+    assert_eq!(
+        out.matches("limits = (cpuMs = 300000, memoryMb = 1024, subRequests = 10000),")
+            .count(),
+        1,
+        "facade-kitesurf engine tier"
     );
     // Dynamic workers emitted outside `emit_system_worker` carry
     // emit-site budgets: the per-worker cron dispatcher and wfops
@@ -1847,7 +1897,7 @@ fn system_workers_render_platform_cpu_budgets() {
     assert_eq!(
         out.matches("limits = (cpuMs = 1000, subRequests = 8),")
             .count(),
-        11
+        13
     );
     // `memoryMb = 128` legitimately survives on the cron dispatcher's
     // emit-site budget — the heavy/system tiers are the unique ones.
@@ -1885,4 +1935,113 @@ fn system_workers_render_platform_cpu_budgets() {
     at_cap.system_workers[0].memory_mb = 4096;
     at_cap.system_workers[0].sub_requests = 10_000;
     assert!(render_tenant_config(&input(&tenant, &bs, &at_cap)).is_ok());
+}
+
+/// Schema v3 system-worker surface, driven end to end by the REAL
+/// facade manifest: per-worker compatFlags + compatibilityDate,
+/// `bindings` (workerLoader + service + text + json), `outbound:
+/// publicOnly`, empty-entrypoint service targets (disk + default
+/// export) and the emitted `disk` service — the vendored kitesurf
+/// engine + payload router + public tree.
+#[test]
+fn system_worker_v3_bindings_flags_and_outbound() {
+    let tenant = tenant();
+    let bs = bundles();
+    let params = runtime_params();
+    let out = render_tenant_config(&input(&tenant, &bs, &params))
+        .unwrap()
+        .text;
+    let block = out
+        .split("(name = \"facade-kitesurf\", worker = (")
+        .nth(1)
+        .expect("facade-kitesurf emitted")
+        .split("    )),")
+        .next()
+        .unwrap();
+
+    // Per-worker compatDate wins over the system date.
+    assert!(
+        block.contains("compatibilityDate = \"2026-09-11\""),
+        "per-worker compatDate:\n{block}"
+    );
+    // Per-worker flags merge over the system set.
+    assert!(
+        block.contains("\"global_fetch_strictly_public\""),
+        "per-worker flags merge into compatibilityFlags:\n{block}"
+    );
+    assert!(
+        block.contains("(name = \"LOADER\", workerLoader = (maxWorkers = 32))"),
+        "workerLoader binding:\n{block}"
+    );
+    // Service binding: plain designator to the payload worker — no
+    // props, no provider path (system↔system calls are internal).
+    assert!(
+        block.contains(
+            "(name = \"FONT_ASSETS\", service = (name = \"facade-kitesurf-front\", entrypoint = \"Assets\"))"
+        ),
+        "service binding designator:\n{block}"
+    );
+    // Text bindings render inline (upstream `vars`, "" toggles kept).
+    assert!(block.contains("(name = \"KITESURF_ENV\", text = \"production\")"));
+    assert!(block.contains("(name = \"KITESURF_NATIVE_EVAL\", text = \"\")"));
+    // Module kinds: esModule entry, wasm embed, text-rule payloads.
+    assert!(block.contains("(name = \"kitesurf/engine/index.js\", esModule = embed"));
+    assert!(block.contains("wasm = embed"));
+    assert!(block.contains(".glue.js\", text = embed"));
+    assert!(block.contains(".css\", text = embed"));
+    assert!(block.contains(".dat\", text = embed"));
+    // publicOnly: NO globalOutbound inside this worker's block.
+    assert!(
+        !block.contains("globalOutbound"),
+        "publicOnly must emit no globalOutbound:\n{block}"
+    );
+
+    // The front worker: service bindings without entrypoints (a `disk`
+    // target and a default-export worker target render identically), a
+    // `json` binding compiled from the vendored `_headers`, deny-routed.
+    let front_block = out
+        .split("(name = \"facade-kitesurf-front\", worker = (")
+        .nth(1)
+        .expect("facade-kitesurf-front emitted")
+        .split("    )),")
+        .next()
+        .unwrap();
+    assert!(
+        front_block.contains("compatibilityDate = \"2026-09-11\""),
+        "front worker pins the engine's compatDate:\n{front_block}"
+    );
+    assert!(
+        front_block
+            .contains("(name = \"PUBLIC\", service = (name = \"facade-kitesurf-public\"))"),
+        "disk-target service binding, no entrypoint:\n{front_block}"
+    );
+    assert!(
+        front_block.contains("(name = \"ENGINE\", service = (name = \"facade-kitesurf\"))"),
+        "default-export service binding, no entrypoint:\n{front_block}"
+    );
+    assert!(
+        front_block.contains("(name = \"HEADERS\", json = \"[{\\\"pattern\\\":\\\"^/fonts/.*$"),
+        "compiled _headers rules:\n{front_block}"
+    );
+    assert!(
+        front_block.contains("globalOutbound = (name = \"vrt-no-network\""),
+        "Deny default:\n{front_block}"
+    );
+    // The disk service is emitted at top level, read-only.
+    assert!(
+        out.contains("(name = \"facade-kitesurf-public\", disk = (path = \"kitesurf-public\")),"),
+        "disk service:\n{out}"
+    );
+    // Everything else still gets the deny-all designator.
+    let kv_block = out
+        .split("(name = \"facade-kv\", worker = (")
+        .nth(1)
+        .unwrap()
+        .split("    )),")
+        .next()
+        .unwrap();
+    assert!(
+        kv_block.contains("globalOutbound = (name = \"vrt-no-network\""),
+        "default deny stays:\n{kv_block}"
+    );
 }
