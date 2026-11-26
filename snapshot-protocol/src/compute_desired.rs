@@ -1242,27 +1242,19 @@ impl WorkerQuotas {
     }
 
     /// True when at least one dimension this runtime generation can
-    /// render (`cpuMs`, `memoryMb`, `subRequests`) was declared, i.e.
-    /// the cell must emit a `limits` block for this worker.
+    /// render (`cpuMs`, `memoryMb`, `subRequests`,
+    /// `outboundConnections`) was declared, i.e. the cell must emit a
+    /// `limits` block for this worker.
     ///
-    /// `subrequests = 0` means "no subrequest budget" in the protocol
-    /// but "unlimited" on the workerd side; it therefore needs no
-    /// `limits` entry (omitted dimension = stock behaviour) and does not
-    /// count as rendered.
+    /// `0` means "no declared budget" on any dimension ("unlimited" on
+    /// the workerd side); it therefore needs no `limits` entry (omitted
+    /// dimension = stock behaviour) and does not count as rendered.
     pub fn declares_enforceable_limit(&self) -> bool {
         (self.cpu_ms != DEFAULT_CPU_MS && self.cpu_ms > 0)
             || (self.memory_mb != DEFAULT_MEMORY_MB && self.memory_mb > 0)
             || (self.subrequests != DEFAULT_SUBREQUESTS && self.subrequests > 0)
-    }
-
-    /// True when a positive `outboundConnections` budget was declared.
-    /// This dimension has no `limits` field in the pinned workerd fork
-    /// yet (the connection-counter patch is deferred), so it can never
-    /// be enforced — a declared value is refused instead of being
-    /// silently dropped. `0` means "no declared budget" (stock
-    /// behaviour) and is accepted.
-    pub fn declares_unenforceable_limit(&self) -> bool {
-        self.outbound_connections > 0 && self.outbound_connections != DEFAULT_OUTBOUND_CONNECTIONS
+            || (self.outbound_connections != DEFAULT_OUTBOUND_CONNECTIONS
+                && self.outbound_connections > 0)
     }
 }
 

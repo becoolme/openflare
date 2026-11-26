@@ -1601,10 +1601,12 @@ fn worker_limits_render_declared_dimensions_only() {
     }
 }
 
-/// `outboundConnections` has no workerd enforcement hook yet: a
-/// non-default declaration is refused instead of silently ignored.
+/// `outboundConnections` renders like every other declared dimension —
+/// the pinned fork enforces it via the per-invocation connection slot
+/// pool (`newOutboundConnection` queues the (N+1)th open until a slot
+/// frees). `0` and the platform default are "not declared".
 #[test]
-fn worker_limits_reject_unenforceable_outbound_connections() {
+fn worker_limits_render_declared_outbound_connections() {
     use snapshot_protocol::compute_desired::WorkerQuotas;
     let mut tenant = tenant();
     tenant.workers[0].quotas = WorkerQuotas {
@@ -1613,13 +1615,35 @@ fn worker_limits_reject_unenforceable_outbound_connections() {
         subrequests: 50,
         outbound_connections: 6,
     };
-    assert_eq!(
-        render_tenant_config(&input(&tenant, &bundles(), &runtime_params())),
-        Err(ConfigError::Quotas("outboundConnections"))
+    let out = render_tenant_config(&input(&tenant, &bundles(), &runtime_params()))
+        .unwrap()
+        .text;
+    let block = out
+        .split("(name = \"worker-w-alpha-1\", worker = (")
+        .nth(1)
+        .unwrap();
+    let block = block.split("    )),").next().unwrap();
+    assert!(
+        block.contains("limits = (outboundConnections = 6)"),
+        "declared dimension renders alone:\n{block}"
     );
-    // 0 means "no declared budget" (stock behaviour) and stays accepted.
-    tenant.workers[0].quotas.outbound_connections = 0;
-    assert!(render_tenant_config(&input(&tenant, &bundles(), &runtime_params())).is_ok());
+    // The platform default (16) is "not declared" — omitted, never an
+    // explicit limit line; same for 0.
+    for v in [16, 0] {
+        tenant.workers[0].quotas.outbound_connections = v;
+        let out = render_tenant_config(&input(&tenant, &bundles(), &runtime_params()))
+            .unwrap()
+            .text;
+        let block = out
+            .split("(name = \"worker-w-alpha-1\", worker = (")
+            .nth(1)
+            .unwrap();
+        let block = block.split("    )),").next().unwrap();
+        assert!(
+            !block.contains("limits = ("),
+            "{v} must not render a limits group:\n{block}"
+        );
+    }
 }
 
 /// Out-of-bounds quota values are rejected at emit depth (defense in
@@ -1702,6 +1726,22 @@ fn quotas_capability_gate_fails_closed() {
     // it never trips the capability gate.
     tenant.workers[1].quotas.cpu_ms = 50;
     tenant.workers[1].quotas.subrequests = 0;
+    assert!(ensure_quotas_enforceable(&tenant, false).is_ok());
+
+    // `outboundConnections` is enforceable on the pinned fork, so a
+    // declared deviation trips the gate like the other dimensions.
+    // (subrequests back to the default — the deviation check reports
+    // the FIRST differing dimension in render order.)
+    tenant.workers[1].quotas.subrequests = 50;
+    tenant.workers[1].quotas.outbound_connections = 6;
+    assert_eq!(
+        ensure_quotas_enforceable(&tenant, false),
+        Err(ConfigError::Quotas("outboundConnections"))
+    );
+    assert!(ensure_quotas_enforceable(&tenant, true).is_ok());
+    // And `outboundConnections = 0` is the same "no budget" shape as
+    // `subrequests = 0` — no limits entry, no gate.
+    tenant.workers[1].quotas.outbound_connections = 0;
     assert!(ensure_quotas_enforceable(&tenant, false).is_ok());
 }
 

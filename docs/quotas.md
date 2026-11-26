@@ -73,14 +73,16 @@ Rules:
 - **0 is never emitted.** `0` means "no declared budget" (`subrequests = 0`);
   workerd reads an absent dimension as unlimited, so the config never claims
   a limit of zero.
-- **`outboundConnections` is not rendered.** The pinned fork has no
-  connection-counter hook yet. A positive non-default value is refused
-  (`CONFIG_QUOTA_UNSUPPORTED`) instead of being silently ignored; `0` and the
-  platform default (16) are accepted as "not declared".
-- Only `cpuMs`, `memoryMb` and `subRequests` reach workerd. `memoryMb`
-  bounds the V8 heap plus external bytes (ArrayBuffer/WASM backing
-  stores, including decoded image bitmaps) — not native/SQLite memory —
-  and startup evaluation is not CPU-limited.
+- All four dimensions reach workerd. `memoryMb` bounds the V8 heap plus
+  external bytes (ArrayBuffer/WASM backing stores, including decoded image
+  bitmaps) — not native/SQLite memory — and startup evaluation is not
+  CPU-limited. `outboundConnections` bounds simultaneous outbound
+  connections per invocation: the (N+1)th open *queues* until a slot frees
+  (a slot is held until the caller is done with the client — in practice
+  until the response body is read) instead of failing, matching
+  Cloudflare's documented semantics. Calls into internally-provided
+  services (KV, R2, actor storage) open no outbound connection and are
+  exempt.
 
 ### System workers (`cpuMs`, `memoryMb`, `subRequests`)
 
@@ -170,7 +172,7 @@ Fail-closed layers, in order:
 
 | layer | test |
 | --- | --- |
-| render | `cargo test -p vrt-config` — golden (`tests/golden/tenant.capnp`), declared-dimension emit, 0/default omission, out-of-bounds and `outboundConnections` rejection, capability gate |
+| render | `cargo test -p vrt-config` — golden (`tests/golden/tenant.capnp`), declared-dimension emit, 0/default omission, out-of-bounds rejection, capability gate |
 | host | `cargo test -p vrt-host --lib`; `tests/assemble.rs::quotas_capability_off_fails_closed` |
 | standalone | `cargo test -p vrt-local` — wrangler `limits` normalization, partial `[quotas]`, `of status` diagnostics |
 | cell | `cargo test -p cell-controller` — ACK `quotas` bit (omit while false) |
