@@ -22,6 +22,8 @@ fn reg() -> &'static Registry {
         r.declare_gauge("vrt_cell_lease_epoch", "Cron lease fencing epoch.");
         r.declare_counter("vrt_cell_cron_dispatch_total", "Cron dispatch outcomes (delivered|failed|retried_switching|skipped_lease_lost|skipped_no_lease|blackout|missed_deadline).");
         r.declare_counter("vrt_cell_logs_total", "Worker log shipping events by outcome (shipped records|drain_failed|push_failed).");
+        r.declare_counter("vrt_cell_meter_push_total", "Usage meter pushes by outcome (pushed|scrape_failed|push_failed).");
+        r.declare_counter("vrt_cell_meter_entries_total", "Worker usage entries accepted by the control plane.");
         r.declare_counter("vrt_cell_poll_errors_total", "Pull/fetch errors by source (desired|render_inputs).");
         r.declare_counter("vrt_cell_d1_promote_total", "D1 promotion outcomes (ok|failed).");
         r.declare_counter("vrt_cell_d1_auto_total", "D1 automatic-failover outcomes (probe_failed|promoted|promote_failed|cooling).");
@@ -244,5 +246,12 @@ pub fn router() -> axum::Router {
 pub fn logs_event(outcome: &'static str, n: usize) {
     if n > 0 {
         reg().inc("vrt_cell_logs_total", &[("outcome", outcome)], n as f64);
+    }
+}
+
+pub fn meter_event(outcome: &'static str, entries: usize) {
+    reg().inc("vrt_cell_meter_push_total", &[("outcome", outcome)], 1.0);
+    if entries > 0 {
+        reg().inc("vrt_cell_meter_entries_total", &[], entries as f64);
     }
 }

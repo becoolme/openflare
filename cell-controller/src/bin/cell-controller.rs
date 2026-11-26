@@ -572,6 +572,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Usage meter: scrape each pod's trusted counters and push per-window
+    // deltas to the control plane. Same scoped token + `[[pods]]` bases as
+    // the log shipper; commit-on-push keeps retries idempotent.
+    if !config.pods.is_empty() {
+        let cp = config.control_plane_url.clone();
+        let cell = config.cell_id.clone();
+        let token = std::fs::read_to_string(&config.token_file)
+            .expect("token_file unreadable")
+            .trim()
+            .to_string();
+        let pods: Vec<(String, String)> = config
+            .pods
+            .iter()
+            .map(|p| (p.id.clone(), p.readyz.clone()))
+            .collect();
+        let timeout = std::time::Duration::from_secs(10);
+        let tick_every = std::time::Duration::from_secs(10);
+        match (
+            cell_controller::meter::HttpMeterSource::new(&pods, timeout),
+            cell_controller::meter::HttpMeterSink::new(&cp, &cell, token, timeout),
+        ) {
+            (Ok(src), Ok(sink)) => {
+                let ids = src.pod_ids();
+                let boot_id = format!("{}-{}", cell, std::process::id());
+                tokio::spawn(async move {
+                    let mut shipper =
+                        cell_controller::meter::MeterShipper::new(src, sink, ids, boot_id);
+                    let mut tick = tokio::time::interval(tick_every);
+                    loop {
+                        tick.tick().await;
+                        let end = chrono::Utc::now().timestamp_millis();
+                        let start = end - tick_every.as_millis() as i64;
+                        let r = shipper.tick(start, end).await;
+                        if r.pushed {
+                            tracing::debug!(entries = r.entries, scraped = r.scraped, "usage meter batch pushed");
+                        } else if r.scrape_failed > 0 {
+                            tracing::debug!(failed = r.scrape_failed, "usage meter scrape failed");
+                        }
+                    }
+                });
+                tracing::info!("usage meter shipper enabled");
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!(%e, "usage meter shipper init failed — metering disabled");
+            }
+        }
+    }
     // Periodic cell report: pod metrics + D1/queue stats + Workflow/DO
     // instance listings. Enabled by default when there is anything to
     // report on; `[report] enabled = false` opts out.
