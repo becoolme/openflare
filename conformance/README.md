@@ -178,6 +178,40 @@ unscheduled — it spends real account quota). `diff.mjs` exits 1 on any
 `diverged`/`missing` case unless `--no-fail`; `not-recorded` verdicts
 mean one side ran without `--record`.
 
+## Running against workerd's bundled modules
+
+`conformance/reference.mjs` runs a case against workerd's **bundled
+modules** (`/workerd/kv.js`, `d1.js`, `r2.js`, `ratelimit.js`) instead of
+the facades, one `workerd serve` process per case. It is the drift
+detector for the bindings we reimplement; see
+[`docs/workerd-bundled-modules.md`](../docs/workerd-bundled-modules.md).
+
+```sh
+# run kv/d1/r2/ratelimit cases on the bundled stack
+node conformance/reference.mjs \
+  --workerd /path/to/pinned/workerd \
+  --capnp   /path/to/pinned/workerd.capnp
+
+# diff against an OpenFlare run
+node conformance/reference.mjs \
+  --workerd /path/to/pinned/workerd --capnp /path/to/workerd.capnp \
+  --against conformance/results/latest.json
+```
+
+- The config is rendered the way workerd's own `cli/wrangler.rs` wires
+  bundled modules (per-case DO `uniqueKey`, sqlite-backed classes, disk
+  services), so it is the real bundled wiring.
+- Supported manifests: `kv_namespaces`, `d1_databases`, `r2_buckets`,
+  `ratelimits`, `vars`. Anything else (queues, cron, DO classes,
+  workflows, assets, `vrt.toml`) reports `skipped` with the unmapped
+  keys — never a silently reduced stack.
+- workerd gates bundled modules behind `--experimental`; the runner
+  passes it (the fork keeps the gate, and vrt-host does the same).
+- The run is a detector, not a gate: steps where the bundled module
+  diverges from the case expectation (client-side validation shapes,
+  `dump()`, response-size limits) are findings to triage, so CI runs it
+  `continue-on-error`.
+
 ## Adding a case
 
 1. `conformance/cases/<binding>/<id>/` — `<id>` is lower-kebab and must

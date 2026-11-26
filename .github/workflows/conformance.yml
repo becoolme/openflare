@@ -77,6 +77,19 @@ jobs:
             --url http://127.0.0.1:8080 \
             --deploy-cmd ./conformance/deploy-standalone.sh \
             --fail-on-skip
+      # Drift detector, not a gate: re-run every case that maps onto
+      # workerd's bundled modules (kv/d1/r2/ratelimits) on the bundled
+      # stack itself and diff step verdicts against the facade run.
+      # `bundledOnly` rows are behaviours our facades are missing; a red
+      # step here means the expectation or a facade drifted, so it must
+      # not fail the release gate until the divergences are triaged.
+      - name: Reference run against workerd's bundled modules
+        continue-on-error: true
+        run: |
+          node conformance/reference.mjs \
+            --workerd .ci/workerd/workerd \
+            --capnp .ci/workerd/workerd.capnp \
+            --against conformance/results/latest.json
       - name: Stack logs on failure
         if: failure()
         run: |
