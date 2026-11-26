@@ -93,6 +93,9 @@ Platform-wide differences (no edge network, server-minted resource ids,
 structural scale-to-zero, a whitelisted `request.cf`, WebSocket session
 limits) are documented in [`docs/compatibility.md`](docs/compatibility.md).
 
+Per-worker usage metering — deltas of the trusted counters shipped to the
+control plane — is documented in [`docs/metering.md`](docs/metering.md).
+
 ## Components
 
 | crate / dir | role |
