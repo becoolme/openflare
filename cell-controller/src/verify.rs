@@ -5,6 +5,7 @@
 //! revision fence) and translates every failure into a typed
 //! [`RejectReason`] suitable for the ACK `reason` field and structured
 //! logs — reasons are fixed identifiers, never attacker-controlled bytes.
+use crate::fence::FenceAttestation;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,8 @@ pub struct CellVerifier {
     cell_id: String,
     trusted_keys: Vec<TrustedKey>,
     guard: RevisionGuard,
+    /// Issue #63: attestation delivered with the accepted document (if any).
+    attestation: Option<FenceAttestation>,
 }
 
 impl CellVerifier {
@@ -130,6 +133,7 @@ impl CellVerifier {
             cell_id: cell_id.into(),
             trusted_keys,
             guard: RevisionGuard::new(),
+            attestation: None,
         }
     }
 
@@ -141,10 +145,28 @@ impl CellVerifier {
         last_revision: u64,
         last_envelope_digest: &str,
     ) -> Option<Self> {
+        Self::restore_with_attestation(
+            cell_id,
+            trusted_keys,
+            last_revision,
+            last_envelope_digest,
+            None,
+        )
+    }
+
+    /// Restore including the persisted fence attestation (issue #63).
+    pub fn restore_with_attestation(
+        cell_id: impl Into<String>,
+        trusted_keys: Vec<TrustedKey>,
+        last_revision: u64,
+        last_envelope_digest: &str,
+        attestation: Option<FenceAttestation>,
+    ) -> Option<Self> {
         Some(Self {
             cell_id: cell_id.into(),
             trusted_keys,
             guard: RevisionGuard::restore(last_revision, last_envelope_digest)?,
+            attestation,
         })
     }
 
@@ -154,6 +176,16 @@ impl CellVerifier {
             self.guard.last_accepted(),
             self.guard.last_envelope_digest(),
         )
+    }
+
+    /// Attestation for the current fence, when the control plane delivered one.
+    pub fn fence_attestation(&self) -> Option<&FenceAttestation> {
+        self.attestation.as_ref()
+    }
+
+    /// Record (or clear) the attestation that belongs to the fence.
+    pub fn set_fence_attestation(&mut self, attestation: Option<FenceAttestation>) {
+        self.attestation = attestation;
     }
 
     /// Full fail-closed verification. On success returns the verified

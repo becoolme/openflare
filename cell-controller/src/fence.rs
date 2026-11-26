@@ -30,12 +30,50 @@ impl std::fmt::Display for FenceError {
 }
 impl std::error::Error for FenceError {}
 
+/// Compact fence attestation delivered with an accepted document (issue #63).
+///
+/// The control plane signs `{kind, scope, revision, payloadDigest,
+/// envelopeDigest}` and serves the signature out-of-band on the desired
+/// response. Persisting it with the fence lets the cell prove a fence that is
+/// ahead of a restored control plane, which otherwise could never heal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FenceAttestation {
+    pub revision: u64,
+    pub payload_digest: String,
+    pub envelope_digest: String,
+    pub attestation: String,
+}
+
+/// Durable fence state: the last accepted revision (+ digest) and, when the
+/// control plane delivered one, its attestation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceState {
+    pub revision: u64,
+    pub envelope_digest: String,
+    pub attestation: Option<FenceAttestation>,
+}
+
 /// Durable revision-fence backend.
 pub trait FenceStore: Send + Sync {
     /// Last accepted `(revision, envelopeDigest)`, `None` on first boot.
     fn load(&self) -> Result<Option<(u64, String)>, FenceError>;
     /// Persist a newly accepted fence position.
     fn store(&self, revision: u64, envelope_digest: &str) -> Result<(), FenceError>;
+    /// Full durable state including the optional fence attestation (#63).
+    fn load_full(&self) -> Result<Option<FenceState>, FenceError> {
+        Ok(self.load()?.map(|(revision, envelope_digest)| FenceState {
+            revision,
+            envelope_digest,
+            attestation: None,
+        }))
+    }
+    /// Persist the full state. Implementations that cannot store the
+    /// attestation keep the legacy behaviour (it is advisory for the legacy
+    /// bounded path).
+    fn store_full(&self, state: &FenceState) -> Result<(), FenceError> {
+        self.store(state.revision, &state.envelope_digest)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,6 +82,9 @@ struct FenceFile {
     schema_version: u32,
     revision: u64,
     envelope_digest: String,
+    /// Issue #63: optional; legacy files load with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fence_attestation: Option<FenceAttestation>,
 }
 
 /// JSON fence file persisted atomically under `path`.
@@ -61,6 +102,12 @@ impl FileFenceStore {
 
 impl FenceStore for FileFenceStore {
     fn load(&self) -> Result<Option<(u64, String)>, FenceError> {
+        Ok(self
+            .load_full()?
+            .map(|state| (state.revision, state.envelope_digest)))
+    }
+
+    fn load_full(&self) -> Result<Option<FenceState>, FenceError> {
         let raw = match fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -81,10 +128,36 @@ impl FenceStore for FileFenceStore {
         {
             return Err(FenceError("fence file fails validation".into()));
         }
-        Ok(Some((file.revision, file.envelope_digest)))
+        if let Some(attestation) = &file.fence_attestation {
+            if attestation.revision != file.revision
+                || attestation.envelope_digest != file.envelope_digest
+                || attestation.payload_digest.len() != 64
+                || !attestation
+                    .payload_digest
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit())
+                || attestation.attestation.is_empty()
+                || attestation.attestation.len() > 512
+            {
+                return Err(FenceError("fence attestation fails validation".into()));
+            }
+        }
+        Ok(Some(FenceState {
+            revision: file.revision,
+            envelope_digest: file.envelope_digest,
+            attestation: file.fence_attestation,
+        }))
     }
 
     fn store(&self, revision: u64, envelope_digest: &str) -> Result<(), FenceError> {
+        self.store_full(&FenceState {
+            revision,
+            envelope_digest: envelope_digest.to_string(),
+            attestation: None,
+        })
+    }
+
+    fn store_full(&self, state: &FenceState) -> Result<(), FenceError> {
         let parent = self
             .path
             .parent()
@@ -100,8 +173,9 @@ impl FenceStore for FileFenceStore {
         ));
         let body = serde_json::to_vec(&FenceFile {
             schema_version: 1,
-            revision,
-            envelope_digest: envelope_digest.to_string(),
+            revision: state.revision,
+            envelope_digest: state.envelope_digest.clone(),
+            fence_attestation: state.attestation.clone(),
         })
         .map_err(|e| FenceError(format!("fence encode: {e}")))?;
         let write = || -> std::io::Result<()> {
@@ -125,22 +199,46 @@ impl FenceStore for FileFenceStore {
 /// In-memory fence for tests.
 #[derive(Default)]
 pub struct MemoryFenceStore {
-    inner: std::sync::Mutex<Option<(u64, String)>>,
+    inner: std::sync::Mutex<Option<FenceState>>,
 }
 
 impl MemoryFenceStore {
     /// Current value (assertions).
     pub fn value(&self) -> Option<(u64, String)> {
-        self.inner.lock().unwrap().clone()
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|state| (state.revision, state.envelope_digest.clone()))
+    }
+
+    /// Current attestation (assertions).
+    pub fn attestation(&self) -> Option<FenceAttestation> {
+        self.inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|state| state.attestation.clone())
     }
 }
 
 impl FenceStore for MemoryFenceStore {
     fn load(&self) -> Result<Option<(u64, String)>, FenceError> {
-        Ok(self.inner.lock().unwrap().clone())
+        Ok(self.value())
     }
     fn store(&self, revision: u64, envelope_digest: &str) -> Result<(), FenceError> {
-        *self.inner.lock().unwrap() = Some((revision, envelope_digest.to_string()));
+        *self.inner.lock().unwrap() = Some(FenceState {
+            revision,
+            envelope_digest: envelope_digest.to_string(),
+            attestation: None,
+        });
+        Ok(())
+    }
+    fn load_full(&self) -> Result<Option<FenceState>, FenceError> {
+        Ok(self.inner.lock().unwrap().clone())
+    }
+    fn store_full(&self, state: &FenceState) -> Result<(), FenceError> {
+        *self.inner.lock().unwrap() = Some(state.clone());
         Ok(())
     }
 }
@@ -209,5 +307,90 @@ mod tests {
         assert!(validate_control_plane_url("http://cp.internal", false).is_err());
         assert!(validate_control_plane_url("http://127.0.0.1:3000", true).is_ok());
         assert!(validate_control_plane_url("ftp://x", true).is_err());
+    }
+
+    fn attestation(revision: u64, digest: &str) -> FenceAttestation {
+        FenceAttestation {
+            revision,
+            payload_digest: "a".repeat(64),
+            envelope_digest: digest.to_string(),
+            attestation: "c2ln".to_string(),
+        }
+    }
+
+    #[test]
+    fn full_state_roundtrips_with_attestation() {
+        let path = tmp_path("attestation");
+        let store = FileFenceStore::new(&path);
+        let digest = "b".repeat(64);
+        let state = FenceState {
+            revision: 12,
+            envelope_digest: digest.clone(),
+            attestation: Some(attestation(12, &digest)),
+        };
+        store.store_full(&state).unwrap();
+        assert_eq!(store.load_full().unwrap(), Some(state));
+        // Legacy accessors still work on the same file.
+        assert_eq!(store.load().unwrap(), Some((12, digest)));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_file_without_attestation_loads_none() {
+        let path = tmp_path("legacy");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 3,
+                "envelope_digest": "d".repeat(64)
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let state = FileFenceStore::new(&path).load_full().unwrap().unwrap();
+        assert_eq!(state.revision, 3);
+        assert!(state.attestation.is_none());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mismatched_attestation_fails_closed() {
+        let path = tmp_path("mismatch");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "revision": 3,
+                "envelope_digest": "d".repeat(64),
+                "fence_attestation": {
+                    "revision": 4,
+                    "payloadDigest": "a".repeat(64),
+                    "envelopeDigest": "d".repeat(64),
+                    "attestation": "c2ln"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(FileFenceStore::new(&path).load_full().is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn memory_store_keeps_the_attestation() {
+        let store = MemoryFenceStore::default();
+        let digest = "e".repeat(64);
+        store
+            .store_full(&FenceState {
+                revision: 9,
+                envelope_digest: digest.clone(),
+                attestation: Some(attestation(9, &digest)),
+            })
+            .unwrap();
+        assert_eq!(store.value(), Some((9, digest.clone())));
+        assert_eq!(store.attestation().unwrap().revision, 9);
+        store.store(10, &digest).unwrap();
+        assert!(store.attestation().is_none());
     }
 }

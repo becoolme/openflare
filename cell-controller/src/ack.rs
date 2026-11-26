@@ -27,6 +27,17 @@ pub enum AckStatus {
     Partial,
 }
 
+/// Compact fence attestation echoed when the persisted fence is ahead of the
+/// acked revision (issue #63).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FenceProof {
+    pub revision: u64,
+    pub payload_digest: String,
+    pub envelope_digest: String,
+    pub attestation: String,
+}
+
 /// One acknowledgement report.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +53,10 @@ pub struct AckReport {
     /// The cell's persisted revision fence (T11/F5) — lets a restored
     /// control-plane DB lift its counter back above the fence.
     pub fence_revision: u64,
+    /// Issue #63: proof for `fenceRevision` when it is ahead of this ack's
+    /// revision (typically after a control-plane restore). Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fence_proof: Option<FenceProof>,
     /// Convergence verdict.
     pub status: AckStatus,
     /// Typed reason code (see [`crate::verify::RejectReason::code`]) or a
@@ -505,5 +520,43 @@ impl AckSink for MemoryAckSink {
             .unwrap_or_else(|e| e.into_inner())
             .push(ack.clone());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn report(fence_proof: Option<FenceProof>) -> AckReport {
+        AckReport {
+            revision: 5,
+            payload_digest: "a".repeat(64),
+            envelope_digest: "b".repeat(64),
+            fence_revision: 9,
+            fence_proof,
+            status: AckStatus::Rejected,
+            reason: Some("revision-rollback".to_string()),
+            applied_at: chrono::Utc::now(),
+            capabilities: None,
+            tenant_failures: None,
+        }
+    }
+
+    #[test]
+    fn fence_proof_is_omitted_when_absent_and_camel_cased_when_present() {
+        let without = serde_json::to_value(report(None)).unwrap();
+        assert!(without.get("fenceProof").is_none());
+
+        let with = serde_json::to_value(report(Some(FenceProof {
+            revision: 9,
+            payload_digest: "c".repeat(64),
+            envelope_digest: "d".repeat(64),
+            attestation: "c2ln".to_string(),
+        })))
+        .unwrap();
+        let proof = with.get("fenceProof").expect("camelCase fenceProof");
+        assert_eq!(proof.get("revision").unwrap(), 9);
+        assert_eq!(proof.get("attestation").unwrap(), "c2ln");
+        assert_eq!(with.get("fenceRevision").unwrap(), 9);
     }
 }

@@ -337,7 +337,7 @@ pub fn restore_fence(
     let store = match config.fence_file.as_deref() {
         Some(path) => {
             let s = fence::FileFenceStore::new(path);
-            match FenceStore::load(&s) {
+            match FenceStore::load_full(&s) {
                 Ok(state) => Some((s, state)),
                 Err(e) => {
                     return Err(format!(
@@ -350,11 +350,12 @@ pub fn restore_fence(
         None => None,
     };
     let verifier = match &store {
-        Some((_, Some((rev, digest)))) => CellVerifier::restore(
+        Some((_, Some(state))) => CellVerifier::restore_with_attestation(
             config.cell_id.clone(),
             config.trusted_keys.clone(),
-            *rev,
-            digest,
+            state.revision,
+            &state.envelope_digest,
+            state.attestation.clone(),
         )
         .ok_or("revision fence restore rejected — refusing to start".to_string())?,
         _ => CellVerifier::new(config.cell_id.clone(), config.trusted_keys.clone()),
