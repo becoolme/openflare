@@ -78,8 +78,15 @@ Options (`node conformance/run.mjs --help`):
 | `--timeout <ms>` | per-request timeout (default 15 s) |
 | `--fail-fast` | stop a case at its first failed step |
 | `--fail-on-skip` | exit 1 when any case is skipped (release gate: a skipped case did not prove its binding) |
+| `--record` | store each step's observed `{status, body}` in the report for `diff.mjs` |
+| `--target <name>` | report stack label; `cloudflare` also skips cases with `cloudflare: false` in case.json |
 | `--list` | print `real-projects.json` entries and exit |
 | `--validate` | validate all manifests and exit |
+
+A deploy hook may print `VRT_CASE_HOSTNAME=<host>` on stdout to set the
+per-case request Host (hostname-routed targets like workers.dev, where
+the manifest's `*.vrt.local` route does not exist). An explicit `--host`
+still wins.
 
 Exit code: `0` when nothing failed (skips are fine unless
 `--fail-on-skip` is passed), `1` on any failed step (or on a skip with
@@ -112,6 +119,61 @@ diagnostics. `vrt-sql` exiting with `VRT_SQL_DURABILITY_SAME_DEVICE`
 means the dev-only exemption documented in
 [`deploy/standalone/README.md`](../deploy/standalone/README.md#durability-in-this-stack-devci-only)
 is missing from the generated `vrt-sql.toml`.
+
+## Differential vs Cloudflare
+
+The same cases can run against real Cloudflare; `diff.mjs` then
+compares the two stacks' *observed* responses field-by-field — a
+divergence is a real behavioral difference (a compat gap, or a wrong
+expectation in the case fixture), not a pass/fail against golden
+behavior.
+
+```sh
+# side a: the standalone openflare stack (as above, plus --record)
+node conformance/run.mjs --url http://127.0.0.1:8080 \
+  --deploy-cmd ./conformance/deploy-standalone.sh \
+  --record --results conformance/results/openflare
+
+# side b: real Cloudflare (wrangler + CF_API_TOKEN/CF_ACCOUNT_ID)
+node conformance/run.mjs --url https://workers.dev \
+  --target cloudflare \
+  --deploy-cmd ./conformance/deploy-cloudflare.sh \
+  --no-restart --record \
+  --results conformance/results/cloudflare
+
+node conformance/diff.mjs \
+  --a conformance/results/openflare/latest.json \
+  --b conformance/results/cloudflare/latest.json \
+  --out conformance/results/diff
+node conformance/cf-teardown.mjs   # delete what the CF pass created
+```
+
+How the Cloudflare pass works:
+
+- `cf-deploy.mjs` provisions the bindings each case's `wrangler.jsonc`
+  names (KV namespaces → real ids, D1 → real `database_id`, R2 buckets,
+  queues — all `conf-*` named, idempotent on reruns), drops the
+  `*.vrt.local` routes for `workers_dev`, `wrangler deploy`s, and
+  reports `<worker>.<subdomain>.workers.dev` back via
+  `VRT_CASE_HOSTNAME`. `--url https://workers.dev` reaches the CF edge;
+  the per-case Host header selects the worker.
+- Everything created is appended to `conformance/results/cf-state.json`;
+  `cf-teardown.mjs` deletes exactly that ledger (run leftovers stay
+  recorded for a retry).
+- `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID` are required;
+  `WRANGLER` overrides the binary, `CF_STATE`/`CF_SUBDOMAIN` the paths
+  and subdomain fallback.
+- Cases report `skipped` (never silently "pass") when they cannot run:
+  `case.cloudflare=false` under `--target cloudflare` (e.g.
+  `cache-basic` — `caches.default` needs a custom zone, and the case
+  only has a `vrt.toml` manifest), and every restart-step case under
+  `--no-restart` since real Cloudflare cannot be restarted by the suite.
+
+`.github/workflows/conformance-diff.yml` wires both passes +
+`diff.mjs` + teardown into one `workflow_dispatch` job (deliberately
+unscheduled — it spends real account quota). `diff.mjs` exits 1 on any
+`diverged`/`missing` case unless `--no-fail`; `not-recorded` verdicts
+mean one side ran without `--record`.
 
 ## Adding a case
 

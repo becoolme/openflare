@@ -345,3 +345,61 @@ test("a restart case without a restart hook is skipped before deploying", async 
     srv.close();
   }
 });
+
+test("deploy hook VRT_CASE_HOSTNAME overrides the manifest hostname", async () => {
+  let seenHost;
+  const { srv, url } = await fakeStack((req, res) => {
+    seenHost = req.headers.host;
+    res.end('{"pong":true}');
+  });
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-test-"));
+    const e = entry(path.join(tmp, "t-case"), "t-case", baseCase());
+    const r = await runCase(
+      e,
+      caseOpts(url, {
+        deployCmd: 'echo "VRT_CASE_HOSTNAME=t-case.acct.workers.dev"',
+      }),
+    );
+    assert.equal(r.status, "passed");
+    assert.equal(seenHost, "t-case.acct.workers.dev");
+  } finally {
+    srv.close();
+  }
+});
+
+test("--record stores observed status + parsed body on each step", async () => {
+  const { srv, url } = await fakeStack((_req, res) => {
+    res.setHeader("content-type", "application/json");
+    res.end('{"pong":true,"v":1}');
+  });
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-test-"));
+    const e = entry(path.join(tmp, "t-case"), "t-case", baseCase());
+    const r = await runCase(e, caseOpts(url, { record: true }));
+    assert.equal(r.status, "passed");
+    assert.deepEqual(r.steps[0].observed, { status: 200, body: { pong: true, v: 1 } });
+  } finally {
+    srv.close();
+  }
+});
+
+test("--target cloudflare skips cases marked cloudflare:false", async () => {
+  const { srv, url } = await fakeStack((_req, res) => res.end("{}"));
+  try {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "conf-test-"));
+    const e = entry(
+      path.join(tmp, "t-case"),
+      "t-case",
+      baseCase({ cloudflare: false }),
+    );
+    const r = await runCase(e, caseOpts(url, { target: "cloudflare" }));
+    assert.equal(r.status, "skipped");
+    assert.match(r.reason, /cloudflare/);
+    // Other targets still run it.
+    const r2 = await runCase(e, caseOpts(url));
+    assert.equal(r2.status, "failed"); // fake stack returns {} — not {pong:true}
+  } finally {
+    srv.close();
+  }
+});
