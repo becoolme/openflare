@@ -24,6 +24,7 @@ fn reg() -> &'static Registry {
         r.declare_counter("vrt_cell_logs_total", "Worker log shipping events by outcome (shipped records|drain_failed|push_failed).");
         r.declare_counter("vrt_cell_meter_push_total", "Usage meter pushes by outcome (pushed|scrape_failed|push_failed).");
         r.declare_counter("vrt_cell_meter_entries_total", "Worker usage entries accepted by the control plane.");
+        r.declare_counter("vrt_cell_meter_overflow_dropped_total", "Meter samples skipped because vrt-metrics folded their worker id to _overflow.");
         r.declare_counter("vrt_cell_poll_errors_total", "Pull/fetch errors by source (desired|render_inputs).");
         r.declare_counter("vrt_cell_d1_promote_total", "D1 promotion outcomes (ok|failed).");
         r.declare_counter("vrt_cell_d1_auto_total", "D1 automatic-failover outcomes (probe_failed|promoted|promote_failed|cooling).");
@@ -253,5 +254,11 @@ pub fn meter_event(outcome: &'static str, entries: usize) {
     reg().inc("vrt_cell_meter_push_total", &[("outcome", outcome)], 1.0);
     if entries > 0 {
         reg().inc("vrt_cell_meter_entries_total", &[], entries as f64);
+    }
+}
+
+pub fn meter_overflow_dropped(samples: u64) {
+    if samples > 0 {
+        reg().inc("vrt_cell_meter_overflow_dropped_total", &[], samples as f64);
     }
 }

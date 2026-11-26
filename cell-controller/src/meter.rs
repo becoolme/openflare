@@ -366,7 +366,10 @@ pub fn accumulate(out: &mut BTreeMap<String, WorkerUsage>, sample: &Sample, delt
     let Some(worker) = sample.labels.get("worker_id") else {
         return;
     };
-    if worker.is_empty() || !delta.is_finite() || delta <= 0.0 {
+    // vrt-metrics folds cardinality overflow into the literal `_overflow`
+    // worker id; it is not a real worker, so it must never reach the control
+    // plane as a usage entry.
+    if worker.is_empty() || worker == "_overflow" || !delta.is_finite() || delta <= 0.0 {
         return;
     }
     if out.len() >= MAX_ENTRIES && !out.contains_key(worker) {
@@ -447,9 +450,21 @@ impl<S: MeterSource, K: MeterSink> MeterShipper<S, K> {
             let prev = self.prev.get(&pod).cloned().unwrap_or_default();
             let mut current = BTreeMap::new();
             let mut usage: BTreeMap<String, WorkerUsage> = BTreeMap::new();
+            let mut overflow_dropped: u64 = 0;
             for sample in &samples {
                 let key = sample_key(sample);
                 current.insert(key.clone(), sample.value);
+                if sample
+                    .labels
+                    .get("worker_id")
+                    .map(|w| w == "_overflow")
+                    .unwrap_or(false)
+                {
+                    // Baseline still advances above, but the folded series is
+                    // not attributable to a worker.
+                    overflow_dropped += 1;
+                    continue;
+                }
                 let old = prev.get(&key).copied().unwrap_or(0.0);
                 let delta = if sample.value >= old {
                     sample.value - old
@@ -458,6 +473,9 @@ impl<S: MeterSource, K: MeterSink> MeterShipper<S, K> {
                     sample.value
                 };
                 accumulate(&mut usage, sample, delta);
+            }
+            if overflow_dropped > 0 {
+                crate::metrics::meter_overflow_dropped(overflow_dropped);
             }
             if usage.is_empty() {
                 // No deltas: advance the baseline without pushing.
@@ -694,5 +712,39 @@ vrt_worker_requests_total{worker_id="w2",status_class="5xx"} NaN
         assert_eq!(batches[0].entries[0].requests, 10);
         // seq never advanced across the failure, so the retry is idempotent.
         assert_eq!(batches[0].seq, 1);
+    }
+
+    #[tokio::test]
+    async fn overflow_worker_id_is_skipped_but_baseline_advances() {
+        let overflow = Sample {
+            name: M_REQUESTS.to_string(),
+            labels: BTreeMap::from([("worker_id".to_string(), "_overflow".to_string())]),
+            value: 9.0,
+        };
+        let src = FakeSource {
+            samples: Mutex::new(vec![
+                vec![sample("w1", 4.0), overflow.clone()],
+                vec![sample("w1", 4.0), overflow],
+            ]),
+        };
+        let sink = FakeSink {
+            fail: Mutex::new(false),
+            batches: Mutex::new(vec![]),
+        };
+        let mut shipper = MeterShipper::new(src, sink, vec!["p1".into()], "boot".into());
+
+        let r1 = shipper.tick(0, 1_000).await;
+        assert!(r1.pushed);
+        {
+            let batches = shipper.sink.batches.lock().unwrap();
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].entries.len(), 1);
+            assert_eq!(batches[0].entries[0].worker_id, "w1");
+            assert_eq!(batches[0].entries[0].requests, 4);
+        }
+        // Same counters next tick: the overflow baseline advanced, so nothing
+        // is re-reported and no push happens.
+        let r2 = shipper.tick(1_000, 2_000).await;
+        assert!(!r2.pushed);
     }
 }
