@@ -281,13 +281,35 @@ fn g1_poc7b_multi_proc_unsaturated() {
     let (guard_a, mut pa, port_a) = poc7b_spawn("poc7b-a", mod_a);
     let (guard_b, mut pb, port_b) = poc7b_spawn("poc7b-b", mod_b);
     let _ = (guard_a, guard_b);
-    let mut procs = [(&mut pa, port_a), (&mut pb, port_b)];
-    for (proc, port) in procs.iter_mut() {
+    let mut procs = [
+        ("a", &mut pa, port_a),
+        ("b", &mut pb, port_b),
+    ];
+    for (tag, proc, port) in procs.iter_mut() {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             if let Some(st) = proc.child.try_wait().unwrap() {
+                // Dump the whole dir listing — a missing/empty
+                // workerd.log after a confirmed bind means the log
+                // was truncated or the fd went elsewhere; the attempt
+                // copies from poc7b_spawn keep the earlier rounds.
+                let listing = std::fs::read_dir(proc.log_path.parent().unwrap())
+                    .map(|rd| {
+                        rd.filter_map(|e| {
+                            e.ok().map(|e| {
+                                format!(
+                                    "{}:{}B",
+                                    e.file_name().to_string_lossy(),
+                                    e.metadata().map(|m| m.len()).unwrap_or(0)
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                    })
+                    .unwrap_or_else(|e| format!("read_dir failed: {e}"));
                 panic!(
-                    "workerd exited early: {st}\n=== workerd.log ===\n{}",
+                    "proc-{tag} :{port} exited early: {st}\n=== workerd.log ===\n{}\n=== dir ===\n{listing}",
                     proc.log()
                 );
             }
