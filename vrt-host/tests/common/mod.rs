@@ -399,6 +399,7 @@ pub async fn http_get(
 /// Build a `WorkerDesired` with one route.
 pub fn worker(worker_id: &str, hostname: &str, digest: &str) -> WorkerDesired {
     WorkerDesired {
+        cache: None,
         worker_id: worker_id.to_string(),
         name: worker_id.to_string(),
         active_version: VersionDesired {

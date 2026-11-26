@@ -30,6 +30,12 @@ pub struct RouteTarget {
     /// never be mistaken for production traffic, and requires a signed
     /// token bound to this `(version_id, worker_id)` pair.
     pub preview: Option<PreviewBinding>,
+    /// Version currently serving this route (cache key input; previews
+    /// carry the preview version).
+    pub version_id: String,
+    /// Workers Cache config (absent = cache off). Resolved from the
+    /// signed snapshot per worker; never from a client header.
+    pub cache: Option<snapshot_protocol::compute_desired::CacheDesired>,
 }
 
 /// What a preview route is authorized to serve. `worker_id` is the
@@ -220,6 +226,8 @@ impl RouteTable {
             assets_first,
             images,
             preview: None,
+            version_id: worker.active_version.version_id.clone(),
+            cache: worker.cache,
         }
     }
 

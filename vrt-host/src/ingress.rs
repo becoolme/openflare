@@ -2840,6 +2840,8 @@ mod cf_blob_tests {
             assets_first: false,
             images: false,
             preview: None,
+            version_id: "v-test".into(),
+            cache: None,
         };
         let inbound = cf_inbound(&[
             ("cf-ipcountry", "JP"),
@@ -3049,6 +3051,8 @@ mod ws_tests {
             assets_first: false,
             images: false,
             preview: None,
+            version_id: "v-test".into(),
+            cache: None,
         };
         scrubbed_headers(
             inbound,
@@ -3254,6 +3258,8 @@ mod ws_tests {
             assets_first: false,
             images: false,
             preview: None,
+            version_id: "v-test".into(),
+            cache: None,
         };
         scrubbed_headers(
             inbound,

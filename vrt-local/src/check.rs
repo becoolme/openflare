@@ -79,6 +79,7 @@ pub fn check_worker(
         tenants: vec![TenantDesired {
             tenant_id: CHECK_TENANT.to_string(),
             workers: vec![WorkerDesired {
+                cache: None,
                 worker_id: format!("check-{}", pkg.name),
                 name: pkg.name.clone(),
                 active_version: VersionDesired {
