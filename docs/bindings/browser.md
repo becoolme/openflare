@@ -93,8 +93,9 @@ Per tenant, enforced by `facade-browser` (override via the manifest's
   `keep_alive`, 60 s pending-attach TTL, 100-entry history.
 
 Attach semantics: unknown sessionId → `404`, known-but-closed → `410`,
-already-attached → `409`. A `keep_alive` session outlives its first
-socket only until the keep-alive window or session cap.
+already-attached → `409`. `keep_alive` widens the **pending-attach**
+window only: a session whose socket drops is terminal (re-attach →
+`410`), it is not resumable.
 
 ## Known differences from Cloudflare
 
@@ -105,12 +106,13 @@ socket only until the keep-alive window or session cap.
   anything requiring real Chromium behaviour (GPU raster, media,
   fingerprints) is absent.
 - **Session persistence.** A kitesurf session lives on its WebSocket;
-  `facade-browser` adds `keep_alive` reattach on top, but sessions do
-  not survive a host restart (no durable storage — same as CF's
-  semantics where sessions are best-effort).
-- **`browser.close` on `connect`.** Mirrors CF: closing a `connect`ed
-  client releases the attachment; the session ends only when it was
-  `launch`ed or the keep-alive/age limit hits.
+  a dropped socket ends the session (re-attach → `410`) — there is no
+  `keep_alive`-style post-disconnect resume like CF offers. Sessions
+  also do not survive a host restart (no durable storage).
+- **`browser.close` on `connect`.** CF releases the attachment and can
+  keep the session for reconnect; VRT closes the session outright —
+  the registry does not distinguish a `connect`ed client from a
+  `launch`ed one once the socket drops.
 
 ## Unsupported keys and error shape
 

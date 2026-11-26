@@ -715,3 +715,54 @@ fn v3_bindings_validation() {
         .insert("facade-kv".into(), w);
     assert!(parse_facade_manifest(&wire(workers)).is_err());
 }
+
+#[test]
+fn resolve_disk_paths_canonicalises_and_fails_closed() {
+    use vrt_config::{resolve_disk_paths, SystemDiskService};
+
+    let root = std::env::temp_dir().join(format!("vrt-diskpaths-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("kitesurf-public")).unwrap();
+    std::fs::write(root.join("a-file"), b"x").unwrap();
+
+    let svc = |name: &str, path: &str| SystemDiskService {
+        service_name: name.into(),
+        path: path.into(),
+    };
+
+    // Happy path: the relative manifest path resolves to the absolute
+    // canonical directory the emit layer renders verbatim.
+    let resolved =
+        resolve_disk_paths(&root, &[svc("facade-kitesurf-public", "kitesurf-public")]).unwrap();
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].service_name, "facade-kitesurf-public");
+    let want = std::fs::canonicalize(root.join("kitesurf-public"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(resolved[0].path, want);
+    assert!(Path::new(&resolved[0].path).is_absolute());
+
+    // Fail closed: any missing directory, a non-directory path, or a
+    // traversal outside facade_dir rejects the whole set (None) rather
+    // than rendering a half-valid config.
+    for bad in ["missing-dir", "a-file", "../outside"] {
+        assert!(
+            resolve_disk_paths(
+                &root,
+                &[
+                    svc("facade-kitesurf-public", "kitesurf-public"),
+                    svc("bad", bad)
+                ]
+            )
+            .is_none(),
+            "path {bad:?} must reject the whole diskServices set"
+        );
+    }
+
+    // Empty input resolves to an empty set — callers with no
+    // diskServices stay on the success path.
+    assert_eq!(resolve_disk_paths(&root, &[]).unwrap().len(), 0);
+
+    std::fs::remove_dir_all(&root).unwrap();
+}
