@@ -331,6 +331,7 @@ mod tests {
                 tenant_id: "t1".into(),
                 workers: vec![
                     WorkerDesired {
+                        cache: None,
                         worker_id: "w1".into(),
                         name: "edge-api".into(),
                         active_version: version("vrt_active"),
@@ -349,6 +350,7 @@ mod tests {
                         preview: None,
                     },
                     WorkerDesired {
+                        cache: None,
                         worker_id: "w1.pv01234567".into(),
                         name: "edge-api-pv01234567".into(),
                         active_version: version("vrt_preview"),
@@ -368,6 +370,7 @@ mod tests {
                         }),
                     },
                     WorkerDesired {
+                        cache: None,
                         worker_id: "w2".into(),
                         name: "assets".into(),
                         active_version: version("vrt_active2"),
@@ -491,6 +494,7 @@ mod tests {
                 tenant_id: "t1".into(),
                 workers: vec![
                     WorkerDesired {
+                        cache: None,
                         worker_id: "w1".into(),
                         name: "edge-api".into(),
                         active_version: version("vrt_preview"),
@@ -509,6 +513,7 @@ mod tests {
                         preview: None,
                     },
                     WorkerDesired {
+                        cache: None,
                         worker_id: "w1.pv01234567".into(),
                         name: "edge-api-pv01234567".into(),
                         active_version: version("vrt_preview2"),
@@ -551,6 +556,7 @@ mod tests {
             tenants: vec![snapshot_protocol::compute_desired::TenantDesired {
                 tenant_id: "t1".into(),
                 workers: vec![snapshot_protocol::compute_desired::WorkerDesired {
+                    cache: None,
                     worker_id: "w1".into(),
                     name: "w1".into(),
                     active_version: snapshot_protocol::compute_desired::VersionDesired {
