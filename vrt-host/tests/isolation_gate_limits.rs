@@ -280,7 +280,10 @@ fn g1_poc7b_multi_proc_unsaturated() {
     let (mod_a, mod_b) = poc7b_modules();
     let (guard_a, mut pa, port_a) = poc7b_spawn("poc7b-a", mod_a);
     let (guard_b, mut pb, port_b) = poc7b_spawn("poc7b-b", mod_b);
-    let _ = (guard_a, guard_b);
+    // Named binding — `let _ =` drops the DirGuards immediately and
+    // removes the run dirs while workerd still lazy-loads `embed`
+    // files out of them (config race → silent exit(1) + ENOENT log).
+    let _guards = (guard_a, guard_b);
     let mut procs = [
         ("a", &mut pa, port_a),
         ("b", &mut pb, port_b),
@@ -414,7 +417,7 @@ fn g1_poc7b_multi_proc_saturated() {
         ports.push(port);
     }
     let (guard_b, mut pb, port_b) = poc7b_spawn("poc7b-sb", mod_b);
-    let _ = guard_b;
+    let _guard_b = guard_b;
     http(port_b, "/");
     for p in &ports {
         http(*p, "/");
