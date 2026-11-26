@@ -36,8 +36,10 @@ use std::path::{Path, PathBuf};
 
 use crate::artifact::{sha256_hex, ArtifactError, BundleCache};
 
-/// Upper bound for one system module (facade bundles are far smaller).
-pub const MAX_SYSTEM_MODULE_BYTES: u64 = 16 * 1024 * 1024;
+/// Upper bound for one system module (facade bundles were far smaller;
+/// wasm-engine system workers ship ~27 MiB modules — same bound as the
+/// pack-side `MAX_MODULE_BYTES` in vrt-config).
+pub const MAX_SYSTEM_MODULE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Why seeding refused. Every variant is fatal at startup.
 #[derive(Debug, thiserror::Error)]

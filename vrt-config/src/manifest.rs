@@ -38,7 +38,14 @@ pub const MAX_MODULE_NAME_LEN: usize = 512;
 /// Maximum modules per bundle.
 pub const MAX_MODULES: usize = 1024;
 /// Maximum decoded bytes of a single module.
-pub const MAX_MODULE_BYTES: usize = 16 * 1024 * 1024;
+///
+/// 64 MiB — the same bound as [`MAX_BUNDLE_BYTES`]: no single module can
+/// exceed the bundle's total byte budget anyway, and wasm-engine workers
+/// ship single modules well past 16 MiB (kitesurf's `kitesurf_core_bg.wasm`
+/// is ~27 MiB and deploys on Cloudflare; upstream's limit is on the
+/// *compressed* upload, not a decoded per-module bound). The stored bundle
+/// cap ([`MAX_STORED_BYTES`]) remains the guard on the base64-encoded doc.
+pub const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum total decoded module bytes per bundle.
 pub const MAX_BUNDLE_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum compatibility flags.
