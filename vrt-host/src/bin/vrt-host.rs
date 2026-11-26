@@ -204,6 +204,37 @@ async fn run_async(
     config: HostConfig,
     preview_routing: Option<vrt_host::config::PreviewRouting>,
 ) -> Result<(), ExitCode> {
+    // M7: bind the metrics listener and publish cell identity BEFORE the
+    // initial-snapshot wait. The cell is not ready until the controller
+    // delivers the first snapshot, but the process must be observable
+    // while it waits: a probe on the metrics port distinguishes "waiting
+    // for desired" from "crashed", and never deadlocks on the snapshot.
+    let registry = TenantRegistry::new();
+    if let Some(metrics_addr) = &config.metrics_listen {
+        let addr: std::net::SocketAddr = metrics_addr.parse().map_err(|_| {
+            tracing::error!("metricsListen is not a socket addr");
+            ExitCode::from(2)
+        })?;
+        let metrics_listener = TcpListener::bind(addr).await.map_err(|e| {
+            tracing::error!(error = %e, "metrics listen failed");
+            ExitCode::from(2)
+        })?;
+        let metrics_router = vrt_host::metrics::router(registry.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(metrics_listener, metrics_router).await;
+        });
+        tracing::info!(%metrics_addr, "metrics listener bound");
+    }
+    // B12: build-info gauge.
+    // T28/H2: cell identity — process config is the single source;
+    // exported as a const label on every emitted series so scraped
+    // data self-identifies (no pod-label/scrape relabel second source).
+    vrt_host::metrics::registry().set_const_label("cell_id", config.effective_cell_id());
+    vrt_host::metrics::registry().set(
+        "vrt_host_build_info",
+        &[("version", env!("CARGO_PKG_VERSION"))],
+        1.0,
+    );
     let store = FileDesiredStore::new(
         &config.desired.path,
         &config.cell_id,
@@ -519,7 +550,6 @@ async fn run_async(
         _ => None,
     };
 
-    let registry = TenantRegistry::new();
     let mut sup_params = config.supervisor.params();
     // Scale to zero: ONE shared coordinator for every tenant actor;
     // `None` (default) keeps the supervisor byte-identical.
@@ -699,34 +729,6 @@ async fn run_async(
             let _ = axum::serve(control_listener, router).await;
         });
     }
-    // B12: dedicated metrics listener (`metricsListen`) — bound only
-    // when configured; k8s exposes it via the named `metrics` port +
-    // NetworkPolicy restricted to vmagent.
-    if let Some(metrics_addr) = &config.metrics_listen {
-        let addr: std::net::SocketAddr = metrics_addr.parse().map_err(|_| {
-            tracing::error!("metricsListen is not a socket addr");
-            ExitCode::from(2)
-        })?;
-        let metrics_listener = TcpListener::bind(addr).await.map_err(|e| {
-            tracing::error!(error = %e, "metrics listen failed");
-            ExitCode::from(2)
-        })?;
-        let metrics_router = vrt_host::metrics::router(registry.clone());
-        tokio::spawn(async move {
-            let _ = axum::serve(metrics_listener, metrics_router).await;
-        });
-        tracing::info!(%metrics_addr, "metrics listener bound");
-    }
-    // B12: build-info gauge.
-    // T28/H2: cell identity — process config is the single source;
-    // exported as a const label on every emitted series so scraped
-    // data self-identifies (no pod-label/scrape relabel second source).
-    vrt_host::metrics::registry().set_const_label("cell_id", config.effective_cell_id());
-    vrt_host::metrics::registry().set(
-        "vrt_host_build_info",
-        &[("version", env!("CARGO_PKG_VERSION"))],
-        1.0,
-    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     // [geoip]: background refresh of the MMDB — bounded retries,
     // atomic install, exits on the shutdown watch like ingress.
