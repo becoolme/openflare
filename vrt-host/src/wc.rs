@@ -711,6 +711,53 @@ pub fn vary_values(names: &[String], req: &HeaderMap) -> Vec<(String, Option<Str
         .collect()
 }
 
+/// Single-flight registry: concurrent misses for one cache key collapse
+/// into one upstream run per pod. The leader stores (or bypasses) and
+/// notifies; followers re-check the store before falling back to a direct
+/// upstream request (fail-open, never a fake hit).
+#[derive(Clone, Default)]
+pub struct Flights {
+    inner: std::sync::Arc<Mutex<HashMap<String, std::sync::Arc<tokio::sync::Notify>>>>,
+}
+
+pub enum FlightEntry {
+    Leader(FlightGuard),
+    Follower(std::sync::Arc<tokio::sync::Notify>),
+}
+
+pub struct FlightGuard {
+    flights: Flights,
+    key: String,
+}
+
+impl Flights {
+    pub fn enter(&self, key: &str) -> FlightEntry {
+        let mut map = self.inner.lock().unwrap();
+        if let Some(n) = map.get(key) {
+            return FlightEntry::Follower(n.clone());
+        }
+        let n = std::sync::Arc::new(tokio::sync::Notify::new());
+        map.insert(key.to_string(), n);
+        FlightEntry::Leader(FlightGuard {
+            flights: self.clone(),
+            key: key.to_string(),
+        })
+    }
+
+    pub async fn wait(n: std::sync::Arc<tokio::sync::Notify>, timeout: Duration) {
+        let _ = tokio::time::timeout(timeout, n.notified()).await;
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let n = self.flights.inner.lock().unwrap().remove(&self.key);
+        if let Some(n) = n {
+            n.notify_waiters();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +925,26 @@ mod tests {
     fn expires_parsing() {
         assert_eq!(httpdate_secs("Sun, 06 Nov 1994 08:49:37 GMT").unwrap(), 784111777);
         assert!(httpdate_secs("nonsense").is_err());
+    }
+
+    #[tokio::test]
+    async fn single_flight_wakes_followers() {
+        let flights = Flights::default();
+        let FlightEntry::Leader(leader) = flights.enter("k") else {
+            panic!("first is leader")
+        };
+        let FlightEntry::Follower(n) = flights.enter("k") else {
+            panic!("second is follower")
+        };
+        let waiter =
+            tokio::spawn(async move { Flights::wait(n, Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished(), "follower waits for the leader");
+        drop(leader);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("followers wake when the leader finishes")
+            .unwrap();
     }
 
     #[test]

@@ -622,6 +622,8 @@ pub struct IngressState {
     /// Workers Cache (`[cache]`): per-pod ingress response cache. Always
     /// constructed; only consulted for routes whose snapshot enables it.
     wc: Arc<crate::wc::Store>,
+    /// Single-flight collapsing for cache misses (per pod).
+    flights: crate::wc::Flights,
 }
 
 impl IngressState {
@@ -661,6 +663,7 @@ impl IngressState {
             dev_catch_all: Arc::new(AtomicBool::new(false)),
             preview_auth: std::sync::OnceLock::new(),
             wc: Arc::new(crate::wc::Store::new()),
+            flights: crate::wc::Flights::default(),
         })
     }
 
@@ -734,6 +737,7 @@ impl IngressState {
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
             wc: self.wc.clone(),
+            flights: self.flights.clone(),
         })
     }
 
@@ -774,6 +778,7 @@ impl IngressState {
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
             wc: self.wc.clone(),
+            flights: self.flights.clone(),
         })
     }
 
@@ -812,6 +817,7 @@ impl IngressState {
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
             wc: self.wc.clone(),
+            flights: self.flights.clone(),
         })
     }
 
@@ -850,6 +856,7 @@ impl IngressState {
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
             wc: self.wc.clone(),
+            flights: self.flights.clone(),
         })
     }
 
@@ -889,6 +896,7 @@ impl IngressState {
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
             wc: self.wc.clone(),
+            flights: self.flights.clone(),
         })
     }
 
@@ -934,6 +942,7 @@ impl IngressState {
             dev_catch_all: self.dev_catch_all.clone(),
             preview_auth: copy_once_lock(&self.preview_auth),
             wc: self.wc.clone(),
+            flights: self.flights.clone(),
         })
     }
 
@@ -1300,26 +1309,48 @@ async fn proxy_inner(
             req.uri(),
             req.method(),
         )
-        .filter(|plan| !plan.head)
         .map(|plan| (plan, req.headers().clone(), req.uri().path().to_string())),
         _ => None,
     };
+    let now = std::time::SystemTime::now();
+    let mut flight = None;
     if let Some((plan, headers, _)) = &cache {
-        if let crate::wc::Lookup::Hit(entry) =
-            state.wc.get(&plan.key, headers, std::time::SystemTime::now())
-        {
+        if let crate::wc::Lookup::Hit(entry) = state.wc.get(&plan.key, headers, now) {
             return Ok(crate::wc::response(
                 &entry,
-                false,
+                plan.head,
                 crate::wc::Status::Hit,
-                std::time::SystemTime::now(),
+                now,
             ));
+        }
+        // Collapse concurrent misses for this key on this pod.
+        match state.flights.enter(&plan.key) {
+            crate::wc::FlightEntry::Follower(n) => {
+                crate::wc::Flights::wait(n, std::time::Duration::from_secs(10)).await;
+                if let crate::wc::Lookup::Hit(entry) =
+                    state.wc.get(&plan.key, headers, std::time::SystemTime::now())
+                {
+                    return Ok(crate::wc::response(
+                        &entry,
+                        plan.head,
+                        crate::wc::Status::Hit,
+                        std::time::SystemTime::now(),
+                    ));
+                }
+                // Leader failed to store: fall through as an uncached
+                // request rather than blocking again.
+            }
+            crate::wc::FlightEntry::Leader(g) => flight = Some(g),
+        }
+        // CF converts a cold HEAD to GET so the full body is stored.
+        if plan.head {
+            *req.method_mut() = Method::GET;
         }
     }
     match handle_routed(state.clone(), peer, req, host.as_str(), &target, &mut metric).await {
         Ok(mut r) => {
             if let Some((plan, req_headers, path)) = &cache {
-                r = cache_store(&state.wc, plan, req_headers, path, r).await?;
+                r = cache_store(&state.wc, plan, req_headers, path, r, plan.head).await?;
             }
             // PREVIEW: a preview response is ALWAYS labelled, so a client
             // (or the app itself) can never mistake preview output for
@@ -1385,6 +1416,7 @@ async fn cache_store(
     req_headers: &axum::http::HeaderMap,
     path: &str,
     resp: Response,
+    head: bool,
 ) -> Result<Response, IngressError> {
     use axum::http::header;
     let (mut parts, body) = resp.into_parts();
@@ -1394,6 +1426,7 @@ async fn cache_store(
             .headers
             .insert("cf-cache-status", axum::http::HeaderValue::from_static("BYPASS"));
         parts.headers.remove("cache-tag");
+        let body = if head { Body::empty() } else { body };
         Ok(Response::from_parts(parts, body))
     };
     if policy.bypass {
@@ -1439,7 +1472,8 @@ async fn cache_store(
         axum::http::HeaderValue::from_static(if stored { "MISS" } else { "BYPASS" }),
     );
     parts.headers.remove("cache-tag");
-    Ok(Response::from_parts(parts, body_or_bytes(bytes)))
+    let body = if head { Body::empty() } else { body_or_bytes(bytes) };
+    Ok(Response::from_parts(parts, body))
 }
 
 fn body_or_bytes(bytes: bytes::Bytes) -> Body {
