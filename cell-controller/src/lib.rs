@@ -39,6 +39,7 @@ pub mod lease;
 pub mod lease_k8s;
 pub mod logs;
 pub mod manifest;
+pub mod meter;
 pub mod metrics;
 pub mod pod;
 pub mod prod;
