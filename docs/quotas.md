@@ -42,7 +42,8 @@ outboundConnections = 16
 Every field is optional; absent dimensions take the platform default
 (50 ms CPU / 128 MiB / 50 subrequests / 16 outbound connections). Values
 outside the protocol bounds fail the deploy with the field name
-(`quotas.cpuMs`, ...).
+(`quotas.cpuMs`, ...); `outboundConnections` is capped at 1000, the
+bound the pinned workerd enforces at config load.
 
 ### Platform API
 

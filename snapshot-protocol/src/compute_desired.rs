@@ -112,7 +112,11 @@ pub const MAX_MEMORY_MB: u32 = 4096;
 /// `quotas.subrequests` bounds (outbound subrequests per request; 0 disables).
 pub const MAX_SUBREQUESTS: u32 = 10_000;
 /// `quotas.outboundConnections` bounds (simultaneous outbound connections).
-pub const MAX_OUTBOUND_CONNECTIONS: u32 = 1024;
+/// The pinned workerd rejects `> 1000` at config load ("above the maximum
+/// of 1000") — a declared 1001..1024 previously passed our validation and
+/// then failed the workerd config check at generation install, so the
+/// protocol bound matches the binary's.
+pub const MAX_OUTBOUND_CONNECTIONS: u32 = 1000;
 
 /// Platform default CPU budget (ms) — the value a worker that never
 /// declared `limits` carries. One source of truth for the control
@@ -3518,9 +3522,17 @@ mod tests {
             (
                 "quota-conns-high",
                 Box::new(|v| {
-                    v["tenants"][0]["workers"][0]["quotas"]["outboundConnections"] = json!(1025)
+                    v["tenants"][0]["workers"][0]["quotas"]["outboundConnections"] = json!(1001)
                 }),
                 "DESIRED_QUOTA_BOUNDS",
+            ),
+            (
+                // workerd's hard cap — the exact boundary must validate.
+                "quota-conns-at-workerd-max",
+                Box::new(|v| {
+                    v["tenants"][0]["workers"][0]["quotas"]["outboundConnections"] = json!(1000)
+                }),
+                "",
             ),
         ];
         for (id, mutate, expected) in cases {
