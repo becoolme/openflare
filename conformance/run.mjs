@@ -212,6 +212,7 @@ export function validateCase(raw, dirname) {
   const known = [
     "schemaVersion", "id", "binding", "title", "requiresWorkerd", "evidence",
     "manifest", "hostname", "readyTimeoutMs", "notes", "steps", "tags",
+    "cloudflare",
   ];
   for (const k of Object.keys(raw))
     if (!known.includes(k)) err(errors, k, `unknown case field (allowed: ${known.join(", ")})`);
@@ -227,6 +228,8 @@ export function validateCase(raw, dirname) {
     err(errors, "title", "required, non-empty string");
   if (raw.requiresWorkerd !== undefined && typeof raw.requiresWorkerd !== "boolean")
     err(errors, "requiresWorkerd", "must be a boolean");
+  if (raw.cloudflare !== undefined && typeof raw.cloudflare !== "boolean")
+    err(errors, "cloudflare", "must be a boolean");
   if (!Array.isArray(raw.evidence) || raw.evidence.length === 0 ||
       !raw.evidence.every((e) => typeof e === "string" && e.length > 0))
     err(errors, "evidence", "required: non-empty array of doc/test references");
@@ -403,6 +406,21 @@ export function matchExpect(expect, actual) {
   return diffs;
 }
 
+/** Recorded step body for --record: parsed JSON when it parses (diffs
+ * then localize to fields), else the raw text capped at 64KiB. */
+export function observeBody(actual) {
+  const observed = { status: actual.status };
+  try {
+    observed.body = JSON.parse(actual.bodyText);
+  } catch {
+    observed.body = actual.bodyText.length > 64 * 1024
+      ? actual.bodyText.slice(0, 64 * 1024)
+      : actual.bodyText;
+    observed.bodyTruncated = actual.bodyText.length > 64 * 1024;
+  }
+  return observed;
+}
+
 function truncate(s, n = 400) {
   return s.length > n ? s.slice(0, n) + `…(${s.length}b)` : s;
 }
@@ -535,7 +553,7 @@ async function deployCase(entry, deployCmd, timeoutMs, log) {
     CASE_ID: entry.id,
     CASE_HOSTNAME: resolveHostname(entry) ?? "",
   };
-  await new Promise((resolve, reject) => {
+  const stdout = await new Promise((resolve, reject) => {
     execFile(
       "sh",
       ["-c", deployCmd],
@@ -549,12 +567,16 @@ async function deployCase(entry, deployCmd, timeoutMs, log) {
           );
         else {
           if (stdout.trim()) log(`  deploy: ${stdout.trim().split("\n").pop()}`);
-          resolve();
+          resolve(String(stdout));
         }
       },
     );
   });
-  return dir;
+  // A hook that deploys somewhere hostname-routed (real Cloudflare,
+  // workers.dev) reports the per-case request host on stdout; it wins
+  // over the manifest hostname but not over an explicit --host.
+  const m = stdout.match(/^VRT_CASE_HOSTNAME=(\S+)\s*$/m);
+  return { dir, hostname: m ? m[1] : null };
 }
 
 /** Run the caller-provided restart hook for an ordered service list.
@@ -636,6 +658,11 @@ export async function runCase(entry, opts) {
     result.reason = "requires workerd (stack is --stub)";
     return result;
   }
+  if (opts.target === "cloudflare" && c.cloudflare === false) {
+    result.status = "skipped";
+    result.reason = "case is not deployable to real Cloudflare (case.cloudflare=false)";
+    return result;
+  }
   if (c.steps.some((s) => s.restart) && !opts.restartCmd) {
     // Explicit, reported skip — never a silent pass. The release gate
     // (`--fail-on-skip`) still turns this into a red run, so a stack
@@ -644,20 +671,22 @@ export async function runCase(entry, opts) {
     result.reason = "case restarts the runtime; pass --restart-cmd (or omit --no-restart)";
     return result;
   }
-  const host = opts.host ?? resolveHostname(entry);
-  if (!host) {
-    result.status = "failed";
-    result.reason = "no hostname (case.hostname/manifest missing, no --host)";
-    return result;
-  }
+  let deployedHost = null;
   if (opts.deployCmd) {
     try {
-      await deployCase(entry, opts.deployCmd, opts.deployTimeoutMs, opts.log);
+      const d = await deployCase(entry, opts.deployCmd, opts.deployTimeoutMs, opts.log);
+      deployedHost = d.hostname;
     } catch (e) {
       result.status = "failed";
       result.reason = `deploy failed: ${e.message}`;
       return result;
     }
+  }
+  const host = opts.host ?? deployedHost ?? resolveHostname(entry);
+  if (!host) {
+    result.status = "failed";
+    result.reason = "no hostname (case.hostname/manifest missing, no --host, no VRT_CASE_HOSTNAME from deploy hook)";
+    return result;
   }
   const readyTimeout = c.readyTimeoutMs ?? opts.readyTimeoutMs;
   for (const [i, step] of c.steps.entries()) {
@@ -688,6 +717,10 @@ export async function runCase(entry, opts) {
       name: step.name,
       status: r.ok ? "passed" : "failed",
     };
+    // --record: keep the observed response verbatim (parsed JSON when it
+    // parses) so conformance/diff.mjs can compare two stacks' actuals
+    // field-by-field, not just each against its own expectations.
+    if (opts.record && r.actual) rec.observed = observeBody(r.actual);
     if (!r.ok) {
       rec.failures = r.diffs;
       if (r.actual)
@@ -863,6 +896,10 @@ Run the binding-conformance cases against a running OpenFlare stack.
   --fail-fast           stop the case at its first failed step
   --fail-on-skip        exit 1 when any case is skipped (release gate;
                         a skipped case did not prove its binding)
+  --record              record each step's observed {status, body} into
+                        the report for conformance/diff.mjs
+  --target <name>       report stack label; "cloudflare" also skips
+                        cases with case.cloudflare=false
   --results <dir>       report output dir (conformance/results)
   --list                print the real-projects manifest and exit
   --validate            validate all manifests and exit
@@ -895,6 +932,8 @@ function parseArgs(argv) {
       case "--deploy-timeout": o.deployTimeoutMs = Number(val()); break;
       case "--fail-fast": o.keepGoing = false; break;
       case "--fail-on-skip": o.failOnSkip = true; break;
+      case "--record": o.record = true; break;
+      case "--target": o.target = val(); break;
       case "--results": o.resultsDir = val(); break;
       case "--list": o.list = true; break;
       case "--validate": o.validate = true; break;
@@ -960,7 +999,7 @@ export async function main(argv, { log = console.log, errlog = console.error } =
     errlog("no cases matched --only");
     return 2;
   }
-  const stack = opts.stub ? "stub" : "workerd";
+  const stack = opts.target ?? (opts.stub ? "stub" : "workerd");
   log(`conformance: ${wanted.length} case(s), stack=${stack}, url=${opts.url}`);
   log(`restart hook: ${restartCmd ?? "disabled (restart cases will skip)"}`);
   const results = [];
@@ -969,6 +1008,8 @@ export async function main(argv, { log = console.log, errlog = console.error } =
       url: opts.url,
       host: opts.host,
       stub: opts.stub,
+      target: opts.target,
+      record: opts.record,
       deployCmd: opts.deployCmd,
       deployTimeoutMs: opts.deployTimeoutMs,
       restartCmd,

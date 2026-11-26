@@ -2,6 +2,7 @@
   "schemaVersion": 1,
   "id": "cache-basic",
   "binding": "cache",
+  "cloudflare": false,
   "title": "Cache API put/match/delete lifecycle, named-cache isolation, request no-store, cached headers",
   "requiresWorkerd": true,
   "evidence": [

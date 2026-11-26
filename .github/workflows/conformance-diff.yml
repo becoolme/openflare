@@ -1,0 +1,121 @@
+name: Conformance diff vs Cloudflare
+
+# Differential conformance: run the binding cases against the standalone
+# openflare stack AND against real Cloudflare (workers.dev), then
+# deep-diff the observed responses field-by-field.
+#
+# Manual-only: the Cloudflare pass provisions real account resources
+# (workers, KV namespaces, R2 buckets, D1 databases, queues — all
+# conf-*-named) and spends account quota. cf-deploy.mjs records
+# everything it creates in a ledger and cf-teardown.mjs deletes it in
+# `if: always()`, even when the run fails.
+#
+# Secrets required: CF_API_TOKEN (Workers + KV/R2/D1/queues edit),
+# CF_ACCOUNT_ID. Add a `schedule:` trigger once the diff is trusted —
+# it is intentionally not scheduled yet.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+
+jobs:
+  diff:
+    name: openflare vs Cloudflare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24.22.1"
+      - name: Fail fast when Cloudflare credentials are not configured
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::CF_API_TOKEN and CF_ACCOUNT_ID secrets are required for the Cloudflare pass"
+            exit 1
+          fi
+      - name: Install wrangler
+        run: npm install -g wrangler@4
+      - name: Read the pinned workerd version and digest
+        id: lock
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("fs");
+            const lock = JSON.parse(fs.readFileSync("deploy/docker/workerd.lock", "utf8"));
+            const art = lock.artifacts && lock.artifacts["linux-x64"];
+            if (!lock.version || !art || !art.binarySha256) {
+              console.error("workerd.lock has no linux-x64.binarySha256 — update the lock and retry");
+              process.exit(1);
+            }
+            fs.appendFileSync(process.env.GITHUB_OUTPUT,
+              `version=${lock.version}\nsha256=${art.binarySha256}\n`);
+          '
+      - name: Cache workerd binary
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: .ci/workerd
+          key: workerd-linux-x64-${{ steps.lock.outputs.sha256 }}
+      - name: Fetch the pinned workerd binary
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: scripts/fetch-workerd.sh --out .ci/workerd --platform linux-x64
+      - name: Verify the binary and stage it for the compose build
+        run: |
+          set -euo pipefail
+          echo "${{ steps.lock.outputs.sha256 }}  .ci/workerd/workerd" | sha256sum -c -
+          .ci/workerd/workerd --version
+          cp .ci/workerd/workerd deploy/standalone/workerd
+          chmod +x deploy/standalone/workerd
+      - name: Build and start the standalone stack
+        env:
+          WORKERD_SOURCE: file
+          WORKERD_SHA256: ${{ steps.lock.outputs.sha256 }}
+        run: docker compose -f deploy/standalone/docker-compose.yml up --build --wait
+      - name: Record the openflare pass
+        run: |
+          node conformance/run.mjs \
+            --url http://127.0.0.1:8080 \
+            --deploy-cmd ./conformance/deploy-standalone.sh \
+            --record \
+            --results conformance/results/openflare
+      # requests hit the CF edge at workers.dev; the deploy hook reports
+      # each case's <worker>.<sub>.workers.dev Host via VRT_CASE_HOSTNAME.
+      # --no-restart: real Cloudflare cannot be restarted by the suite.
+      - name: Record the Cloudflare pass
+        run: |
+          node conformance/run.mjs \
+            --url https://workers.dev \
+            --target cloudflare \
+            --deploy-cmd ./conformance/deploy-cloudflare.sh \
+            --no-restart \
+            --record \
+            --results conformance/results/cloudflare
+      - name: Diff the recordings
+        run: |
+          node conformance/diff.mjs \
+            --a conformance/results/openflare/latest.json \
+            --b conformance/results/cloudflare/latest.json \
+            --out conformance/results/diff
+      - name: Stack logs on failure
+        if: failure()
+        run: |
+          docker compose -f deploy/standalone/docker-compose.yml logs \
+            --no-color --tail 500
+      - name: Tear down Cloudflare resources
+        if: always()
+        run: node conformance/cf-teardown.mjs
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-diff-report
+          path: conformance/results/
+          if-no-files-found: warn
+          retention-days: 30

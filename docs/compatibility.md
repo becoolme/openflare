@@ -6,9 +6,12 @@ platform-level summary; per-binding detail lives in
 [`docs/bindings/`](bindings/README.md) and the key-by-key wrangler table
 in [`docs/wrangler-config.md`](wrangler-config.md).
 
-> Conformance comparison is **not automated yet — planned**. Every row
-> below is derived by hand from the sources cited; there is no
-> differential test suite against Cloudflare in this tree today.
+> Differential conformance **is automated**: `conformance/run.mjs
+> --record` + `conformance/diff.mjs` compare observed responses against
+> a real Cloudflare deploy (see
+> [conformance/README.md](../conformance/README.md#differential-vs-cloudflare)).
+> The rows below are still maintained by hand from the sources cited —
+> the suite covers the cases in `conformance/cases/`, not every row here.
 
 ## Summary
 
