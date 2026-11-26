@@ -1096,15 +1096,14 @@ fn emit_worker_surface(
 /// extension) for a worker's declared quotas.
 ///
 /// Semantics (see `doc/platform/workers-runtime-quotas.md`):
-/// - Only dimensions this generation can enforce are emitted:
-///   `cpuMs`, `memoryMb`, `subRequests`.
+/// - All four dimensions are emitted when declared away from the
+///   platform default: `cpuMs`, `memoryMb`, `subRequests`,
+///   `outboundConnections`.
 /// - A dimension equal to the platform default is "not declared" and is
 ///   omitted, so a worker without explicit limits renders byte-for-byte
 ///   like stock workerd (no behaviour change on upgrade).
 /// - `0` is never emitted (workerd reads an absent dimension as
 ///   unlimited; `subrequests = 0` is the protocol's "no budget").
-/// - `outboundConnections` has no workerd hook yet and is rejected by
-///   [`validate_tenant`] instead of being silently dropped.
 fn emit_worker_limits(out: &mut String, quotas: &WorkerQuotas) {
     let mut dims: Vec<String> = Vec::new();
     if quotas.cpu_ms > 0 && quotas.cpu_ms != snapshot_protocol::compute_desired::DEFAULT_CPU_MS {
@@ -1119,6 +1118,15 @@ fn emit_worker_limits(out: &mut String, quotas: &WorkerQuotas) {
         && quotas.subrequests != snapshot_protocol::compute_desired::DEFAULT_SUBREQUESTS
     {
         dims.push(format!("subRequests = {}", quotas.subrequests));
+    }
+    if quotas.outbound_connections > 0
+        && quotas.outbound_connections
+            != snapshot_protocol::compute_desired::DEFAULT_OUTBOUND_CONNECTIONS
+    {
+        dims.push(format!(
+            "outboundConnections = {}",
+            quotas.outbound_connections
+        ));
     }
     if !dims.is_empty() {
         out.push_str(&format!("      limits = ({}),\n", dims.join(", ")));
@@ -3271,10 +3279,8 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
             return Err(ConfigError::Identifier("versionId"));
         }
         // Per-worker quotas: bounds are re-checked at emit depth
-        // (compute.desired validation is the first gate) and
-        // `outboundConnections` is refused outright — the pinned workerd
-        // fork has no connection-counter hook, so a declared value would
-        // be silently ignored (fail closed, never a fake limit).
+        // (compute.desired validation is the first gate). All four
+        // dimensions are enforceable on the pinned fork.
         let quotas = &worker.quotas;
         if !(snapshot_protocol::compute_desired::MIN_CPU_MS
             ..=snapshot_protocol::compute_desired::MAX_CPU_MS)
@@ -3294,9 +3300,6 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
         if quotas.outbound_connections
             > snapshot_protocol::compute_desired::MAX_OUTBOUND_CONNECTIONS
         {
-            return Err(ConfigError::Quotas("outboundConnections"));
-        }
-        if quotas.declares_unenforceable_limit() {
             return Err(ConfigError::Quotas("outboundConnections"));
         }
         let mut names = HashSet::new();
