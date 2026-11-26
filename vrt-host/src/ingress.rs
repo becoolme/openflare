@@ -1321,6 +1321,9 @@ async fn proxy_inner(
                 plan.head,
                 crate::wc::Status::Hit,
                 now,
+                req.headers()
+                    .get(axum::http::header::RANGE)
+                    .and_then(|v| v.to_str().ok()),
             ));
         }
         // Collapse concurrent misses for this key on this pod.
@@ -1335,6 +1338,9 @@ async fn proxy_inner(
                         plan.head,
                         crate::wc::Status::Hit,
                         std::time::SystemTime::now(),
+                        req.headers()
+                            .get(axum::http::header::RANGE)
+                            .and_then(|v| v.to_str().ok()),
                     ));
                 }
                 // Leader failed to store: fall through as an uncached

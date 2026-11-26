@@ -657,21 +657,88 @@ fn variant_key(base: &str, vary: &[(String, Option<String>)], entry: &Entry) -> 
     format!("{base}\u{1f}v={h:016x}")
 }
 
-/// Build a response from a stored entry. `head` strips the body.
-pub fn response(entry: &Entry, head: bool, status: Status, now: SystemTime) -> Response {
-    let mut resp = Response::builder().status(entry.status);
+/// Build a response from a stored entry. `head` strips the body; `range`
+/// slices a cached full 200 into `206`/`416` (CF semantics: the Worker is
+/// never invoked for a cached range).
+pub fn response(
+    entry: &Entry,
+    head: bool,
+    status: Status,
+    now: SystemTime,
+    range: Option<&str>,
+) -> Response {
+    let mut builder = Response::builder();
+    let (code, body, content_range) = match range {
+        Some(raw) => match slice_range(entry.body.len(), raw) {
+            Ok((start, end)) => (
+                StatusCode::PARTIAL_CONTENT,
+                Bytes::copy_from_slice(&entry.body[start..=end]),
+                Some(format!("bytes {start}-{end}/{}", entry.body.len())),
+            ),
+            Err(()) => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                Bytes::new(),
+                Some(format!("bytes */{}", entry.body.len())),
+            ),
+        },
+        None => (entry.status, entry.body.clone(), None),
+    };
+    builder = builder.status(code);
     for (name, value) in &entry.headers {
-        if name == header::SET_COOKIE || name.as_str() == "cache-tag" {
+        if name == header::SET_COOKIE
+            || name.as_str() == "cache-tag"
+            || name == header::CONTENT_RANGE
+            || (range.is_some() && name == header::CONTENT_LENGTH)
+        {
             continue;
         }
-        resp = resp.header(name, value);
+        builder = builder.header(name, value);
+    }
+    if let Some(cr) = &content_range {
+        builder = builder.header(header::CONTENT_RANGE, cr);
+    }
+    if range.is_some() {
+        builder = builder.header(header::CONTENT_LENGTH, body.len().to_string());
     }
     let age = entry.age_seconds(now);
-    resp = resp
+    builder = builder
         .header("cf-cache-status", status.header())
         .header(header::AGE, age.to_string());
-    let body = if head { Body::empty() } else { Body::from(entry.body.clone()) };
-    resp.body(body).unwrap_or_else(|_| Response::new(Body::empty()))
+    let body = if head { Body::empty() } else { Body::from(body) };
+    builder
+        .body(body)
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Parse a single `Range: bytes=…` against a full body length.
+/// Returns an inclusive `(start, end)` or `Err` for 416.
+fn slice_range(total: usize, raw: &str) -> Result<(usize, usize), ()> {
+    let spec = raw.strip_prefix("bytes=").ok_or(())?;
+    let spec = spec.split(',').next().ok_or(())?.trim();
+    if total == 0 {
+        return Err(());
+    }
+    let (a, b) = spec.split_once('-').ok_or(())?;
+    let (start, end) = if a.is_empty() {
+        // suffix: -N (last N bytes)
+        let n: usize = b.trim().parse().map_err(|_| ())?;
+        if n == 0 {
+            return Err(());
+        }
+        (total.saturating_sub(n), total - 1)
+    } else {
+        let start: usize = a.trim().parse().map_err(|_| ())?;
+        let end = if b.trim().is_empty() {
+            total - 1
+        } else {
+            b.trim().parse::<usize>().map_err(|_| ())?
+        };
+        (start, end.min(total - 1))
+    };
+    if start > end || start >= total {
+        return Err(());
+    }
+    Ok((start, end))
 }
 
 /// Strip internal headers before storing; reject oversize header blocks.
@@ -945,6 +1012,37 @@ mod tests {
             .await
             .expect("followers wake when the leader finishes")
             .unwrap();
+    }
+
+    #[test]
+    fn range_slicing_serves_206_and_416() {
+        let entry = Entry {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: vec![(header::CONTENT_LENGTH, HeaderValue::from_static("10"))],
+            body: Bytes::from_static(b"0123456789"),
+            stored_at: now(),
+            fresh_for: Duration::from_secs(60),
+            no_cache: false,
+            vary: vec![],
+            tags: vec![],
+            size: 0,
+        };
+        let r = response(&entry, false, Status::Hit, now(), Some("bytes=2-4"));
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(r.headers()[header::CONTENT_RANGE], "bytes 2-4/10");
+        assert_eq!(r.headers()[header::CONTENT_LENGTH], "3");
+
+        let r = response(&entry, false, Status::Hit, now(), Some("bytes=-3"));
+        assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(r.headers()[header::CONTENT_RANGE], "bytes 7-9/10");
+
+        let r = response(&entry, false, Status::Hit, now(), Some("bytes=20-"));
+        assert_eq!(r.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(r.headers()[header::CONTENT_RANGE], "bytes */10");
+
+        let r = response(&entry, true, Status::Hit, now(), None);
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[test]
