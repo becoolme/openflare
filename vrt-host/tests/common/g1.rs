@@ -79,7 +79,11 @@ pub struct WorkerProc {
 }
 impl WorkerProc {
     pub fn log(&self) -> String {
-        std::fs::read_to_string(&self.log_path).unwrap_or_default()
+        // Lossy: read_to_string returns Err on any non-UTF-8 byte and
+        // unwrap_or_default would print an empty log over real content.
+        std::fs::read(&self.log_path)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
     }
 }
 impl Drop for WorkerProc {

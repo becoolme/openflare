@@ -217,8 +217,11 @@ fn poc7b_spawn(tag: &str, module: &str) -> (DirGuard, WorkerProc, u16) {
     let bin = workerd_bin();
     let dir = gate_root(tag);
     let guard = DirGuard(dir.clone());
-    // Early-exit retry: a cross-process port race can still make the
-    // first spawn lose its bind. Re-render for a fresh port, bounded.
+    // Early-exit retry: a cross-process port race can still make a
+    // spawn lose its bind (g1.rs ALLOC_PORTS only dedupes in-process).
+    // Worker startup got slower with the system-worker payload, so
+    // the old fixed +400ms liveness check let later exits slip past
+    // the retry — wait for the actual bind instead.
     for attempt in 0..3 {
         let (cfg, ports, args, _text) = render(
             &dir,
@@ -232,13 +235,32 @@ fn poc7b_spawn(tag: &str, module: &str) -> (DirGuard, WorkerProc, u16) {
             },
         );
         let mut proc = spawn(&bin, &cfg, &dir, &args);
-        std::thread::sleep(Duration::from_millis(400));
-        match proc.child.try_wait().unwrap() {
-            None => return (guard, proc, ports["w"]),
-            Some(st) if attempt == 2 => {
-                panic!("workerd exited early after 3 spawns: {st}\n{}", proc.log())
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let up = loop {
+            if proc.child.try_wait().unwrap().is_some() {
+                break false;
             }
-            Some(_) => continue,
+            if std::net::TcpStream::connect(("127.0.0.1", ports["w"])).is_ok() {
+                break true;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker on :{} never bound",
+                ports["w"]
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if up {
+            return (guard, proc, ports["w"]);
+        }
+        // Preserve the dead attempt's log — the next spawn's
+        // File::create truncates `workerd.log`.
+        let _ = std::fs::copy(
+            dir.join("workerd.log"),
+            dir.join(format!("workerd-attempt{attempt}.log")),
+        );
+        if attempt == 2 {
+            panic!("workerd failed to come up after 3 spawns\n{}", proc.log())
         }
     }
     unreachable!()
