@@ -203,6 +203,23 @@ mean one side ran without `--record`.
      expect passes — use it for eventually-consistent effects (queue
      delivery, cron ticks, alarms). Step 0 always retries up to the
      case's readiness budget after a deploy.
+   - **Deploy convergence drift**: after a deploy the draining old
+     workerd process and the new one serve concurrently for a window
+     (tens of seconds on the standalone stack). Step 0 passing only
+     proves the new code exists *somewhere* — a later step can still
+     land on the old process. Therefore any step that asserts behavior
+     only the new `worker.js` has (a new route, a changed response
+     shape) must carry `retry` with a budget that covers the drain
+     (60s works), or it will flake deterministically in CI. The
+     canonical example is `browser/basic`.
+   - **Keep probes self-contained per request**: assertions that
+     accumulate state across requests in module-level state (counters,
+     Sets of observed ids) are cross-isolate fragile — the same drift
+     window means one request mutates the old process's copy and the
+     next reads the new one's. Either derive the assertion inside a
+     single request (open–close–inspect your own session, see
+     `/history` in `browser/basic`) or reset state at the probe's
+     start.
    - A step may instead be a restart action — see
      [Restart steps](#restart-steps).
 4. Prefer **normalized responses**: the worker maps volatile values
