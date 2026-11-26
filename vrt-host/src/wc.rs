@@ -539,6 +539,23 @@ impl Store {
         n
     }
 
+    /// Purge every entry of one worker (all versions/entrypoints/paths).
+    pub fn purge_worker(&self, tenant: &str, worker: &str) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let prefix = format!("{tenant}\u{1f}{worker}\u{1f}");
+        let keys: Vec<String> = inner
+            .entries
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        let n = keys.len();
+        for key in keys {
+            inner.remove(&key);
+        }
+        n
+    }
+
     pub fn purge_all(&self, tenant: &str) -> usize {
         let mut inner = self.inner.lock().unwrap();
         let prefix = format!("{tenant}\u{1f}");
@@ -943,6 +960,35 @@ mod tests {
         assert!(matches!(store.get(base, &req(&[("accept", "raw")]), now()), Lookup::Miss));
         assert_eq!(store.purge_tags("t", &["PAGE".to_string()]), 2);
         assert_eq!(store.stats().0, 0);
+    }
+
+    #[test]
+    fn purge_worker_is_tenant_scoped() {
+        let store = Store::new();
+        let put = |tenant: &str, worker: &str, path: &str| {
+            store.put(
+                &format!("{tenant}\u{1f}{worker}\u{1f}v\u{1f}default\u{1f}{path}?"),
+                Entry {
+                    status: StatusCode::OK,
+                    version: Version::HTTP_11,
+                    headers: vec![],
+                    body: Bytes::from_static(b"x"),
+                    stored_at: now(),
+                    fresh_for: Duration::from_secs(60),
+                    no_cache: false,
+                    vary: vec![],
+                    tags: vec![],
+                    size: 0,
+                },
+            )
+        };
+        assert!(put("t", "w1", "/a"));
+        assert!(put("t", "w2", "/b"));
+        assert!(put("t2", "w1", "/c"));
+        assert_eq!(store.purge_worker("t", "w1"), 1);
+        assert_eq!(store.stats().0, 2);
+        assert_eq!(store.purge_all("t2"), 1);
+        assert_eq!(store.stats().0, 1);
     }
 
     #[test]
