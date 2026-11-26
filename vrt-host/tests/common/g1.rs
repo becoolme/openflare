@@ -266,7 +266,6 @@ pub fn render(
     let mut bundles = Vec::new();
     let mut worker_json = Vec::new();
     let mut ingress_ports = BTreeMap::new();
-    let mut has_do = false;
     for (id, name, module, bindings) in workers {
         let bundle = VersionBundle::build(
             DeployManifest::from_pack(&json!({
@@ -278,9 +277,6 @@ pub fn render(
             .unwrap(),
         )
         .unwrap();
-        if bindings.to_string().contains("durableObject") {
-            has_do = true;
-        }
         worker_json.push(json!({
             "workerId": id, "name": name,
             "activeVersion": {
@@ -386,12 +382,10 @@ pub fn render(
     }
     let cfg = dir.join("cfg.capnp");
     std::fs::write(&cfg, &text).unwrap();
-    let args = vrt_host::assemble::experimental_extra_args(
+    let args = vrt_config::runtime_experimental_extra_args(
         &params.system_compat_flags,
-        vrt_host::assemble::ExperimentalNeeds {
-            durable_objects_or_workflows: has_do,
-            ..Default::default()
-        },
+        &tenant,
+        &params.system_workers,
     );
     (cfg, ingress_ports, args, text)
 }

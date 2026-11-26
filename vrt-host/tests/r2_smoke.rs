@@ -437,9 +437,10 @@ fn render_cfg(dir: &Path, port: u16, bundle: &VersionBundle) -> (PathBuf, Vec<St
     std::fs::write(&cfg, text).unwrap();
     (
         cfg,
-        vrt_host::assemble::experimental_extra_args(
+        vrt_config::runtime_experimental_extra_args(
             &params.system_compat_flags,
-            Default::default(),
+            &tenant,
+            &params.system_workers,
         ),
     )
 }
