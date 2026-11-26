@@ -18,10 +18,10 @@
 //!   (`/readyz` fails + cron triggers stop — the already-running pods own
 //!   their own fail-closed enforcement; see the design doc).
 
-use crate::ack::{AckError, AckReport, AckSink, AckStatus};
+use crate::ack::{AckError, AckReport, AckSink, AckStatus, FenceProof};
 use crate::assign::{assign_workers, PodAssignment};
 use crate::cron::{CronRunner, CronTickOutcome};
-use crate::fence::FenceStore;
+use crate::fence::{FenceAttestation, FenceState, FenceStore};
 use crate::health::{new_health, PodHealth, ReadyState, SharedHealth};
 use crate::lease::LeaseStore;
 use crate::manifest::{ManifestApplier, ManifestError};
@@ -307,8 +307,8 @@ impl CellController {
 
     /// Full reconcile cycle at `now`.
     pub async fn reconcile_once(&mut self, now: DateTime<Utc>) -> ReconcileOutcome {
-        let raw = match self.deps.source.fetch().await {
-            Ok(Some(raw)) => raw,
+        let fetched = match self.deps.source.fetch_detailed().await {
+            Ok(Some(fetched)) => fetched,
             Ok(None) => {
                 self.clear_error();
                 return ReconcileOutcome::NoPublication;
@@ -318,8 +318,9 @@ impl CellController {
                 return ReconcileOutcome::PullFailed(error);
             }
         };
+        let raw = fetched.body.as_slice();
 
-        let verified = match self.verifier.verify(&raw, now) {
+        let verified = match self.verifier.verify(raw, now) {
             Ok(v) => v,
             Err(reason) => {
                 crate::metrics::verify_failure(reason.code());
@@ -331,7 +332,7 @@ impl CellController {
                 let acked = if reason.is_transient() {
                     false
                 } else {
-                    let claimed = extract_claimed(&raw);
+                    let claimed = extract_claimed(raw);
                     match (
                         claimed.revision,
                         claimed.payload_digest,
@@ -364,8 +365,31 @@ impl CellController {
         // snapshots. Failure is transient: nothing applied, no
         // terminal ACK; the in-memory fence already advanced
         // (monotone), so stale replays stay rejected regardless.
+        // Issue #63: the attestation the control plane delivered out-of-band
+        // belongs to this revision; the digests come from the verified doc.
+        let attestation = fetched.fence_attestation.and_then(|header| {
+            if header.revision != verified.revision {
+                tracing::warn!(
+                    revision = verified.revision,
+                    header_revision = header.revision,
+                    "fence attestation revision does not match the verified document — ignored"
+                );
+                return None;
+            }
+            Some(FenceAttestation {
+                revision: verified.revision,
+                payload_digest: verified.payload_digest.clone(),
+                envelope_digest: verified.envelope_digest.clone(),
+                attestation: header.attestation,
+            })
+        });
         if let Some(fence) = &self.deps.fence {
-            if let Err(e) = fence.store(verified.revision, &verified.envelope_digest) {
+            let state = FenceState {
+                revision: verified.revision,
+                envelope_digest: verified.envelope_digest.clone(),
+                attestation: attestation.clone(),
+            };
+            if let Err(e) = fence.store_full(&state) {
                 let reason = RejectReason::FencePersist;
                 self.set_error(reason.code());
                 tracing::warn!(error = %e, "revision fence persist failed");
@@ -375,6 +399,8 @@ impl CellController {
                 };
             }
         }
+        // In-memory copy used when building acks; identical to the persisted one.
+        self.verifier.set_fence_attestation(attestation);
 
         // T13/H1: the NetworkPolicy must be APPLIED AND CONFIRMED before
         // any tenant traffic flows — including on replays that would
@@ -894,6 +920,24 @@ impl CellController {
         // clear; the server persists it as "no reported failures")
         // while `None` omits the key entirely for the pre-MIG-1
         // strip-and-retry below.
+        // Issue #63: when the persisted fence is AHEAD of the revision being
+        // acked (typically after a control-plane restore), prove it with the
+        // attestation the plane delivered for the fence document.
+        let fence_proof = {
+            let (fence_revision, _) = self.verifier.fence();
+            if fence_revision > revision {
+                self.verifier
+                    .fence_attestation()
+                    .map(|attestation| FenceProof {
+                        revision: attestation.revision,
+                        payload_digest: attestation.payload_digest.clone(),
+                        envelope_digest: attestation.envelope_digest.clone(),
+                        attestation: attestation.attestation.clone(),
+                    })
+            } else {
+                None
+            }
+        };
         let build = |tenant_failures: Option<Vec<TenantFailure>>| AckReport {
             revision,
             payload_digest: payload_digest.clone(),
@@ -902,6 +946,7 @@ impl CellController {
             // its counter — `verifier.fence()` is the in-memory one;
             // identical once `store()` succeeded.
             fence_revision: self.verifier.fence().0,
+            fence_proof: fence_proof.clone(),
             status,
             // Bounded — the server rejects a whole report whose
             // reason exceeds 256 units (RV-R68).

@@ -43,12 +43,36 @@ pub enum SourceError {
     Exhausted,
 }
 
+/// Revision-fence attestation delivered out-of-band on the desired response
+/// (issue #63). The digests are filled in from the verified envelope.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceAttestationHeader {
+    pub revision: u64,
+    pub attestation: String,
+}
+
+/// Desired body plus optional transport metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchedDesired {
+    pub body: Vec<u8>,
+    pub fence_attestation: Option<FenceAttestationHeader>,
+}
+
 /// Pull boundary for the latest signed `compute.desired` envelope.
 #[async_trait::async_trait]
 pub trait DesiredSource: Send + Sync {
     /// Latest envelope bytes for this cell, `None` when the control plane
     /// has no publication yet (404). Must never panic.
     async fn fetch(&self) -> Result<Option<Vec<u8>>, SourceError>;
+
+    /// Body plus the optional fence attestation header. Sources that do not
+    /// carry headers keep the legacy (no attestation) behaviour.
+    async fn fetch_detailed(&self) -> Result<Option<FetchedDesired>, SourceError> {
+        Ok(self.fetch().await?.map(|body| FetchedDesired {
+            body,
+            fence_attestation: None,
+        }))
+    }
 }
 
 /// HTTP pull implementation over `reqwest` (rustls). Authorization uses
@@ -81,9 +105,10 @@ impl HttpDesiredSource {
     }
 }
 
-#[async_trait::async_trait]
-impl DesiredSource for HttpDesiredSource {
-    async fn fetch(&self) -> Result<Option<Vec<u8>>, SourceError> {
+impl HttpDesiredSource {
+    async fn fetch_inner(
+        &self,
+    ) -> Result<Option<(Vec<u8>, Option<FenceAttestationHeader>)>, SourceError> {
         let mut attempts = 0usize;
         let mut last = SourceError::Exhausted;
         while self.plan.can_retry(attempts) {
@@ -113,6 +138,30 @@ impl DesiredSource for HttpDesiredSource {
             if status == reqwest::StatusCode::NOT_FOUND {
                 return Ok(None);
             }
+            // Issue #63: read the fence attestation before consuming the body.
+            // Malformed/absent headers are ignored (legacy bounded path).
+            let fence_attestation = {
+                let attestation = response
+                    .headers()
+                    .get("x-vrt-fence-attestation")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty() && v.len() <= 512)
+                    .map(str::to_string);
+                let revision = response
+                    .headers()
+                    .get("x-vrt-fence-revision")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v >= 1);
+                match (attestation, revision) {
+                    (Some(attestation), Some(revision)) => Some(FenceAttestationHeader {
+                        revision,
+                        attestation,
+                    }),
+                    _ => None,
+                }
+            };
             if !status.is_success() {
                 last = SourceError::Status(status.as_u16());
                 continue;
@@ -160,9 +209,26 @@ impl DesiredSource for HttpDesiredSource {
                 last = e;
                 continue;
             }
-            return Ok(Some(body));
+            return Ok(Some((body, fence_attestation)));
         }
         Err(last)
+    }
+}
+
+#[async_trait::async_trait]
+impl DesiredSource for HttpDesiredSource {
+    async fn fetch(&self) -> Result<Option<Vec<u8>>, SourceError> {
+        Ok(self.fetch_inner().await?.map(|(body, _)| body))
+    }
+
+    async fn fetch_detailed(&self) -> Result<Option<FetchedDesired>, SourceError> {
+        Ok(self
+            .fetch_inner()
+            .await?
+            .map(|(body, fence_attestation)| FetchedDesired {
+                body,
+                fence_attestation,
+            }))
     }
 }
 
@@ -173,6 +239,7 @@ pub struct MemoryDesiredSource {
     script: Mutex<std::collections::VecDeque<Result<Option<Vec<u8>>, SourceError>>>,
     fallback: Result<Option<Vec<u8>>, SourceError>,
     calls: AtomicUsize,
+    attestation: Mutex<Option<FenceAttestationHeader>>,
 }
 
 impl MemoryDesiredSource {
@@ -182,6 +249,7 @@ impl MemoryDesiredSource {
             script: Mutex::new(std::collections::VecDeque::new()),
             fallback,
             calls: AtomicUsize::new(0),
+            attestation: Mutex::new(None),
         }
     }
 
@@ -197,6 +265,11 @@ impl MemoryDesiredSource {
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// Attach a fence attestation header to every subsequent fetch.
+    pub fn set_attestation(&self, attestation: Option<FenceAttestationHeader>) {
+        *self.attestation.lock().unwrap_or_else(|e| e.into_inner()) = attestation;
+    }
 }
 
 #[async_trait::async_trait]
@@ -208,6 +281,19 @@ impl DesiredSource for MemoryDesiredSource {
             .unwrap_or_else(|e| e.into_inner())
             .pop_front()
             .unwrap_or_else(|| self.fallback.clone())
+    }
+
+    async fn fetch_detailed(&self) -> Result<Option<FetchedDesired>, SourceError> {
+        let body = self.fetch().await?;
+        let attestation = self
+            .attestation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        Ok(body.map(|body| FetchedDesired {
+            body,
+            fence_attestation: attestation,
+        }))
     }
 }
 

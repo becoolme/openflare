@@ -1650,3 +1650,94 @@ async fn new_revision_resets_retained_failures() {
         "r7 failures must not be attributed to r8: {sent:?}"
     );
 }
+
+// ---- Issue #63: fence attestation persistence + echo ----
+
+#[tokio::test]
+async fn fence_attestation_is_persisted_and_echoed_when_fence_leads() {
+    use cell_controller::ack::AckStatus;
+    use cell_controller::fence::{FenceError, FenceState, FenceStore, MemoryFenceStore};
+    use cell_controller::source::FenceAttestationHeader;
+
+    struct Shared(std::sync::Arc<MemoryFenceStore>);
+    impl FenceStore for Shared {
+        fn load(&self) -> Result<Option<(u64, String)>, FenceError> {
+            self.0.load()
+        }
+        fn store(&self, revision: u64, digest: &str) -> Result<(), FenceError> {
+            self.0.store(revision, digest)
+        }
+        fn load_full(&self) -> Result<Option<FenceState>, FenceError> {
+            self.0.load_full()
+        }
+        fn store_full(&self, state: &FenceState) -> Result<(), FenceError> {
+            self.0.store_full(state)
+        }
+    }
+
+    let fence = std::sync::Arc::new(MemoryFenceStore::default());
+    let source = Arc::new(MemoryDesiredSource::new(Ok(None)));
+    let ack = Arc::new(MemoryAckSink::default());
+    let mut controller = CellController::new(
+        "cell-1",
+        CellVerifier::new("cell-1", vec![key().trusted_key()]),
+        CellControllerDeps {
+            source: source.clone(),
+            channel: Arc::new(MemoryPodChannel::new(&["p0"])),
+            ack: ack.clone(),
+            deliver_retry: RetryPlan {
+                max_attempts: 1,
+                base_delay: std::time::Duration::ZERO,
+                max_delay: std::time::Duration::ZERO,
+                jitter_seed: 0,
+            },
+            ack_retry: RetryPlan::default(),
+            manifests: None,
+            egress_required: false,
+            netpolicy: None,
+            fence: Some(Box::new(Shared(fence.clone()))),
+            capabilities: Default::default(),
+        },
+    );
+
+    // Rev 7 arrives with the plane's attestation → persisted with the fence.
+    source.set_attestation(Some(FenceAttestationHeader {
+        revision: 7,
+        attestation: "sig-7".to_string(),
+    }));
+    let snapshot7 = publish("cell-1", 7, &[worker("w1", None)], 3600);
+    let envelope7 = snapshot_protocol::compute_envelope_digest(&snapshot7.bytes).unwrap();
+    source.push(Ok(Some(snapshot7.bytes.clone())));
+    match controller.reconcile_once(now()).await {
+        ReconcileOutcome::Applied { revision: 7, .. } => {}
+        other => panic!("{other:?}"),
+    }
+    let stored = fence.load_full().unwrap().expect("fence persisted");
+    let stored_attestation = stored.attestation.expect("attestation persisted");
+    assert_eq!(stored_attestation.revision, 7);
+    assert_eq!(stored_attestation.attestation, "sig-7");
+    assert_eq!(stored_attestation.payload_digest, snapshot7.payload_digest);
+    assert_eq!(stored_attestation.envelope_digest, envelope7);
+
+    // A restored plane publishes rev 5. The REJECTED ack (fence ahead) must
+    // carry the proof for rev 7 so the plane can lift its counter.
+    source.set_attestation(None);
+    source.push(Ok(Some(
+        publish("cell-1", 5, &[worker("w1", None)], 3600).bytes,
+    )));
+    match controller.reconcile_once(now()).await {
+        ReconcileOutcome::Rejected { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    let sent = ack.sent();
+    let rejected = sent
+        .iter()
+        .find(|a| a.revision == 5 && a.status == AckStatus::Rejected)
+        .expect("rejected ack for rev 5");
+    assert_eq!(rejected.fence_revision, 7);
+    let proof = rejected.fence_proof.clone().expect("fence proof echoed");
+    assert_eq!(proof.revision, 7);
+    assert_eq!(proof.attestation, "sig-7");
+    assert_eq!(proof.payload_digest, snapshot7.payload_digest);
+    assert_eq!(proof.envelope_digest, envelope7);
+}

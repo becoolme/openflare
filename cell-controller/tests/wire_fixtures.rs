@@ -160,6 +160,7 @@ fn desired_ack_fixture() {
         payload_digest: "a".repeat(64),
         envelope_digest: "b".repeat(64),
         fence_revision: 5,
+        fence_proof: None,
         status: AckStatus::Partial,
         reason: Some("pods-not-applied:pod-1,pod-2".to_string()),
         applied_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
