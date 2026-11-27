@@ -227,6 +227,34 @@ pub struct DeletionDesired {
     pub revision: u64,
 }
 
+/// Workers Cache enablement for one worker (Cloudflare `[cache]`).
+/// Absent on the worker = caching off. The config is version-scoped:
+/// a rollback restores the previous setting with the version.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheDesired {
+    /// Master switch: consult/populate the entrypoint cache.
+    pub enabled: bool,
+    /// Share cache entries across versions (default: version is part of
+    /// the key, so a deploy starts from an empty cache).
+    #[serde(default)]
+    pub cross_version_cache: bool,
+    /// Optional key shaping (`cf.cacheKey`); absent = default key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<CacheKeyDesired>,
+}
+
+/// Query-string shaping for the cache key. Empty `include` means "all",
+/// `exclude` always wins; order is normalized (sorted) either way.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheKeyDesired {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_query: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_query: Vec<String>,
+}
+
 /// Desired state for one worker replica assignment on this cell.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -307,6 +335,14 @@ pub struct WorkerDesired {
     /// `deny_unknown_fields` — fail closed).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub streaming_tail_consumers: Vec<TailConsumerDesired>,
+
+    /// Workers Cache (`[cache]`): ingress response caching for this
+    /// worker's `fetch` entrypoints. Absent = off; skipped when absent so
+    /// snapshots without caching stay byte-identical. Old cells reject a
+    /// snapshot that carries the field (`deny_unknown_fields` — fail
+    /// closed), so cells roll out before the control plane emits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheDesired>,
 
     /// Per-isolate/per-request resource limits enforced by the runtime.
     pub quotas: WorkerQuotas,
@@ -3040,6 +3076,42 @@ mod tests {
 
     fn desired(value: &serde_json::Value) -> Result<ComputeDesired, serde_json::Error> {
         serde_json::from_value(value.clone())
+    }
+
+    #[test]
+    fn cache_wire_shape() {
+        // Absent stays absent: cache-off snapshots remain byte-identical
+        // (skip_serializing_if), so a control plane not yet emitting the
+        // field keeps producing the same bytes.
+        let mut p = valid_payload();
+        assert!(p["tenants"][0]["workers"][0].get("cache").is_none());
+        let d = desired(&p).unwrap();
+        assert!(d.tenants[0].workers[0].cache.is_none());
+        let back = serde_json::to_value(&d).unwrap();
+        assert!(back["tenants"][0]["workers"][0].get("cache").is_none());
+
+        // Enabled config roundtrips with both fields.
+        p["tenants"][0]["workers"][0]["cache"] =
+            json!({"enabled": true, "crossVersionCache": true});
+        let d = desired(&p).unwrap();
+        let c = d.tenants[0].workers[0].cache.as_ref().expect("cache");
+        assert!(c.enabled);
+        assert!(c.cross_version_cache);
+        let back = serde_json::to_value(&d).unwrap();
+        assert_eq!(
+            back["tenants"][0]["workers"][0]["cache"],
+            json!({"enabled": true, "crossVersionCache": true})
+        );
+
+        // Fail closed on unknown members: never silently ignore cache
+        // semantics from a newer control plane or a typo.
+        p["tenants"][0]["workers"][0]["cache"] = json!({"enabled": true, "bogus": 1});
+        assert!(desired(&p).is_err());
+
+        // crossVersionCache defaults to false when omitted.
+        p["tenants"][0]["workers"][0]["cache"] = json!({"enabled": true});
+        let d = desired(&p).unwrap();
+        assert!(!d.tenants[0].workers[0].cache.as_ref().unwrap().cross_version_cache);
     }
 
     /// Table-driven invalid payloads: (id, mutator, expected error code).

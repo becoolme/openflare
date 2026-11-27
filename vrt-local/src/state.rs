@@ -238,6 +238,7 @@ fn preview_worker_desired(
 ) -> WorkerDesired {
     let (tag, created_at) = version_metadata_fields(version);
     WorkerDesired {
+        cache: None,
         worker_id: preview_instance_id(&worker.worker_id, &version.version_id),
         name: preview_instance_name(name, &version.version_id),
         active_version: VersionDesired {
@@ -616,6 +617,7 @@ impl LocalState {
                 .ok_or(LocalError::State("activeVersion"))?;
             let (tag, created_at) = version_metadata_fields(active);
             workers.push(WorkerDesired {
+                cache: None,
                 worker_id: w.worker_id.clone(),
                 name: name.clone(),
                 active_version: VersionDesired {

@@ -239,6 +239,7 @@ mod tests {
 
     fn w(id: &str) -> WorkerDesired {
         WorkerDesired {
+            cache: None,
             worker_id: id.to_string(),
             name: id.to_string(),
             active_version: VersionDesired {

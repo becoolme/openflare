@@ -178,6 +178,7 @@ mod tests {
 
     fn worker(id: &str, preview: Option<PreviewDesired>) -> WorkerDesired {
         WorkerDesired {
+            cache: None,
             worker_id: id.into(),
             name: id.replace('.', "-"),
             active_version: VersionDesired {

@@ -12560,6 +12560,7 @@ sleep 10
             DoClassDesired, RouteDesired, VersionDesired, WorkerDesired, WorkerQuotas,
         };
         WorkerDesired {
+            cache: None,
             worker_id: worker_id.into(),
             name: worker_id.into(),
             active_version: VersionDesired {

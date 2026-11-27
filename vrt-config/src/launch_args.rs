@@ -158,6 +158,7 @@ mod tests {
     /// Minimal worker carrying no `$experimental` surface.
     fn worker() -> WorkerDesired {
         WorkerDesired {
+            cache: None,
             worker_id: "w_0123456789abcdef".into(),
             name: "w1".into(),
             active_version: VersionDesired {

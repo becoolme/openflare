@@ -8,7 +8,7 @@
 
 use crate::context::{BindingResource, Permissions};
 use chrono::{DateTime, Utc};
-use snapshot_protocol::compute_desired::{BindingDesired, ComputeDesired};
+use snapshot_protocol::compute_desired::{BindingDesired, CacheDesired, ComputeDesired};
 use snapshot_protocol::envelope::Verified;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -36,6 +36,8 @@ pub struct WorkerView {
     pub bindings: HashMap<String, BindingResource>,
     /// `binding name -> permissions` table from the snapshot.
     pub permissions: HashMap<String, Permissions>,
+    /// Workers Cache config for this worker (absent = off).
+    pub cache: Option<CacheDesired>,
 }
 
 /// Per-tenant authorization view.
@@ -127,6 +129,7 @@ pub(crate) fn build_views(
                     draining: draining.into_iter().collect(),
                     bindings,
                     permissions,
+                    cache: worker.cache.clone(),
                 },
             );
         }

@@ -128,6 +128,7 @@ pub fn worker(
     bindings: Vec<BindingDesired>,
 ) -> WorkerDesired {
     WorkerDesired {
+        cache: None,
         worker_id: id.to_string(),
         name: id.to_string(),
         active_version: version(version_id, digest),
