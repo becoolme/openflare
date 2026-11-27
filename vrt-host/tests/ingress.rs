@@ -1785,3 +1785,137 @@ async fn dev_catch_all_routes_only_single_worker_desired() {
     wait_state(&rt, TenantState::Stopped, Duration::from_secs(8)).await;
     handle.join().await;
 }
+
+/// POST a JSON body with one auth header; returns (status, body).
+/// Local helper — the cache-purge admin endpoint is the only POST the
+/// ingress tests drive.
+async fn http_post_json(
+    addr: std::net::SocketAddr,
+    path: &str,
+    token: &str,
+    json: &str,
+) -> (u16, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\nx-vrt-cache-token: {token}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+        json.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
+/// Workers Cache round trip — the ingress-level integration the wc.rs
+/// unit tests cannot cover: a cache-enabled route serves MISS then HIT
+/// out of the pod-local store (the body proves the upstream is never
+/// recontacted), and a purge through the admin HTTP endpoint forces the
+/// next request back upstream. One `wc::Store` instance backs lookup,
+/// single-flight and invalidation — this exercises the wiring, not the
+/// units.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workers_cache_hit_then_purge_then_miss() {
+    let registry = TenantRegistry::new();
+    let rt1 = TenantRuntime::new("t1");
+    registry.insert("t1".to_string(), rt1.clone());
+    let mut fx = Fixture::new();
+    let spec = fx.stub_spec("t1", &["w1"], &[]);
+    let handle = spawn(&rt1, spec);
+    wait_state(&rt1, TenantState::Ready, Duration::from_secs(8)).await;
+
+    // Same fixture as the routing tests but with the entrypoint cache on.
+    let mut w = worker("w1", "app.example.com", "d1");
+    w.cache = Some(snapshot_protocol::compute_desired::CacheDesired {
+        enabled: true,
+        cross_version_cache: false,
+        key: None,
+    });
+    let desired = snapshot_protocol::compute_desired::ComputeDesired {
+        schema_version: 1,
+        cell_id: "cell".into(),
+        revision: 1,
+        tenants: vec![tenant("t1", vec![w])],
+        deletions: vec![],
+    };
+
+    let state = IngressState::new(
+        registry.clone(),
+        Duration::from_secs(5),
+        Duration::from_millis(500),
+        1024,
+    );
+    state.set_routes(RouteTable::from_desired(&desired));
+    let ig = start_ingress(&state).await;
+    let addr = ig.addr;
+
+    // The stub emits `cache-control: max-age=60` through its emit hook,
+    // making the 200 explicitly storable; its body carries a per-connection
+    // sequence number, so a served-from-cache copy is byte-identical while
+    // any upstream recontact advances it.
+    let emit = [("x-stub-emit-header", "cache-control=max-age=60")];
+    fn status_of<'a>(headers: &'a [(String, String)]) -> &'a str {
+        headers
+            .iter()
+            .find(|(k, _)| k == "cf-cache-status")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("<absent>")
+    }
+
+    // Cold: proxied upstream and stored — MISS.
+    let (status, headers, cold_body) = http_get(addr, "app.example.com", "/", &emit).await;
+    assert_eq!(status, 200);
+    assert_eq!(status_of(&headers), "MISS", "headers: {headers:?}");
+    assert!(cold_body.contains("stub ok"), "{cold_body}");
+
+    // Warm: served from the pod-local store without upstream contact —
+    // the byte-identical body (same conn seq) proves it.
+    let (status, headers, warm_body) = http_get(addr, "app.example.com", "/", &emit).await;
+    assert_eq!(status, 200);
+    assert_eq!(status_of(&headers), "HIT", "headers: {headers:?}");
+    assert_eq!(warm_body, cold_body, "HIT must serve the stored copy");
+
+    // Purge through the admin endpoint wired to the SAME store instance
+    // the ingress serves — the production topology in miniature.
+    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_addr = admin_listener.local_addr().unwrap();
+    let admin_app = vrt_host::wc_admin::router(vrt_host::wc_admin::AdminState {
+        store: state.cache_store().clone(),
+        token: "test-token".into(),
+    });
+    let admin_task = tokio::spawn(async move {
+        axum::serve(admin_listener, admin_app).await.unwrap();
+    });
+    let (status, body) = http_post_json(
+        admin_addr,
+        "/internal/cache/purge",
+        "test-token",
+        r#"{"tenantId":"t1","workerId":"w1"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "purge: {body}");
+    assert!(body.contains("\"purged\":1"), "one entry purged: {body}");
+
+    // Cold again: the purge invalidated the entry, so the upstream is
+    // recontacted — the conn sequence advances and the status is MISS.
+    let (status, headers, repurge_body) = http_get(addr, "app.example.com", "/", &emit).await;
+    assert_eq!(status, 200);
+    assert_eq!(status_of(&headers), "MISS", "headers: {headers:?}");
+    assert_ne!(
+        repurge_body, cold_body,
+        "post-purge response must come from a fresh upstream fetch"
+    );
+
+    admin_task.abort();
+    ig.stop().await;
+    handle.send(SupervisorCmd::Stop).await;
+    wait_state(&rt1, TenantState::Stopped, Duration::from_secs(8)).await;
+    handle.join().await;
+}
