@@ -177,6 +177,7 @@ fn desired_ack_fixture() {
             d1_cell_ops: true,
             workflows_cross_worker: true,
             storage_purge: true,
+            cache: true,
             cache_purge: false,
             vectorize_purge: false,
             kv: false,
