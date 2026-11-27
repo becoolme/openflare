@@ -3094,7 +3094,7 @@ mod tests {
         p["tenants"][0]["workers"][0]["cache"] =
             json!({"enabled": true, "crossVersionCache": true});
         let d = desired(&p).unwrap();
-        let c = d.tenants[0].workers[0].cache.expect("cache");
+        let c = d.tenants[0].workers[0].cache.as_ref().expect("cache");
         assert!(c.enabled);
         assert!(c.cross_version_cache);
         let back = serde_json::to_value(&d).unwrap();
@@ -3111,7 +3111,7 @@ mod tests {
         // crossVersionCache defaults to false when omitted.
         p["tenants"][0]["workers"][0]["cache"] = json!({"enabled": true});
         let d = desired(&p).unwrap();
-        assert!(!d.tenants[0].workers[0].cache.unwrap().cross_version_cache);
+        assert!(!d.tenants[0].workers[0].cache.as_ref().unwrap().cross_version_cache);
     }
 
     /// Table-driven invalid payloads: (id, mutator, expected error code).
