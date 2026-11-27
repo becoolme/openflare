@@ -19,7 +19,7 @@ serde_json = "1"
 sha2 = "0.10"
 snapshot-protocol = { path = "../snapshot-protocol" }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
 vrt-metrics = { path = "../vrt-metrics" }
 vrt-securefs = { path = "../vrt-securefs" }
 toml = "0.8"

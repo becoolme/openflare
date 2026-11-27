@@ -25,6 +25,7 @@ pub mod ack;
 pub mod alarm_index;
 pub mod alarm_wake;
 pub mod assign;
+pub mod cachepurge;
 pub mod controller;
 pub mod cron;
 pub mod d1_auto;

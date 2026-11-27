@@ -128,6 +128,11 @@ pub struct AckCapabilities {
     /// op is never queued for this cell (fail closed).
     #[serde(default)]
     pub storage_purge: bool,
+    /// CACHE_PURGE executor wired (`[cache_purge]` + token + loopback
+    /// pod bases) — the control plane only dispatches cache purge ops
+    /// onto cells that claim it. Omitted while false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache_purge: bool,
     /// `[storage_purge.vectorize]` wired — the control plane may enqueue
     /// `STORAGE_PURGE{storage:"vectorize"}` ops. Omitted while false for
     /// rolling upgrades.
