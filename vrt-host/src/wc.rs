@@ -302,6 +302,28 @@ pub fn evaluate(
     policy
 }
 
+/// Request-side bypass: a request `no-store`, `no-cache`, or `max-age=0`
+/// must not be served from the cache (the revalidated response is still
+/// stored). Header names are case-insensitive.
+pub fn request_bypass(headers: &HeaderMap) -> bool {
+    let Some(cc) = headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    cc.split(',').any(|tok| {
+        let tok = tok.trim().to_ascii_lowercase();
+        if tok == "no-store" || tok == "no-cache" {
+            return true;
+        }
+        tok.strip_prefix("max-age=")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|n| n == 0)
+            .unwrap_or(false)
+    })
+}
+
 /// Heuristic freshness table (RFC 9111 §4.2.2 defaults used by CF).
 fn heuristic_ttl(status: u16) -> Option<Duration> {
     let secs = match status {
@@ -982,6 +1004,20 @@ mod tests {
         assert!(matches!(store.get(base, &req(&[("accept", "raw")]), now()), Lookup::Miss));
         assert_eq!(store.purge_tags("t", &["PAGE".to_string()]), 2);
         assert_eq!(store.stats().0, 0);
+    }
+
+    #[test]
+    fn request_directives_bypass() {
+        let mut h = HeaderMap::new();
+        assert!(!request_bypass(&h));
+        h.insert(header::CACHE_CONTROL, "max-age=60".parse().unwrap());
+        assert!(!request_bypass(&h));
+        h.insert(header::CACHE_CONTROL, "max-age=0".parse().unwrap());
+        assert!(request_bypass(&h));
+        h.insert(header::CACHE_CONTROL, "public, No-Cache".parse().unwrap());
+        assert!(request_bypass(&h));
+        h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+        assert!(request_bypass(&h));
     }
 
     #[test]

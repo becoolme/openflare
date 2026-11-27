@@ -1327,6 +1327,7 @@ async fn proxy_inner(
         .map(str::to_string);
     let cache_head = cache.as_ref().map(|(p, _, _)| p.head).unwrap_or(false);
     if let Some((plan, headers, _)) = &cache {
+        if !crate::wc::request_bypass(headers) {
         match state.wc.get(&plan.key, headers, now) {
             crate::wc::Lookup::Hit(entry) => {
                 wc_metric("hit");
@@ -1341,10 +1342,12 @@ async fn proxy_inner(
             crate::wc::Lookup::Stale(entry) => stale_entry = Some(entry),
             _ => {}
         }
+        }
         // Collapse concurrent misses for this key on this pod.
         match state.flights.enter(&plan.key) {
             crate::wc::FlightEntry::Follower(n) => {
                 crate::wc::Flights::wait(n, std::time::Duration::from_secs(10)).await;
+                if !crate::wc::request_bypass(headers) {
                 match state.wc.get(&plan.key, headers, std::time::SystemTime::now()) {
                     crate::wc::Lookup::Hit(entry) => {
                         wc_metric("hit");
@@ -1358,6 +1361,7 @@ async fn proxy_inner(
                     }
                     crate::wc::Lookup::Stale(entry) => stale_entry = Some(entry),
                     _ => {}
+                }
                 }
                 // Leader failed to store: fall through as an uncached
                 // request rather than blocking again.
