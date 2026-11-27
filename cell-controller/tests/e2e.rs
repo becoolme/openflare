@@ -1415,6 +1415,7 @@ fn t13_config(netpolicy: bool) -> cell_controller::prod::ProdConfig {
         d1sql: None,
         queue_dispatch: None,
         storage_purge: None,
+        cache_purge: None,
         quotas: true,
         report: None,
     }

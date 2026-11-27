@@ -78,6 +78,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // CACHE_PURGE: fan-out executor over the `[[pods]]` loopback
+    // bases — same wired-not-just-configured rule as storage_purge:
+    // a present-but-broken `[cache_purge]` (missing token, non-loopback
+    // base) must never advertise the bit.
+    let cache_purge_exec = match &config.cache_purge {
+        Some(cfg) => {
+            let pod_bases: Vec<(String, String)> = config
+                .pods
+                .iter()
+                .map(|p| (p.id.clone(), p.readyz.clone()))
+                .collect();
+            match cell_controller::cachepurge::CachePurgeExecutor::connect(cfg, &pod_bases) {
+                Ok(e) => Some(std::sync::Arc::new(e)),
+                Err(e) => {
+                    tracing::error!(%e, "cache_purge executor init failed — capability off");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
     let capabilities = cell_controller::ack::AckCapabilities {
         cron: cron_capability,
         assets: true,
@@ -104,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // rejecting the field, and the control plane gates on this bit.
         workflows_cross_worker: true,
         storage_purge: storage_purge_exec.is_some(),
+        cache_purge: cache_purge_exec.is_some(),
         vectorize_purge: storage_purge_exec
             .as_ref()
             .is_some_and(|e| e.has_vectorize()),
@@ -514,6 +536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     wf_exec.as_ref(),
                     d1_exec.as_ref(),
                     storage_purge_exec.as_deref(),
+                    cache_purge_exec.as_deref(),
                     kv_exec.as_ref(),
                     r2_exec.as_ref(),
                     &mut seen,

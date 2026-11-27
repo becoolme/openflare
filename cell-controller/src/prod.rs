@@ -91,6 +91,11 @@ pub struct ProdConfig {
     /// false (the control plane never dispatches the kind here).
     #[serde(default)]
     pub storage_purge: Option<crate::storagepurge::StoragePurgeConfig>,
+    /// `[cache_purge]` — Workers Cache purge fan-out wiring (token env
+    /// + timeout; pod bases come from `[[pods]]`). Absent ⇒ `cachePurge`
+    /// capability false and CACHE_PURGE ops are never dispatched here.
+    #[serde(default)]
+    pub cache_purge: Option<crate::cachepurge::CachePurgeConfig>,
     /// Per-worker quotas capability (ACK bit `quotas`): the cell's
     /// vrt-host renders the workerd `limits` block. Default `false`:
     /// the bit is OMITTED from the ACK while false, so a control plane

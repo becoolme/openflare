@@ -638,6 +638,7 @@ pub async fn wfops_tick(
     wf_exec: Option<&WfOpsExecutor>,
     d1_exec: Option<&crate::d1ops::D1OpsExecutor>,
     storage_exec: Option<&crate::storagepurge::StoragePurgeExecutor>,
+    cache_exec: Option<&crate::cachepurge::CachePurgeExecutor>,
     kv_exec: Option<&crate::kvops::KvOpsExecutor>,
     r2_exec: Option<&crate::r2ops::R2OpsExecutor>,
     seen: &mut crate::execset::SeenSet,
@@ -701,6 +702,13 @@ pub async fn wfops_tick(
                     Some(s) => s.execute(op).await,
                     // No purge executor on this cell — op stays
                     // PENDING (fail closed; never a fake outcome).
+                    None => continue,
+                },
+                // CACHE_PURGE: Workers Cache invalidation fan-out to
+                // every pod's loopback purge endpoint. No executor ⇒
+                // stays PENDING (fail closed; never a fake outcome).
+                crate::cachepurge::CACHE_PURGE_KIND => match cache_exec {
+                    Some(x) => x.execute(op).await,
                     None => continue,
                 },
                 // KV1: namespace data ops — routed to the shared
@@ -1097,6 +1105,7 @@ mod tests {
             "R2_PUT",
             "R2_DELETE",
             "STORAGE_PURGE",
+            "CACHE_PURGE",
             "WF_ACTION",
             "",
         ] {
