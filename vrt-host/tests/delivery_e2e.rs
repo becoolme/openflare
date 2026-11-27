@@ -232,6 +232,7 @@ async fn rig_with_opts(
         d1sql: None,
         queue_dispatch: None,
         storage_purge: None,
+        cache_purge: None,
         quotas: true,
         report: None,
     };
@@ -500,6 +501,7 @@ async fn probe_failure_never_acks_applied() {
         d1sql: None,
         queue_dispatch: None,
         storage_purge: None,
+        cache_purge: None,
         quotas: true,
         report: None,
     };
