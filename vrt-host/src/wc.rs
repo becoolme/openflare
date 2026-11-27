@@ -14,9 +14,10 @@
 //!   store-but-expire, `Vary` variants, `Cache-Tag` + purge, `Cf-Cache-Status`.
 //! - Bounded per-pod store with per-tenant/global byte quotas and LRU.
 //!
-//! Not yet wired here: single-flight collapsing, shared upper tier, Range
-//! slicing, `stale-if-error` serving, `ctx.cache`. See
-//! `doc/platform/workers-cache.md`.
+//! Not yet wired here: shared upper tier (entries are pod-local by design)
+//! and `ctx.cache`. Single-flight collapsing, Range slicing and
+//! `stale-if-error` serving are wired in ingress.rs — keep this list
+//! current or delete it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
