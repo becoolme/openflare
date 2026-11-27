@@ -227,7 +227,7 @@ impl RouteTable {
             images,
             preview: None,
             version_id: worker.active_version.version_id.clone(),
-            cache: worker.cache,
+            cache: worker.cache.clone(),
         }
     }
 

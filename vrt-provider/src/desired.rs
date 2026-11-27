@@ -129,7 +129,7 @@ pub(crate) fn build_views(
                     draining: draining.into_iter().collect(),
                     bindings,
                     permissions,
-                    cache: worker.cache,
+                    cache: worker.cache.clone(),
                 },
             );
         }

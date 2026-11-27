@@ -122,6 +122,8 @@ pub fn key_plan(
     worker_id: &str,
     version_id: &str,
     cross_version: bool,
+    include_query: &[String],
+    exclude_query: &[String],
     uri: &axum::http::Uri,
     method: &Method,
 ) -> Option<KeyPlan> {
@@ -129,7 +131,7 @@ pub fn key_plan(
         return None;
     }
     let path = uri.path();
-    let query = uri.query().unwrap_or("");
+    let query = normalize_query(uri.query().unwrap_or(""), include_query, exclude_query);
     let version = if cross_version { "*" } else { version_id };
     Some(KeyPlan {
         key: format!(
@@ -137,6 +139,27 @@ pub fn key_plan(
         ),
         head: *method == Method::HEAD,
     })
+}
+
+/// Normalize the query for the cache key: optional include allowlist,
+/// exclude always wins, pairs sorted so `b=2&a=1` == `a=1&b=2`.
+fn normalize_query(raw: &str, include: &[String], exclude: &[String]) -> String {
+    let mut pairs: Vec<(String, String)> = raw
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (k.to_string(), v.to_string())
+        })
+        .filter(|(k, _)| include.is_empty() || include.iter().any(|i| i == k))
+        .filter(|(k, _)| !exclude.iter().any(|e| e == k))
+        .collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| if v.is_empty() { k } else { format!("{k}={v}") })
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 /// Result of a lookup.
@@ -1016,6 +1039,19 @@ mod tests {
     }
 
     #[test]
+    fn key_query_include_exclude() {
+        let uri: axum::http::Uri = "/p?b=2&a=1&utm=z&c=3".parse().unwrap();
+        let all = key_plan("t", "w", "v", false, &[], &[], &uri, &Method::GET).unwrap();
+        assert!(all.key.ends_with("/p?a=1&b=2&c=3&utm=z"));
+        let inc = vec!["a".to_string(), "b".to_string()];
+        let only = key_plan("t", "w", "v", false, &inc, &[], &uri, &Method::GET).unwrap();
+        assert!(only.key.ends_with("/p?a=1&b=2"));
+        let exc = vec!["utm".to_string()];
+        let without = key_plan("t", "w", "v", false, &[], &exc, &uri, &Method::GET).unwrap();
+        assert!(without.key.ends_with("/p?a=1&b=2&c=3"));
+    }
+
+    #[test]
     fn request_directives_bypass() {
         let mut h = HeaderMap::new();
         assert!(!request_bypass(&h));
@@ -1190,10 +1226,10 @@ mod tests {
     #[test]
     fn key_excludes_host_and_scopes_version() {
         let uri: axum::http::Uri = "/a/b?x=1".parse().unwrap();
-        let k = key_plan("t", "w", "v1", false, &uri, &Method::GET).unwrap();
+        let k = key_plan("t", "w", "v1", false, &[], &[], &uri, &Method::GET).unwrap();
         assert_eq!(k.key, "t\u{1f}w\u{1f}v1\u{1f}default\u{1f}/a/b?x=1");
-        let k = key_plan("t", "w", "v1", true, &uri, &Method::GET).unwrap();
+        let k = key_plan("t", "w", "v1", true, &[], &[], &uri, &Method::GET).unwrap();
         assert!(k.key.contains("\u{1f}*\u{1f}"));
-        assert!(key_plan("t", "w", "v1", false, &uri, &Method::POST).is_none());
+        assert!(key_plan("t", "w", "v1", false, &[], &[], &uri, &Method::POST).is_none());
     }
 }

@@ -1305,12 +1305,20 @@ async fn proxy_inner(
     // Workers Cache: preview hosts stay uncached (their auth/stamp contract
     // is applied after the proxy and must never be bypassed). HEAD is not
     // converted yet, so only GET participates.
-    let cache = match (&target.preview, target.cache) {
+    let cache = match (&target.preview, target.cache.clone()) {
         (None, Some(cfg)) if cfg.enabled => crate::wc::key_plan(
             &target.tenant_id,
             &target.worker_id,
             &target.version_id,
             cfg.cross_version_cache,
+            cfg.key
+                .as_ref()
+                .map(|k| k.include_query.as_slice())
+                .unwrap_or(&[]),
+            cfg.key
+                .as_ref()
+                .map(|k| k.exclude_query.as_slice())
+                .unwrap_or(&[]),
             req.uri(),
             req.method(),
         )

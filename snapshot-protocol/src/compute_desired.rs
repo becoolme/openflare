@@ -230,7 +230,7 @@ pub struct DeletionDesired {
 /// Workers Cache enablement for one worker (Cloudflare `[cache]`).
 /// Absent on the worker = caching off. The config is version-scoped:
 /// a rollback restores the previous setting with the version.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CacheDesired {
     /// Master switch: consult/populate the entrypoint cache.
@@ -239,6 +239,20 @@ pub struct CacheDesired {
     /// the key, so a deploy starts from an empty cache).
     #[serde(default)]
     pub cross_version_cache: bool,
+    /// Optional key shaping (`cf.cacheKey`); absent = default key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<CacheKeyDesired>,
+}
+
+/// Query-string shaping for the cache key. Empty `include` means "all",
+/// `exclude` always wins; order is normalized (sorted) either way.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheKeyDesired {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_query: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_query: Vec<String>,
 }
 
 /// Desired state for one worker replica assignment on this cell.
