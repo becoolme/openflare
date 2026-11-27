@@ -306,6 +306,15 @@ pub fn evaluate(
 /// must not be served from the cache (the revalidated response is still
 /// stored). Header names are case-insensitive.
 pub fn request_bypass(headers: &HeaderMap) -> bool {
+    // HTTP/1.0 clients signal "revalidate" with Pragma.
+    if headers
+        .get(header::PRAGMA)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("no-cache")))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     let Some(cc) = headers
         .get(header::CACHE_CONTROL)
         .and_then(|v| v.to_str().ok())
@@ -1018,6 +1027,9 @@ mod tests {
         assert!(request_bypass(&h));
         h.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
         assert!(request_bypass(&h));
+        let mut p = HeaderMap::new();
+        p.insert(header::PRAGMA, "no-cache".parse().unwrap());
+        assert!(request_bypass(&p));
     }
 
     #[test]
