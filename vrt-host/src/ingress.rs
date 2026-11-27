@@ -627,6 +627,11 @@ pub struct IngressState {
 }
 
 impl IngressState {
+    /// Workers Cache store (control-plane purge + diagnostics).
+    pub fn cache_store(&self) -> &Arc<crate::wc::Store> {
+        &self.wc
+    }
+
     /// New state. `routes` is replaced wholesale on each converge.
     pub fn new(
         registry: Arc<TenantRegistry>,

@@ -725,6 +725,19 @@ async fn run_async(
         if let Some(hub) = &log_hub {
             router = router.merge(vrt_host::logs::router(hub.clone()));
         }
+        // Workers Cache purge (control-plane → cell). Mounted only when
+        // the explicit env token exists; the control listener is already
+        // loopback-only by config (fail closed otherwise).
+        if let Ok(token) = std::env::var("VRT_CACHE_PURGE_TOKEN") {
+            if !token.is_empty() {
+                router = router.merge(vrt_host::wc_admin::router(
+                    vrt_host::wc_admin::AdminState {
+                        store: ingress_state.cache_store().clone(),
+                        token: std::sync::Arc::from(token.as_str()),
+                    },
+                ));
+            }
+        }
         tokio::spawn(async move {
             let _ = axum::serve(control_listener, router).await;
         });

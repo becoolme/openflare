@@ -79,6 +79,7 @@ pub mod ready;
 pub mod render_inputs;
 pub mod route;
 pub mod wc;
+pub mod wc_admin;
 pub mod runaway;
 pub mod spec;
 pub mod state;
