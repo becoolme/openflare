@@ -128,6 +128,14 @@ pub struct AckCapabilities {
     /// op is never queued for this cell (fail closed).
     #[serde(default)]
     pub storage_purge: bool,
+    /// Workers Cache serving — the `cache` per-worker desired field
+    /// (CF `[cache]`: entrypoint response cache + key shaping) renders
+    /// with this generation. A pre-cache cell rejects the unknown worker
+    /// field via `deny_unknown_fields`, so the control plane only admits
+    /// cache-enabled workers onto cells that claim it. Omitted while
+    /// false (rolling upgrade).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cache: bool,
     /// CACHE_PURGE executor wired (`[cache_purge]` + token + loopback
     /// pod bases) — the control plane only dispatches cache purge ops
     /// onto cells that claim it. Omitted while false (rolling upgrade).

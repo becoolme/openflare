@@ -159,6 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // `{"type":"unsafeEval"}` bindings (unsafe_eval) render ships
         // with this generation -- unconditionally on.
         unsafe_eval: true,
+        // Workers Cache serving (`cache` worker field) renders with
+        // this generation -- unconditionally on (same reasoning).
+        cache: true,
         // `[observability]` worker fields render with this
         // generation -- unconditionally on (same reasoning).
         observability: true,
