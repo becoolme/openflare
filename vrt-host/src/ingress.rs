@@ -1319,36 +1319,45 @@ async fn proxy_inner(
     };
     let now = std::time::SystemTime::now();
     let mut flight = None;
+    let mut stale_entry: Option<crate::wc::Entry> = None;
+    let req_range = req
+        .headers()
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let cache_head = cache.as_ref().map(|(p, _, _)| p.head).unwrap_or(false);
     if let Some((plan, headers, _)) = &cache {
-        if let crate::wc::Lookup::Hit(entry) = state.wc.get(&plan.key, headers, now) {
-            wc_metric("hit");
-            return Ok(crate::wc::response(
-                &entry,
-                plan.head,
-                crate::wc::Status::Hit,
-                now,
-                req.headers()
-                    .get(axum::http::header::RANGE)
-                    .and_then(|v| v.to_str().ok()),
-            ));
+        match state.wc.get(&plan.key, headers, now) {
+            crate::wc::Lookup::Hit(entry) => {
+                wc_metric("hit");
+                return Ok(crate::wc::response(
+                    &entry,
+                    plan.head,
+                    crate::wc::Status::Hit,
+                    now,
+                    req_range.as_deref(),
+                ));
+            }
+            crate::wc::Lookup::Stale(entry) => stale_entry = Some(entry),
+            _ => {}
         }
         // Collapse concurrent misses for this key on this pod.
         match state.flights.enter(&plan.key) {
             crate::wc::FlightEntry::Follower(n) => {
                 crate::wc::Flights::wait(n, std::time::Duration::from_secs(10)).await;
-                if let crate::wc::Lookup::Hit(entry) =
-                    state.wc.get(&plan.key, headers, std::time::SystemTime::now())
-                {
-                    wc_metric("hit");
-                    return Ok(crate::wc::response(
-                        &entry,
-                        plan.head,
-                        crate::wc::Status::Hit,
-                        std::time::SystemTime::now(),
-                        req.headers()
-                            .get(axum::http::header::RANGE)
-                            .and_then(|v| v.to_str().ok()),
-                    ));
+                match state.wc.get(&plan.key, headers, std::time::SystemTime::now()) {
+                    crate::wc::Lookup::Hit(entry) => {
+                        wc_metric("hit");
+                        return Ok(crate::wc::response(
+                            &entry,
+                            plan.head,
+                            crate::wc::Status::Hit,
+                            std::time::SystemTime::now(),
+                            req_range.as_deref(),
+                        ));
+                    }
+                    crate::wc::Lookup::Stale(entry) => stale_entry = Some(entry),
+                    _ => {}
                 }
                 // Leader failed to store: fall through as an uncached
                 // request rather than blocking again.
@@ -1362,6 +1371,18 @@ async fn proxy_inner(
     }
     match handle_routed(state.clone(), peer, req, host.as_str(), &target, &mut metric).await {
         Ok(mut r) => {
+            if r.status().is_server_error() {
+                if let Some(entry) = &stale_entry {
+                    wc_metric("stale");
+                    return Ok(crate::wc::response(
+                        entry,
+                        cache_head,
+                        crate::wc::Status::Stale,
+                        now,
+                        req_range.as_deref(),
+                    ));
+                }
+            }
             if let Some((plan, req_headers, path)) = &cache {
                 r = cache_store(&state.wc, plan, req_headers, path, r, plan.head).await?;
             }
@@ -1403,6 +1424,16 @@ async fn proxy_inner(
             Ok(r)
         }
         Err(e) => {
+            if let Some(entry) = &stale_entry {
+                wc_metric("stale");
+                return Ok(crate::wc::response(
+                    entry,
+                    cache_head,
+                    crate::wc::Status::Stale,
+                    now,
+                    req_range.as_deref(),
+                ));
+            }
             metric.finish(None, e.metric_reason());
             // Platform-authored record (never tenant text); the hub
             // coalesces per (worker, code) and bounds everything, so a
@@ -1483,6 +1514,7 @@ async fn cache_store(
             body: bytes.clone(),
             stored_at: now,
             fresh_for: policy.ttl.unwrap_or_default(),
+            stale_for: policy.stale_for,
             no_cache: policy.no_cache,
             vary: crate::wc::vary_values(&policy.vary, req_headers),
             tags: policy.tags.clone(),

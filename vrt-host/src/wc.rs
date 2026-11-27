@@ -80,6 +80,9 @@ pub struct Entry {
     pub body: Bytes,
     pub stored_at: SystemTime,
     pub fresh_for: Duration,
+    /// How long past freshness a stale copy may still serve on upstream
+    /// error (`stale-if-error`; bounded to 24h, zero disables).
+    pub stale_for: Duration,
     /// `no-cache` stores the entry but never serves it without revalidation.
     pub no_cache: bool,
     /// Header names from `Vary` plus the request values captured at store.
@@ -139,6 +142,9 @@ pub fn key_plan(
 /// Result of a lookup.
 pub enum Lookup {
     Hit(Entry),
+    /// Past freshness but within the `stale-if-error` window; kept for a
+    /// possible fallback if the upstream fails.
+    Stale(Entry),
     /// Entry existed but is past its freshness window (and was dropped).
     Expired,
     Miss,
@@ -147,6 +153,7 @@ pub enum Lookup {
 /// Freshness/bypass decision for a response.
 pub struct Policy {
     pub ttl: Option<Duration>,
+    pub stale_for: Duration,
     pub no_cache: bool,
     pub vary: Vec<String>,
     pub tags: Vec<String>,
@@ -163,6 +170,7 @@ pub fn evaluate(
 ) -> Policy {
     let mut policy = Policy {
         ttl: None,
+        stale_for: Duration::ZERO,
         no_cache: false,
         vary: Vec::new(),
         tags: Vec::new(),
@@ -270,6 +278,12 @@ pub fn evaluate(
         // no-cache (never served without revalidation).
         policy.no_cache = true;
     }
+
+    // stale-if-error: default 24h unless a directive forbids stale
+    // (s-maxage/must-revalidate/proxy-revalidate); explicit 0 disables.
+    let stale_capped = !flag("s-maxage") && !flag("must-revalidate") && !flag("proxy-revalidate");
+    let stale_secs = secs("stale-if-error").unwrap_or(if stale_capped { 86_400 } else { 0 });
+    policy.stale_for = Duration::from_secs(stale_secs.min(86_400));
 
     // Cache Deception Armor: only for heuristic freshness (no explicit
     // Cache-Control/Expires), text/* or application/*, extension mismatch.
@@ -450,8 +464,14 @@ impl Store {
                 continue;
             }
             let age = now.duration_since(entry.stored_at).unwrap_or_default();
-            if entry.no_cache || age >= entry.fresh_for {
-                // Expired: drop and report (no serving of stale in phase 1).
+            if entry.no_cache {
+                inner.remove(&key);
+                return Lookup::Expired;
+            }
+            if age >= entry.fresh_for {
+                if age < entry.fresh_for + entry.stale_for {
+                    return Lookup::Stale(entry.clone());
+                }
                 inner.remove(&key);
                 return Lookup::Expired;
             }
@@ -916,6 +936,7 @@ mod tests {
             body: Bytes::from_static(b"x"),
             stored_at: now(),
             fresh_for: Duration::from_secs(60),
+            stale_for: Duration::ZERO,
             no_cache: true,
             vary: vec![],
             tags: vec![],
@@ -947,6 +968,7 @@ mod tests {
                 body: Bytes::from(accept.to_string()),
                 stored_at: now(),
                 fresh_for: Duration::from_secs(60),
+                stale_for: Duration::ZERO,
                 no_cache: false,
                 vary: vary_values(&p.vary, &req_h),
                 tags: p.tags,
@@ -963,6 +985,29 @@ mod tests {
     }
 
     #[test]
+    fn stale_window_keeps_then_drops() {
+        let store = Store::new();
+        let base = "t\u{1f}w\u{1f}v\u{1f}default\u{1f}/x?";
+        let mk = |stale_for: Duration| Entry {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: vec![],
+            body: Bytes::from_static(b"x"),
+            stored_at: now() - Duration::from_secs(2),
+            fresh_for: Duration::from_secs(1),
+            stale_for,
+            no_cache: false,
+            vary: vec![],
+            tags: vec![],
+            size: 0,
+        };
+        assert!(store.put(base, mk(Duration::from_secs(60))));
+        assert!(matches!(store.get(base, &HeaderMap::new(), now()), Lookup::Stale(_)));
+        assert!(store.put(base, mk(Duration::ZERO)));
+        assert!(matches!(store.get(base, &HeaderMap::new(), now()), Lookup::Expired));
+    }
+
+    #[test]
     fn purge_worker_is_tenant_scoped() {
         let store = Store::new();
         let put = |tenant: &str, worker: &str, path: &str| {
@@ -975,6 +1020,7 @@ mod tests {
                     body: Bytes::from_static(b"x"),
                     stored_at: now(),
                     fresh_for: Duration::from_secs(60),
+                    stale_for: Duration::ZERO,
                     no_cache: false,
                     vary: vec![],
                     tags: vec![],
@@ -1005,6 +1051,7 @@ mod tests {
                 body: Bytes::from_static(b"x"),
                 stored_at: now(),
                 fresh_for: Duration::from_secs(60),
+                stale_for: Duration::ZERO,
                 no_cache: false,
                 vary: vec![],
                 tags: vec![],
@@ -1069,6 +1116,7 @@ mod tests {
             body: Bytes::from_static(b"0123456789"),
             stored_at: now(),
             fresh_for: Duration::from_secs(60),
+            stale_for: Duration::ZERO,
             no_cache: false,
             vary: vec![],
             tags: vec![],
