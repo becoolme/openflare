@@ -1485,6 +1485,9 @@ async fn cache_store(
         },
     );
     wc_metric(if stored { "miss" } else { "bypass" });
+    let (entries, stored_bytes, _) = store.stats();
+    crate::metrics::registry().set("vrt_host_cache_entries", &[], entries as f64);
+    crate::metrics::registry().set("vrt_host_cache_bytes", &[], stored_bytes as f64);
     parts.headers.insert(
         "cf-cache-status",
         axum::http::HeaderValue::from_static(if stored { "MISS" } else { "BYPASS" }),

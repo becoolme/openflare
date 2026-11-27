@@ -34,6 +34,14 @@ pub fn registry() -> Arc<Registry> {
 
 fn declare_all(r: &Registry) {
     // ---- worker logs (no worker-id labels: bounded cardinality) ----
+    r.declare_gauge(
+        "vrt_host_cache_entries",
+        "Workers Cache entries stored on this pod.",
+    );
+    r.declare_gauge(
+        "vrt_host_cache_bytes",
+        "Workers Cache stored bytes on this pod.",
+    );
     r.declare_counter(
         "vrt_host_cache_lookups_total",
         "Workers Cache lookups by outcome (hit, miss, bypass).",
