@@ -1326,8 +1326,9 @@ async fn proxy_inner(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let cache_head = cache.as_ref().map(|(p, _, _)| p.head).unwrap_or(false);
+    let req_bypass = crate::wc::request_bypass(req.headers());
     if let Some((plan, headers, _)) = &cache {
-        if !crate::wc::request_bypass(headers) {
+        if !req_bypass {
         match state.wc.get(&plan.key, headers, now) {
             crate::wc::Lookup::Hit(entry) => {
                 wc_metric("hit");
@@ -1347,7 +1348,7 @@ async fn proxy_inner(
         match state.flights.enter(&plan.key) {
             crate::wc::FlightEntry::Follower(n) => {
                 crate::wc::Flights::wait(n, std::time::Duration::from_secs(10)).await;
-                if !crate::wc::request_bypass(headers) {
+                if !req_bypass {
                 match state.wc.get(&plan.key, headers, std::time::SystemTime::now()) {
                     crate::wc::Lookup::Hit(entry) => {
                         wc_metric("hit");
@@ -1388,7 +1389,16 @@ async fn proxy_inner(
                 }
             }
             if let Some((plan, req_headers, path)) = &cache {
-                r = cache_store(&state.wc, plan, req_headers, path, r, plan.head).await?;
+                r = cache_store(
+                    &state.wc,
+                    plan,
+                    req_headers,
+                    path,
+                    r,
+                    plan.head,
+                    req_bypass,
+                )
+                .await?;
             }
             // PREVIEW: a preview response is ALWAYS labelled, so a client
             // (or the app itself) can never mistake preview output for
@@ -1473,6 +1483,7 @@ async fn cache_store(
     path: &str,
     resp: Response,
     head: bool,
+    req_bypass: bool,
 ) -> Result<Response, IngressError> {
     use axum::http::header;
     let (mut parts, body) = resp.into_parts();
@@ -1525,13 +1536,25 @@ async fn cache_store(
             size: 0,
         },
     );
-    wc_metric(if stored { "miss" } else { "bypass" });
+    wc_metric(if req_bypass {
+        "bypass"
+    } else if stored {
+        "miss"
+    } else {
+        "bypass"
+    });
     let (entries, stored_bytes, _) = store.stats();
     crate::metrics::registry().set("vrt_host_cache_entries", &[], entries as f64);
     crate::metrics::registry().set("vrt_host_cache_bytes", &[], stored_bytes as f64);
     parts.headers.insert(
         "cf-cache-status",
-        axum::http::HeaderValue::from_static(if stored { "MISS" } else { "BYPASS" }),
+        axum::http::HeaderValue::from_static(if req_bypass {
+            "BYPASS"
+        } else if stored {
+            "MISS"
+        } else {
+            "BYPASS"
+        }),
     );
     parts.headers.remove("cache-tag");
     let body = if head { Body::empty() } else { body_or_bytes(bytes) };

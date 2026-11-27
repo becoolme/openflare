@@ -120,6 +120,9 @@ async fn purge(State(state): State<AdminState>, headers: HeaderMap, req: Json<Pu
     } else {
         state.store.purge_all(&req.tenant_id)
     };
+    let (entries, stored_bytes, _) = state.store.stats();
+    crate::metrics::registry().set("vrt_host_cache_entries", &[], entries as f64);
+    crate::metrics::registry().set("vrt_host_cache_bytes", &[], stored_bytes as f64);
     (StatusCode::OK, Json(serde_json::json!({ "purged": purged }))).into_response()
 }
 
