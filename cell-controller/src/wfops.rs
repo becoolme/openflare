@@ -641,6 +641,7 @@ pub async fn wfops_tick(
     cache_exec: Option<&crate::cachepurge::CachePurgeExecutor>,
     kv_exec: Option<&crate::kvops::KvOpsExecutor>,
     r2_exec: Option<&crate::r2ops::R2OpsExecutor>,
+    queue_exec: Option<&crate::queueops::QueueOpsExecutor>,
     seen: &mut crate::execset::SeenSet,
     executed: &mut ExecutedSet,
     desired: Option<&snapshot_protocol::compute_desired::ComputeDesired>,
@@ -720,6 +721,12 @@ pub async fn wfops_tick(
                 // R2 data ops — shared R2 backend executor; never the
                 // wf fallback (which would FAIL the unknown kind).
                 k if crate::r2ops::is_r2_kind(k) => match r2_exec {
+                    Some(x) => x.execute(op).await,
+                    None => continue,
+                },
+                // Q-PUB: control-plane queue publish — signed vrt-sql
+                // send with deterministic ids; never the wf fallback.
+                k if crate::queueops::is_queueop_kind(k) => match queue_exec {
                     Some(x) => x.execute(op).await,
                     None => continue,
                 },
