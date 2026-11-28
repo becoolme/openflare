@@ -400,6 +400,13 @@ impl QueueSqlClient {
         .map(|_| ())
     }
 
+    /// Control-plane publish path (Q-PUB): same signed `send` as the
+    /// DLQ forward — the op executor owns id/shape validation, this is
+    /// the transport only.
+    pub async fn send_for_op(&self, queue_id: &str, body: &serde_json::Value) -> Result<(), SqlCallError> {
+        self.call(queue_id, "send", body).await.map(|_| ())
+    }
+
     /// DLQ forwarding enqueue (same original msg id => idempotent).
     async fn dlq_send(&self, dlq_queue_id: &str, msgs: &[&PendingMsg]) -> Result<(), SqlCallError> {
         let body = serde_json::json!({

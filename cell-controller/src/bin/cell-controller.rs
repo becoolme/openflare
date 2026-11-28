@@ -497,6 +497,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         b as std::sync::Arc<dyn vrt_provider::r2::R2DataBackend>,
                     )
                 });
+            // Q-PUB: publish executor shares the dispatcher's signed
+            // vrt-sql client shape; built independently so a missing
+            // [d1sql] disables publish exactly as it disables consume.
+            let queue_exec = d1cfg_cell.as_ref().and_then(|d1c| {
+                vrt_securefs::load_service_secret(
+                    std::path::Path::new(&d1c.auth_secret_file),
+                    vrt_securefs::SecretPurpose::ServiceHmac,
+                )
+                .ok()
+                .and_then(|sec| {
+                    cell_controller::queue_dispatch::QueueSqlClient::new(
+                        &d1c.endpoint,
+                        sec.into_bytes(),
+                        std::time::Duration::from_secs(d1c.timeout_secs.max(1)),
+                    )
+                    .ok()
+                })
+                .map(cell_controller::queueops::QueueOpsExecutor::new)
+            });
             if wf_exec.is_none()
                 && d1_exec.is_none()
                 && storage_purge_exec.is_none()
@@ -542,6 +561,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     cache_purge_exec.as_deref(),
                     kv_exec.as_ref(),
                     r2_exec.as_ref(),
+                    queue_exec.as_ref(),
                     &mut seen,
                     &mut executed,
                     desired.as_ref(),

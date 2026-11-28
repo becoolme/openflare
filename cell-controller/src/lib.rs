@@ -45,6 +45,7 @@ pub mod metrics;
 pub mod pod;
 pub mod prod;
 pub mod queue_dispatch;
+pub mod queueops;
 pub mod report;
 pub mod retry;
 pub mod source;
