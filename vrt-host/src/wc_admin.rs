@@ -148,6 +148,7 @@ mod tests {
                 stored_at: SystemTime::now(),
                 fresh_for: Duration::from_secs(60),
                 stale_for: Duration::ZERO,
+                swr_for: Duration::ZERO,
                 no_cache: false,
                 vary: vec![],
                 tags: vec!["page".into()],
