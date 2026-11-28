@@ -42,7 +42,7 @@ not copied; this does not affect runtime behavior.
 | facade/loader/python-snapshot.ts | a69bc46cd34708e1b57848f60fde07d51b2a331f5c9ed5e5c23067a57bd8d292 |
 | facade/loader/shared.ts | 0bcc1aef30a74df9d90237e4d2ef8276ab346bb0645207575746d9a0dd9feca5 |
 | facade/loader/snapshot.ts | 61cb57e3b0295e97d078553a321a5c3c6c88aeda66cdfb228de62fcb9cdb885b |
-| facade/r2/native-adapter.ts | c76662432f27af9df7b333e8399737590485a547828eec3469759043b6103eae |
+| facade/r2/native-adapter.ts | f7798bc303b0cfe2076115064d9a53ff4139f5d0fb5b8de214a20a7aa058ceb0 |
 | facade/r2/protocol.d.ts | 6ba944f8a412ecb0862cfc28f09aac58a3cacbd3366d32cfb4adf55f53303411 |
 | facade/r2/transport.ts | 57807485b32d145439c8ff563a67c708d44833c7d686c241851d0b82ba26186a |
 | facade/r2/validation.ts | 9ae80f5607a29493d0f776d2d243bad2b127569e3a74908d055e39d29a189d84 |
@@ -51,10 +51,22 @@ not copied; this does not affect runtime behavior.
 
 ## Local modifications
 
-**None.** The vendored files are byte-identical to upstream. All platform
-adaptation (props -> identity headers, the `BINDING_BACKEND` wrapper, the
-assets/pg transports, the module manifest) lives in the repository's own
-`facade/` layer and never edits files in this directory.
+One documented patch; everything else is byte-identical to upstream.
+
+- `facade/r2/native-adapter.ts`, multipart `complete`: upstream strips the
+  HTTP and custom metadata fields out of the `completeMultipartUpload`
+  result (its comment notes Cloudflare's `complete()` omits them). The
+  vendored copy instead passes the stored values through, because workerd
+  parses the `complete()` result through the same non-list metadata path as
+  `head`/`put` (`r2-multipart.c++`, `r2-bucket.c++`) and Cloudflare documents
+  the result as a full `R2Object` with non-optional
+  `httpMetadata`/`customMetadata` — stripping them would force callers to
+  re-read the object. The rest of the file is unmodified.
+
+All other platform adaptation (props -> identity headers, the
+`BINDING_BACKEND` wrapper, the assets/pg transports, the module manifest)
+lives in the repository's own `facade/` layer and does not edit files in
+this directory.
 
 ## Updating
 
@@ -64,8 +76,8 @@ assets/pg transports, the module manifest) lives in the repository's own
    removed, recompute the import closure first
    (`facade/tools/gen-manifest.mjs` fails on any missing module).
 3. Recompute the sha256 column (`shasum -a 256 facade/**/*.ts` in this
-   directory) and update the pinned commit above. List any local patch here
-   (currently none).
+   directory) and update the pinned commit above. List any local patch in the
+   "Local modifications" section above.
 4. Regenerate `facade/{dist/,manifest.json}`
    (`cd facade && node tools/gen-manifest.mjs`), then run
    `cd facade && node --test`,
