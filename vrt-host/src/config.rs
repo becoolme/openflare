@@ -103,6 +103,11 @@ pub struct HostConfig {
     /// `caches.*` throws `No Cache was configured` (explicit).
     #[serde(default)]
     pub cache: Option<CacheConfig>,
+    /// A4: `[cacheUpper]` — optional cross-pod Workers Cache tier
+    /// (Redis/Kvrocks). Presence + a non-empty URL env enables it; absent or
+    /// unreachable ⇒ local-only (fail open, never a fake hit).
+    #[serde(default)]
+    pub cache_upper: Option<CacheUpperConfig>,
     /// T13/M2: `[isolation]` — per-tenant uid/gid process isolation.
     /// Presence enables `Assembler::with_isolation`: tenant workerd
     /// children setuid to `vrt_securefs::tenant_uid(base, span,
@@ -534,6 +539,28 @@ pub struct IsolationConfig {
     pub base: u32,
     /// Range size — uids are `[base, base + span)`.
     pub span: u32,
+}
+
+/// A4: shared upper cache tier wiring. The URL itself comes from the process
+/// env named by `url_env` (never the config file), mirroring the secret
+/// convention: a missing/empty env or an unreachable backend disables the
+/// upper tier and the host serves local-only.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CacheUpperConfig {
+    /// Env var holding the Redis/Kvrocks URL (default `VRT_CACHE_UPPER_URL`).
+    #[serde(default = "default_cache_upper_url_env")]
+    pub url_env: String,
+    /// Per-command timeout in milliseconds (default 500).
+    #[serde(default = "default_cache_upper_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_cache_upper_url_env() -> String {
+    "VRT_CACHE_UPPER_URL".to_string()
+}
+fn default_cache_upper_timeout_ms() -> u64 {
+    500
 }
 
 /// C1: `[cache]` capacity contract — in-memory LRU bounds. Presence

@@ -17,10 +17,16 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use http::HeaderMap;
+use base64::Engine as _;
+use bytes::Bytes;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Version};
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::wc::{Entry, Lookup};
 
@@ -239,6 +245,323 @@ fn same_variant(a: &Entry, b: &Entry) -> bool {
             .all(|(n, v)| b.vary.iter().any(|(bn, bv)| bn == n && bv == v))
 }
 
+
+/// One stored entry on the shared wire (body base64; metadata JSON). Kept
+/// explicit so a future adapter (Redis/Kvrocks) can evolve the encoding
+/// without touching the `Entry` type.
+#[derive(Debug, Serialize, Deserialize)]
+struct SharedRecord {
+    status: u16,
+    version: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+    stored_at_ms: u64,
+    fresh_for_ms: u64,
+    stale_for_ms: u64,
+    swr_for_ms: u64,
+    no_cache: bool,
+    vary: Vec<(String, Option<String>)>,
+    tags: Vec<String>,
+}
+
+impl From<&Entry> for SharedRecord {
+    fn from(entry: &Entry) -> Self {
+        Self {
+            status: entry.status.as_u16(),
+            version: match entry.version {
+                Version::HTTP_10 => 10,
+                Version::HTTP_2 => 2,
+                Version::HTTP_3 => 3,
+                _ => 11,
+            },
+            headers: entry
+                .headers
+                .iter()
+                .filter_map(|(n, v)| {
+                    Some((n.as_str().to_string(), v.to_str().ok()?.to_string()))
+                })
+                .collect(),
+            body: base64::engine::general_purpose::STANDARD.encode(&entry.body),
+            stored_at_ms: entry
+                .stored_at
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            fresh_for_ms: entry.fresh_for.as_millis() as u64,
+            stale_for_ms: entry.stale_for.as_millis() as u64,
+            swr_for_ms: entry.swr_for.as_millis() as u64,
+            no_cache: entry.no_cache,
+            vary: entry.vary.clone(),
+            tags: entry.tags.clone(),
+        }
+    }
+}
+
+impl SharedRecord {
+    fn into_entry(self) -> Option<Entry> {
+        let status = StatusCode::from_u16(self.status).ok()?;
+        let version = match self.version {
+            10 => Version::HTTP_10,
+            2 => Version::HTTP_2,
+            3 => Version::HTTP_3,
+            _ => Version::HTTP_11,
+        };
+        let headers = self
+            .headers
+            .into_iter()
+            .filter_map(|(n, v)| {
+                Some((
+                    HeaderName::from_bytes(n.as_bytes()).ok()?,
+                    HeaderValue::from_str(&v).ok()?,
+                ))
+            })
+            .collect();
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(self.body.as_bytes())
+            .ok()?;
+        Some(Entry {
+            status,
+            version,
+            headers,
+            body: Bytes::from(body),
+            stored_at: UNIX_EPOCH + Duration::from_millis(self.stored_at_ms),
+            fresh_for: Duration::from_millis(self.fresh_for_ms),
+            stale_for: Duration::from_millis(self.stale_for_ms),
+            swr_for: Duration::from_millis(self.swr_for_ms),
+            no_cache: self.no_cache,
+            vary: self.vary,
+            tags: self.tags,
+            size: 0,
+        })
+    }
+}
+
+/// Stable per-variant hash (the response's captured Vary pairs). No Vary
+/// entries share the `default` field.
+fn variant_field(entry: &Entry) -> String {
+    if entry.vary.is_empty() {
+        return "default".to_string();
+    }
+    let mut pairs = entry.vary.clone();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = Sha256::new();
+    for (name, value) in &pairs {
+        h.update(name.as_bytes());
+        h.update(b"\0");
+        match value {
+            Some(v) => h.update(v.as_bytes()),
+            None => h.update(b"\x01"),
+        };
+        h.update(b"\x1f");
+    }
+    hex::encode(h.finalize())
+}
+
+fn redis_key(base: &str) -> String {
+    format!("vrt:wc:{base}")
+}
+fn tag_key(tenant: &str, tag: &str) -> String {
+    format!("vrt:wc:tag:{tenant}:{tag}")
+}
+fn base_of_key(key: &str) -> &str {
+    key.strip_prefix("vrt:wc:").unwrap_or(key)
+}
+
+/// Redis/Kvrocks shared tier: one Redis hash per base key (field = variant),
+/// a tag SET per (tenant, tag), bounded commands with a timeout. Any command
+/// error/timeout surfaces as `SharedError` and the ingress degrades locally.
+pub struct RedisSharedTier {
+    conn: ConnectionManager,
+    timeout: Duration,
+}
+
+impl RedisSharedTier {
+    pub async fn connect(url: &str, timeout_ms: u64) -> Result<Self, SharedError> {
+        let client = redis::Client::open(url).map_err(|e| SharedError(e.to_string()))?;
+        let conn = client
+            .get_connection_manager()
+            .await
+            .map_err(|e| SharedError(e.to_string()))?;
+        Ok(Self {
+            conn,
+            timeout: Duration::from_millis(timeout_ms.max(1)),
+        })
+    }
+
+    async fn cmd<F, T>(&self, future: F) -> Result<T, SharedError>
+    where
+        F: std::future::Future<Output = redis::RedisResult<T>>,
+    {
+        match tokio::time::timeout(self.timeout, future).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(SharedError(error.to_string())),
+            Err(_) => Err(SharedError("redis command timed out".to_string())),
+        }
+    }
+
+    async fn keys_with_prefix(&self, tenant: &str) -> Result<Vec<String>, SharedError> {
+        let pattern = format!("vrt:wc:{tenant}\u{1f}*");
+        let mut cursor = "0".to_string();
+        let mut out = Vec::new();
+        loop {
+            let mut conn = self.conn.clone();
+            let (next, batch): (String, Vec<String>) = self
+                .cmd(
+                    redis::cmd("SCAN")
+                        .arg(&cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(500)
+                        .query_async(&mut conn),
+                )
+                .await?;
+            out.extend(batch);
+            if next == "0" {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(out)
+    }
+
+    async fn delete_keys(&self, keys: &[String]) -> Result<usize, SharedError> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.clone();
+        let _: () = self
+            .cmd(redis::cmd("DEL").arg(keys).query_async(&mut conn))
+            .await?;
+        Ok(keys.len())
+    }
+
+    async fn delete_matching(
+        &self,
+        tenant: &str,
+        pred: impl Fn(&str) -> bool,
+    ) -> Result<usize, SharedError> {
+        let keys = self.keys_with_prefix(tenant).await?;
+        let keys: Vec<String> = keys
+            .into_iter()
+            .filter(|k| pred(base_of_key(k)))
+            .collect();
+        self.delete_keys(&keys).await
+    }
+}
+
+#[async_trait]
+impl SharedTier for RedisSharedTier {
+    async fn get(
+        &self,
+        base: &str,
+        req: &HeaderMap,
+        now: SystemTime,
+    ) -> Result<Option<Entry>, SharedError> {
+        let mut conn = self.conn.clone();
+        let map: HashMap<String, String> = self.cmd(conn.hgetall(redis_key(base))).await?;
+        for raw in map.values() {
+            let Ok(record) = serde_json::from_str::<SharedRecord>(raw) else {
+                continue;
+            };
+            let Some(entry) = record.into_entry() else {
+                continue;
+            };
+            if entry_expired(&entry, now) {
+                continue;
+            }
+            if entry_matches(&entry, req) {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn put(&self, base: &str, entry: &Entry) -> Result<(), SharedError> {
+        let key = redis_key(base);
+        let field = variant_field(entry);
+        let value =
+            serde_json::to_string(&SharedRecord::from(entry)).map_err(|e| SharedError(e.to_string()))?;
+        let ttl = (entry.fresh_for + entry.stale_for.max(entry.swr_for))
+            .as_millis()
+            .max(1) as i64;
+        // One round trip: metadata + TTL + every tag-index membership. A
+        // response may carry up to MAX_TAGS tags; per-tag commands would make
+        // a single store cost thousands of round trips.
+        let mut pipe = redis::pipe();
+        pipe.hset_multiple(&key, &[(field.as_str(), value.as_str())])
+            .ignore();
+        pipe.pexpire(&key, ttl).ignore();
+        if let Some(tenant) = base.split('\u{1f}').next() {
+            for tag in &entry.tags {
+                pipe.sadd(tag_key(tenant, &tag.to_ascii_lowercase()), key.as_str())
+                    .ignore();
+            }
+        }
+        let mut conn = self.conn.clone();
+        let _: () = self.cmd(pipe.query_async(&mut conn)).await?;
+        Ok(())
+    }
+
+    async fn purge_worker(&self, tenant: &str, worker: &str) -> Result<usize, SharedError> {
+        let prefix = format!("{tenant}\u{1f}{worker}\u{1f}");
+        self.delete_matching(tenant, |base| base.starts_with(&prefix))
+            .await
+    }
+
+    async fn purge_tags(&self, tenant: &str, tags: &[String]) -> Result<usize, SharedError> {
+        let want: Vec<String> = tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+        let mut removed = 0usize;
+        for tag in &want {
+            let idx = tag_key(tenant, tag);
+            let mut conn = self.conn.clone();
+            let members: Vec<String> = self.cmd(conn.smembers(&idx)).await?;
+            for key in members {
+                let mut conn = self.conn.clone();
+                let map: HashMap<String, String> = self.cmd(conn.hgetall(&key)).await?;
+                let mut fields = Vec::new();
+                for (field, raw) in &map {
+                    let Ok(record) = serde_json::from_str::<SharedRecord>(raw) else {
+                        continue;
+                    };
+                    if record
+                        .tags
+                        .iter()
+                        .any(|t| want.iter().any(|w| w == &t.to_ascii_lowercase()))
+                    {
+                        fields.push(field.clone());
+                    }
+                }
+                if !fields.is_empty() {
+                    removed += fields.len();
+                    let mut conn = self.conn.clone();
+                    let _: () = self.cmd(conn.hdel(&key, fields)).await?;
+                }
+                let mut conn = self.conn.clone();
+                let remaining: usize = self.cmd(conn.hlen(&key)).await?;
+                if remaining == 0 {
+                    let mut conn = self.conn.clone();
+                    let _: () = self.cmd(conn.del(&key)).await?;
+                }
+            }
+            let mut conn = self.conn.clone();
+            let _: () = self.cmd(conn.del(&idx)).await?;
+        }
+        Ok(removed)
+    }
+
+    async fn purge_prefix(&self, tenant: &str, prefix: &str) -> Result<usize, SharedError> {
+        self.delete_matching(tenant, |base| {
+            key_path(base).is_some_and(|p| p.starts_with(prefix))
+        })
+        .await
+    }
+
+    async fn purge_all(&self, tenant: &str) -> Result<usize, SharedError> {
+        self.delete_matching(tenant, |_| true).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,4 +638,44 @@ mod tests {
         assert!(entry_expired(&e, SystemTime::now()));
         assert!(matches!(classify_entry(e, SystemTime::now()), Lookup::Expired));
     }
+    #[test]
+    fn shared_record_roundtrip() {
+        let mut e = entry();
+        e.headers = vec![(
+            HeaderName::from_static("x-a"),
+            HeaderValue::from_static("b"),
+        )];
+        e.body = Bytes::from_static(b"hello");
+        e.vary = vec![("x-v".to_string(), Some("a".to_string()))];
+        let back = SharedRecord::from(&e).into_entry().unwrap();
+        assert_eq!(back.status, e.status);
+        assert_eq!(back.body, e.body);
+        assert_eq!(back.vary, e.vary);
+        assert_eq!(back.tags, e.tags);
+        assert_eq!(back.headers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redis_roundtrip_when_configured() {
+        let Ok(url) = std::env::var("VRT_TEST_REDIS_URL") else {
+            return;
+        };
+        let tier = RedisSharedTier::connect(&url, 1_000).await.unwrap();
+        let tenant = format!("rt-{}", std::process::id());
+        let worker = "w";
+        let base = format!("{tenant}\u{1f}{worker}\u{1f}v\u{1f}default\u{1f}/rt?");
+        tier.put(&base, &entry()).await.unwrap();
+        assert!(tier
+            .get(&base, &HeaderMap::new(), SystemTime::now())
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(tier.purge_worker(&tenant, worker).await.unwrap(), 1);
+        assert!(tier
+            .get(&base, &HeaderMap::new(), SystemTime::now())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
 }
