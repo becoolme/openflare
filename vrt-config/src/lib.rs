@@ -18,6 +18,7 @@
 //!   materialization contract (`embeds`, `external_addrs`).
 
 pub mod bundle;
+pub mod cachectl;
 mod canonical;
 pub mod capnp;
 pub mod check;
@@ -39,8 +40,8 @@ pub use capnp::{
     ensure_quotas_enforceable, render_tenant_config, resolve_secret, resolve_tenant_env,
     resolve_var, secret_env_name, EmbedKind, EmbedRef, ExternalAddr, FacadeRefs, RenderedConfig,
     RuntimeParams, SecretValue, ServiceEndpoint, SystemBinding, SystemDiskService, SystemModuleRef,
-    SystemOutbound, SystemWorkerRef, TenantRenderInput, BINDING_BACKEND_SERVICE, BUNDLE_DIR_PREFIX, CACHE_SERVICE,
-    MAX_VALUE_LEN, OUTBOUND_NETWORK_SERVICE, SYS_DIR_PREFIX,
+    SystemOutbound, SystemWorkerRef, TenantRenderInput, BINDING_BACKEND_SERVICE, BUNDLE_DIR_PREFIX,
+    CACHE_SERVICE, MAX_VALUE_LEN, OUTBOUND_NETWORK_SERVICE, SYS_DIR_PREFIX,
 };
 pub use compat_flags::{is_experimental_compat_flag, is_tenant_allowed_compat_flag};
 pub use egress::{EgressAllowEntry, EgressNameRule, EgressPolicy, EGRESS_POLICY_BINDING};

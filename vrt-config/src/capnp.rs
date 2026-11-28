@@ -863,6 +863,14 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         emit_secrets_store_service(&mut out, worker, input)?;
     }
 
+    // Workers Cache: per-worker `ctx.cache` control shims. The tenant
+    // binding referencing them is emitted with the worker surface.
+    for worker in &input.tenant.workers {
+        if cache_enabled(worker) {
+            emit_cachectl_shim(&mut out, worker, input);
+        }
+    }
+
     let mut systems: Vec<&SystemWorkerRef> = input
         .params
         .system_workers
@@ -884,8 +892,7 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
     // read-only file trees (e.g. the kitesurf `public/` payload) served
     // by workerd's DiskDirectory HTTP surface. `writable` stays unset:
     // the payload is image-owned and immutable.
-    let mut disk_services: Vec<&SystemDiskService> =
-        input.params.disk_services.iter().collect();
+    let mut disk_services: Vec<&SystemDiskService> = input.params.disk_services.iter().collect();
     disk_services.sort_by(|a, b| utf16_cmp(&a.service_name, &b.service_name));
     for disk in disk_services {
         out.push_str(&format!(
@@ -970,6 +977,16 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
         out.push_str(&format!(
             "    (name = {}, external = (http = ())),\n",
             capnp_text(CACHE_SERVICE)
+        ));
+    }
+    // Workers Cache: the per-worker `vrt-cachectl-*` shims forward to the
+    // host's private control listener. Emitted only when a cache-enabled
+    // worker exists and the host configured that listener.
+    let any_cache_facade = input.tenant.workers.iter().any(cache_enabled);
+    if any_cache_facade && !input.params.wf_delete_addr.is_empty() {
+        out.push_str(&format!(
+            "    (name = {}, external = (http = ())),\n",
+            capnp_text(crate::cachectl::DEL_SERVICE)
         ));
     }
     // AE: one `external` service per DISTINCT dataset name — workerd
@@ -1120,6 +1137,12 @@ pub fn render_tenant_config(input: &TenantRenderInput<'_>) -> Result<RenderedCon
                     address: input.params.cache_addr.clone(),
                 });
             }
+            if any_cache_facade && !input.params.wf_delete_addr.is_empty() {
+                v.push(ExternalAddr {
+                    service: crate::cachectl::DEL_SERVICE.into(),
+                    address: input.params.wf_delete_addr.clone(),
+                });
+            }
             for ds in ae_datasets(input.tenant) {
                 v.push(ExternalAddr {
                     service: ds.to_string(),
@@ -1179,6 +1202,9 @@ fn emit_worker_surface(
     // divergent `env:<name>` mapping or an unresolvable ref is a
     // per-worker fault, not a render-fatal one).
     emit_secrets_store_service(out, worker, input)?;
+    if cache_enabled(worker) {
+        emit_cachectl_shim(out, worker, input);
+    }
     emit_worker_sockets(out, worker, input);
     Ok(())
 }
@@ -1421,7 +1447,10 @@ fn emit_tenant_worker(
     // workflow class may shadow the `VrtWaituntilProbe` entrypoint
     // (fail closed, per-worker — the dry-run surface converts this to
     // a skipped worker, never a poisoned sibling).
-    let wu_wrap = !input.params.waituntil_socket.is_empty();
+    // The wrapper is also the `ctx.cache` injection point, so emit it when
+    // any worker enables caching even if this host has no waitUntil probe.
+    let wu_wrap =
+        !input.params.waituntil_socket.is_empty() || input.tenant.workers.iter().any(cache_enabled);
     if wu_wrap {
         for m in &modules {
             if m.name() == crate::waituntil::ENTRY_MODULE
@@ -1486,6 +1515,15 @@ fn emit_tenant_worker(
     out.push_str("      bindings = [\n");
     for binding in &worker.bindings {
         emit_binding(out, binding, worker, input, env)?;
+    }
+    // Workers Cache: the wrapper attaches `ctx.cache` when this binding is
+    // present; the shim owns the token/scope and the host gate.
+    if cache_enabled(worker) {
+        out.push_str(&format!(
+            "        (name = {}, service = {}),\n",
+            capnp_text(crate::cachectl::SHIM_BINDING),
+            capnp_text(&crate::cachectl::shim_service_name(&worker.worker_id)),
+        ));
     }
     // W1: `env.<binding>` — workerd `wrapped` binding whose inner
     // `binding` service points at this workflow's engine service and
@@ -1697,11 +1735,7 @@ fn emit_binding(
 ) -> Result<(), ConfigError> {
     match binding {
         BindingDesired::Var(var) => {
-            let value = resolve_var(
-                &input.params.vars,
-                &input.tenant.tenant_id,
-                &var.var_ref,
-            )?;
+            let value = resolve_var(&input.params.vars, &input.tenant.tenant_id, &var.var_ref)?;
             out.push_str(&format!(
                 "        (name = {}, text = {}),\n",
                 capnp_text(&var.name),
@@ -2504,8 +2538,7 @@ fn emit_system_worker(
         .chain(system.compatibility_flags.iter().map(|f| f.as_str()))
         .filter(|flag| seen_flags.insert(*flag))
         .collect();
-    let system_flags =
-        crate::compat_flags::flags_for_compat_date(merged_flags, compat_date);
+    let system_flags = crate::compat_flags::flags_for_compat_date(merged_flags, compat_date);
     if !system_flags.is_empty() {
         out.push_str(&format!(
             "      compatibilityFlags = [{}],\n",
@@ -3111,6 +3144,43 @@ fn emit_workflow_engine(
     Ok(())
 }
 
+/// Workers Cache: whether a worker's version enables the entrypoint cache.
+fn cache_enabled(worker: &WorkerDesired) -> bool {
+    worker.cache.as_ref().is_some_and(|c| c.enabled)
+}
+
+/// Workers Cache: emit the per-worker `vrt-cachectl-<workerId>` shim that
+/// backs `ctx.cache.purge()`. The scope is platform-injected; the token is a
+/// `fromEnvironment` binding (never in the config text); the host address is
+/// the same private control listener as `vrt-cachedel`. Internal only:
+/// no socket, deny-all outbound — tenant ingress can never reach it.
+fn emit_cachectl_shim(out: &mut String, worker: &WorkerDesired, input: &TenantRenderInput<'_>) {
+    let scope = serde_json::json!({
+        "tenantId": input.tenant.tenant_id,
+        "workerId": worker.worker_id,
+    });
+    let mut bindings = format!(
+        "        (name = \"VRT_CACHE_SCOPE\", json = {}),\n        (name = \"VRT_CACHE_TOKEN\", fromEnvironment = {}),\n",
+        capnp_text(&scope.to_string()),
+        capnp_text(crate::cachectl::TOKEN_ENV),
+    );
+    if !input.params.wf_delete_addr.is_empty() {
+        bindings.push_str(&format!(
+            "        (name = \"VRT_CACHEDEL\", service = {}),\n",
+            capnp_text(crate::cachectl::DEL_SERVICE),
+        ));
+    }
+    out.push_str(&format!(
+        "    (name = {},\n      worker = (\n      compatibilityDate = {},\n      modules = [\n        (name = \"cachectl.mjs\", esModule = {}),\n      ],\n      bindings = [\n{}      ],\n      globalOutbound = (name = {}, entrypoint = {}),\n    )),\n",
+        capnp_text(&crate::cachectl::shim_service_name(&worker.worker_id)),
+        capnp_text(&input.params.system_compat_date),
+        capnp_text(crate::cachectl::SHIM_JS),
+        bindings,
+        capnp_text(&input.params.deny_outbound.service),
+        capnp_text(&input.params.deny_outbound.entrypoint),
+    ));
+}
+
 /// W6-r2: emit the per-worker `vrt-wf-loopback-<workerId>` shim —
 /// answers the vendored engine's MINIFLARE_LOOPBACK calls by
 /// forwarding `DELETE`/`waitForPendingDelete` to the host's
@@ -3246,10 +3316,7 @@ fn secrets_store_service_name(worker_id: &str) -> String {
 /// (T13/M6, same rule as [`resolve_secret`]): a ref in another
 /// tenant's namespace never resolves.
 pub fn resolve_var<'m>(
-    vars: &'m std::collections::BTreeMap<
-        String,
-        std::collections::BTreeMap<String, String>,
-    >,
+    vars: &'m std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     tenant_id: &str,
     var_ref: &str,
 ) -> Result<&'m str, ConfigError> {
@@ -3309,8 +3376,7 @@ pub fn resolve_tenant_env(
                         // Same secret_name via two bindings shares the
                         // env slot — the render already refused
                         // divergent refs for one name.
-                        std::collections::btree_map::Entry::Occupied(o)
-                            if o.get() == value => {}
+                        std::collections::btree_map::Entry::Occupied(o) if o.get() == value => {}
                         std::collections::btree_map::Entry::Occupied(_) => {
                             return Err(ConfigError::Identifier("secretEnv"));
                         }
