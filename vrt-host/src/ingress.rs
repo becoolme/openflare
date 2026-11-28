@@ -1335,7 +1335,7 @@ async fn proxy_inner(
         .map(str::to_string);
     let cache_head = cache.as_ref().map(|(p, _, _)| p.head).unwrap_or(false);
     let req_bypass = crate::wc::request_bypass(req.headers());
-    if let Some((plan, headers, _)) = &cache {
+    if let Some((plan, headers, path)) = &cache {
         if !req_bypass {
         match state.wc.get(&plan.key, headers, now) {
             crate::wc::Lookup::Hit(entry) => {
@@ -1344,6 +1344,56 @@ async fn proxy_inner(
                     &entry,
                     plan.head,
                     crate::wc::Status::Hit,
+                    now,
+                    req_range.as_deref(),
+                ));
+            }
+            crate::wc::Lookup::Updating(entry) => {
+                // Serve the stale copy now; refresh it once per key in the background
+                // (single-flight). Followers share the in-flight refresh and still get
+                // the stored copy immediately.
+                if let crate::wc::FlightEntry::Leader(guard) = state.flights.enter(&plan.key) {
+                    let bg_state = state.clone();
+                    let mut bg_req = clone_get(&req);
+                    if plan.head {
+                        *bg_req.method_mut() = Method::GET;
+                    }
+                    let bg_host = host.clone();
+                    let bg_target = target.clone();
+                    let bg_plan = plan.clone();
+                    let bg_headers = headers.clone();
+                    let bg_path = path.clone();
+                    tokio::spawn(async move {
+                        let mut m = crate::metrics::RequestMetric::begin(&bg_target.worker_id);
+                        if let Ok(r) = handle_routed(
+                            bg_state.clone(),
+                            peer,
+                            bg_req,
+                            &bg_host,
+                            &bg_target,
+                            &mut m,
+                        )
+                        .await
+                        {
+                            let _ = cache_store(
+                                &bg_state.wc,
+                                &bg_plan,
+                                &bg_headers,
+                                &bg_path,
+                                r,
+                                bg_plan.head,
+                                false,
+                            )
+                            .await;
+                        }
+                        drop(guard);
+                    });
+                }
+                wc_metric("updating");
+                return Ok(crate::wc::response(
+                    &entry,
+                    plan.head,
+                    crate::wc::Status::Updating,
                     now,
                     req_range.as_deref(),
                 ));
@@ -1365,6 +1415,56 @@ async fn proxy_inner(
                             plan.head,
                             crate::wc::Status::Hit,
                             std::time::SystemTime::now(),
+                            req_range.as_deref(),
+                        ));
+                    }
+                    crate::wc::Lookup::Updating(entry) => {
+                        // Serve the stale copy now; refresh it once per key in the background
+                        // (single-flight). Followers share the in-flight refresh and still get
+                        // the stored copy immediately.
+                        if let crate::wc::FlightEntry::Leader(guard) = state.flights.enter(&plan.key) {
+                            let bg_state = state.clone();
+                            let mut bg_req = clone_get(&req);
+                            if plan.head {
+                                *bg_req.method_mut() = Method::GET;
+                            }
+                            let bg_host = host.clone();
+                            let bg_target = target.clone();
+                            let bg_plan = plan.clone();
+                            let bg_headers = headers.clone();
+                            let bg_path = path.clone();
+                            tokio::spawn(async move {
+                                let mut m = crate::metrics::RequestMetric::begin(&bg_target.worker_id);
+                                if let Ok(r) = handle_routed(
+                                    bg_state.clone(),
+                                    peer,
+                                    bg_req,
+                                    &bg_host,
+                                    &bg_target,
+                                    &mut m,
+                                )
+                                .await
+                                {
+                                    let _ = cache_store(
+                                        &bg_state.wc,
+                                        &bg_plan,
+                                        &bg_headers,
+                                        &bg_path,
+                                        r,
+                                        bg_plan.head,
+                                        false,
+                                    )
+                                    .await;
+                                }
+                                drop(guard);
+                            });
+                        }
+                        wc_metric("updating");
+                        return Ok(crate::wc::response(
+                            &entry,
+                            plan.head,
+                            crate::wc::Status::Updating,
+                            now,
                             req_range.as_deref(),
                         ));
                     }
@@ -1538,6 +1638,7 @@ async fn cache_store(
             stored_at: now,
             fresh_for: policy.ttl.unwrap_or_default(),
             stale_for: policy.stale_for,
+            swr_for: policy.swr_for,
             no_cache: policy.no_cache,
             vary: crate::wc::vary_values(&policy.vary, req_headers),
             tags: policy.tags.clone(),
@@ -3606,4 +3707,17 @@ mod ws_tests {
             Some(peer_ip)
         );
     }
+}
+
+/// Build a body-less GET copy of a request for a background SWR refresh.
+/// The cache only serves GET/HEAD, so dropping the body is lossless.
+fn clone_get(req: &Request) -> Request {
+    let mut b = Request::builder()
+        .method(req.method().clone())
+        .uri(req.uri().clone())
+        .version(req.version());
+    for (k, v) in req.headers() {
+        b = b.header(k, v);
+    }
+    b.body(Body::empty()).expect("empty request")
 }

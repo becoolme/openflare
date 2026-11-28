@@ -84,6 +84,10 @@ pub struct Entry {
     /// How long past freshness a stale copy may still serve on upstream
     /// error (`stale-if-error`; bounded to 24h, zero disables).
     pub stale_for: Duration,
+    /// How long past freshness a stale copy may be served immediately
+    /// while a background refresh runs (`stale-while-revalidate`; bounded
+    /// to 24h, zero disables).
+    pub swr_for: Duration,
     /// `no-cache` stores the entry but never serves it without revalidation.
     pub no_cache: bool,
     /// Header names from `Vary` plus the request values captured at store.
@@ -166,6 +170,9 @@ fn normalize_query(raw: &str, include: &[String], exclude: &[String]) -> String 
 /// Result of a lookup.
 pub enum Lookup {
     Hit(Entry),
+    /// Past freshness but within the `stale-while-revalidate` window: serve
+    /// this copy now and refresh it in the background (deduped).
+    Updating(Entry),
     /// Past freshness but within the `stale-if-error` window; kept for a
     /// possible fallback if the upstream fails.
     Stale(Entry),
@@ -178,6 +185,7 @@ pub enum Lookup {
 pub struct Policy {
     pub ttl: Option<Duration>,
     pub stale_for: Duration,
+    pub swr_for: Duration,
     pub no_cache: bool,
     pub vary: Vec<String>,
     pub tags: Vec<String>,
@@ -195,6 +203,7 @@ pub fn evaluate(
     let mut policy = Policy {
         ttl: None,
         stale_for: Duration::ZERO,
+        swr_for: Duration::ZERO,
         no_cache: false,
         vary: Vec::new(),
         tags: Vec::new(),
@@ -308,6 +317,17 @@ pub fn evaluate(
     let stale_capped = !flag("s-maxage") && !flag("must-revalidate") && !flag("proxy-revalidate");
     let stale_secs = secs("stale-if-error").unwrap_or(if stale_capped { 86_400 } else { 0 });
     policy.stale_for = Duration::from_secs(stale_secs.min(86_400));
+
+    // stale-while-revalidate: serve the stale copy immediately and refresh
+    // in the background. Same disabling directives as stale-if-error (an
+    // `s-maxage`/must-revalidate contract forbids serving stale without
+    // revalidation); explicit 0 disables; capped to 24h.
+    let swr_secs = secs("stale-while-revalidate").unwrap_or(0);
+    policy.swr_for = if stale_capped {
+        Duration::from_secs(swr_secs.min(86_400))
+    } else {
+        Duration::ZERO
+    };
 
     // Cache Deception Armor: only for heuristic freshness (no explicit
     // Cache-Control/Expires), text/* or application/*, extension mismatch.
@@ -519,6 +539,16 @@ impl Store {
                 continue;
             }
             let age = now.duration_since(entry.stored_at).unwrap_or_default();
+            let has_swr = entry.swr_for > Duration::ZERO;
+            if age >= entry.fresh_for && has_swr {
+                if age < entry.fresh_for + entry.swr_for {
+                    return Lookup::Updating(entry.clone());
+                }
+                if entry.no_cache {
+                    inner.remove(&key);
+                    return Lookup::Expired;
+                }
+            }
             if entry.no_cache {
                 inner.remove(&key);
                 return Lookup::Expired;
@@ -992,6 +1022,7 @@ mod tests {
             stored_at: now(),
             fresh_for: Duration::from_secs(60),
             stale_for: Duration::ZERO,
+            swr_for: Duration::ZERO,
             no_cache: true,
             vary: vec![],
             tags: vec![],
@@ -1024,6 +1055,7 @@ mod tests {
                 stored_at: now(),
                 fresh_for: Duration::from_secs(60),
                 stale_for: Duration::ZERO,
+                swr_for: Duration::ZERO,
                 no_cache: false,
                 vary: vary_values(&p.vary, &req_h),
                 tags: p.tags,
@@ -1081,6 +1113,7 @@ mod tests {
             stored_at: now() - Duration::from_secs(2),
             fresh_for: Duration::from_secs(1),
             stale_for,
+            swr_for: Duration::ZERO,
             no_cache: false,
             vary: vec![],
             tags: vec![],
@@ -1106,6 +1139,7 @@ mod tests {
                     stored_at: now(),
                     fresh_for: Duration::from_secs(60),
                     stale_for: Duration::ZERO,
+                    swr_for: Duration::ZERO,
                     no_cache: false,
                     vary: vec![],
                     tags: vec![],
@@ -1137,6 +1171,7 @@ mod tests {
                 stored_at: now(),
                 fresh_for: Duration::from_secs(60),
                 stale_for: Duration::ZERO,
+                swr_for: Duration::ZERO,
                 no_cache: false,
                 vary: vec![],
                 tags: vec![],
@@ -1202,6 +1237,7 @@ mod tests {
             stored_at: now(),
             fresh_for: Duration::from_secs(60),
             stale_for: Duration::ZERO,
+            swr_for: Duration::ZERO,
             no_cache: false,
             vary: vec![],
             tags: vec![],
@@ -1233,4 +1269,81 @@ mod tests {
         assert!(k.key.contains("\u{1f}*\u{1f}"));
         assert!(key_plan("t", "w", "v1", false, &[], &[], &uri, &Method::POST).is_none());
     }
+    #[test]
+    fn swr_serves_stale_for_background_update() {
+        let store = Store::new();
+        let base = "swr\u{1f}w\u{1f}v\u{1f}default\u{1f}/x?";
+        let entry = Entry {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: vec![],
+            body: Bytes::from_static(b"x"),
+            stored_at: now() - Duration::from_secs(70),
+            fresh_for: Duration::from_secs(60),
+            stale_for: Duration::ZERO,
+            swr_for: Duration::from_secs(30),
+            no_cache: false,
+            vary: vec![],
+            tags: vec![],
+            size: 0,
+        };
+        assert!(store.put(base, entry));
+        assert!(matches!(
+            store.get(base, &HeaderMap::new(), now()),
+            Lookup::Updating(_)
+        ));
+        // Past fresh+swr with stale_for=0 => dropped.
+        assert!(matches!(
+            store.get(base, &HeaderMap::new(), now() + Duration::from_secs(30)),
+            Lookup::Expired
+        ));
+    }
+
+    #[test]
+    fn swr_directive_parses_and_yields_to_s_maxage() {
+        let mut resp = HeaderMap::new();
+        resp.insert(
+            header::CACHE_CONTROL,
+            "max-age=60, stale-while-revalidate=30".parse().unwrap(),
+        );
+        let p = evaluate(&HeaderMap::new(), StatusCode::OK, &resp, "/");
+        assert_eq!(p.ttl, Some(Duration::from_secs(60)));
+        assert_eq!(p.swr_for, Duration::from_secs(30));
+        resp.insert(
+            header::CACHE_CONTROL,
+            "s-maxage=60, stale-while-revalidate=30".parse().unwrap(),
+        );
+        let p = evaluate(&HeaderMap::new(), StatusCode::OK, &resp, "/");
+        assert_eq!(p.swr_for, Duration::ZERO);
+    }
+
+    #[test]
+    fn no_cache_with_swr_serves_stale_while_updating() {
+        let store = Store::new();
+        let base = "swr-nc\u{1f}w\u{1f}v\u{1f}default\u{1f}/x?";
+        let entry = Entry {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: vec![],
+            body: Bytes::from_static(b"x"),
+            stored_at: now() - Duration::from_secs(5),
+            fresh_for: Duration::ZERO,
+            stale_for: Duration::ZERO,
+            swr_for: Duration::from_secs(10),
+            no_cache: true,
+            vary: vec![],
+            tags: vec![],
+            size: 0,
+        };
+        assert!(store.put(base, entry));
+        assert!(matches!(
+            store.get(base, &HeaderMap::new(), now()),
+            Lookup::Updating(_)
+        ));
+        assert!(matches!(
+            store.get(base, &HeaderMap::new(), now() + Duration::from_secs(10)),
+            Lookup::Expired
+        ));
+    }
+
 }
