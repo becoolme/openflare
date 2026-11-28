@@ -4906,11 +4906,11 @@ impl Actor {
             Box::new((*desired_spec).clone())
         } else {
             match self.assemble_excluded(&desired_spec) {
-                Some(spec) => spec,
-                None => {
+                Ok(spec) => spec,
+                Err(why) => {
                     self.on_launch_failed(SpawnFailure {
                         reason: "assemble",
-                        detail: None,
+                        detail: Some(why),
                     });
                     return;
                 }
@@ -5218,23 +5218,37 @@ impl Actor {
         if !added {
             return Err(give_up("config-load"));
         }
-        self.assemble_excluded(desired)
-            .ok_or_else(|| give_up("assemble"))
+        self.assemble_excluded(desired).map_err(|why| SpawnFailure {
+            reason: "assemble",
+            detail: Some(format!("{why}; original config-load stderr: {detail}")),
+        })
     }
 
     /// Reassemble `desired` minus `self.excluded` — the reduced spec
     /// keeps the FULL `relaunch` context (`self.excluded` is the
     /// single filter applied at every rebuild) and gets the desired
     /// `config_digest` stamped AFTER a successful preflight.
-    fn assemble_excluded(&mut self, desired: &TenantLaunchSpec) -> Option<Box<TenantLaunchSpec>> {
-        let asm = self.deps.assembler.clone()?;
-        let rl = desired.relaunch.clone()?;
-        let tenant = crate::exclusion::filtered_tenant(&rl.tenant, &self.excluded)?;
+    /// `Err` carries the operator-facing reason the reduced generation
+    /// could not be built — it surfaces as the tenant failure detail,
+    /// where a bare `assemble` token tells nobody anything.
+    fn assemble_excluded(
+        &mut self,
+        desired: &TenantLaunchSpec,
+    ) -> Result<Box<TenantLaunchSpec>, String> {
+        let Some(asm) = self.deps.assembler.clone() else {
+            return Err("no assembler configured".to_string());
+        };
+        let Some(rl) = desired.relaunch.clone() else {
+            return Err("launch spec carries no relaunch context".to_string());
+        };
+        let Some(tenant) = crate::exclusion::filtered_tenant(&rl.tenant, &self.excluded) else {
+            return Err("every worker was excluded as a config-load failure".to_string());
+        };
         let gen = self.deps.gen_counter.fetch_add(1, Ordering::Relaxed) + 1;
         match asm.assemble(&tenant, rl.revision, gen) {
             Ok(mut spec) => {
                 spec.relaunch = desired.relaunch.clone();
-                Some(Box::new(spec))
+                Ok(Box::new(spec))
             }
             Err(error) => {
                 tracing::warn!(
@@ -5242,7 +5256,7 @@ impl Actor {
                     %error,
                     "exclusion reassembly failed"
                 );
-                None
+                Err(error.to_string())
             }
         }
     }
@@ -5912,7 +5926,7 @@ impl Actor {
                         );
                         self.on_launch_failed(SpawnFailure {
                             reason: "assemble",
-                            detail: None,
+                            detail: Some(error.to_string()),
                         });
                         return;
                     }
@@ -8775,6 +8789,13 @@ impl SupervisorHost {
                         _ => "workers-not-ready",
                     };
                     runtime.set_assemble_error(Some(reason.to_string()));
+                    // The typed reason is whitelist-stable for status
+                    // consumers; the assemble error itself is the detail
+                    // that tells the operator WHAT failed (unresolved
+                    // ref, missing artifact bytes, quota shape) — same
+                    // diagnostic slot the launch path uses, cleared on
+                    // the next successful install.
+                    runtime.set_last_error(Some(error.to_string()));
                     outcome.failed.push(tenant.tenant_id.clone());
                 }
             }
