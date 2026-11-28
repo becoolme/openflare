@@ -1337,7 +1337,7 @@ async fn proxy_inner(
     let req_bypass = crate::wc::request_bypass(req.headers());
     if let Some((plan, headers, path)) = &cache {
         if !req_bypass {
-        match state.wc.get(&plan.key, headers, now) {
+        match state.wc.get_tiered(&plan.key, headers, now).await {
             crate::wc::Lookup::Hit(entry) => {
                 wc_metric("hit");
                 return Ok(crate::wc::response(
@@ -1407,7 +1407,7 @@ async fn proxy_inner(
             crate::wc::FlightEntry::Follower(n) => {
                 crate::wc::Flights::wait(n, std::time::Duration::from_secs(10)).await;
                 if !req_bypass {
-                match state.wc.get(&plan.key, headers, std::time::SystemTime::now()) {
+                match state.wc.get_tiered(&plan.key, headers, std::time::SystemTime::now()).await {
                     crate::wc::Lookup::Hit(entry) => {
                         wc_metric("hit");
                         return Ok(crate::wc::response(
@@ -1628,8 +1628,9 @@ async fn cache_store(
         return bypass(parts, body_or_bytes(bytes));
     };
     let now = std::time::SystemTime::now();
-    let stored = store.put(
-        &plan.key,
+    let stored = store
+        .put_tiered(
+            &plan.key,
         crate::wc::Entry {
             status: parts.status,
             version: parts.version,
@@ -1644,7 +1645,8 @@ async fn cache_store(
             tags: policy.tags.clone(),
             size: 0,
         },
-    );
+        )
+        .await;
     wc_metric(if req_bypass {
         "bypass"
     } else if stored {
