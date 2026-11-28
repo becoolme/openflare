@@ -19,6 +19,8 @@ in [`docs/wrangler-config.md`](wrangler-config.md).
 | --- | --- | --- |
 | Workers modules / service-worker syntax | workerd | runs the real workerd `worker` definition |
 | Compatibility dates & flags | workerd | `compatibility_date`, `compatibility_flags` pass through to workerd; generated flags are checked against the pinned binary in CI |
+| `node:fs` virtual filesystem | Drop-in | workerd's in-memory VFS (`/bundle` read-only, per-request `/tmp`, `/dev`) under `nodejs_compat` — enablement rules, the module-top-level `/tmp` trap and verification evidence in [node-fs.md](node-fs.md) |
+| Dynamic code (`eval` / runtime loading) | Partial | explicit capability bindings only: `unsafe_eval` → [bindings/unsafe.md](bindings/unsafe.md), `worker_loaders` → [bindings/worker-loaders.md](bindings/worker-loaders.md); global `eval`/`new Function` stay blocked in request handlers, non-literal `import()`/`require()` fail the deploy |
 | Programmatic `cloudflare.config.ts` / `.js` | Partial | evaluated by Node via `@cloudflare/config`, then normalized like a wrangler file — [wrangler-config.md](wrangler-config.md) |
 | KV | Drop-in | [bindings/kv.md](bindings/kv.md) |
 | R2 | Partial | [bindings/r2.md](bindings/r2.md) |
@@ -200,6 +202,23 @@ Runtime failures visible at ingress carry platform codes documented in
 
 ## Changelog
 
+- 2026-11-28: `node:fs` documented and verified end-to-end
+  ([node-fs.md](node-fs.md)). The runtime support was already present
+  but undocumented and untested — and NOT on by default in practice:
+  worker records created without an explicit date default to
+  `2024-01-01`, before the implication point, so a deploy that never
+  declares `compatibility_date` keeps the module off. The reference
+  page pins the exact enablement rules plus the verified VFS contract
+  — `/bundle` read-only, `/tmp` scoped to the
+  requesting IoContext (invisible across requests AND across the
+  module-top-level/request boundary, silently), `/dev` devices —
+  and `vrt-host/tests/workerd_entry_smoke.rs::real_workerd_node_fs`
+  joins the external real-workerd e2e suite. Same pass re-verified
+  `unsafe_eval` and `workerLoader` against the pinned fork
+  vrt-20261125-31ed629 (linux/arm64): all existing smoke assertions
+  reproduce exactly, and the loader quota error is now the
+  descriptive `worker loader '<name>' cannot load …` shape (the
+  generic `internal error` note in worker-loaders.md was corrected).
 - 2026-11-23: `of deploy --config-sandbox=worker` (default `node`).
   The worker path evaluates `cloudflare.config.*` in a workerd dynamic
   worker with a caller-enforced 5 s deadline and the same typed error
