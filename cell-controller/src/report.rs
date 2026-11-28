@@ -729,6 +729,10 @@ impl HistogramAcc {
         let mut buckets: Vec<Bucket> = self
             .buckets
             .into_values()
+            // The +Inf bucket duplicates the totals in `count`; JSON cannot
+            // represent a non-finite f64 (serde_json emits null, which the
+            // control plane's strict schema rejects, poisoning every report).
+            .filter(|(le, _)| le.is_finite())
             .map(|(le, count)| Bucket {
                 le,
                 count: count.round().max(0.0) as u64,
@@ -1602,6 +1606,33 @@ vrt_host_wake_seconds_count 1
         assert!(report.reset);
         assert_eq!(report.window_ms, 0.max(1_100_000 - 2_000_000));
         assert_eq!(report.workers[0].requests, 2); // current values counted again
+    }
+
+    #[test]
+    fn inf_histogram_bucket_never_reaches_the_wire() {
+        // Real workerd exposition always ends duration histograms with
+        // le="+Inf"; serde_json would serialize the non-finite f64 as null
+        // and the control plane's strict schema rejects the whole report.
+        let exposition = |counter: f64| {
+            parse_exposition(&format!(
+                r#"
+process_start_time_seconds 1000
+vrt_worker_requests_total{{worker_id="team:w",status_class="2xx"}} {counter}
+vrt_worker_request_duration_seconds_bucket{{worker_id="team:w",le="0.005"}} 2
+vrt_worker_request_duration_seconds_bucket{{worker_id="team:w",le="+Inf"}} 3
+vrt_worker_request_duration_seconds_sum{{worker_id="team:w"}} 0.06
+vrt_worker_request_duration_seconds_count{{worker_id="team:w"}} 3
+vrt_tenant_cpu_seconds_total{{tenant_id="team"}} {counter}
+vrt_tenant_memory_rss_bytes{{tenant_id="team"}} 1024
+"#
+            ))
+        };
+        let (_, state) = build_pod_report("pod-0", &exposition(10.0), None, 1_060_000);
+        let (report, _) = build_pod_report("pod-0", &exposition(16.0), Some(&state), 1_090_000);
+        let duration = &report.workers[0].request_duration;
+        assert!(duration.buckets.iter().all(|b| b.le.is_finite()), "{:?}", duration.buckets);
+        let wire = serde_json::to_string(&report).expect("report serializes");
+        assert!(!wire.contains("\"le\":null"), "{wire}");
     }
 
     #[test]
