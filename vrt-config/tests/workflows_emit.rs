@@ -513,3 +513,43 @@ fn spec_with(tenant: &TenantDesired) -> snapshot_protocol::compute_desired::Comp
     }))
     .unwrap()
 }
+
+#[test]
+fn workflow_rejects_fetcher_rpc_disabled_compat() {
+    for (date, flags) in [("2024-04-02", vec![]), ("2025-01-01", vec!["no_rpc"])] {
+        let mut value = serde_json::to_value(tenant_with_wf()).unwrap();
+        value["workers"][0]["activeVersion"]["compatibilityDate"] = json!(date);
+        value["workers"][0]["activeVersion"]["compatibilityFlags"] = json!(flags);
+        let tenant: TenantDesired = serde_json::from_value(value).unwrap();
+        let rendered = render_tenant_config(&input(&tenant, &bs(), &runtime_params()))
+            .expect("incompatible workflow worker is isolated from siblings");
+        assert!(
+            rendered
+                .skipped_reasons
+                .iter()
+                .any(|r| r.worker_id == "w-alpha-1" && r.code == "CONFIG_WORKFLOW_COMPATIBILITY"),
+            "{:?}",
+            rendered.skipped_reasons
+        );
+    }
+}
+
+#[test]
+fn workflow_accepts_fetcher_rpc_compat_date() {
+    for (date, flags) in [("2024-04-03", vec![]), ("2024-04-02", vec!["rpc"])] {
+        let mut value = serde_json::to_value(tenant_with_wf()).unwrap();
+        value["workers"][0]["activeVersion"]["compatibilityDate"] = json!(date);
+        value["workers"][0]["activeVersion"]["compatibilityFlags"] = json!(flags);
+        let tenant: TenantDesired = serde_json::from_value(value).unwrap();
+        let rendered = render_tenant_config(&input(&tenant, &bs(), &runtime_params()))
+            .expect("workflow worker with Fetcher RPC renders");
+        assert!(
+            !rendered
+                .skipped_reasons
+                .iter()
+                .any(|r| r.worker_id == "w-alpha-1"),
+            "{:?}",
+            rendered.skipped_reasons
+        );
+    }
+}

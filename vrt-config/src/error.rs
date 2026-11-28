@@ -114,6 +114,11 @@ pub enum ConfigError {
     #[error("capacity bound exceeded: {0}")]
     Capacity(&'static str),
 
+    /// A workflow declaration is bound to a tenant worker whose Fetcher RPC
+    /// support is disabled or postdates the worker compatibility date.
+    #[error("workflow requires Fetcher RPC support in the tenant worker")]
+    WorkflowCompatibility,
+
     /// A tenant `compatibilityFlags[]` entry is not a known stable flag —
     /// either `$experimental`-annotated or unknown to the vendored
     /// `compatibility-date.capnp` snapshot. Fail closed: with
@@ -158,6 +163,7 @@ impl ConfigError {
             Self::ServiceReference(_) => "CONFIG_UNRESOLVED_SERVICE",
             Self::Digest(_) => "CONFIG_INVALID_DIGEST",
             Self::Capacity(_) => "CONFIG_CAPACITY_EXCEEDED",
+            Self::WorkflowCompatibility => "CONFIG_WORKFLOW_COMPATIBILITY",
             Self::CompatFlag(_) => "CONFIG_COMPAT_FLAG",
             Self::Quotas(_) => "CONFIG_QUOTA_UNSUPPORTED",
             Self::AllWorkersExcluded => "CONFIG_ALL_WORKERS_EXCLUDED",
