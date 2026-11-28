@@ -597,6 +597,32 @@ async fn run_async(
     // [geoip]: local MMDB fills `request.cf` geo/ASN fields the
     // verified upstream chain did not provide.
     .with_geoip(geoip.clone());
+    // A4: optional cross-pod Workers Cache tier. A configured-but-unreachable
+    // upper tier stays local-only — fail open, never a fake HIT.
+    if let Some(upper) = config.cache_upper.as_ref() {
+        let url = std::env::var(&upper.url_env).unwrap_or_default();
+        if url.trim().is_empty() {
+            tracing::warn!(
+                env = %upper.url_env,
+                "cacheUpper configured but its env is empty; shared cache tier disabled"
+            );
+        } else {
+            match vrt_host::wc_shared::RedisSharedTier::connect(&url, upper.timeout_ms).await {
+                Ok(tier) => {
+                    let _ = ingress_state
+                        .cache_store()
+                        .set_shared(std::sync::Arc::new(tier));
+                    tracing::info!("workers cache shared tier connected");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "cacheUpper connect failed; shared cache tier disabled"
+                    );
+                }
+            }
+        }
+    }
     // WebSocket tunnel bounds (`[ingress.websocket]`, validated at load).
     let ws = config.ingress.websocket_limits();
     let ingress_state = ingress_state.with_ws_limits(

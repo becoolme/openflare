@@ -20,7 +20,7 @@
 //! current or delete it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
@@ -491,7 +491,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 pub struct Store {
     inner: Mutex<Inner>,
     /// Optional cross-pod upper tier (A4); absent = local-only.
-    shared: Option<Arc<dyn crate::wc_shared::SharedTier>>,
+    shared: OnceLock<Arc<dyn crate::wc_shared::SharedTier>>,
 }
 
 struct Inner {
@@ -518,7 +518,7 @@ impl Default for Store {
                 global_bytes: 0,
                 order: VecDeque::new(),
             }),
-            shared: None,
+            shared: OnceLock::new(),
         }
     }
 }
@@ -531,10 +531,14 @@ impl Store {
     /// Attach the optional cross-pod upper tier (A4). Tests/control-plane use
     /// the in-memory implementation; production wires the Redis adapter.
     pub fn with_shared(shared: Arc<dyn crate::wc_shared::SharedTier>) -> Self {
-        Self {
-            shared: Some(shared),
-            ..Self::default()
-        }
+        let store = Self::default();
+        let _ = store.set_shared(shared);
+        store
+    }
+
+    /// Install the cross-pod upper tier once (later calls are ignored).
+    pub fn set_shared(&self, shared: Arc<dyn crate::wc_shared::SharedTier>) -> bool {
+        self.shared.set(shared).is_ok()
     }
 
     /// Look up a matching, fresh entry. Expired entries are removed.
@@ -627,7 +631,7 @@ impl Store {
         if !matches!(local, Lookup::Miss | Lookup::Expired) {
             return local;
         }
-        let Some(shared) = &self.shared else {
+        let Some(shared) = self.shared.get() else {
             return local;
         };
         match shared.get(base, req, now).await {
@@ -647,9 +651,13 @@ impl Store {
     /// verdict; a shared failure is logged and never fails the response.
     pub async fn put_tiered(&self, base: &str, entry: Entry) -> bool {
         let stored = self.put(base, entry.clone());
-        if let Some(shared) = &self.shared {
-            if let Err(error) = shared.put(base, &entry).await {
-                crate::wc_shared::log_shared_failure("put", &error);
+        if let Some(shared) = self.shared.get() {
+            // Upper-tier safety: never replicate an entry the lower tier's
+            // per-entry cap rejects outright.
+            if entry.body.len() <= MAX_ENTRY_BYTES {
+                if let Err(error) = shared.put(base, &entry).await {
+                    crate::wc_shared::log_shared_failure("put", &error);
+                }
             }
         }
         stored
@@ -657,7 +665,7 @@ impl Store {
 
     pub async fn purge_worker_tiered(&self, tenant: &str, worker: &str) -> usize {
         let local = self.purge_worker(tenant, worker);
-        if let Some(shared) = &self.shared {
+        if let Some(shared) = self.shared.get() {
             if let Err(error) = shared.purge_worker(tenant, worker).await {
                 crate::wc_shared::log_shared_failure("purge_worker", &error);
             }
@@ -667,7 +675,7 @@ impl Store {
 
     pub async fn purge_tags_tiered(&self, tenant: &str, tags: &[String]) -> usize {
         let local = self.purge_tags(tenant, tags);
-        if let Some(shared) = &self.shared {
+        if let Some(shared) = self.shared.get() {
             if let Err(error) = shared.purge_tags(tenant, tags).await {
                 crate::wc_shared::log_shared_failure("purge_tags", &error);
             }
@@ -677,7 +685,7 @@ impl Store {
 
     pub async fn purge_prefix_tiered(&self, tenant: &str, prefix: &str) -> usize {
         let local = self.purge_prefix(tenant, prefix);
-        if let Some(shared) = &self.shared {
+        if let Some(shared) = self.shared.get() {
             if let Err(error) = shared.purge_prefix(tenant, prefix).await {
                 crate::wc_shared::log_shared_failure("purge_prefix", &error);
             }
@@ -687,7 +695,7 @@ impl Store {
 
     pub async fn purge_all_tiered(&self, tenant: &str) -> usize {
         let local = self.purge_all(tenant);
-        if let Some(shared) = &self.shared {
+        if let Some(shared) = self.shared.get() {
             if let Err(error) = shared.purge_all(tenant).await {
                 crate::wc_shared::log_shared_failure("purge_all", &error);
             }
