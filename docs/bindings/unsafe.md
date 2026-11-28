@@ -84,3 +84,9 @@ binding and nothing to migrate or persist.
   vector plus reject vectors for a non-eval `type`, a raw `[unsafe]`
   injection key, and an unknown per-entry key (Rust/TS parity).
 - `vrt-config/tests/render.rs` — capnp `unsafeEval` group emission.
+- `vrt-host/tests/workerd_entry_smoke.rs` — `real_workerd_unsafe_eval`
+  (real binary, `VRT_WORKERD_BIN`-gated): the bound worker answers
+  `{"eval":"2","fn":"3","wasm":"true"}` and the unbound sibling answers
+  all-`denied`. Verified against the pinned fork vrt-20261125-31ed629
+  (upstream 1.20261123.1) on linux/arm64, 2026-11-28 — both shapes
+  reproduce exactly.

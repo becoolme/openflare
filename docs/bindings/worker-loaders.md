@@ -125,11 +125,11 @@ semantics plus a platform guard:
 - A binding name colliding with another binding on the same worker →
   `DESIRED_DUPLICATE` (`bindingName`) at snapshot validation.
 - `get()`/`load()` past the live-worker quota throws in the calling
-  worker. The bound is enforced in the loader's kj layer, so the JS
-  caller sees workerd's generic `internal error; reference = <id>`
-  rather than a descriptive message (observed on the pinned fork
-  binary); a held stub/entrypoint must be released before loading
-  again.
+  worker: `Error: worker loader '<name>' cannot load … the limit of
+  <N> live workers is reached` (verified on the pinned fork
+  vrt-20261125-31ed629, 2026-11-28 — earlier observations of a generic
+  `internal error; reference = <id>` no longer reproduce on this pin).
+  A held stub/entrypoint must be released before loading again.
 
 ## Examples and tests
 
@@ -148,3 +148,7 @@ semantics plus a platform guard:
   `real_workerd_worker_loader` (real binary, `VRT_WORKERD_BIN`-gated):
   `env.LOADER.get()`/`load()` serve, the named cache runs the code
   callback once, and a held-stub loop hits the `maxWorkers` bound.
+  Verified against the pinned fork vrt-20261125-31ed629 (upstream
+  1.20261123.1) on linux/arm64, 2026-11-28: `get`/`load`/`cache` answer
+  exactly as asserted and the quota error is the descriptive shape
+  quoted above.

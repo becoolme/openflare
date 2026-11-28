@@ -480,11 +480,12 @@ fn real_workerd_worker_loader() {
     );
 
     // The fork's quota: held stubs keep loaded workers live, so the
-    // third load on a maxWorkers=2 namespace must throw. The bound is
-    // enforced in the loader's kj layer, so the JS caller currently
-    // sees workerd's generic `internal error; reference = <id>` rather
-    // than a descriptive message — assert the count held at 2 and that
-    // the load was rejected, not the wording (a later pin may add one).
+    // third load on a maxWorkers=2 namespace must throw. Assert the
+    // count held at 2 and that the load was rejected, not the wording —
+    // the pinned fork vrt-20261125-31ed629 already surfaces a
+    // descriptive message (`worker loader 'LOADER_A' cannot load …
+    // the limit of 2 live workers is reached`, verified 2026-11-28 on
+    // linux/arm64), but the exact string is the fork's to change.
     let (status, body) = http_get(port, "/quota");
     assert_eq!(status, 200, "quota probe must answer: {body}");
     let (held, err) = body
@@ -617,6 +618,195 @@ fn real_workerd_unsafe_eval() {
         "unbound worker must refuse env.EVAL.eval/newFunction/newWasmModule: {body}"
     );
     drop(proc);
+}
+
+// ---------------------------------------------------------------------------
+// node:fs VFS smoke — the pinned fork must expose workerd's virtual
+// filesystem semantics exactly as documented upstream: `/bundle` carries
+// the uploaded modules read-only, `/tmp` is writable but scoped to the
+// requesting IoContext (invisible across requests AND across the
+// module-top-level/request boundary), `/dev` holds the device files, and
+// the module is present only when nodejs_compat applies without a
+// disable flag. Probes return structured values, not error strings —
+// behavior is asserted, upstream error wording is not.
+// ---------------------------------------------------------------------------
+
+/// Positive-case worker: static `import fs from 'node:fs'` at module
+/// scope (the dominant user pattern) plus a module-top-level `/tmp`
+/// write whose request-time invisibility is part of the asserted
+/// contract. Every `readdir` is sorted in JS so the assertions do not
+/// depend on VFS enumeration order.
+const NODEFS_MAIN_JS: &str = r#"
+import fs from 'node:fs';
+let topWriteErr = 'none';
+try { fs.writeFileSync('/tmp/init.txt', 'from-toplevel'); } catch { topWriteErr = 'thrown'; }
+
+export default {
+  async fetch(req) {
+    const path = new URL(req.url).pathname;
+    if (path === '/write-crossreq') {
+      fs.writeFileSync('/tmp/crossreq.txt', 'x');
+      return new Response('written');
+    }
+    const probe = (f) => { try { return String(f()); } catch { return 'thrown'; } };
+    const out = {
+      root: fs.readdirSync('/').sort().join(','),
+      bundle: fs.readdirSync('/bundle').sort().join(','),
+      dev: fs.readdirSync('/dev').sort().join(','),
+      bundle_read: probe(() => fs.readFileSync('/bundle/main.js', 'utf8').length > 100 ? 'readable' : 'short'),
+      bundle_write: probe(() => { fs.writeFileSync('/bundle/evil.js', 'x'); return 'write-succeeded'; }),
+      root_write: probe(() => { fs.writeFileSync('/evil', 'x'); return 'write-succeeded'; }),
+      tmp_roundtrip: probe(() => { fs.writeFileSync('/tmp/probe.txt', 'hello-vfs'); return fs.readFileSync('/tmp/probe.txt', 'utf8'); }),
+      tmp_stat: probe(() => fs.statSync('/tmp/probe.txt').isFile() ? 'file' : 'not-file'),
+      tmp_mkdir: probe(() => { fs.mkdirSync('/tmp/sub/dir', { recursive: true }); fs.writeFileSync('/tmp/sub/dir/f.txt', 'y'); return fs.readFileSync('/tmp/sub/dir/f.txt', 'utf8'); }),
+      crossreq: probe(() => fs.existsSync('/tmp/crossreq.txt') ? 'VISIBLE' : 'absent'),
+      toplevel_write_err: topWriteErr,
+      toplevel_visible: probe(() => fs.existsSync('/tmp/init.txt') ? 'VISIBLE' : 'absent'),
+    };
+    return new Response(JSON.stringify(out));
+  },
+};
+"#;
+
+/// Negative-case worker: dynamic `import('node:fs')` inside the fetch
+/// handler, so a missing module surfaces as a caught throw instead of
+/// a boot failure — the same worker source serves both negative modes.
+const NODEFS_NEG_JS: &str = r#"
+export default {
+  async fetch() {
+    let msg = 'imported';
+    try { await import('node:fs'); } catch { msg = 'thrown'; }
+    return new Response(msg);
+  },
+};
+"#;
+
+/// The expected positive probe payload — verified against the pinned
+/// fork binary (vrt-20261125-31ed629, upstream 1.20261123.1) on
+/// linux/arm64. Key order is the JS insertion order above.
+const NODEFS_POSITIVE_JSON: &str = r#"{"root":"bundle,dev,tmp","bundle":"main.js","dev":"full,null,random,zero","bundle_read":"readable","bundle_write":"thrown","root_write":"thrown","tmp_roundtrip":"hello-vfs","tmp_stat":"file","tmp_mkdir":"y","crossreq":"absent","toplevel_write_err":"none","toplevel_visible":"absent"}"#;
+
+#[derive(Clone, Copy)]
+enum NodeFsMode {
+    /// nodejs_compat at a post-2025-09-15 date — fs implied on.
+    Compat,
+    /// No nodejs_compat at all — no node: specifier resolution.
+    NoCompat,
+    /// nodejs_compat + explicit disable — the disable flag must win
+    /// over the date-implied enable.
+    Disabled,
+    /// Pre-implication date + explicit enable — the opt-in path for
+    /// tenants pinned to older compatibility dates.
+    EnableOld,
+}
+
+fn write_nodefs_capnp(dir: &Path, port: u16, mode: NodeFsMode) -> PathBuf {
+    let negative = matches!(mode, NodeFsMode::NoCompat | NodeFsMode::Disabled);
+    let module = if negative { "neg.js" } else { "main.js" };
+    std::fs::write(
+        dir.join(module),
+        if negative { NODEFS_NEG_JS } else { NODEFS_MAIN_JS },
+    )
+    .unwrap();
+    let (date, flags) = match mode {
+        NodeFsMode::Compat => ("2026-01-01", r#"compatibilityFlags = ["nodejs_compat"],"#),
+        NodeFsMode::NoCompat => ("2026-01-01", ""),
+        NodeFsMode::Disabled => (
+            "2026-01-01",
+            r#"compatibilityFlags = ["nodejs_compat", "disable_nodejs_fs_module"],"#,
+        ),
+        NodeFsMode::EnableOld => (
+            "2025-01-01",
+            r#"compatibilityFlags = ["nodejs_compat", "enable_nodejs_fs_module"],"#,
+        ),
+    };
+    let cfg = format!(
+        r#"using Workerd = import "/workerd/workerd.capnp";
+const cfg :Workerd.Config = (
+  services = [
+    (name = "main", worker = (
+      modules = [(name = "{module}", esModule = embed "{module}")],
+      compatibilityDate = "{date}",
+      {flags}
+    )),
+  ],
+  sockets = [(name = "http", address = "127.0.0.1:{port}",
+              http = (), service = (name = "main"))],
+);
+"#,
+        module = module,
+        date = date,
+        flags = flags,
+        port = port,
+    );
+    let path = dir.join("cfg.capnp");
+    std::fs::write(&path, cfg).unwrap();
+    path
+}
+
+#[test]
+#[ignore = "requires VRT_WORKERD_BIN"]
+fn real_workerd_node_fs() {
+    let bin = workerd_bin().expect("VRT_WORKERD_BIN unset");
+    assert!(bin.exists(), "VRT_WORKERD_BIN does not exist: {bin:?}");
+
+    // Positive modes: the VFS contract holds identically whether fs was
+    // enabled by the compat date or by the explicit opt-in flag.
+    for mode in [NodeFsMode::Compat, NodeFsMode::EnableOld] {
+        let Some(dir) = smoke_root() else {
+            return;
+        };
+        let port = free_port();
+        let cfg = write_nodefs_capnp(&dir, port, mode);
+        let mut proc = spawn(&bin, &cfg, &dir);
+        if !wait_ready(port, &mut proc) {
+            panic!(
+                "node_fs(positive): never listened\n-- workerd.log --\n{}",
+                log_text(&proc)
+            );
+        }
+        let (status, body) = http_get(port, "/probe");
+        assert_eq!(
+            (status, body.as_str()),
+            (200, NODEFS_POSITIVE_JSON),
+            "node:fs VFS contract: {body}"
+        );
+        // A file written by one request must NOT be visible to the
+        // next — /tmp is scoped to the requesting IoContext.
+        let (status, _) = http_get(port, "/write-crossreq");
+        assert_eq!(status, 200, "write-crossreq must answer");
+        let (status, body) = http_get(port, "/probe");
+        assert_eq!(
+            (status, body.as_str()),
+            (200, NODEFS_POSITIVE_JSON),
+            "node:fs VFS contract must hold after a cross-request write: {body}"
+        );
+        drop(proc);
+    }
+
+    // Negative modes: no nodejs_compat, or an explicit disable flag —
+    // the module does not resolve.
+    for mode in [NodeFsMode::NoCompat, NodeFsMode::Disabled] {
+        let Some(dir) = smoke_root() else {
+            return;
+        };
+        let port = free_port();
+        let cfg = write_nodefs_capnp(&dir, port, mode);
+        let mut proc = spawn(&bin, &cfg, &dir);
+        if !wait_ready(port, &mut proc) {
+            panic!(
+                "node_fs(negative): never listened\n-- workerd.log --\n{}",
+                log_text(&proc)
+            );
+        }
+        let (status, body) = http_get(port, "/");
+        assert_eq!(
+            (status, body.as_str()),
+            (200, "thrown"),
+            "node:fs must not resolve without the enable path: {body}"
+        );
+        drop(proc);
+    }
 }
 
 // ---------------------------------------------------------------------------
