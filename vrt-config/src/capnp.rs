@@ -1408,14 +1408,15 @@ fn emit_tenant_worker(
     env: &mut BTreeMap<String, SecretValue>,
 ) -> Result<(), ConfigError> {
     let service = worker_service_name(&worker.worker_id);
-    // workerd enables Fetcher RPC from 2024-04-03; explicit `no_rpc`
-    // opts out even on newer dates. Workflow bindings always use JSRPC,
-    // so this worker is unrenderable rather than failing inside its isolate.
+    // workerd enables Fetcher RPC from 2024-04-03, or earlier with the
+    // explicit `rpc` flag; `no_rpc` opts out even on newer dates. The
+    // obsolete `workflows_bindings_rpc` flag has no effect. Workflow
+    // bindings always use JSRPC, so this worker is unrenderable without it.
     let version = &worker.active_version;
-    if !worker.workflows.is_empty()
-        && (version.compatibility_date.as_str() < "2024-04-03"
-            || version.compatibility_flags.iter().any(|f| f == "no_rpc"))
-    {
+    let rpc_enabled = version.compatibility_date.as_str() >= "2024-04-03"
+        || version.compatibility_flags.iter().any(|f| f == "rpc");
+    let rpc_disabled = version.compatibility_flags.iter().any(|f| f == "no_rpc");
+    if !worker.workflows.is_empty() && (!rpc_enabled || rpc_disabled) {
         return Err(ConfigError::WorkflowCompatibility);
     }
     out.push_str(&format!(
