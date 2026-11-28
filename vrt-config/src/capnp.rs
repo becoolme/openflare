@@ -1408,6 +1408,16 @@ fn emit_tenant_worker(
     env: &mut BTreeMap<String, SecretValue>,
 ) -> Result<(), ConfigError> {
     let service = worker_service_name(&worker.worker_id);
+    // workerd enables Fetcher RPC from 2024-04-03; explicit `no_rpc`
+    // opts out even on newer dates. Workflow bindings always use JSRPC,
+    // so this worker is unrenderable rather than failing inside its isolate.
+    let version = &worker.active_version;
+    if !worker.workflows.is_empty()
+        && (version.compatibility_date.as_str() < "2024-04-03"
+            || version.compatibility_flags.iter().any(|f| f == "no_rpc"))
+    {
+        return Err(ConfigError::WorkflowCompatibility);
+    }
     out.push_str(&format!(
         "    (name = {}, worker = (\n      compatibilityDate = {},\n",
         capnp_text(&service),
@@ -3514,15 +3524,6 @@ fn validate_tenant(tenant: &TenantDesired) -> Result<(), ConfigError> {
         }
         if !valid_identifier(&version.version_id, MAX_IDENTIFIER_LEN) {
             return Err(ConfigError::Identifier("versionId"));
-        }
-        // workerd enables Fetcher RPC from 2024-04-03; explicit `no_rpc`
-        // opts out even on newer dates. Workflow bindings always use JSRPC,
-        // so fail closed here instead of exploding inside the tenant isolate.
-        if !worker.workflows.is_empty()
-            && (version.compatibility_date.as_str() < "2024-04-03"
-                || version.compatibility_flags.iter().any(|f| f == "no_rpc"))
-        {
-            return Err(ConfigError::WorkflowCompatibility);
         }
         // Per-worker quotas: bounds are re-checked at emit depth
         // (compute.desired validation is the first gate). All four

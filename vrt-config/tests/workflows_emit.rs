@@ -521,10 +521,16 @@ fn workflow_rejects_fetcher_rpc_disabled_compat() {
         value["workers"][0]["activeVersion"]["compatibilityDate"] = json!(date);
         value["workers"][0]["activeVersion"]["compatibilityFlags"] = json!(flags);
         let tenant: TenantDesired = serde_json::from_value(value).unwrap();
-        let err = render_tenant_config(&input(&tenant, &bs(), &runtime_params()))
-            .err()
-            .expect("workflow without Fetcher RPC must fail closed");
-        assert_eq!(err, ConfigError::WorkflowCompatibility, "{err}");
+        let rendered = render_tenant_config(&input(&tenant, &bs(), &runtime_params()))
+            .expect("incompatible workflow worker is isolated from siblings");
+        assert!(
+            rendered
+                .skipped_reasons
+                .iter()
+                .any(|r| r.worker_id == "w-alpha-1" && r.code == "CONFIG_WORKFLOW_COMPATIBILITY"),
+            "{:?}",
+            rendered.skipped_reasons
+        );
     }
 }
 
