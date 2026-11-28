@@ -1480,4 +1480,114 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn two_pods_share_the_upper_tier() {
+        use crate::wc_shared::{InMemorySharedTier, SharedTier};
+        let shared = std::sync::Arc::new(InMemorySharedTier::new());
+        let pod_a = Store::with_shared(shared.clone());
+        let pod_b = Store::with_shared(shared.clone());
+        let base = "t\u{1f}w\u{1f}v\u{1f}default\u{1f}/x?";
+        let entry = Entry {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: vec![],
+            body: Bytes::from_static(b"x"),
+            stored_at: now(),
+            fresh_for: Duration::from_secs(60),
+            stale_for: Duration::ZERO,
+            swr_for: Duration::ZERO,
+            no_cache: false,
+            vary: vec![],
+            tags: vec![],
+            size: 0,
+        };
+        assert!(pod_a.put_tiered(base, entry).await);
+        // Another pod has no local copy; the upper hit backfills it.
+        assert!(matches!(
+            pod_b.get_tiered(base, &HeaderMap::new(), now()).await,
+            Lookup::Hit(_)
+        ));
+        assert!(matches!(
+            pod_b.get(base, &HeaderMap::new(), now()),
+            Lookup::Hit(_)
+        ));
+        // A worker purge fans out to the upper; a fresh pod sees nothing.
+        assert_eq!(pod_a.purge_worker_tiered("t", "w").await, 1);
+        assert!(shared
+            .get(base, &HeaderMap::new(), now())
+            .await
+            .unwrap()
+            .is_none());
+        let pod_c = Store::with_shared(shared.clone());
+        assert!(matches!(
+            pod_c.get_tiered(base, &HeaderMap::new(), now()).await,
+            Lookup::Miss
+        ));
+        // The already-backfilled lower copy on B is purged by B's own purge.
+        assert!(matches!(
+            pod_b.get(base, &HeaderMap::new(), now()),
+            Lookup::Hit(_)
+        ));
+        pod_b.purge_worker_tiered("t", "w").await;
+    }
+
+    #[tokio::test]
+    async fn shared_failure_degrades_to_local_only() {
+        use crate::wc_shared::{SharedError, SharedTier};
+        struct Down;
+        #[async_trait::async_trait]
+        impl SharedTier for Down {
+            async fn get(
+                &self,
+                _: &str,
+                _: &HeaderMap,
+                _: SystemTime,
+            ) -> Result<Option<Entry>, SharedError> {
+                Err(SharedError("down".into()))
+            }
+            async fn put(&self, _: &str, _: &Entry) -> Result<(), SharedError> {
+                Err(SharedError("down".into()))
+            }
+            async fn purge_worker(&self, _: &str, _: &str) -> Result<usize, SharedError> {
+                Err(SharedError("down".into()))
+            }
+            async fn purge_tags(&self, _: &str, _: &[String]) -> Result<usize, SharedError> {
+                Err(SharedError("down".into()))
+            }
+            async fn purge_prefix(&self, _: &str, _: &str) -> Result<usize, SharedError> {
+                Err(SharedError("down".into()))
+            }
+            async fn purge_all(&self, _: &str) -> Result<usize, SharedError> {
+                Err(SharedError("down".into()))
+            }
+        }
+        let store = Store::with_shared(std::sync::Arc::new(Down));
+        let base = "t\u{1f}w\u{1f}v\u{1f}default\u{1f}/y?";
+        // No fake hit while the upper is down; the local path still works.
+        assert!(matches!(
+            store.get_tiered(base, &HeaderMap::new(), now()).await,
+            Lookup::Miss
+        ));
+        let entry = Entry {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: vec![],
+            body: Bytes::from_static(b"y"),
+            stored_at: now(),
+            fresh_for: Duration::from_secs(60),
+            stale_for: Duration::ZERO,
+            swr_for: Duration::ZERO,
+            no_cache: false,
+            vary: vec![],
+            tags: vec![],
+            size: 0,
+        };
+        assert!(store.put_tiered(base, entry).await);
+        assert!(matches!(
+            store.get(base, &HeaderMap::new(), now()),
+            Lookup::Hit(_)
+        ));
+        assert_eq!(store.purge_worker_tiered("t", "w").await, 1);
+    }
+
 }
