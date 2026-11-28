@@ -81,3 +81,49 @@ fn cache_emits_service_outbound_and_addr() {
         .expect("vrt-cache external addr");
     assert_eq!(addr.address, "unix:/run/vrt/cache/team-alpha.sock");
 }
+
+// Workers Cache façade: `ctx.cache.purge()` is attached by the waitUntil
+// wrapper only when the worker's version enables caching; the per-worker
+// shim owns the token/scope and forwards to the host control listener.
+#[test]
+fn ctx_cache_facade_only_when_enabled() {
+    use snapshot_protocol::compute_desired::CacheDesired;
+
+    let mut t = tenant();
+    let mut params = runtime_params();
+    params.wf_delete_addr = "http://127.0.0.1:9091".into();
+
+    // Cache off (default): no binding, no shim, no external.
+    let r0 = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
+    assert!(!r0.text.contains("VRT_CACHE_CTL"), "{}", r0.text);
+    assert!(!r0.text.contains("vrt-cachectl-"), "{}", r0.text);
+    assert!(r0
+        .external_addrs
+        .iter()
+        .all(|a| a.service != "vrt-cachedel"));
+
+    t.workers[0].cache = Some(CacheDesired {
+        enabled: true,
+        ..CacheDesired::default()
+    });
+    let r = render_tenant_config(&input(&t, &bs(), &params)).unwrap();
+    let out = &r.text;
+    let worker = &t.workers[0].worker_id;
+    assert!(out.contains("VRT_CACHE_CTL"), "{out}");
+    assert!(out.contains(&format!("vrt-cachectl-{worker}")), "{out}");
+    assert!(
+        out.contains("name = \"vrt-cachedel\", external = ("),
+        "{out}"
+    );
+    assert!(out.contains("VRT_CACHE_PURGE_TOKEN"), "{out}");
+    assert!(out.contains("VRT_CACHE_SCOPE"), "{out}");
+    // The injected wrapper carries the façade implementation.
+    assert!(out.contains("__makeCache"), "{out}");
+    assert!(
+        r.external_addrs.iter().any(|a| a.service == "vrt-cachedel"),
+        "{:?}",
+        r.external_addrs
+    );
+    // Only the cache-enabled worker gets the tenant binding.
+    assert_eq!(out.matches("(name = \"VRT_CACHE_CTL\"").count(), 1, "{out}");
+}

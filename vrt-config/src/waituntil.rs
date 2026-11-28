@@ -86,8 +86,42 @@ export function __alarmsPending() { return __alarms; }
 const __WRAPPED = Symbol("vrt.wu.wrapped");
 let __failed = false;
 export function __wrapFailed() { return __failed; }
-export function __wrapCtx(ctx) {
-  if (ctx === null || ctx === undefined || typeof ctx.waitUntil !== "function") {
+// Workers Cache: attach the platform `ctx.cache` façade when the worker
+// carries the VRT_CACHE_CTL service binding. The shim injects the
+// platform-resolved tenant/worker scope; the token never reaches tenant code.
+export function __makeCache(env) {
+  const b = env && env.VRT_CACHE_CTL;
+  return Object.freeze({
+    async purge(opts) {
+      if (!b || typeof b.fetch !== "function") throw new Error("ctx.cache is unavailable");
+      const r = await b.fetch("http://vrt-cachectl/purge", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(opts === undefined ? {} : opts),
+      });
+      if (!r.ok) {
+        let t = "";
+        try { t = (await r.text()).slice(0, 200); } catch (e) {}
+        throw new Error("ctx.cache.purge failed (" + r.status + ")" + (t ? " " + t : ""));
+      }
+      return await r.json();
+    },
+  });
+}
+export function __wrapCtx(ctx, env) {
+  if (ctx === null || ctx === undefined) {
+    return ctx;
+  }
+  if (env && env.VRT_CACHE_CTL && (ctx.cache === undefined || ctx.cache === null)) {
+    try {
+      Object.defineProperty(ctx, "cache", {
+        value: __makeCache(env),
+        configurable: true,
+        writable: false,
+      });
+    } catch (e) {}
+  }
+  if (typeof ctx.waitUntil !== "function") {
     return ctx;
   }
   if (ctx.waitUntil[__WRAPPED] === true) return ctx;
@@ -153,7 +187,7 @@ pub fn entry_js(main: &str, classes: &[String]) -> String {
         r#"let __wrapped = true;
 function __wrapHandler(fn, t) {
   return function (...a) {
-    if (a.length >= 3) a[2] = __wrapCtx(a[2]);
+    if (a.length >= 3) a[2] = __wrapCtx(a[2], a[1]);
     return fn.apply(t, a);
   };
 }
@@ -163,7 +197,7 @@ function __fallback() {
   const fb = {};
   for (const evName of ["fetch", "scheduled", "queue"]) {
     fb[evName] = async function (...a) {
-      const ctx = a[a.length - 1];
+      const ctx = __wrapCtx(a[a.length - 1], a[1]);
       const hs = __listenersOf(evName);
       if (!hs.length) {
         return evName === "fetch" ? new Response("no handler", { status: 503 }) : undefined;
@@ -189,7 +223,7 @@ function __wrapDefault(d) {
   // the constructor — subclass wraps it.
   if (typeof d === "function") {
     return class extends d {
-      constructor(ctx, env, ...rest) { super(__wrapCtx(ctx), env, ...rest); }
+      constructor(ctx, env, ...rest) { super(__wrapCtx(ctx, env), env, ...rest); }
     };
   }
   if (typeof d === "object") {
@@ -213,7 +247,7 @@ export default __wrapDefault(__user.default);
     for (i, class) in classes.iter().enumerate() {
         let key = js_str(class);
         out.push_str(&format!(
-            "const __WU{i} = typeof __user[{key}] === \"function\"\n  ? (typeof __user[{key}].prototype.alarm === \"function\"\n    ? class extends __user[{key}] {{\n        constructor(ctx, env, ...rest) {{ super(__wrapCtx(ctx), env, ...rest); }}\n        async alarm(...a) {{\n          __alarmStart();\n          try {{ return await super.alarm(...a); }} finally {{ __alarmEnd(); }}\n        }}\n      }}\n    : class extends __user[{key}] {{\n        constructor(ctx, env, ...rest) {{ super(__wrapCtx(ctx), env, ...rest); }}\n      }})\n  : __user[{key}];\nexport {{ __WU{i} as {class} }};\n"
+            "const __WU{i} = typeof __user[{key}] === \"function\"\n  ? (typeof __user[{key}].prototype.alarm === \"function\"\n    ? class extends __user[{key}] {{\n        constructor(ctx, env, ...rest) {{ super(__wrapCtx(ctx, env), env, ...rest); }}\n        async alarm(...a) {{\n          __alarmStart();\n          try {{ return await super.alarm(...a); }} finally {{ __alarmEnd(); }}\n        }}\n      }}\n    : class extends __user[{key}] {{\n        constructor(ctx, env, ...rest) {{ super(__wrapCtx(ctx, env), env, ...rest); }}\n      }})\n  : __user[{key}];\nexport {{ __WU{i} as {class} }};\n"
         ));
     }
     out
@@ -307,6 +341,12 @@ mod tests {
         let js = entry_js("index.js", &["Counter".to_string()]);
         assert!(!js.contains("new Proxy(ctx"));
         assert!(js.contains("wrapped: __wrapped && !__wrapFailed()"));
-        assert!(js.contains("super(__wrapCtx(ctx), env, ...rest)"));
+        assert!(js.contains("super(__wrapCtx(ctx, env), env, ...rest)"));
+        // Workers Cache façade: attached in place when the worker carries
+        // the platform cache-control binding.
+        assert!(PRELUDE_JS.contains("export function __makeCache"));
+        assert!(PRELUDE_JS.contains("env.VRT_CACHE_CTL"));
+        assert!(PRELUDE_JS.contains("Object.defineProperty(ctx, \"cache\""));
+        assert!(js.contains("__wrapCtx(a[2], a[1])"));
     }
 }
