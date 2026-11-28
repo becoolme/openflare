@@ -328,6 +328,8 @@ where
     let mut env_check = String::new();
     let mut hang_ms = 0u64;
     let mut emit_header = String::new();
+    let mut emit_raw: Vec<String> = Vec::new();
+    let mut status: u16 = 200;
     let mut echo_headers = Vec::new();
     for line in head_text.lines().skip(1) {
         if let Some((name, value)) = line.split_once(':') {
@@ -338,6 +340,8 @@ where
                 "x-stub-env-check" => env_check = value.to_string(),
                 "x-stub-hang-ms" => hang_ms = value.parse().unwrap_or(0),
                 "x-stub-emit-header" => emit_header = value.to_string(),
+                "x-stub-emit-raw" => emit_raw.push(value.replace(['\r', '\n'], "")),
+                "x-stub-status" => status = value.parse().unwrap_or(200),
                 _ => {
                     // MIG-9: echo `cf-*` too — client-IP injection tests
                     // assert on the synthesized `cf-connecting-ip` and
@@ -384,8 +388,18 @@ where
         body.push_str(line);
         body.push('\n');
     }
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Status",
+    };
     let mut response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\nx-stub-worker: {socket}\r\n",
+        "HTTP/1.1 {status} {reason}\r\ncontent-length: {}\r\nconnection: close\r\nx-stub-worker: {socket}\r\n",
         body.len()
     );
     for name in env_check.split(',') {
@@ -409,6 +423,10 @@ where
                 response.push_str(&format!("{name}: {value}\r\n"));
             }
         }
+    }
+    for raw in &emit_raw {
+        response.push_str(raw);
+        response.push_str("\r\n");
     }
     response.push_str("\r\n");
     let _ = stream.write_all(response.as_bytes());
