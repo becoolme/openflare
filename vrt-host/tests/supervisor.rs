@@ -1381,3 +1381,58 @@ fn mig8_readyz_snapshot_loss_still_gates() {
     assert_eq!(view.reason.as_deref(), Some("snapshot-unavailable"), "{view:?}");
 }
 
+/// An assembler whose `assemble` always fails — drives the converge-path
+/// failure arm without any launch/retry machinery.
+struct FailingAssembler;
+
+impl vrt_host::supervisor::TenantAssembler for FailingAssembler {
+    fn assemble(
+        &self,
+        _tenant: &snapshot_protocol::compute_desired::TenantDesired,
+        _revision: u64,
+        _generation: u64,
+    ) -> Result<vrt_host::spec::TenantLaunchSpec, vrt_host::assemble::AssembleError> {
+        Err(vrt_host::assemble::AssembleError::LaunchArgs(
+            "test-specified assemble failure",
+        ))
+    }
+
+    fn params_fingerprint(&self) -> Result<String, vrt_host::assemble::AssembleError> {
+        Ok("stub".to_string())
+    }
+}
+
+/// A converge-path assemble failure must tell the operator WHAT failed —
+/// before the detail plumbing the status surface carried the typed reason
+/// (`workers-not-ready`) with a bare `assemble` or nothing at all, and a
+/// typoed varRef was indistinguishable from a missing artifact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn converge_assemble_failure_records_error_detail() {
+    let registry = vrt_host::supervisor::TenantRegistry::new();
+    let mut host = vrt_host::supervisor::SupervisorHost::new(
+        registry.clone(),
+        vrt_host::supervisor::SupervisorDeps::default(),
+        test_params(),
+    );
+    let assembler: std::sync::Arc<dyn vrt_host::supervisor::TenantAssembler> =
+        std::sync::Arc::new(FailingAssembler);
+    host.converge(&desired_with("ta", &["w1"], 1, &[]), &assembler);
+    let rt = registry.get("ta").unwrap();
+    wait_for(
+        || {
+            rt.last_error()
+                .is_some_and(|e| e.contains("test-specified assemble failure"))
+        },
+        Duration::from_secs(10),
+        "assemble error detail",
+    )
+    .await;
+    let err = rt.last_error().unwrap();
+    assert!(
+        err.contains("launch args: test-specified assemble failure"),
+        "assemble error chain in last_error: {err}"
+    );
+    // The typed reason stays whitelist-stable alongside the detail.
+    assert_eq!(rt.assemble_error().as_deref(), Some("workers-not-ready"));
+    host.shutdown_all(Duration::from_secs(15)).await;
+}
