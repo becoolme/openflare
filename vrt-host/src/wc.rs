@@ -20,7 +20,7 @@
 //! current or delete it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
@@ -490,6 +490,8 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 /// Bounded per-pod store.
 pub struct Store {
     inner: Mutex<Inner>,
+    /// Optional cross-pod upper tier (A4); absent = local-only.
+    shared: Option<Arc<dyn crate::wc_shared::SharedTier>>,
 }
 
 struct Inner {
@@ -516,6 +518,7 @@ impl Default for Store {
                 global_bytes: 0,
                 order: VecDeque::new(),
             }),
+            shared: None,
         }
     }
 }
@@ -523,6 +526,15 @@ impl Default for Store {
 impl Store {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the optional cross-pod upper tier (A4). Tests/control-plane use
+    /// the in-memory implementation; production wires the Redis adapter.
+    pub fn with_shared(shared: Arc<dyn crate::wc_shared::SharedTier>) -> Self {
+        Self {
+            shared: Some(shared),
+            ..Self::default()
+        }
     }
 
     /// Look up a matching, fresh entry. Expired entries are removed.
@@ -605,6 +617,82 @@ impl Store {
         inner.entries.insert(key.clone(), stored);
         inner.order.push_back(key);
         true
+    }
+
+    /// Tiered lookup: local first, then the optional shared tier; a shared
+    /// hit is backfilled locally. A shared outage degrades to the local
+    /// result — never a fake hit.
+    pub async fn get_tiered(&self, base: &str, req: &HeaderMap, now: SystemTime) -> Lookup {
+        let local = self.get(base, req, now);
+        if !matches!(local, Lookup::Miss | Lookup::Expired) {
+            return local;
+        }
+        let Some(shared) = &self.shared else {
+            return local;
+        };
+        match shared.get(base, req, now).await {
+            Ok(Some(entry)) => {
+                let _ = self.put(base, entry.clone());
+                crate::wc_shared::classify_entry(entry, now)
+            }
+            Ok(None) => local,
+            Err(error) => {
+                crate::wc_shared::log_shared_failure("get", &error);
+                local
+            }
+        }
+    }
+
+    /// Write-through: local first, then shared. Returns the local admission
+    /// verdict; a shared failure is logged and never fails the response.
+    pub async fn put_tiered(&self, base: &str, entry: Entry) -> bool {
+        let stored = self.put(base, entry.clone());
+        if let Some(shared) = &self.shared {
+            if let Err(error) = shared.put(base, &entry).await {
+                crate::wc_shared::log_shared_failure("put", &error);
+            }
+        }
+        stored
+    }
+
+    pub async fn purge_worker_tiered(&self, tenant: &str, worker: &str) -> usize {
+        let local = self.purge_worker(tenant, worker);
+        if let Some(shared) = &self.shared {
+            if let Err(error) = shared.purge_worker(tenant, worker).await {
+                crate::wc_shared::log_shared_failure("purge_worker", &error);
+            }
+        }
+        local
+    }
+
+    pub async fn purge_tags_tiered(&self, tenant: &str, tags: &[String]) -> usize {
+        let local = self.purge_tags(tenant, tags);
+        if let Some(shared) = &self.shared {
+            if let Err(error) = shared.purge_tags(tenant, tags).await {
+                crate::wc_shared::log_shared_failure("purge_tags", &error);
+            }
+        }
+        local
+    }
+
+    pub async fn purge_prefix_tiered(&self, tenant: &str, prefix: &str) -> usize {
+        let local = self.purge_prefix(tenant, prefix);
+        if let Some(shared) = &self.shared {
+            if let Err(error) = shared.purge_prefix(tenant, prefix).await {
+                crate::wc_shared::log_shared_failure("purge_prefix", &error);
+            }
+        }
+        local
+    }
+
+    pub async fn purge_all_tiered(&self, tenant: &str) -> usize {
+        let local = self.purge_all(tenant);
+        if let Some(shared) = &self.shared {
+            if let Err(error) = shared.purge_all(tenant).await {
+                crate::wc_shared::log_shared_failure("purge_all", &error);
+            }
+        }
+        local
     }
 
     pub fn purge_tags(&self, tenant: &str, tags: &[String]) -> usize {
@@ -1343,6 +1431,44 @@ mod tests {
         assert!(matches!(
             store.get(base, &HeaderMap::new(), now() + Duration::from_secs(10)),
             Lookup::Expired
+        ));
+    }
+
+    #[tokio::test]
+    async fn tiered_lookup_backfills_and_purge_fans_out() {
+        use crate::wc_shared::{InMemorySharedTier, SharedTier};
+        let shared = std::sync::Arc::new(InMemorySharedTier::new());
+        let store = Store::with_shared(shared.clone());
+        let base = "t\u{1f}w\u{1f}v\u{1f}default\u{1f}/x?";
+        let entry = Entry {
+            status: StatusCode::OK,
+            version: Version::HTTP_11,
+            headers: vec![],
+            body: Bytes::from_static(b"x"),
+            stored_at: now(),
+            fresh_for: Duration::from_secs(60),
+            stale_for: Duration::ZERO,
+            swr_for: Duration::ZERO,
+            no_cache: false,
+            vary: vec![],
+            tags: vec![],
+            size: 0,
+        };
+        shared.put(base, &entry).await.unwrap();
+        assert!(matches!(
+            store.get_tiered(base, &HeaderMap::new(), now()).await,
+            Lookup::Hit(_)
+        ));
+        // The upper hit is backfilled into the lower tier.
+        assert!(matches!(
+            store.get(base, &HeaderMap::new(), now()),
+            Lookup::Hit(_)
+        ));
+        assert_eq!(store.purge_worker_tiered("t", "w").await, 1);
+        assert!(shared.get(base, &HeaderMap::new(), now()).await.unwrap().is_none());
+        assert!(matches!(
+            store.get(base, &HeaderMap::new(), now()),
+            Lookup::Miss
         ));
     }
 

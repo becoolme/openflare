@@ -98,7 +98,7 @@ async fn purge(State(state): State<AdminState>, headers: HeaderMap, req: Json<Pu
             )
                 .into_response();
         }
-        state.store.purge_worker(&req.tenant_id, worker)
+        state.store.purge_worker_tiered(&req.tenant_id, worker).await
     } else if let Some(tags) = &req.tags {
         if tags.is_empty() || tags.len() > crate::wc::MAX_TAGS {
             return (
@@ -107,7 +107,7 @@ async fn purge(State(state): State<AdminState>, headers: HeaderMap, req: Json<Pu
             )
                 .into_response();
         }
-        state.store.purge_tags(&req.tenant_id, tags)
+        state.store.purge_tags_tiered(&req.tenant_id, tags).await
     } else if let Some(prefix) = &req.path_prefix {
         if !prefix.starts_with('/') || prefix.len() > 2048 {
             return (
@@ -116,9 +116,9 @@ async fn purge(State(state): State<AdminState>, headers: HeaderMap, req: Json<Pu
             )
                 .into_response();
         }
-        state.store.purge_prefix(&req.tenant_id, prefix)
+        state.store.purge_prefix_tiered(&req.tenant_id, prefix).await
     } else {
-        state.store.purge_all(&req.tenant_id)
+        state.store.purge_all_tiered(&req.tenant_id).await
     };
     let (entries, stored_bytes, _) = state.store.stats();
     crate::metrics::registry().set("vrt_host_cache_entries", &[], entries as f64);
