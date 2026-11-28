@@ -120,19 +120,28 @@ pub struct KeyPlan {
     pub head: bool,
 }
 
+/// Public HTTP requests always target the default export.
+pub const DEFAULT_ENTRYPOINT: &str = "default";
+
 /// Build the base key: tenant/worker/(version|*)/entrypoint/path+query.
-/// Host is deliberately excluded (CF semantics).
+/// Host is deliberately excluded (CF semantics). The entrypoint segment is
+/// explicit so named entrypoints (A3) can never share a key with the
+/// default export; an empty or separator-bearing name disables caching.
 pub fn key_plan(
     tenant_id: &str,
     worker_id: &str,
     version_id: &str,
     cross_version: bool,
+    entrypoint: &str,
     include_query: &[String],
     exclude_query: &[String],
     uri: &axum::http::Uri,
     method: &Method,
 ) -> Option<KeyPlan> {
-    if !matches!(*method, Method::GET | Method::HEAD) {
+    if !matches!(*method, Method::GET | Method::HEAD)
+        || entrypoint.is_empty()
+        || entrypoint.contains('\u{1f}')
+    {
         return None;
     }
     let path = uri.path();
@@ -140,7 +149,7 @@ pub fn key_plan(
     let version = if cross_version { "*" } else { version_id };
     Some(KeyPlan {
         key: format!(
-            "{tenant_id}\u{1f}{worker_id}\u{1f}{version}\u{1f}default\u{1f}{path}?{query}"
+            "{tenant_id}\u{1f}{worker_id}\u{1f}{version}\u{1f}{entrypoint}\u{1f}{path}?{query}"
         ),
         head: *method == Method::HEAD,
     })
@@ -1170,13 +1179,13 @@ mod tests {
     #[test]
     fn key_query_include_exclude() {
         let uri: axum::http::Uri = "/p?b=2&a=1&utm=z&c=3".parse().unwrap();
-        let all = key_plan("t", "w", "v", false, &[], &[], &uri, &Method::GET).unwrap();
+        let all = key_plan("t", "w", "v", false, "default", &[], &[], &uri, &Method::GET).unwrap();
         assert!(all.key.ends_with("/p?a=1&b=2&c=3&utm=z"));
         let inc = vec!["a".to_string(), "b".to_string()];
-        let only = key_plan("t", "w", "v", false, &inc, &[], &uri, &Method::GET).unwrap();
+        let only = key_plan("t", "w", "v", false, "default", &inc, &[], &uri, &Method::GET).unwrap();
         assert!(only.key.ends_with("/p?a=1&b=2"));
         let exc = vec!["utm".to_string()];
-        let without = key_plan("t", "w", "v", false, &[], &exc, &uri, &Method::GET).unwrap();
+        let without = key_plan("t", "w", "v", false, "default", &[], &exc, &uri, &Method::GET).unwrap();
         assert!(without.key.ends_with("/p?a=1&b=2&c=3"));
     }
 
@@ -1359,11 +1368,11 @@ mod tests {
     #[test]
     fn key_excludes_host_and_scopes_version() {
         let uri: axum::http::Uri = "/a/b?x=1".parse().unwrap();
-        let k = key_plan("t", "w", "v1", false, &[], &[], &uri, &Method::GET).unwrap();
+        let k = key_plan("t", "w", "v1", false, "default", &[], &[], &uri, &Method::GET).unwrap();
         assert_eq!(k.key, "t\u{1f}w\u{1f}v1\u{1f}default\u{1f}/a/b?x=1");
-        let k = key_plan("t", "w", "v1", true, &[], &[], &uri, &Method::GET).unwrap();
+        let k = key_plan("t", "w", "v1", true, "default", &[], &[], &uri, &Method::GET).unwrap();
         assert!(k.key.contains("\u{1f}*\u{1f}"));
-        assert!(key_plan("t", "w", "v1", false, &[], &[], &uri, &Method::POST).is_none());
+        assert!(key_plan("t", "w", "v1", false, "default", &[], &[], &uri, &Method::POST).is_none());
     }
     #[test]
     fn swr_serves_stale_for_background_update() {
@@ -1588,6 +1597,20 @@ mod tests {
             Lookup::Hit(_)
         ));
         assert_eq!(store.purge_worker_tiered("t", "w").await, 1);
+    }
+
+    #[test]
+    fn entrypoint_is_part_of_the_key() {
+        let uri: axum::http::Uri = "/x?a=1".parse().unwrap();
+        let default =
+            key_plan("t", "w", "v", false, "default", &[], &[], &uri, &Method::GET).unwrap();
+        let named = key_plan("t", "w", "v", false, "api", &[], &[], &uri, &Method::GET).unwrap();
+        assert_ne!(default.key, named.key);
+        assert!(named.key.contains("\u{1f}api\u{1f}"));
+        assert!(key_plan("t", "w", "v", false, "", &[], &[], &uri, &Method::GET).is_none());
+        assert!(
+            key_plan("t", "w", "v", false, "a\u{1f}b", &[], &[], &uri, &Method::GET).is_none()
+        );
     }
 
 }

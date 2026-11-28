@@ -1311,6 +1311,7 @@ async fn proxy_inner(
             &target.worker_id,
             &target.version_id,
             cfg.cross_version_cache,
+            crate::wc::DEFAULT_ENTRYPOINT,
             cfg.key
                 .as_ref()
                 .map(|k| k.include_query.as_slice())
